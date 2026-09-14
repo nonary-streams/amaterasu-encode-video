@@ -1,0 +1,535 @@
+//! COM/MF objects stay on their creating worker thread. All pointers passed to
+//! Windows reference live COM objects, stack outputs, or bounded owned buffers.
+use crate::model::{Configuration, EncoderDescription, Packet};
+use std::{
+    collections::VecDeque,
+    mem::ManuallyDrop,
+    time::{Duration, Instant},
+};
+use windows::{
+    Win32::{
+        Media::MediaFoundation::*,
+        System::{Com::*, Variant::VARIANT},
+    },
+    core::{Interface, PWSTR},
+};
+
+type NativeResult<T> = windows::core::Result<T>;
+struct Activation(IMFActivate);
+impl Drop for Activation {
+    fn drop(&mut self) {
+        // SAFETY: activation is owned by this worker, including on setup failure.
+        unsafe {
+            let _ = self.0.ShutdownObject();
+        }
+    }
+}
+
+struct Runtime;
+impl Runtime {
+    fn start() -> NativeResult<Self> {
+        // SAFETY: called on a dedicated thread and balanced on that thread.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            if let Err(error) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
+                CoUninitialize();
+                return Err(error);
+            }
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // SAFETY: all transforms are dropped before their runtime owner.
+        unsafe {
+            let _ = MFShutdown();
+            CoUninitialize();
+        }
+    }
+}
+
+fn activations() -> NativeResult<Vec<IMFActivate>> {
+    let input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_NV12,
+    };
+    let output = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+    let mut pointer = std::ptr::null_mut();
+    let mut count = 0;
+    // SAFETY: the returned COM references are moved into Vec, then the task
+    // allocation (only its array storage) is freed exactly once.
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(&input),
+            Some(&output),
+            &mut pointer,
+            &mut count,
+        )?;
+        let mut values = Vec::new();
+        if !pointer.is_null() {
+            for index in 0..count as usize {
+                if let Some(value) = pointer.add(index).read() {
+                    values.push(value);
+                }
+            }
+            CoTaskMemFree(Some(pointer.cast()));
+        }
+        Ok(values)
+    }
+}
+
+pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
+    let _runtime = Runtime::start().map_err(|_| "media_foundation_unavailable")?;
+    let values = activations().map_err(|_| "encoder_enumeration_failed")?;
+    let mut result = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let mut name = PWSTR::null();
+        let mut length = 0;
+        // SAFETY: MF allocates the UTF-16 string; free after bounded copying.
+        let name = unsafe {
+            value
+                .GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut name, &mut length)
+                .map_err(|_| "encoder_enumeration_failed")?;
+            let text = if !name.is_null() && length <= 1024 {
+                String::from_utf16_lossy(std::slice::from_raw_parts(name.0, length as usize))
+            } else {
+                "Hardware H.264 encoder".into()
+            };
+            CoTaskMemFree(Some(name.0.cast()));
+            text
+        };
+        result.push(EncoderDescription {
+            index: index as u32,
+            name,
+            codec: "h264",
+            hardware: true,
+        });
+    }
+    Ok(result)
+}
+
+pub struct Encoder {
+    transform: IMFTransform,
+    events: IMFMediaEventGenerator,
+    codec: ICodecAPI,
+    input: u32,
+    output: u32,
+    credits: u32,
+    packets: VecDeque<Packet>,
+    duration: i64,
+    draining: bool,
+    drained: bool,
+    configuration: Configuration,
+    normalizer: crate::bitstream::Normalizer,
+    _activation: Activation,
+    _runtime: Runtime,
+}
+
+impl Encoder {
+    pub fn open(index: u32, config: &Configuration) -> Result<Self, &'static str> {
+        Self::create(index, config).map_err(|_| "encoder_open_failed")
+    }
+    fn create(index: u32, config: &Configuration) -> NativeResult<Self> {
+        let runtime = Runtime::start()?;
+        let values = activations()?;
+        let activation = values.get(index as usize).ok_or_else(|| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
+        let activation = Activation(activation.clone());
+        // SAFETY: generated bindings own all COM references; sample buffers remain
+        // owned until ProcessInput takes its own reference. No raw vtable casts.
+        unsafe {
+            let transform: IMFTransform = activation.0.ActivateObject()?;
+            let attributes = transform.GetAttributes()?;
+            if attributes.GetUINT32(&MF_TRANSFORM_ASYNC)? != 1 {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_NOTIMPL,
+                ));
+            }
+            attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+            let events = transform.cast()?;
+            let codec: ICodecAPI = transform.cast()?;
+            codec.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true))?;
+            codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32))?;
+            configure_reference_frames(&codec, config.max_reference_frames)?;
+            let mut inputs = [0];
+            let mut outputs = [0];
+            if let Err(error) = transform.GetStreamIDs(&mut inputs, &mut outputs)
+                && error.code() != windows::Win32::Foundation::E_NOTIMPL
+            {
+                return Err(error);
+            }
+            let output_type = media_type(config, MFVideoFormat_H264)?;
+            output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate)?;
+            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            transform.SetOutputType(outputs[0], &output_type, 0)?;
+            let input_type = media_type(config, MFVideoFormat_NV12)?;
+            input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, config.width)?;
+            transform.SetInputType(inputs[0], &input_type, 0)?;
+            verify_reference_frames(&codec, config.max_reference_frames)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+            Ok(Self {
+                transform,
+                events,
+                codec,
+                input: inputs[0],
+                output: outputs[0],
+                credits: 0,
+                packets: VecDeque::new(),
+                duration: 10_000_000 / i64::from(config.fps),
+                draining: false,
+                drained: false,
+                configuration: config.clone(),
+                normalizer: crate::bitstream::Normalizer::default(),
+                _activation: activation,
+                _runtime: runtime,
+            })
+        }
+    }
+    pub fn submit(
+        &mut self,
+        data: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<(), &'static str> {
+        if self.draining {
+            return Err("encoder_draining");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.credits == 0 {
+            self.pump().map_err(|_| "encoder_event_failed")?;
+            if Instant::now() >= deadline {
+                return Err("encoder_timeout");
+            }
+            if self.credits == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // SAFETY: buffer length equals the owned NV12 vector; Lock/Unlock are
+        // balanced, and sample retains the COM buffer after this function.
+        unsafe {
+            if force {
+                self.codec
+                    .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true))
+                    .map_err(|_| "force_keyframe_failed")?;
+            }
+            let mut input_info = MFT_INPUT_STREAM_INFO::default();
+            self.transform
+                .GetInputStreamInfo(self.input, &mut input_info)
+                .map_err(|_| "encoder_input_failed")?;
+            let buffer = aligned_buffer(data.len() as u32, input_info.cbAlignment)
+                .map_err(|_| "sample_allocation_failed")?;
+            let mut pointer = std::ptr::null_mut();
+            buffer
+                .Lock(&mut pointer, None, None)
+                .map_err(|_| "sample_lock_failed")?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pointer, data.len());
+            buffer.Unlock().map_err(|_| "sample_unlock_failed")?;
+            buffer
+                .SetCurrentLength(data.len() as u32)
+                .map_err(|_| "sample_length_failed")?;
+            let sample = MFCreateSample().map_err(|_| "sample_allocation_failed")?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|_| "sample_buffer_failed")?;
+            sample
+                .SetSampleTime(timestamp)
+                .map_err(|_| "sample_time_failed")?;
+            sample
+                .SetSampleDuration(self.duration)
+                .map_err(|_| "sample_time_failed")?;
+            self.transform
+                .ProcessInput(self.input, &sample, 0)
+                .map_err(|_| "encoder_input_failed")?;
+            self.credits -= 1;
+        }
+        Ok(())
+    }
+    pub fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        self.pump().map_err(|_| "encoder_output_failed")?;
+        Ok(self.packets.pop_front())
+    }
+    pub fn drain(&mut self) -> Result<(), &'static str> {
+        if !self.draining {
+            // SAFETY: live transform, sequential worker access.
+            unsafe {
+                self.transform
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
+                    .map_err(|_| "encoder_drain_failed")?;
+                self.transform
+                    .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
+                    .map_err(|_| "encoder_drain_failed")?;
+            }
+            self.draining = true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self.drained {
+            self.pump().map_err(|_| "encoder_drain_failed")?;
+            if Instant::now() >= deadline {
+                return Err("encoder_timeout");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+    fn pump(&mut self) -> NativeResult<()> {
+        // SAFETY: nonblocking event reads and output processing are serialized.
+        unsafe {
+            for _ in 0..64 {
+                let event = match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                    Ok(event) => event,
+                    Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => break,
+                    Err(error) => return Err(error),
+                };
+                event.GetStatus()?.ok()?;
+                match event.GetType()? {
+                    value if value == METransformNeedInput.0 as u32 => {
+                        self.credits = self.credits.saturating_add(1)
+                    }
+                    value if value == METransformHaveOutput.0 as u32 => self.read_output()?,
+                    value if value == METransformDrainComplete.0 as u32 => self.drained = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+    fn read_output(&mut self) -> NativeResult<()> {
+        match self.read_output_sample() {
+            Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                self.renegotiate_output()?;
+                self.read_output_sample()
+            }
+            result => result,
+        }
+    }
+    fn renegotiate_output(&self) -> NativeResult<()> {
+        // SAFETY: inspect bounded offered types and preserve the configured
+        // codec and dimensions; unsupported dynamic changes fail closed.
+        unsafe {
+            let expected_size =
+                (u64::from(self.configuration.width) << 32) | u64::from(self.configuration.height);
+            for index in 0..32 {
+                let media = self.transform.GetOutputAvailableType(self.output, index)?;
+                if media.GetGUID(&MF_MT_SUBTYPE)? != MFVideoFormat_H264 {
+                    continue;
+                }
+                if let Ok(size) = media.GetUINT64(&MF_MT_FRAME_SIZE)
+                    && size != expected_size
+                {
+                    continue;
+                }
+                media.SetUINT64(&MF_MT_FRAME_SIZE, expected_size)?;
+                media.SetUINT64(
+                    &MF_MT_FRAME_RATE,
+                    (u64::from(self.configuration.fps) << 32) | 1,
+                )?;
+                media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+                media.SetUINT32(&MF_MT_AVG_BITRATE, self.configuration.bitrate)?;
+                media.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+                if self.transform.SetOutputType(self.output, &media, 0).is_ok() {
+                    verify_reference_frames(&self.codec, self.configuration.max_reference_frames)?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE))
+    }
+    fn read_output_sample(&mut self) -> NativeResult<()> {
+        // SAFETY: ManuallyDrop members transfer one COM reference from MF. Take
+        // both even on errors, so driver-allocated samples/events cannot leak.
+        unsafe {
+            let info = self.transform.GetOutputStreamInfo(self.output)?;
+            let sample = if info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 == 0 {
+                let sample = MFCreateSample()?;
+                if info.cbSize > 16 * 1024 * 1024 {
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_OUTOFMEMORY,
+                    ));
+                }
+                sample.AddBuffer(&aligned_buffer(info.cbSize, info.cbAlignment)?)?;
+                Some(sample)
+            } else {
+                None
+            };
+            let mut output = [MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: self.output,
+                pSample: ManuallyDrop::new(sample),
+                dwStatus: 0,
+                pEvents: ManuallyDrop::new(None),
+            }];
+            let mut status = 0;
+            let result = self.transform.ProcessOutput(0, &mut output, &mut status);
+            let sample = ManuallyDrop::take(&mut output[0].pSample);
+            drop(ManuallyDrop::take(&mut output[0].pEvents));
+            result?;
+            if let Some(sample) = sample {
+                let buffer = sample.ConvertToContiguousBuffer()?;
+                let length = buffer.GetCurrentLength()? as usize;
+                if length == 0 {
+                    return Ok(());
+                }
+                if length > 16 * 1024 * 1024 || self.packets.len() >= 16 {
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_OUTOFMEMORY,
+                    ));
+                }
+                let mut pointer = std::ptr::null_mut();
+                buffer.Lock(&mut pointer, None, None)?;
+                let bytes = std::slice::from_raw_parts(pointer, length).to_vec();
+                buffer.Unlock()?;
+                let output_type = self.transform.GetOutputCurrentType(self.output)?;
+                // MFVideoFormat_H264 specifies one complete coded picture per
+                // sample; H264_ES explicitly does not. Progressive negotiation
+                // makes that picture a frame rather than an individual field.
+                if output_type.GetGUID(&MF_MT_SUBTYPE)? != MFVideoFormat_H264
+                    || output_type.GetUINT32(&MF_MT_INTERLACE_MODE)?
+                        != MFVideoInterlace_Progressive.0 as u32
+                {
+                    return Err(windows::core::Error::from_hresult(MF_E_INVALIDMEDIATYPE));
+                }
+                if let Ok(length) = output_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) {
+                    if length > 1024 * 1024 {
+                        return Err(windows::core::Error::from_hresult(
+                            windows::Win32::Foundation::E_INVALIDARG,
+                        ));
+                    }
+                    let mut header = vec![0; length as usize];
+                    output_type.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut header, None)?;
+                    self.normalizer.header(&header).map_err(|_| {
+                        windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+                    })?;
+                }
+                let (bytes, keyframe) = self.normalizer.sample(&bytes).map_err(|_| {
+                    windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+                })?;
+                self.packets.push_back(Packet {
+                    bytes,
+                    timestamp_100ns: sample.GetSampleTime()?,
+                    keyframe,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Configures the static H.264 SPS reference-frame limit before media types are
+/// committed. Reading the value back prevents a driver from silently accepting
+/// but ignoring a strict one-reference-frame request.
+fn configure_reference_frames(codec: &ICodecAPI, maximum: u32) -> NativeResult<()> {
+    if maximum == 0 {
+        return Ok(());
+    }
+    // SAFETY: the live codec is owned by this thread. Microsoft specifies this
+    // property as VT_UI4 and requires SetValue/GetValue before encoding starts.
+    unsafe {
+        codec.SetValue(&CODECAPI_AVEncVideoMaxNumRefFrame, &VARIANT::from(maximum))?;
+    }
+    verify_reference_frames(codec, maximum)
+}
+
+fn verify_reference_frames(codec: &ICodecAPI, maximum: u32) -> NativeResult<()> {
+    if maximum == 0 {
+        return Ok(());
+    }
+    // SAFETY: the live codec is owned by this thread. The property is VT_UI4;
+    // conversion also rejects a driver returning the wrong variant type.
+    let configured = unsafe { codec.GetValue(&CODECAPI_AVEncVideoMaxNumRefFrame)? };
+    if u32::try_from(&configured)? != maximum {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_NOTIMPL,
+        ));
+    }
+    Ok(())
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        // SAFETY: no other thread owns or uses this transform. Shutdown stops the
+        // async event queue; COM references drop before the runtime guard.
+        unsafe {
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
+                let _ = shutdown.Shutdown();
+            }
+        }
+    }
+}
+
+fn media_type(config: &Configuration, subtype: windows::core::GUID) -> NativeResult<IMFMediaType> {
+    // SAFETY: locally owned attribute store; sizes/rates were bounded by control validation.
+    unsafe {
+        let media = MFCreateMediaType()?;
+        media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
+        media.SetUINT64(
+            &MF_MT_FRAME_SIZE,
+            (u64::from(config.width) << 32) | u64::from(config.height),
+        )?;
+        media.SetUINT64(&MF_MT_FRAME_RATE, (u64::from(config.fps) << 32) | 1)?;
+        media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+        media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        Ok(media)
+    }
+}
+
+fn aligned_buffer(length: u32, alignment: u32) -> NativeResult<IMFMediaBuffer> {
+    let alignment = alignment.max(1);
+    if !alignment.is_power_of_two() || alignment > 65_536 {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    }
+    // SAFETY: documented alignment mask is alignment minus one. MF owns memory.
+    unsafe { MFCreateAlignedMemoryBuffer(length, alignment - 1) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a Windows host with a hardware H.264 MFT; synthetic frames only"]
+    fn hardware_encodes_synthetic_nv12_with_idr_and_drains() {
+        let devices = enumerate().unwrap();
+        assert!(!devices.is_empty(), "no hardware NV12/H264 MFT available");
+        let config = Configuration {
+            width: 640,
+            height: 480,
+            fps: 30,
+            bitrate: 2_000_000,
+            max_reference_frames: 0,
+        };
+        let mut encoder = Encoder::open(devices[0].index, &config).unwrap();
+        for sequence in 0..4 {
+            let mut pixels = vec![128; 640 * 480 * 3 / 2];
+            pixels[..640 * 480].fill(16 + sequence as u8);
+            encoder
+                .submit(pixels, sequence * 333_333, sequence == 0)
+                .unwrap();
+        }
+        encoder.drain().unwrap();
+        let mut count = 0;
+        let mut idr = false;
+        while let Some(packet) = encoder.receive().unwrap() {
+            assert!(packet.bytes.starts_with(&[0, 0, 0, 1]));
+            idr |= packet.keyframe;
+            count += 1;
+        }
+        assert!(count >= 4);
+        assert!(idr);
+    }
+}

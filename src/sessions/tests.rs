@@ -1,0 +1,358 @@
+use super::*;
+use crate::native::Registration;
+use amaterasu_abi::{AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery};
+use std::{
+    ffi::c_void,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+struct Fake {
+    packets: VecDeque<Packet>,
+    submissions: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Backend for Fake {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+        self.submissions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        Ok(self.packets.pop_front())
+    }
+    fn drain(&mut self) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn configuration() -> Configuration {
+    Configuration {
+        width: 16,
+        height: 16,
+        fps: 60,
+        bitrate: 1_000_000,
+        max_reference_frames: 0,
+    }
+}
+
+struct Sink {
+    reject: bool,
+    flags: Vec<u32>,
+    sequences: Vec<u64>,
+}
+
+unsafe extern "C" fn write(context: *mut c_void, packet: *const EncodedPacket) -> Status {
+    // SAFETY: test supplies a live Sink and receives a callback-lifetime packet.
+    let sink = unsafe { &mut *context.cast::<Sink>() };
+    let packet = unsafe { &*packet };
+    if sink.reject {
+        return MEDIA_BUSY;
+    }
+    sink.flags.push(packet.flags);
+    sink.sequences.push(packet.sequence);
+    STATUS_OK
+}
+
+unsafe fn binding(registration: &Registration, owner: &str) -> *const EncoderApi {
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: 0,
+        min_size: size_of::<EncoderApi>() as u32,
+    };
+    let mut output: *const NativeInterface = std::ptr::null();
+    // SAFETY: local valid factory/query/output and principal storage.
+    assert_eq!(
+        unsafe {
+            registration.factory.bind.unwrap()(
+                registration.factory.context,
+                BorrowedBytes::new(owner.as_bytes()),
+                &query,
+                &mut output,
+            )
+        },
+        STATUS_OK
+    );
+    output.cast()
+}
+
+#[test]
+fn native_bindings_enforce_owner_preserve_rejected_packets_and_emit_eos_once() {
+    exercise_packet_flags(false);
+}
+
+#[test]
+fn boundary_opt_in_marks_data_and_never_combines_eos() {
+    exercise_packet_flags(true);
+}
+
+fn exercise_packet_flags(packet_boundaries: bool) {
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(Fake {
+                packets: VecDeque::from([Packet {
+                    bytes: vec![0, 0, 1, 0x41, 1],
+                    timestamp_100ns: 10,
+                    keyframe: false,
+                }]),
+                submissions: submissions.clone(),
+                drops: drops.clone(),
+            }),
+            packet_boundaries,
+        )
+        .unwrap();
+    let shared = Arc::new(Mutex::new(sessions));
+    let registration = Registration::new(shared.clone());
+    let mut sink = Sink {
+        reject: true,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    let data = vec![0; 16 * 16 * 4];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_BGRA8,
+        stride: 64,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 42,
+    };
+    // SAFETY: test retains factories, bindings, frame allocations and callback
+    // context through all calls, then releases each binding exactly once.
+    unsafe {
+        let alice = &*binding(&registration, "alice");
+        let bob = &*binding(&registration, "bob");
+        assert_eq!((bob.submit)(bob.base.context, 1, &frame, 0), MEDIA_CLOSED);
+        assert_eq!(
+            (bob.receive)(bob.base.context, 1, packet_sink),
+            MEDIA_CLOSED
+        );
+        assert_eq!((bob.drain)(bob.base.context, 1), MEDIA_CLOSED);
+        assert_eq!((alice.submit)(alice.base.context, 1, &frame, 1), STATUS_OK);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (alice.receive)(alice.base.context, 1, packet_sink),
+            MEDIA_BUSY
+        );
+        sink.reject = false;
+        assert_eq!(
+            (alice.receive)(alice.base.context, 1, packet_sink),
+            STATUS_OK
+        );
+        assert_eq!(sink.sequences, [42]);
+        assert_eq!((alice.drain)(alice.base.context, 1), STATUS_OK);
+        assert_eq!(
+            (alice.submit)(alice.base.context, 1, &frame, 0),
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            (alice.receive)(alice.base.context, 1, packet_sink),
+            STATUS_OK
+        );
+        assert_eq!(
+            (alice.receive)(alice.base.context, 1, packet_sink),
+            MEDIA_PENDING
+        );
+        let data_flags = if packet_boundaries {
+            FLAG_END_OF_ACCESS_UNIT
+        } else {
+            0
+        };
+        assert_eq!(sink.flags, [data_flags, FLAG_END_OF_STREAM]);
+        assert!(sink.flags.iter().all(|flags| flags
+            & (FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT)
+            != (FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT)));
+        shared.lock().unwrap().close("alice", 1).unwrap();
+        assert_eq!(
+            (alice.receive)(alice.base.context, 1, packet_sink),
+            MEDIA_CLOSED
+        );
+        alice.base.release.unwrap()(alice.base.context);
+        bob.base.release.unwrap()(bob.base.context);
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bounded_pending_input_returns_busy_without_accepting() {
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(Fake {
+                packets: VecDeque::new(),
+                submissions: submissions.clone(),
+                drops: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let mut frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 0,
+        sequence: 0,
+    };
+    for sequence in 0..16 {
+        frame.timestamp_us = sequence;
+        frame.sequence = sequence;
+        // SAFETY: owned data remains live and immutable.
+        assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+    }
+    frame.timestamp_us = 16;
+    frame.sequence = 16;
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        MEDIA_BUSY
+    );
+    assert_eq!(submissions.load(Ordering::SeqCst), 16);
+}
+
+#[test]
+fn control_validates_limits_disabled_default_and_operation_tombstones() {
+    let mut sessions = Sessions::new(false);
+    assert_eq!(
+        sessions
+            .open("alice", 0, configuration(), None, false)
+            .unwrap_err(),
+        "disabled"
+    );
+    let mut config = configuration();
+    config.width = 17;
+    assert!(config.validate().is_err());
+    assert!(
+        serde_json::from_value::<crate::model::Operation>(
+            json!({"action":"open","encoder":0,"configuration":configuration(),"owner":"bob"})
+        )
+        .is_err()
+    );
+    sessions.operations.insert(
+        ("alice".into(), "one".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: 0,
+            configuration: configuration(),
+        },
+    );
+    assert_eq!(
+        sessions
+            .open("alice", 0, configuration(), Some("one".into()), false)
+            .unwrap_err(),
+        "session_closed"
+    );
+    assert_eq!(
+        sessions.lookup("bob", "one").unwrap_err(),
+        "session_not_found"
+    );
+}
+
+#[test]
+fn changing_boundary_mode_conflicts_with_existing_operation() {
+    let mut sessions = Sessions::new(true);
+    sessions.operations.insert(
+        ("alice".into(), "one".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: 0,
+            configuration: configuration(),
+        },
+    );
+    assert_eq!(
+        sessions
+            .open("alice", 0, configuration(), Some("one".into()), true)
+            .unwrap_err(),
+        "operation_conflict"
+    );
+    let operation: crate::model::Operation = serde_json::from_value(
+        json!({"action":"open","encoder":0,"configuration":configuration()}),
+    )
+    .unwrap();
+    assert!(matches!(
+        operation,
+        crate::model::Operation::Open {
+            packet_boundaries: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
+    let operation: crate::model::Operation = serde_json::from_value(json!({
+        "action":"open",
+        "encoder":0,
+        "configuration":{"width":16,"height":16,"fps":60,"bitrate":1_000_000}
+    }))
+    .unwrap();
+    let crate::model::Operation::Open {
+        configuration: legacy,
+        ..
+    } = operation
+    else {
+        panic!("expected open operation");
+    };
+    assert_eq!(legacy.max_reference_frames, 0);
+    assert!(
+        serde_json::to_value(&legacy).unwrap()["max_reference_frames"].is_null(),
+        "legacy configuration must retain its old wire shape"
+    );
+
+    let mut strict = legacy.clone();
+    strict.max_reference_frames = 1;
+    assert_eq!(
+        serde_json::to_value(&strict).unwrap()["max_reference_frames"],
+        1
+    );
+
+    let mut invalid = configuration();
+    invalid.max_reference_frames = 2;
+    assert_eq!(invalid.validate(), Err("invalid_configuration"));
+
+    let mut sessions = Sessions::new(true);
+    sessions.operations.insert(
+        ("alice".into(), "reference-limit".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: 0,
+            configuration: configuration(),
+        },
+    );
+    let mut changed = configuration();
+    changed.max_reference_frames = 1;
+    assert_eq!(open_reply(7, &changed, false)["max_reference_frames"], 1);
+    assert_eq!(
+        sessions
+            .open("alice", 0, changed, Some("reference-limit".into()), false,)
+            .unwrap_err(),
+        "operation_conflict"
+    );
+}
