@@ -1,0 +1,226 @@
+# Managed video pipeline
+
+`amaterasu_video` provides control and native service `amaterasu.video/1`. Product
+coordination stays in this independently built library. It opens an allowlisted capture
+stream and Media Foundation encoder session asynchronously, then moves borrowed
+CPU frames directly into the encoder's copying submit API. Encoded packets reach
+consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
+
+Settings default to:
+
+```json
+{"enabled":false,"capture_providers":["dxgi"],"drain_timeout_ms":5000}
+```
+
+Capture providers are finite identifiers: `dxgi` maps to
+`amaterasu.capture-dxgi/1`; `wgc` maps to `amaterasu.capture-wgc/1`. An empty
+allowlist, unknown identifier, or drain timeout outside 100–30000 ms is rejected.
+Enabled startup binds every configured native capture provider and the encoder.
+Disabled startup registers services but binds no lower interface and opens no
+devices. Unsupported hardware/platforms fail through real provider responses;
+there is no synthetic frame or software fallback.
+
+## API
+
+```json
+{"action":"open","output":"<capture enumerate output id>","encoder":0,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
+{"action":"status"}
+{"action":"status","stream":1}
+{"action":"force_idr","stream":1}
+{"action":"drain","stream":1}
+{"action":"close","stream":1}
+```
+
+Open optionally accepts `"capture_provider":"dxgi"` or `"wgc"`, defaulting to
+`dxgi`. The chosen provider must be in the startup allowlist. Obtain the output ID
+from that provider's enumeration; DXGI and WGC output IDs are not interchangeable.
+The selected service is retained for all open, lookup, close and teardown calls;
+a caller cannot supply an arbitrary service name or silently trigger a fallback.
+
+Open completes after both lower resources open, returning
+`{"ok":true,"stream":1,"state":"running",...}`. This state means the pipeline has
+resources, not that a frame, packet, client connection or full stream is ready.
+Dimensions are checked again against each actual captured frame; a mismatch starts
+cleanup. No scaling or output topology change is performed.
+
+When the capture provider returns `desktop_geometry`, video strictly parses and
+retains the captured output and virtual desktop rectangles. Before opening the
+encoder, it requires the provider's native geometry callback to return the exact
+same validated snapshot. The snapshot is included in open, lookup, status, and
+retained failure metadata. A malformed control snapshot, missing native support,
+or initial mismatch fails startup and closes the owned capture stream.
+
+Older capture v1.0 providers remain supported. Video binds only the 40-byte v1.0
+capture prefix and reads the optional v1.1 geometry callback only when the native
+header advertises both minor version 1 and the complete table size. Such providers
+must omit `desktop_geometry`; its absence keeps authoritative absolute-pointer
+mapping disabled while relative input and video continue to work.
+
+Status returns only the caller's active records and up to four recent failures
+(shared bounded history across callers), with configuration, output, selected
+capture provider, state, `dropped_frames`, `force_idr_pending`, and error. Recent
+failures persist after successful resource cleanup with state `failed`, allowing
+timeout/backend errors to remain visible. History is in-memory and may be evicted. Stream IDs and ownership last only for this module
+instance. At most two streams exist across all callers, matching the encoder's
+per-owner limit. Dimensions must be even, 16–3840 by 16–2160; fps 1–120; bitrate
+100000–100000000. Output IDs are nonempty, at most 512 UTF-8 bytes, without control
+characters. Unknown JSON fields are rejected.
+
+`configuration.max_reference_frames` accepts only `0` or `1` and defaults to
+`0`. Zero preserves the existing unconstrained encoder request and is omitted
+from serialized configuration. Video also omits `packet_boundaries` from the
+encoder request when false, preserving the legacy strict request shape. One asks for a
+single H.264 reference frame, is forwarded unchanged to `amaterasu.encode/1`,
+and participates in operation-ID equality. Video activates the stream only when
+the encoder's open metadata confirms the exact requested value; otherwise it
+cleans up with `reference_frame_constraint_unavailable`. The Windows encoder
+implements this with Microsoft's documented
+[`CODECAPI_AVEncVideoMaxNumRefFrame`](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avencvideomaxnumrefframe)
+property. Real hardware and emitted bitstreams remain unqualified.
+
+Close first stops delivery, discards buffered packets, and returns `closing`.
+Status ceases to include the record after confirmed lower cleanup. A failed cleanup
+remains visible as `cleanup_failed`, consuming its bounded slot; close retries it.
+Repeating close while cleanup is already running returns its current state without
+cancelling or restarting that cleanup. Wrong-owner close returns `not_found`. A missing status filter returns an empty
+list. Close remains an explicit abort and can interrupt graceful drain.
+
+`force_idr` is accepted only for an owned running stream. It coalesces repeated
+requests into a flag for the next accepted encoder input. Capture pending/busy or
+encoder backpressure leaves that flag pending; acceptance clears it. The encoder
+receives the exact native force flag. Actual keyframe generation still depends on
+the hardware encoder honoring the request.
+
+`drain` is accepted only for an owned running stream and returns `draining`.
+Repeating it while draining preserves the original deadline. Video stops capturing,
+closes the selected capture stream, and invokes encoder drain until it accepts the
+command (busy attempts accept nothing). It then continues receiving packets without
+submitting frames. Buffered output stays available until the consumer accepts EOS.
+EOS is queued once, respects the FIFO capacity, and remains queued on sink rejection.
+Once EOS is buffered, video stops calling the encoder and waits only for consumer
+acceptance or the original deadline. After EOS acceptance, native receive returns `MEDIA_CLOSED`; subsequent ticks close
+the encoder and reconcile resource ownership. No video-generated EOS substitutes
+for the encoder's actual EOS.
+
+The configured drain deadline covers capture shutdown, encoder drain and consumer
+EOS acceptance. Expiry or backend failure aborts buffered output and begins the
+existing confirmed-settlement cleanup flow. Errors remain visible in active cleanup
+or recent failure status. Deadline enforcement occurs on module ticks, not in a
+real-time timer. `force_idr` while draining returns `invalid_state`.
+
+## Native flow and limits
+
+Consumers with the native-use grant bind `VideoApi` from `amaterasu-media` using
+major 1, minor 0 and `size_of::<VideoApi>()`. Its `receive(context,stream,PacketSink)`
+returns at most one H.264 Annex B packet. The factory copies the authenticated
+consumer principal into its context and every receive checks that principal against
+the control stream owner. A JSON call grant alone never permits native binding.
+
+The tick thread holds capture and encoder bindings. It processes one stream per
+tick, schedules capture at no more than its configured fps, and performs at most one
+capture and one encoder receive per selected tick. Host tick cadence and provider
+latency can reduce the achieved frame rate. The borrowed capture callback calls
+encoder submit immediately; `MEDIA_BUSY` drops that incoming frame. Busy capture
+simply skips that sample. Dimensions, format/stride and size validation precede
+submission; fatal capture/encoder errors stop the pipeline and start cleanup.
+
+For streams with authoritative geometry, video rechecks the complete native
+snapshot before every scheduled frame read. A changed, lost, invalid, or failed
+snapshot closes packet delivery and begins the normal owned cleanup flow before
+another frame is submitted. A transient geometry `MEDIA_BUSY` skips that tick and
+does not read a frame. This bounds ordinary detection to the configured frame
+cadence plus module scheduling, but it cannot make display hotplug and frame capture
+one atomic platform operation; a topology change can still race the last successful
+check.
+
+Each video stream owns a FIFO of at most four packets and 16 MiB total, copied once
+from the encoder sink. A full queue returns `MEDIA_BUSY` without consuming the
+encoder packet. Consumer sink rejection likewise retains the exact queued packet.
+The shared queue uses nonblocking native lock acquisition; contended receive returns
+`MEDIA_BUSY`. Callbacks must be bounded and must not retain borrowed bytes. Reentry
+into receive is busy while the queue callback runs. No video-owned worker threads
+or copied raw-frame queues exist.
+
+## Authority, cancellation and lifecycle
+
+Video needs `provide` and `native_provide` for `amaterasu.video/1`, `call` and
+`native_use` for each configured capture service and `amaterasu.encode/1`, and
+signed startup dependencies on those providers. Initiating control consumers currently
+need call grants for video, the selected capture service and the encoder because parent delegation
+intersects initiating authority. Lower resources are owned by the video runtime
+principal; lower native bindings authenticate that same principal.
+
+Open requests delegate with the initiating request as parent and recheck its
+liveness between steps. Each pipeline has a unique provider operation ID. On
+cancellation, transport loss, a malformed reply or undeliverable final completion,
+video retains known pending IDs until both cancellation and result release are
+confirmed. Failed settlement blocks all lookup/close work; after three attempts the
+record remains failed, retaining IDs for an explicit close retry. A lost acceptance
+reply retains the exact original request envelope. Video first confirms its parent
+has ended, then recovers the broker's deduplicated request ID and settles it. If the
+broker retry record has expired, the ended parent prevents a fresh child open.
+Parentless uncertain cleanup requests contain only lookup or exact-ID close.
+
+Once settlement is confirmed, video looks up the exact owned provider operation and
+closes those IDs through parentless cleanup calls. It does not replay unknown open
+effects or search by output name. Cleanup attempts each step at most three times;
+encoder cleanup failure still proceeds to capture cleanup, retaining a failed
+record if either side is unresolved. Internal RPC results are released to avoid
+exhausting retained runtime request capacity.
+
+The signed package must stop native video consumers before video, then destroy
+video before its lower providers. Drop invalidates all copied packet queues, makes one bounded attempt to settle
+pending work and end opening parents, and enqueues parentless exact known-ID closes
+only after settlement succeeds. It cannot wait for lower provider ticks or reconcile
+unknown IDs synchronously. Whole-host teardown releases lower native bindings and
+provider destruction closes their resources. Independently unloading video while
+keeping lower providers running is not supported; queued teardown closes are best
+effort, not a synchronous cleanup flush. No ownership is persisted
+across process restart. Native grants describe trusted-code authority, not a sandbox.
+
+## Validation and remaining gates
+
+Fake pipeline tests cover parent delegation, cancellation lookup/close, lost open
+completion, owner isolation, continued capture cleanup after encoder cleanup fails,
+and disabled behavior. Additional regressions inject lost acceptance/result replies,
+cancel/release failures and failed parent completion, verify the expired broker
+retry boundary, and check idempotent close and teardown queue invalidation. Native tests exercise dimension rejection, busy-frame drop, the force-IDR C flag,
+bounded packet queues, sink rejection and authenticated packet ownership. Provider
+selection tests verify allowlist rejection and provider-specific cleanup. Graceful
+output tests verify capture shutdown, no further frame submission, exactly-once EOS,
+FIFO backpressure, ownership, timeout settlement and visible failure records. Windows
+cross-compilation checks the composed interface types; real Windows capture-to-H.264
+end-to-end hardware validation remains required.
+
+Networking, audio, pacing against a remote clock, bitrate adaptation,
+resizing/colorspace policy, GPU texture sharing, session/launch
+coordination, and restart recovery remain pending. Current provider limits (including
+bounded encoder operation tombstones) also apply; this increment does not claim
+production streaming or full Vibeshine parity. Dependencies are SDK, media ABI,
+serde/serde_json, and getrandom for unique per-instance control operation IDs.
+
+Open accepts an optional `operation_id` containing 1–128 ASCII graphic bytes.
+`{"action":"lookup","operation_id":"launch-1"}` returns the caller's existing
+stream metadata, including `state` and the more specific `stage`. An exact open
+retry returns the same stream even while opening, without transferring the
+original request's parent ownership. Configuration/provider/output/encoder changes
+produce `operation_conflict`. A retry after cleanup returns `stream_closed`;
+lookup after cleanup or from a different caller returns `not_found`.
+
+The module retains at most 128 caller-scoped operation records, including closed
+tombstones, until unload; it never evicts an old record and recreates that
+operation. New identified opens then return `operation_limit`. Existing opens
+without an operation ID retain their original behavior. Retry or lookup replies
+do not promise that an opening stream will survive: cancellation or loss of the
+original open completion still settles lower requests and cleans their resources.
+A lost duplicate reply never initiates cleanup of the original stream.
+
+Top-level open option `packet_boundaries` defaults to false for compatibility with
+consumers that only recognize the original packet flags. Set it to true to request
+`FLAG_END_OF_ACCESS_UNIT` (4) on complete encoded pictures. Video forwards the mode
+to encode and requires explicit confirmation before activating; otherwise it
+cleans up with `packet_boundaries_unavailable`. Metadata advertises
+`supports_packet_boundaries: true` and the selected `packet_boundaries` value.
+The mode participates in operation-ID equality. EOS remains a separate empty
+packet without the boundary flag. Consumers must opt in and verify the returned
+mode before relying on the new flag.
