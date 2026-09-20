@@ -56,6 +56,7 @@ struct Stream {
     error: Option<&'static str>,
     next_frame: Instant,
     dropped: u64,
+    submitted: u64,
     unresolved: bool,
 }
 
@@ -81,6 +82,7 @@ impl Stream {
             "force_idr_pending":self.force_idr,
             "configuration": self.configuration,
             "dropped_frames": self.dropped,
+            "submitted_frames": self.submitted,
             "error": self.error,
         });
         if let Some(geometry) = self.desktop_geometry {
@@ -293,6 +295,7 @@ impl Pipeline {
                 error: None,
                 next_frame: Instant::now(),
                 dropped: 0,
+                submitted: 0,
                 unresolved: false,
             },
         );
@@ -392,6 +395,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     }) {
         Ok(progress) => {
             stream.dropped = stream.dropped.saturating_add(u64::from(progress.dropped));
+            stream.submitted = stream
+                .submitted
+                .saturating_add(u64::from(progress.submitted));
             if progress.submitted {
                 stream.force_idr = false;
             }
