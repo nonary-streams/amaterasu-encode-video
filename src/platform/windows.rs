@@ -4,6 +4,7 @@ use crate::model::{Configuration, EncoderDescription, Packet};
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
+    sync::atomic::{AtomicI32, AtomicU8, Ordering},
     time::{Duration, Instant},
 };
 use windows::{
@@ -15,6 +16,51 @@ use windows::{
 };
 
 type NativeResult<T> = windows::core::Result<T>;
+const STAGE_NONE: u8 = 0;
+const STAGE_PROCESS_INPUT: u8 = 1;
+const STAGE_PROCESS_OUTPUT: u8 = 2;
+const STAGE_STREAM_CHANGE: u8 = 3;
+const STAGE_DRAIN: u8 = 4;
+
+static LAST_STAGE: AtomicU8 = AtomicU8::new(STAGE_NONE);
+static LAST_HRESULT: AtomicI32 = AtomicI32::new(0);
+
+/// Non-secret Media Foundation failure detail for an owned diagnostics query.
+/// It intentionally retains only an operation stage and HRESULT, never frame,
+/// bitstream, endpoint, or display content.
+#[derive(Clone, Copy)]
+pub struct Diagnostic {
+    pub stage: &'static str,
+    pub hresult: u32,
+}
+
+pub fn last_failure() -> Option<Diagnostic> {
+    let stage = LAST_STAGE.load(Ordering::Acquire);
+    (stage != STAGE_NONE).then(|| Diagnostic {
+        stage: stage_name(stage),
+        hresult: LAST_HRESULT.load(Ordering::Acquire) as u32,
+    })
+}
+
+fn clear_failure() {
+    LAST_HRESULT.store(0, Ordering::Release);
+    LAST_STAGE.store(STAGE_NONE, Ordering::Release);
+}
+
+fn record_failure(stage: u8, error: &windows::core::Error) {
+    LAST_HRESULT.store(error.code().0, Ordering::Release);
+    LAST_STAGE.store(stage, Ordering::Release);
+}
+
+fn stage_name(stage: u8) -> &'static str {
+    match stage {
+        STAGE_PROCESS_INPUT => "process_input",
+        STAGE_PROCESS_OUTPUT => "process_output",
+        STAGE_STREAM_CHANGE => "stream_change",
+        STAGE_DRAIN => "drain",
+        _ => "unknown",
+    }
+}
 struct Activation(IMFActivate);
 impl Drop for Activation {
     fn drop(&mut self) {
@@ -134,6 +180,7 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn open(index: u32, config: &Configuration) -> Result<Self, &'static str> {
+        clear_failure();
         Self::create(index, config).map_err(|_| "encoder_open_failed")
     }
     fn create(index: u32, config: &Configuration) -> NativeResult<Self> {
@@ -246,9 +293,10 @@ impl Encoder {
             sample
                 .SetSampleDuration(self.duration)
                 .map_err(|_| "sample_time_failed")?;
-            self.transform
-                .ProcessInput(self.input, &sample, 0)
-                .map_err(|_| "encoder_input_failed")?;
+            if let Err(error) = self.transform.ProcessInput(self.input, &sample, 0) {
+                record_failure(STAGE_PROCESS_INPUT, &error);
+                return Err("encoder_input_failed");
+            }
             self.credits -= 1;
         }
         Ok(())
@@ -261,12 +309,17 @@ impl Encoder {
         if !self.draining {
             // SAFETY: live transform, sequential worker access.
             unsafe {
-                self.transform
+                if let Err(error) = self
+                    .transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
-                    .map_err(|_| "encoder_drain_failed")?;
-                self.transform
-                    .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
-                    .map_err(|_| "encoder_drain_failed")?;
+                {
+                    record_failure(STAGE_DRAIN, &error);
+                    return Err("encoder_drain_failed");
+                }
+                if let Err(error) = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) {
+                    record_failure(STAGE_DRAIN, &error);
+                    return Err("encoder_drain_failed");
+                }
             }
             self.draining = true;
         }
@@ -305,10 +358,22 @@ impl Encoder {
     fn read_output(&mut self) -> NativeResult<()> {
         match self.read_output_sample() {
             Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                self.renegotiate_output()?;
-                self.read_output_sample()
+                if let Err(error) = self.renegotiate_output() {
+                    record_failure(STAGE_STREAM_CHANGE, &error);
+                    return Err(error);
+                }
+                let result = self.read_output_sample();
+                if let Err(error) = &result {
+                    record_failure(STAGE_PROCESS_OUTPUT, error);
+                }
+                result
             }
-            result => result,
+            result => {
+                if let Err(error) = &result {
+                    record_failure(STAGE_PROCESS_OUTPUT, error);
+                }
+                result
+            }
         }
     }
     fn renegotiate_output(&self) -> NativeResult<()> {
@@ -370,7 +435,10 @@ impl Encoder {
             let result = self.transform.ProcessOutput(0, &mut output, &mut status);
             let sample = ManuallyDrop::take(&mut output[0].pSample);
             drop(ManuallyDrop::take(&mut output[0].pEvents));
-            result?;
+            if let Err(error) = result {
+                record_failure(STAGE_PROCESS_OUTPUT, &error);
+                return Err(error);
+            }
             if let Some(sample) = sample {
                 let buffer = sample.ConvertToContiguousBuffer()?;
                 let length = buffer.GetCurrentLength()? as usize;
@@ -496,6 +564,20 @@ fn aligned_buffer(length: u32, alignment: u32) -> NativeResult<IMFMediaBuffer> {
     }
     // SAFETY: documented alignment mask is alignment minus one. MF owns memory.
     unsafe { MFCreateAlignedMemoryBuffer(length, alignment - 1) }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_stage_mapping_is_stable_and_never_contains_media_data() {
+        assert_eq!(stage_name(STAGE_PROCESS_INPUT), "process_input");
+        assert_eq!(stage_name(STAGE_PROCESS_OUTPUT), "process_output");
+        assert_eq!(stage_name(STAGE_STREAM_CHANGE), "stream_change");
+        assert_eq!(stage_name(STAGE_DRAIN), "drain");
+        assert_eq!(stage_name(255), "unknown");
+    }
 }
 
 #[cfg(test)]

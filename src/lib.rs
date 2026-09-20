@@ -105,7 +105,12 @@ impl EncodeModule {
                 } else {
                     Vec::new()
                 };
-                Ok(json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders}))
+                let diagnostic = platform::last_failure().map(|detail| {
+                    json!({"stage":detail.stage,"hresult":format!("0x{:08x}", detail.hresult)})
+                });
+                Ok(
+                    json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders,"diagnostic":diagnostic}),
+                )
             }
             Operation::Open {
                 packet_boundaries,

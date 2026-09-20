@@ -1,14 +1,22 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Encoder, enumerate};
+pub use windows::{Encoder, enumerate, last_failure};
 #[cfg(not(windows))]
 mod unsupported {
     use crate::model::{Configuration, EncoderDescription, Packet};
+    #[derive(Clone, Copy)]
+    pub struct Diagnostic {
+        pub stage: &'static str,
+        pub hresult: u32,
+    }
     pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
         Ok(Vec::new())
     }
     pub struct Encoder;
+    pub fn last_failure() -> Option<Diagnostic> {
+        None
+    }
     impl Encoder {
         pub fn open(_: u32, _: &Configuration) -> Result<Self, &'static str> {
             Err("unsupported_platform")
@@ -26,4 +34,4 @@ mod unsupported {
 }
 
 #[cfg(not(windows))]
-pub use unsupported::{Encoder, enumerate};
+pub use unsupported::{Encoder, enumerate, last_failure};
