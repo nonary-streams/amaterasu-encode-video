@@ -98,6 +98,7 @@ pub struct OpenSpec {
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
     pub constant_rate: bool,
+    pub wgc_pacing_smoothing: bool,
     pub minimum_fps_target: f64,
     pub output: String,
     pub encoder: EncoderIdentity,
@@ -116,6 +117,8 @@ pub enum Operation {
         capture_provider: CaptureProvider,
         #[serde(default)]
         constant_rate: bool,
+        #[serde(default = "default_wgc_pacing_smoothing")]
+        wgc_pacing_smoothing: bool,
         #[serde(default = "default_minimum_fps_target")]
         minimum_fps_target: f64,
         output: String,
@@ -146,6 +149,10 @@ pub fn error(code: &str) -> Value {
 
 fn default_minimum_fps_target() -> f64 {
     20.0
+}
+
+fn default_wgc_pacing_smoothing() -> bool {
+    true
 }
 
 pub fn valid_minimum_fps_target(value: f64) -> bool {
@@ -217,6 +224,7 @@ mod tests {
         let legacy: Operation = serde_json::from_value(request.clone()).unwrap();
         let Operation::Open {
             constant_rate,
+            wgc_pacing_smoothing,
             minimum_fps_target,
             ..
         } = legacy
@@ -224,16 +232,19 @@ mod tests {
             unreachable!();
         };
         assert!(!constant_rate);
+        assert!(wgc_pacing_smoothing);
         assert_eq!(minimum_fps_target, 20.0);
 
         request["capture_provider"] = json!("wgc");
         request["constant_rate"] = json!(true);
+        request["wgc_pacing_smoothing"] = json!(false);
         request["minimum_fps_target"] = json!(23.5);
         assert!(matches!(
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
                 capture_provider: CaptureProvider::Wgc,
                 constant_rate: true,
+                wgc_pacing_smoothing: false,
                 minimum_fps_target: 23.5,
                 ..
             }

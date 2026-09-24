@@ -154,7 +154,8 @@ impl Plane for FakePlane {
         if self.fail {
             Err("frame_rejected")
         } else {
-            let capture_submitted = input.capture_due && !self.dropped;
+            let fresh_capture = input.capture_due;
+            let capture_submitted = fresh_capture && !self.dropped;
             let repeat_attempted = !capture_submitted
                 && !self.dropped
                 && input.repeat_due
@@ -163,6 +164,10 @@ impl Plane for FakePlane {
                 dropped: self.dropped,
                 submitted: capture_submitted || repeat_attempted,
                 repeat_attempted,
+                capture_arrival: (fresh_capture
+                    && input.provider == CaptureProvider::Wgc
+                    && !input.constant_rate)
+                    .then(Instant::now),
                 frame: capture_submitted.then_some(FrameMetadata {
                     width: input.configuration.width,
                     height: input.configuration.height,
@@ -231,6 +236,7 @@ fn open() -> Operation {
         operation_id: None,
         capture_provider: CaptureProvider::Dxgi,
         constant_rate: false,
+        wgc_pacing_smoothing: true,
         minimum_fps_target: 20.0,
         output: "display-1".into(),
         encoder: encoder_identity(),
@@ -287,12 +293,14 @@ fn constant_rate_delivery_is_opt_in_and_only_forwards_for_wgc() {
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
 
     assert_eq!(runtime.completed[0].1["constant_rate"], true);
+    assert_eq!(runtime.completed[0].1["wgc_pacing_smoothing"], true);
     assert!(runtime.commands.iter().any(|command| matches!(
         command,
         Command::Request { service, payload, .. }
             if service == "amaterasu.capture-wgc/1"
                 && payload["action"] == "open"
                 && payload["constant_rate"] == true
+                && payload.get("wgc_pacing_smoothing").is_none()
     )));
 
     let (mut pipeline, mut runtime, _) = setup();
@@ -304,6 +312,69 @@ fn constant_rate_delivery_is_opt_in_and_only_forwards_for_wgc() {
     pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
     assert_eq!(runtime.completed[0].1["code"], "constant_rate_requires_wgc");
     assert_eq!(runtime.open_effects, 0);
+}
+
+#[test]
+fn wgc_pacing_tracks_capture_arrival_independently_of_encoder_backpressure() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 60;
+    configuration.bitrate = 100_000;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+
+    assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 1);
+    let submitted = pipeline.streams[&1].submitted;
+    plane.dropped = true;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    let stream = &pipeline.streams[&1];
+    assert_eq!(stream.wgc_pacing.group_frames, 2);
+    assert_eq!(stream.submitted, submitted);
+    assert_eq!(stream.dropped, 1);
+}
+
+#[test]
+fn constant_rate_cached_reuse_does_not_drive_wgc_pacing() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        constant_rate,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    *constant_rate = true;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 60;
+    configuration.bitrate = 100_000;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(pipeline.streams[&1].last_pixels.is_some());
+
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 0);
 }
 
 #[test]
@@ -854,6 +925,7 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             encoder,
             configuration,
             constant_rate,
+            wgc_pacing_smoothing,
             minimum_fps_target,
             ..
         } => Operation::Open {
@@ -861,6 +933,7 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             operation_id: None,
             capture_provider: CaptureProvider::Wgc,
             constant_rate,
+            wgc_pacing_smoothing,
             minimum_fps_target,
             output,
             encoder,

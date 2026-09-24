@@ -8,6 +8,7 @@ use amaterasu_module_sdk::{ModuleResult, NativeBinding, RuntimeClient, abi::*};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 pub const ENCODE: &str = "amaterasu.encode/1";
 pub struct Pump<'a> {
     pub video: u64,
@@ -16,6 +17,7 @@ pub struct Pump<'a> {
     pub encoder: u64,
     pub configuration: &'a Configuration,
     pub capture_due: bool,
+    pub constant_rate: bool,
     pub repeat_due: bool,
     pub repeat_frame: Option<&'a OwnedFrame>,
     pub timestamp_us: u64,
@@ -32,6 +34,10 @@ pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
     pub repeat_attempted: bool,
+    /// Monotonic arrival time of a fresh, non-constant-rate WGC frame, sampled
+    /// before encoder submit. `None` means freshness is unavailable or no frame
+    /// arrived; encoder backpressure does not clear an observed arrival.
+    pub capture_arrival: Option<Instant>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
 }
@@ -104,6 +110,8 @@ struct Submission<'a> {
     configuration: &'a Configuration,
     status: Status,
     called: bool,
+    track_wgc_arrival: bool,
+    capture_arrival: Option<Instant>,
     force_idr: bool,
     timestamp_us: u64,
     sequence: u64,
@@ -119,6 +127,9 @@ unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Sta
     let submission = unsafe { &mut *context.cast::<Submission<'_>>() };
     let frame = unsafe { &*frame };
     submission.called = true;
+    if submission.track_wgc_arrival {
+        submission.capture_arrival = Some(Instant::now());
+    }
     submission.status = if frame.validate().is_err()
         || frame.width != submission.configuration.width
         || frame.height != submission.configuration.height
@@ -249,6 +260,8 @@ fn capture(
         configuration: input.configuration,
         status: MEDIA_PENDING,
         called: false,
+        track_wgc_arrival: input.provider == CaptureProvider::Wgc && !input.constant_rate,
+        capture_arrival: None,
         force_idr: input.force_idr,
         timestamp_us: input.timestamp_us,
         sequence: input.sequence,
@@ -271,6 +284,7 @@ fn capture(
         dropped: submission.called && submission.status == MEDIA_BUSY,
         submitted: submission.called && submission.status == STATUS_OK,
         repeat_attempted: false,
+        capture_arrival: submission.capture_arrival,
         frame: (submission.called && submission.status == STATUS_OK)
             .then_some(submission.frame)
             .flatten(),
@@ -310,6 +324,7 @@ fn repeat(
         dropped: status == MEDIA_BUSY,
         submitted: status == STATUS_OK,
         repeat_attempted: true,
+        capture_arrival: None,
         frame: None,
         owned_frame: None,
     })
@@ -428,6 +443,8 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            track_wgc_arrival: true,
+            capture_arrival: None,
             force_idr: false,
             timestamp_us: 7,
             sequence: 3,
@@ -448,10 +465,17 @@ mod tests {
         let context = (&mut submission as *mut Submission<'_>).cast();
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert_eq!(submission.status, MEDIA_BUSY);
+        assert!(submission.capture_arrival.is_some());
         assert!(submission.owned_frame.is_none());
         frame.width = 8;
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert_eq!(submission.status, STATUS_INVALID_ARGUMENT);
+
+        submission.track_wgc_arrival = false;
+        submission.capture_arrival = None;
+        frame.width = 16;
+        assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
+        assert!(submission.capture_arrival.is_none());
     }
 
     #[derive(Default)]
@@ -520,6 +544,8 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            track_wgc_arrival: true,
+            capture_arrival: None,
             force_idr: false,
             timestamp_us: 12,
             sequence: 3,
@@ -542,6 +568,7 @@ mod tests {
             encoder: 2,
             configuration: &configuration,
             capture_due: false,
+            constant_rate: false,
             repeat_due: true,
             repeat_frame: Some(owned_frame),
             timestamp_us: 21,
@@ -608,6 +635,8 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            track_wgc_arrival: true,
+            capture_arrival: None,
             force_idr: true,
             timestamp_us: 7,
             sequence: 3,

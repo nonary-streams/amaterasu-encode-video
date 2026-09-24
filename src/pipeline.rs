@@ -1,6 +1,7 @@
 mod lifecycle;
 mod operations;
 mod output;
+mod pacing;
 
 use crate::{
     model::{
@@ -41,6 +42,8 @@ struct Stream {
     provider: CaptureProvider,
     constant_rate: bool,
     minimum_fps_target: f64,
+    wgc_pacing_smoothing: bool,
+    wgc_pacing: pacing::WgcPacing,
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
@@ -121,6 +124,7 @@ impl Stream {
             "output": self.output,
             "capture_provider":self.provider,
             "constant_rate": self.constant_rate,
+            "wgc_pacing_smoothing": self.wgc_pacing_smoothing,
             "minimum_fps_target": self.minimum_fps_target,
             "force_idr_pending":self.force_idr,
             "configuration": self.configuration,
@@ -203,6 +207,7 @@ impl Pipeline {
                 operation_id,
                 capture_provider,
                 constant_rate,
+                wgc_pacing_smoothing,
                 minimum_fps_target,
                 output,
                 encoder,
@@ -215,6 +220,7 @@ impl Pipeline {
                     operation_id,
                     provider: capture_provider,
                     constant_rate,
+                    wgc_pacing_smoothing,
                     minimum_fps_target,
                     output,
                     encoder,
@@ -292,6 +298,7 @@ impl Pipeline {
             operation_id,
             provider,
             constant_rate,
+            wgc_pacing_smoothing,
             minimum_fps_target,
             output,
             encoder,
@@ -335,12 +342,15 @@ impl Pipeline {
         }
         self.streams.insert(id, {
             let opened_at = Instant::now();
+            let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
             Stream {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
                 constant_rate,
                 minimum_fps_target,
+                wgc_pacing_smoothing,
+                wgc_pacing,
                 force_idr: false,
                 grace: None,
                 output,
@@ -445,6 +455,7 @@ fn elapsed_at_rate(now: Instant, anchor: Instant, frames_per_second: f64) -> boo
 fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let now = Instant::now();
     let mut capture_due = now >= stream.next_frame;
+    let mut capture_slot = capture_due.then_some(stream.next_frame);
     if capture_due {
         match plane.verify_geometry(
             stream.provider,
@@ -453,15 +464,23 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         ) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => {
+                if stream.provider == CaptureProvider::Wgc && !stream.constant_rate {
+                    stream.wgc_pacing.capture_missed(
+                        stream
+                            .next_frame
+                            .saturating_duration_since(stream.opened_at),
+                    );
+                }
                 stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
                 capture_due = false;
+                capture_slot = None;
             }
             Err(code) => {
                 stream.cleanup(code);
                 return;
             }
         }
-        if capture_due {
+        if capture_due && (stream.provider != CaptureProvider::Wgc || stream.constant_rate) {
             stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
         }
     }
@@ -477,6 +496,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,
         capture_due,
+        constant_rate: stream.constant_rate,
         repeat_due,
         repeat_frame: stream.last_pixels.as_ref(),
         timestamp_us,
@@ -484,11 +504,43 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         force_idr: stream.force_idr,
     }) {
         Ok(progress) => {
+            let completed_at = Instant::now();
+            if capture_due && stream.provider == CaptureProvider::Wgc && !stream.constant_rate {
+                let capture_slot = capture_slot.expect("due WGC capture retains its target slot");
+                if let Some(arrival) = progress.capture_arrival {
+                    let arrival_offset = arrival.saturating_duration_since(stream.opened_at);
+                    let Some(projected_slot) = stream.wgc_pacing.capture_arrived(arrival_offset)
+                    else {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    };
+                    let Some((next_slot, missed_slot)) = pacing::next_slot_after_completion(
+                        projected_slot,
+                        completed_at.saturating_duration_since(stream.opened_at),
+                        stream.configuration.fps,
+                    ) else {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    };
+                    if missed_slot {
+                        stream.wgc_pacing.capture_missed(projected_slot);
+                    }
+                    let Some(next_deadline) = stream.opened_at.checked_add(next_slot) else {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    };
+                    stream.next_frame = next_deadline;
+                } else {
+                    stream
+                        .wgc_pacing
+                        .capture_missed(capture_slot.saturating_duration_since(stream.opened_at));
+                    stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+                }
+            }
             stream.dropped = stream.dropped.saturating_add(u64::from(progress.dropped));
             stream.submitted = stream
                 .submitted
                 .saturating_add(u64::from(progress.submitted));
-            let completed_at = Instant::now();
             if progress.repeat_attempted {
                 stream.last_repeat_attempt_at = Some(completed_at);
             }

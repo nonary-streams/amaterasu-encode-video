@@ -42,6 +42,17 @@ read cadence; the WGC module does not busy-wait or create a timer. The default i
 event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP,
 RTSP, and stream-session is still pending.
 
+Video Open accepts `"wgc_pacing_smoothing"`, defaulting to `true`, to snapshot
+the global Windows policy. On non-constant-rate WGC streams, a fresh frame after
+a missed capture slot reuses the prior cadence phase when its projected phase
+error is at most `min(2 ms, frame interval / 4)` and the projected hold is at
+most 200 ms. Encoder backpressure after a fresh capture does not count as a
+miss. The setting does not affect minimum-FPS repeats. Constant-rate WGC streams
+keep the existing cadence because the current capture ABI does not identify
+cached-frame reuse separately from a fresh source frame. This pump is
+nonblocking, so it does not reproduce Vibeshine's 200 ms blocking snapshot
+after a pacing bust.
+
 Open completes after both lower resources open, returning
 `{"ok":true,"stream":1,"state":"running",...}`. This state means the pipeline has
 resources, not that a frame, packet, client connection or full stream is ready.

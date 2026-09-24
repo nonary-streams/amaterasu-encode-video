@@ -106,6 +106,7 @@ pub(super) fn tick(
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,
         capture_due: false,
+        constant_rate: stream.constant_rate,
         repeat_due: false,
         repeat_frame: None,
         timestamp_us: 0,
