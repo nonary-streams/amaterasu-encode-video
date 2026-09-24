@@ -512,8 +512,12 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                     || progress.capture_reused)
             {
                 if let Some(arrival) = progress.capture_arrival {
-                    let arrival_offset = arrival.saturating_duration_since(stream.opened_at);
-                    let Some(projected_slot) = stream.wgc_pacing.capture_arrived(arrival_offset)
+                    let observed_offset = arrival
+                        .observed_at
+                        .saturating_duration_since(stream.opened_at);
+                    let Some(projected_slot) = stream
+                        .wgc_pacing
+                        .capture_arrived(arrival.timestamp_us, observed_offset)
                     else {
                         stream.cleanup("frame_clock_exhausted");
                         return;

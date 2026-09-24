@@ -3,6 +3,14 @@ use std::time::Duration;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const MAX_SNAP_WINDOW_NS: u128 = 2_000_000;
 const MAX_HOLD_NS: u128 = 200_000_000;
+const MAX_DURATION_NS: u128 = u64::MAX as u128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceClock {
+    anchor_timestamp_us: u64,
+    last_timestamp_us: u64,
+    anchor_monotonic: Duration,
+}
 
 /// Tracks WGC capture slots and retains a missed slot as a possible re-anchor.
 pub(super) struct WgcPacing {
@@ -11,6 +19,7 @@ pub(super) struct WgcPacing {
     group_anchor: Option<Duration>,
     pub(super) group_frames: u64,
     last_missed_slot: Option<Duration>,
+    source_clock: Option<SourceClock>,
 }
 
 impl WgcPacing {
@@ -21,10 +30,16 @@ impl WgcPacing {
             group_anchor: None,
             group_frames: 0,
             last_missed_slot: None,
+            source_clock: None,
         }
     }
 
-    pub(super) fn capture_arrived(&mut self, raw_anchor: Duration) -> Option<Duration> {
+    pub(super) fn capture_arrived(
+        &mut self,
+        source_timestamp_us: u64,
+        observed_at: Duration,
+    ) -> Option<Duration> {
+        let raw_anchor = self.map_source_timestamp(source_timestamp_us, observed_at);
         if let Some(missed_slot) = self.last_missed_slot.take() {
             self.group_anchor = Some(
                 phase_preserving_anchor(missed_slot, raw_anchor, self.fps, self.enabled)
@@ -38,6 +53,41 @@ impl WgcPacing {
             self.group_frames = 1;
         }
         self.next_slot()
+    }
+
+    fn map_source_timestamp(&mut self, timestamp_us: u64, observed_at: Duration) -> Duration {
+        if timestamp_us == 0 {
+            self.source_clock = None;
+            return observed_at;
+        }
+
+        let mapped = self.source_clock.and_then(|clock| {
+            if timestamp_us <= clock.last_timestamp_us {
+                return None;
+            }
+            let elapsed_us = timestamp_us.checked_sub(clock.anchor_timestamp_us)?;
+            let mapped = clock
+                .anchor_monotonic
+                .checked_add(Duration::from_micros(elapsed_us))?;
+            (mapped.as_nanos() <= MAX_DURATION_NS).then_some(mapped)
+        });
+
+        if let Some(mapped) = mapped {
+            self.source_clock = self.source_clock.map(|mut clock| {
+                clock.last_timestamp_us = timestamp_us;
+                clock
+            });
+            return mapped;
+        }
+
+        // Invalid source time falls back to the local monotonic observation and
+        // starts a fresh mapping. Future source timestamps can then recover.
+        self.source_clock = Some(SourceClock {
+            anchor_timestamp_us: timestamp_us,
+            last_timestamp_us: timestamp_us,
+            anchor_monotonic: observed_at,
+        });
+        observed_at
     }
 
     pub(super) fn capture_missed(&mut self, target: Duration) {
@@ -173,7 +223,7 @@ mod tests {
     fn consecutive_empty_polls_keep_the_first_missed_slot() {
         let mut pacing = WgcPacing::new(true, 60);
         assert_eq!(
-            pacing.capture_arrived(duration(0)),
+            pacing.capture_arrived(100_000, duration(0)),
             Some(duration(16_666_666))
         );
 
@@ -181,7 +231,7 @@ mod tests {
         pacing.capture_missed(duration(33_333_332));
         assert_eq!(pacing.last_missed_slot, Some(duration(16_666_666)));
         assert_eq!(
-            pacing.capture_arrived(duration(33_500_000)),
+            pacing.capture_arrived(133_500, duration(33_500_000)),
             Some(duration(49_999_998))
         );
     }
@@ -190,7 +240,7 @@ mod tests {
     fn cached_reuse_advances_the_existing_grid_without_reanchoring() {
         let mut pacing = WgcPacing::new(true, 60);
         assert_eq!(
-            pacing.capture_arrived(duration(0)),
+            pacing.capture_arrived(100_000, duration(0)),
             Some(duration(16_666_666))
         );
 
@@ -203,15 +253,75 @@ mod tests {
     #[test]
     fn cached_reuse_preserves_a_pending_miss_for_a_later_fresh_frame() {
         let mut pacing = WgcPacing::new(true, 60);
-        pacing.capture_arrived(duration(0));
+        pacing.capture_arrived(100_000, duration(0));
         pacing.capture_missed(duration(16_666_666));
 
         assert_eq!(pacing.cached_reuse_slot(), None);
         assert_eq!(pacing.last_missed_slot, Some(duration(16_666_666)));
         assert_eq!(
-            pacing.capture_arrived(duration(33_500_000)),
+            pacing.capture_arrived(133_500, duration(33_500_000)),
             Some(duration(49_999_998))
         );
+    }
+
+    #[test]
+    fn source_timestamp_removes_callback_delay_from_phase_reanchor() {
+        let mut pacing = WgcPacing::new(true, 60);
+        assert_eq!(
+            pacing.capture_arrived(100_000, duration(0)),
+            Some(duration(16_666_666))
+        );
+        pacing.capture_missed(duration(16_666_666));
+
+        // The source frame timestamp advances by 33.5 ms, but its callback is
+        // observed 8 ms later. Pacing follows source time and snaps within 2 ms.
+        assert_eq!(
+            pacing.capture_arrived(133_500, duration(41_500_000)),
+            Some(duration(49_999_998))
+        );
+        assert_eq!(pacing.group_anchor, Some(duration(33_333_332)));
+    }
+
+    #[test]
+    fn zero_and_regressing_source_timestamps_fall_back_to_observed_time() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.capture_arrived(100_000, duration(0));
+        pacing.capture_missed(duration(16_666_666));
+
+        // Zero is invalid and uses the local observation; the next valid source
+        // timestamp starts a new source-clock mapping at its own observation.
+        pacing.capture_arrived(0, duration(40_000_000));
+        assert_eq!(pacing.group_anchor, Some(duration(40_000_000)));
+        assert_eq!(pacing.source_clock, None);
+
+        pacing.capture_arrived(200_000, duration(50_000_000));
+        assert_eq!(
+            pacing.source_clock.unwrap().anchor_monotonic,
+            duration(50_000_000)
+        );
+        pacing.capture_arrived(190_000, duration(60_000_000));
+        assert_eq!(
+            pacing.source_clock.unwrap().anchor_monotonic,
+            duration(60_000_000)
+        );
+        assert_eq!(pacing.source_clock.unwrap().anchor_timestamp_us, 190_000);
+    }
+
+    #[test]
+    fn unrepresentable_source_delta_falls_back_and_reanchors() {
+        let mut pacing = WgcPacing::new(true, 60);
+        assert_eq!(
+            pacing.map_source_timestamp(1, duration(10_000_000)),
+            duration(10_000_000)
+        );
+
+        let observed_at = duration(20_000_000);
+        assert_eq!(
+            pacing.map_source_timestamp(u64::MAX, observed_at),
+            observed_at
+        );
+        assert_eq!(pacing.source_clock.unwrap().anchor_timestamp_us, u64::MAX);
+        assert_eq!(pacing.source_clock.unwrap().anchor_monotonic, observed_at);
     }
 
     #[test]

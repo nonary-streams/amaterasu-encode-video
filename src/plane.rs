@@ -29,6 +29,15 @@ pub enum GeometryProgress {
     Ready,
     Busy,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureArrival {
+    /// Source-side monotonic timestamp before the video pipeline rewrites the
+    /// frame timestamp for encoder submission.
+    pub timestamp_us: u64,
+    /// Local monotonic time sampled at callback entry, used to map the source
+    /// clock onto the video stream's `Instant` epoch.
+    pub observed_at: Instant,
+}
 #[derive(Default)]
 pub struct Progress {
     pub dropped: bool,
@@ -37,10 +46,10 @@ pub struct Progress {
     /// The capture provider delivered cached pixels for this scheduled slot.
     /// This is only known when the provider exposes the v1.2 freshness tail.
     pub capture_reused: bool,
-    /// Monotonic arrival time of a fresh WGC source frame, sampled before
-    /// encoder submit. `None` means freshness is unavailable or no new source
-    /// frame arrived; encoder backpressure does not clear observed arrival.
-    pub capture_arrival: Option<Instant>,
+    /// Source timestamp and local observation of a fresh WGC frame. `None`
+    /// means freshness is unavailable or no new source frame arrived; encoder
+    /// backpressure does not clear observed arrival.
+    pub capture_arrival: Option<CaptureArrival>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
 }
@@ -115,7 +124,7 @@ struct Submission<'a> {
     called: bool,
     track_wgc_arrival: bool,
     capture_reused: bool,
-    capture_arrival: Option<Instant>,
+    capture_arrival: Option<CaptureArrival>,
     force_idr: bool,
     timestamp_us: u64,
     sequence: u64,
@@ -164,7 +173,10 @@ unsafe fn submit_frame(
         submission.capture_reused = true;
     }
     if submission.track_wgc_arrival && source_is_fresh != Some(false) {
-        submission.capture_arrival = Some(Instant::now());
+        submission.capture_arrival = Some(CaptureArrival {
+            timestamp_us: frame.timestamp_us,
+            observed_at: Instant::now(),
+        });
     }
     submission.status = if frame.validate().is_err()
         || frame.width != submission.configuration.width
@@ -544,7 +556,10 @@ mod tests {
         let context = (&mut submission as *mut Submission<'_>).cast();
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert_eq!(submission.status, MEDIA_BUSY);
-        assert!(submission.capture_arrival.is_some());
+        assert_eq!(
+            submission.capture_arrival.unwrap().timestamp_us,
+            frame.timestamp_us
+        );
         assert!(submission.owned_frame.is_none());
         frame.width = 8;
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
@@ -635,6 +650,10 @@ mod tests {
         let context = (&mut submission as *mut Submission<'_>).cast();
         assert_eq!(unsafe { submit(context, &captured) }, STATUS_OK);
         assert_eq!(submission.status, STATUS_OK);
+        assert_eq!(
+            submission.capture_arrival.unwrap().timestamp_us,
+            captured.timestamp_us
+        );
         assert_eq!(submission.frame.unwrap().timestamp_us, 12);
         assert_eq!(submission.frame.unwrap().sequence, 3);
         let owned_frame = submission.owned_frame.as_ref().unwrap();

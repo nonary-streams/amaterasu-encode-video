@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::EncoderIdentity;
-use crate::plane::{FrameMetadata, GeometryProgress, OwnedFrame, Progress};
+use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 #[derive(Default)]
@@ -171,7 +171,10 @@ impl Plane for FakePlane {
                 capture_arrival: (fresh_capture
                     && input.provider == CaptureProvider::Wgc
                     && (!input.constant_rate || self.freshness_api))
-                    .then(Instant::now),
+                    .then(|| CaptureArrival {
+                        timestamp_us: input.sequence.saturating_mul(16_667).max(1),
+                        observed_at: Instant::now(),
+                    }),
                 frame: capture_submitted.then_some(FrameMetadata {
                     width: input.configuration.width,
                     height: input.configuration.height,
