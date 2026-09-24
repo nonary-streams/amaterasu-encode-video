@@ -97,6 +97,7 @@ pub struct OpenSpec {
     pub packet_boundaries: bool,
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
+    pub constant_rate: bool,
     pub output: String,
     pub encoder: EncoderIdentity,
     pub configuration: Configuration,
@@ -112,6 +113,8 @@ pub enum Operation {
         operation_id: Option<String>,
         #[serde(default)]
         capture_provider: CaptureProvider,
+        #[serde(default)]
+        constant_rate: bool,
         output: String,
         encoder: EncoderIdentity,
         configuration: Configuration,
@@ -182,5 +185,42 @@ mod tests {
         );
         required.max_reference_frames = 2;
         assert!(!required.validate());
+    }
+
+    #[test]
+    fn constant_rate_mode_is_compatible_and_opt_in() {
+        let mut request = json!({
+            "action": "open",
+            "output": "display-1",
+            "encoder": {
+                "clsid": "{00000000-0000-0000-0000-000000000001}",
+                "friendly_name": "Test encoder"
+            },
+            "configuration": {
+                "width": 16,
+                "height": 16,
+                "fps": 60,
+                "bitrate": 100000
+            }
+        });
+        let legacy: Operation = serde_json::from_value(request.clone()).unwrap();
+        assert!(matches!(
+            legacy,
+            Operation::Open {
+                constant_rate: false,
+                ..
+            }
+        ));
+
+        request["capture_provider"] = json!("wgc");
+        request["constant_rate"] = json!(true);
+        assert!(matches!(
+            serde_json::from_value::<Operation>(request).unwrap(),
+            Operation::Open {
+                capture_provider: CaptureProvider::Wgc,
+                constant_rate: true,
+                ..
+            }
+        ));
     }
 }

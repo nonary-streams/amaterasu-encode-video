@@ -38,6 +38,7 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
+    constant_rate: bool,
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
@@ -82,6 +83,7 @@ impl Stream {
             "supports_packet_boundaries": true,
             "output": self.output,
             "capture_provider":self.provider,
+            "constant_rate": self.constant_rate,
             "force_idr_pending":self.force_idr,
             "configuration": self.configuration,
             "dropped_frames": self.dropped,
@@ -159,6 +161,7 @@ impl Pipeline {
                 packet_boundaries,
                 operation_id,
                 capture_provider,
+                constant_rate,
                 output,
                 encoder,
                 configuration,
@@ -169,6 +172,7 @@ impl Pipeline {
                     packet_boundaries,
                     operation_id,
                     provider: capture_provider,
+                    constant_rate,
                     output,
                     encoder,
                     configuration,
@@ -244,6 +248,7 @@ impl Pipeline {
             packet_boundaries,
             operation_id,
             provider,
+            constant_rate,
             output,
             encoder,
             configuration,
@@ -252,6 +257,8 @@ impl Pipeline {
             Some("disabled")
         } else if !self.providers.contains(&provider) {
             Some("capture_provider_not_allowed")
+        } else if constant_rate && provider != CaptureProvider::Wgc {
+            Some("constant_rate_requires_wgc")
         } else if !configuration.validate()
             || output.is_empty()
             || output.len() > 512
@@ -287,6 +294,7 @@ impl Pipeline {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
+                constant_rate,
                 force_idr: false,
                 grace: None,
                 output,
@@ -489,10 +497,14 @@ fn advance(
 fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
-        Stage::Capture => (
-            stream.provider.service(),
-            json!({"action":"open","output":stream.output,"operation_id":operation}),
-        ),
+        Stage::Capture => {
+            let mut request =
+                json!({"action":"open","output":stream.output,"operation_id":operation});
+            if stream.constant_rate {
+                request["constant_rate"] = json!(true);
+            }
+            (stream.provider.service(), request)
+        }
         Stage::Encoder => (ENCODE, encoder_open_request(stream)),
         Stage::FindEncoder => (ENCODE, json!({"action":"lookup","operation_id":operation})),
         Stage::CloseEncoder => (

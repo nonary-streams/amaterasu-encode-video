@@ -199,6 +199,7 @@ fn open() -> Operation {
         packet_boundaries: false,
         operation_id: None,
         capture_provider: CaptureProvider::Dxgi,
+        constant_rate: false,
         output: "display-1".into(),
         encoder: encoder_identity(),
         configuration: Configuration {
@@ -232,6 +233,45 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
         runtime.completed[0].1["configuration"]["max_reference_frames"],
         1
     );
+}
+
+#[test]
+fn constant_rate_delivery_is_opt_in_and_only_forwards_for_wgc() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        constant_rate,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    *constant_rate = true;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    assert_eq!(runtime.completed[0].1["constant_rate"], true);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.capture-wgc/1"
+                && payload["action"] == "open"
+                && payload["constant_rate"] == true
+    )));
+
+    let (mut pipeline, mut runtime, _) = setup();
+    let mut request = open();
+    let Operation::Open { constant_rate, .. } = &mut request else {
+        unreachable!();
+    };
+    *constant_rate = true;
+    pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
+    assert_eq!(runtime.completed[0].1["code"], "constant_rate_requires_wgc");
+    assert_eq!(runtime.open_effects, 0);
 }
 
 #[test]
@@ -781,11 +821,13 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             output,
             encoder,
             configuration,
+            constant_rate,
             ..
         } => Operation::Open {
             packet_boundaries: false,
             operation_id: None,
             capture_provider: CaptureProvider::Wgc,
+            constant_rate,
             output,
             encoder,
             configuration,

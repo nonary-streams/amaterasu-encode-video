@@ -36,6 +36,11 @@ Open optionally accepts `"capture_provider":"dxgi"` or `"wgc"`, defaulting to
 from that provider's enumeration; DXGI and WGC output IDs are not interchangeable.
 The selected service is retained for all open, lookup, close and teardown calls;
 a caller cannot supply an arbitrary service name or silently trigger a fallback.
+For WGC only, `"constant_rate":true` repeats the last completed image when a
+scheduled read finds no new frame. Video's configured FPS sets the read cadence;
+the WGC module does not busy-wait or create a timer. The default is event-driven
+WGC delivery. Product-level `capture = wgcc` routing through NVHTTP, RTSP, and
+stream-session is still pending.
 
 Open completes after both lower resources open, returning
 `{"ok":true,"stream":1,"state":"running",...}`. This state means the pipeline has
