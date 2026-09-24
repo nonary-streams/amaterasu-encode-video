@@ -31,8 +31,9 @@ pub enum GeometryProgress {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureArrival {
-    /// Source-side monotonic timestamp before the video pipeline rewrites the
-    /// frame timestamp for encoder submission.
+    /// Provider source time before the video pipeline rewrites frame metadata:
+    /// v1.3 supplies WGC acquisition time separately; older tables use the
+    /// source frame timestamp.
     pub timestamp_us: u64,
     /// Local monotonic time sampled at callback entry, used to map the source
     /// clock onto the video stream's `Instant` epoch.
@@ -44,7 +45,7 @@ pub struct Progress {
     pub submitted: bool,
     pub repeat_attempted: bool,
     /// The capture provider delivered cached pixels for this scheduled slot.
-    /// This is only known when the provider exposes the v1.2 freshness tail.
+    /// This is only known when the provider exposes a v1.2-or-newer freshness tail.
     pub capture_reused: bool,
     /// Source timestamp and local observation of a fresh WGC frame. `None`
     /// means freshness is unavailable or no new source frame arrived; encoder
@@ -140,7 +141,7 @@ unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Sta
     let submission = unsafe { &mut *context.cast::<Submission<'_>>() };
     let frame = unsafe { &*frame };
     // SAFETY: the capture provider borrows the frame through this callback.
-    unsafe { submit_frame(submission, frame, None) }
+    unsafe { submit_frame(submission, frame, None, None) }
 }
 
 unsafe extern "C" fn submit_with_freshness(
@@ -160,13 +161,41 @@ unsafe extern "C" fn submit_with_freshness(
         _ => return STATUS_INVALID_ARGUMENT,
     };
     // SAFETY: the capture provider borrows the frame through this callback.
-    unsafe { submit_frame(submission, frame, Some(is_fresh)) }
+    unsafe { submit_frame(submission, frame, Some(is_fresh), None) }
+}
+
+unsafe extern "C" fn submit_with_capture_timestamp(
+    context: *mut c_void,
+    capture_frame: *const CaptureFrameV1_3,
+    freshness: u32,
+) -> Status {
+    if context.is_null() || capture_frame.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the provider retains the callback context and wrapper through this call.
+    let submission = unsafe { &mut *context.cast::<Submission<'_>>() };
+    let capture_frame = unsafe { &*capture_frame };
+    let is_fresh = match freshness {
+        CAPTURE_FRAME_FRESH => true,
+        CAPTURE_FRAME_CACHED_REUSE => false,
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    // SAFETY: the provider borrows the frame bytes through this callback.
+    unsafe {
+        submit_frame(
+            submission,
+            &capture_frame.frame,
+            Some(is_fresh),
+            Some(capture_frame.capture_pacing_timestamp_us),
+        )
+    }
 }
 
 unsafe fn submit_frame(
     submission: &mut Submission<'_>,
     frame: &CpuFrame,
     source_is_fresh: Option<bool>,
+    capture_pacing_timestamp_us: Option<u64>,
 ) -> Status {
     submission.called = true;
     if source_is_fresh == Some(false) {
@@ -174,7 +203,7 @@ unsafe fn submit_frame(
     }
     if submission.track_wgc_arrival && source_is_fresh != Some(false) {
         submission.capture_arrival = Some(CaptureArrival {
-            timestamp_us: frame.timestamp_us,
+            timestamp_us: capture_pacing_timestamp_us.unwrap_or(frame.timestamp_us),
             observed_at: Instant::now(),
         });
     }
@@ -269,7 +298,19 @@ impl Plane for NativePlane {
             // part of that prefix, so old providers do not expose an optional tail.
             let capture_api =
                 unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
-            let freshness_api = if input.provider == CaptureProvider::Wgc
+            let capture_timestamp_api = if input.provider == CaptureProvider::Wgc
+                && capture_timestamp_tail_available(capture_api.base.header)?
+            {
+                // SAFETY: v1.3 minor and full table size were verified above.
+                Some(
+                    unsafe { binding.table::<CaptureApiV1_3>() }
+                        .map_err(|_| "capture_interface")?,
+                )
+            } else {
+                None
+            };
+            let freshness_api = if capture_timestamp_api.is_none()
+                && input.provider == CaptureProvider::Wgc
                 && freshness_tail_available(capture_api.base.header)?
             {
                 // SAFETY: both v1.2 minor and full table size were verified above.
@@ -280,7 +321,13 @@ impl Plane for NativePlane {
             } else {
                 None
             };
-            capture(capture_api, freshness_api, encoder_api, &input)?
+            capture(
+                capture_api,
+                capture_timestamp_api,
+                freshness_api,
+                encoder_api,
+                &input,
+            )?
         } else {
             Progress::default()
         };
@@ -310,6 +357,7 @@ impl Plane for NativePlane {
 
 fn capture(
     capture: &CaptureApiPrefix,
+    capture_timestamp_api: Option<&CaptureApiV1_3>,
     freshness_api: Option<&CaptureApiV1_2>,
     encoder: &EncoderApi,
     input: &Pump<'_>,
@@ -321,7 +369,7 @@ fn capture(
         status: MEDIA_PENDING,
         called: false,
         track_wgc_arrival: input.provider == CaptureProvider::Wgc
-            && (!input.constant_rate || freshness_api.is_some()),
+            && (!input.constant_rate || capture_timestamp_api.is_some() || freshness_api.is_some()),
         capture_reused: false,
         capture_arrival: None,
         force_idr: input.force_idr,
@@ -330,7 +378,21 @@ fn capture(
         frame: None,
         owned_frame: None,
     };
-    let result = if let Some(freshness_api) = freshness_api {
+    let result = if let Some(capture_timestamp_api) = capture_timestamp_api {
+        let sink = FreshFrameSinkV1_3 {
+            context: (&mut submission as *mut Submission<'_>).cast(),
+            write: submit_with_capture_timestamp,
+        };
+        // SAFETY: stack sink context and frame bytes remain live through the
+        // synchronous v1.3 callback; encoder submission copies accepted bytes.
+        unsafe {
+            (capture_timestamp_api.read_frame_with_capture_timestamp)(
+                capture_timestamp_api.base.context,
+                input.capture,
+                sink,
+            )
+        }
+    } else if let Some(freshness_api) = freshness_api {
         let sink = FreshFrameSinkV1_2 {
             context: (&mut submission as *mut Submission<'_>).cast(),
             write: submit_with_freshness,
@@ -369,6 +431,16 @@ fn capture(
             .flatten(),
         owned_frame: submission.owned_frame,
     })
+}
+
+fn capture_timestamp_tail_available(header: AbiHeader) -> Result<bool, &'static str> {
+    if header.minor < CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR {
+        return Ok(false);
+    }
+    if header.size < CAPTURE_API_V1_3_SIZE {
+        return Err("capture_interface");
+    }
+    Ok(true)
 }
 
 fn freshness_tail_available(header: AbiHeader) -> Result<bool, &'static str> {
@@ -570,6 +642,80 @@ mod tests {
         frame.width = 16;
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert!(submission.capture_arrival.is_none());
+    }
+
+    #[test]
+    fn v1_3_source_timestamp_does_not_change_encoder_metadata() {
+        let mut observed = SubmittedFrames::default();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: (&mut observed as *mut SubmittedFrames).cast(),
+                release: None,
+            },
+            submit: record_frame,
+            receive,
+            drain,
+        };
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 60,
+            bitrate: 100_000,
+            max_reference_frames: 0,
+        };
+        let bytes = [0x5a; 16 * 16 * 4];
+        let captured = CaptureFrameV1_3 {
+            frame: CpuFrame {
+                width: 16,
+                height: 16,
+                format: PIXEL_BGRA8,
+                stride: 64,
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+                timestamp_us: 700,
+                sequence: 900,
+            },
+            capture_pacing_timestamp_us: 123_456,
+        };
+        let mut submission = Submission {
+            api: &api,
+            encoder: 2,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            track_wgc_arrival: true,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 12,
+            sequence: 3,
+            frame: None,
+            owned_frame: None,
+        };
+        let context = (&mut submission as *mut Submission<'_>).cast();
+
+        assert_eq!(
+            unsafe { submit_with_capture_timestamp(context, &captured, CAPTURE_FRAME_FRESH) },
+            STATUS_OK
+        );
+        assert_eq!(submission.capture_arrival.unwrap().timestamp_us, 123_456);
+        assert_eq!(submission.frame.unwrap().timestamp_us, 12);
+        assert_eq!(submission.frame.unwrap().sequence, 3);
+        assert_eq!(observed.0.len(), 1);
+        assert_eq!(observed.0[0], (3, 12, bytes.to_vec()));
+
+        submission.capture_arrival = None;
+        submission.capture_reused = false;
+        assert_eq!(
+            unsafe {
+                submit_with_capture_timestamp(context, &captured, CAPTURE_FRAME_CACHED_REUSE)
+            },
+            STATUS_OK
+        );
+        assert!(submission.capture_arrival.is_none());
+        assert!(submission.capture_reused);
+        assert_eq!(observed.0[1], (3, 12, bytes.to_vec()));
     }
 
     #[derive(Default)]
@@ -890,6 +1036,34 @@ mod tests {
                 size: CAPTURE_API_V1_1_SIZE,
                 major: 1,
                 minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            }),
+            Err("capture_interface")
+        );
+    }
+
+    #[test]
+    fn capture_timestamp_tail_requires_both_minor_and_full_table_size() {
+        assert_eq!(
+            capture_timestamp_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_2_SIZE,
+                major: 1,
+                minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            }),
+            Ok(false)
+        );
+        assert_eq!(
+            capture_timestamp_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_3_SIZE,
+                major: 1,
+                minor: CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            capture_timestamp_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_2_SIZE,
+                major: 1,
+                minor: CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
             }),
             Err("capture_interface")
         );
