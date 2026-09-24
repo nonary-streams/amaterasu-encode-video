@@ -505,8 +505,12 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     }) {
         Ok(progress) => {
             let completed_at = Instant::now();
-            if capture_due && stream.provider == CaptureProvider::Wgc && !stream.constant_rate {
-                let capture_slot = capture_slot.expect("due WGC capture retains its target slot");
+            if capture_due
+                && stream.provider == CaptureProvider::Wgc
+                && (!stream.constant_rate
+                    || progress.capture_arrival.is_some()
+                    || progress.capture_reused)
+            {
                 if let Some(arrival) = progress.capture_arrival {
                     let arrival_offset = arrival.saturating_duration_since(stream.opened_at);
                     let Some(projected_slot) = stream.wgc_pacing.capture_arrived(arrival_offset)
@@ -514,23 +518,20 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                         stream.cleanup("frame_clock_exhausted");
                         return;
                     };
-                    let Some((next_slot, missed_slot)) = pacing::next_slot_after_completion(
-                        projected_slot,
-                        completed_at.saturating_duration_since(stream.opened_at),
-                        stream.configuration.fps,
-                    ) else {
+                    if !schedule_wgc_after_completion(stream, projected_slot, completed_at) {
                         stream.cleanup("frame_clock_exhausted");
                         return;
-                    };
-                    if missed_slot {
-                        stream.wgc_pacing.capture_missed(projected_slot);
                     }
-                    let Some(next_deadline) = stream.opened_at.checked_add(next_slot) else {
+                } else if progress.capture_reused {
+                    if let Some(projected_slot) = stream.wgc_pacing.cached_reuse_slot()
+                        && !schedule_wgc_after_completion(stream, projected_slot, completed_at)
+                    {
                         stream.cleanup("frame_clock_exhausted");
                         return;
-                    };
-                    stream.next_frame = next_deadline;
+                    }
                 } else {
+                    let capture_slot =
+                        capture_slot.expect("due WGC capture retains its target slot");
                     stream
                         .wgc_pacing
                         .capture_missed(capture_slot.saturating_duration_since(stream.opened_at));
@@ -558,6 +559,28 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         }
         Err(code) => stream.cleanup(code),
     }
+}
+
+fn schedule_wgc_after_completion(
+    stream: &mut Stream,
+    projected_slot: Duration,
+    completed_at: Instant,
+) -> bool {
+    let Some((next_slot, missed_slot)) = pacing::next_slot_after_completion(
+        projected_slot,
+        completed_at.saturating_duration_since(stream.opened_at),
+        stream.configuration.fps,
+    ) else {
+        return false;
+    };
+    if missed_slot {
+        stream.wgc_pacing.capture_missed(projected_slot);
+    }
+    let Some(next_deadline) = stream.opened_at.checked_add(next_slot) else {
+        return false;
+    };
+    stream.next_frame = next_deadline;
+    true
 }
 
 fn next_capture_deadline(now: Instant, fps: u32) -> Instant {

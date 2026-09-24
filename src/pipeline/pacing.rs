@@ -50,6 +50,14 @@ impl WgcPacing {
         }
     }
 
+    /// Advances an already established output grid for a cached delivery.
+    /// Reuse never changes the source-arrival anchor or clears a pending miss.
+    pub(super) fn cached_reuse_slot(&mut self) -> Option<Duration> {
+        self.group_anchor?;
+        self.group_frames = self.group_frames.checked_add(1)?;
+        self.next_slot()
+    }
+
     fn next_slot(&self) -> Option<Duration> {
         let anchor = self.group_anchor?;
         if self.fps == 0 {
@@ -171,6 +179,34 @@ mod tests {
 
         pacing.capture_missed(duration(16_666_666));
         pacing.capture_missed(duration(33_333_332));
+        assert_eq!(pacing.last_missed_slot, Some(duration(16_666_666)));
+        assert_eq!(
+            pacing.capture_arrived(duration(33_500_000)),
+            Some(duration(49_999_998))
+        );
+    }
+
+    #[test]
+    fn cached_reuse_advances_the_existing_grid_without_reanchoring() {
+        let mut pacing = WgcPacing::new(true, 60);
+        assert_eq!(
+            pacing.capture_arrived(duration(0)),
+            Some(duration(16_666_666))
+        );
+
+        assert_eq!(pacing.cached_reuse_slot(), Some(duration(33_333_333)));
+        assert_eq!(pacing.group_frames, 2);
+        assert_eq!(pacing.group_anchor, Some(duration(0)));
+        assert_eq!(pacing.last_missed_slot, None);
+    }
+
+    #[test]
+    fn cached_reuse_preserves_a_pending_miss_for_a_later_fresh_frame() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.capture_arrived(duration(0));
+        pacing.capture_missed(duration(16_666_666));
+
+        assert_eq!(pacing.cached_reuse_slot(), None);
         assert_eq!(pacing.last_missed_slot, Some(duration(16_666_666)));
         assert_eq!(
             pacing.capture_arrived(duration(33_500_000)),

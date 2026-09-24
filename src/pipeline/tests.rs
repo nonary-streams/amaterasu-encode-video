@@ -123,6 +123,8 @@ struct FakePlane {
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
     fail: bool,
+    freshness_api: bool,
+    capture_reused: bool,
     geometry_checks: Vec<Option<CaptureGeometry>>,
     geometry_results: VecDeque<Result<GeometryProgress, &'static str>>,
 }
@@ -154,8 +156,9 @@ impl Plane for FakePlane {
         if self.fail {
             Err("frame_rejected")
         } else {
-            let fresh_capture = input.capture_due;
-            let capture_submitted = fresh_capture && !self.dropped;
+            let capture_reused = input.capture_due && input.constant_rate && self.capture_reused;
+            let fresh_capture = input.capture_due && !capture_reused;
+            let capture_submitted = input.capture_due && !self.dropped;
             let repeat_attempted = !capture_submitted
                 && !self.dropped
                 && input.repeat_due
@@ -164,9 +167,10 @@ impl Plane for FakePlane {
                 dropped: self.dropped,
                 submitted: capture_submitted || repeat_attempted,
                 repeat_attempted,
+                capture_reused,
                 capture_arrival: (fresh_capture
                     && input.provider == CaptureProvider::Wgc
-                    && !input.constant_rate)
+                    && (!input.constant_rate || self.freshness_api))
                     .then(Instant::now),
                 frame: capture_submitted.then_some(FrameMetadata {
                     width: input.configuration.width,
@@ -375,6 +379,51 @@ fn constant_rate_cached_reuse_does_not_drive_wgc_pacing() {
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
 
     assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 0);
+}
+
+#[test]
+fn v1_2_constant_rate_reuses_advance_the_grid_without_reanchoring() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        constant_rate,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    *constant_rate = true;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 60;
+    configuration.bitrate = 100_000;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+    plane.freshness_api = true;
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+
+    assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 1);
+    let first_scheduled_slot = pipeline.streams[&1].next_frame;
+
+    plane.capture_reused = true;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 2);
+    let repeated_scheduled_slot = pipeline.streams[&1].next_frame;
+    assert_eq!(
+        repeated_scheduled_slot.duration_since(first_scheduled_slot),
+        Duration::from_nanos(16_666_667)
+    );
+
+    plane.capture_reused = false;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].wgc_pacing.group_frames, 3);
+    assert!(pipeline.streams[&1].next_frame > repeated_scheduled_slot);
 }
 
 #[test]

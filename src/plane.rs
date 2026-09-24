@@ -34,9 +34,12 @@ pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
     pub repeat_attempted: bool,
-    /// Monotonic arrival time of a fresh, non-constant-rate WGC frame, sampled
-    /// before encoder submit. `None` means freshness is unavailable or no frame
-    /// arrived; encoder backpressure does not clear an observed arrival.
+    /// The capture provider delivered cached pixels for this scheduled slot.
+    /// This is only known when the provider exposes the v1.2 freshness tail.
+    pub capture_reused: bool,
+    /// Monotonic arrival time of a fresh WGC source frame, sampled before
+    /// encoder submit. `None` means freshness is unavailable or no new source
+    /// frame arrived; encoder backpressure does not clear observed arrival.
     pub capture_arrival: Option<Instant>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
@@ -111,6 +114,7 @@ struct Submission<'a> {
     status: Status,
     called: bool,
     track_wgc_arrival: bool,
+    capture_reused: bool,
     capture_arrival: Option<Instant>,
     force_idr: bool,
     timestamp_us: u64,
@@ -120,14 +124,46 @@ struct Submission<'a> {
 }
 
 unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Status {
-    if frame.is_null() {
+    if context.is_null() || frame.is_null() {
         return STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: stack context and capture frame live through synchronous read_frame.
     let submission = unsafe { &mut *context.cast::<Submission<'_>>() };
     let frame = unsafe { &*frame };
+    // SAFETY: the capture provider borrows the frame through this callback.
+    unsafe { submit_frame(submission, frame, None) }
+}
+
+unsafe extern "C" fn submit_with_freshness(
+    context: *mut c_void,
+    frame: *const CpuFrame,
+    freshness: u32,
+) -> Status {
+    if context.is_null() || frame.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: capture provider retains stack context and frame through callback.
+    let submission = unsafe { &mut *context.cast::<Submission<'_>>() };
+    let frame = unsafe { &*frame };
+    let is_fresh = match freshness {
+        CAPTURE_FRAME_FRESH => true,
+        CAPTURE_FRAME_CACHED_REUSE => false,
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    // SAFETY: the capture provider borrows the frame through this callback.
+    unsafe { submit_frame(submission, frame, Some(is_fresh)) }
+}
+
+unsafe fn submit_frame(
+    submission: &mut Submission<'_>,
+    frame: &CpuFrame,
+    source_is_fresh: Option<bool>,
+) -> Status {
     submission.called = true;
-    if submission.track_wgc_arrival {
+    if source_is_fresh == Some(false) {
+        submission.capture_reused = true;
+    }
+    if submission.track_wgc_arrival && source_is_fresh != Some(false) {
         submission.capture_arrival = Some(Instant::now());
     }
     submission.status = if frame.validate().is_err()
@@ -221,7 +257,18 @@ impl Plane for NativePlane {
             // part of that prefix, so old providers do not expose an optional tail.
             let capture_api =
                 unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
-            capture(capture_api, encoder_api, &input)?
+            let freshness_api = if input.provider == CaptureProvider::Wgc
+                && freshness_tail_available(capture_api.base.header)?
+            {
+                // SAFETY: both v1.2 minor and full table size were verified above.
+                Some(
+                    unsafe { binding.table::<CaptureApiV1_2>() }
+                        .map_err(|_| "capture_interface")?,
+                )
+            } else {
+                None
+            };
+            capture(capture_api, freshness_api, encoder_api, &input)?
         } else {
             Progress::default()
         };
@@ -251,6 +298,7 @@ impl Plane for NativePlane {
 
 fn capture(
     capture: &CaptureApiPrefix,
+    freshness_api: Option<&CaptureApiV1_2>,
     encoder: &EncoderApi,
     input: &Pump<'_>,
 ) -> Result<Progress, &'static str> {
@@ -260,7 +308,9 @@ fn capture(
         configuration: input.configuration,
         status: MEDIA_PENDING,
         called: false,
-        track_wgc_arrival: input.provider == CaptureProvider::Wgc && !input.constant_rate,
+        track_wgc_arrival: input.provider == CaptureProvider::Wgc
+            && (!input.constant_rate || freshness_api.is_some()),
+        capture_reused: false,
         capture_arrival: None,
         force_idr: input.force_idr,
         timestamp_us: input.timestamp_us,
@@ -268,12 +318,28 @@ fn capture(
         frame: None,
         owned_frame: None,
     };
-    let sink = FrameSink {
-        context: (&mut submission as *mut Submission<'_>).cast(),
-        write: submit,
+    let result = if let Some(freshness_api) = freshness_api {
+        let sink = FreshFrameSinkV1_2 {
+            context: (&mut submission as *mut Submission<'_>).cast(),
+            write: submit_with_freshness,
+        };
+        // SAFETY: both the stack sink context and frame bytes live through the
+        // provider's synchronous callback; encoder submit copies accepted bytes.
+        unsafe {
+            (freshness_api.read_frame_with_freshness)(
+                freshness_api.base.context,
+                input.capture,
+                sink,
+            )
+        }
+    } else {
+        let sink = FrameSink {
+            context: (&mut submission as *mut Submission<'_>).cast(),
+            write: submit,
+        };
+        // SAFETY: stack sink borrows one frame and encoder copies accepted input.
+        unsafe { (capture.read_frame)(capture.base.context, input.capture, sink) }
     };
-    // SAFETY: stack sink borrows one frame and encoder copies accepted input.
-    let result = unsafe { (capture.read_frame)(capture.base.context, input.capture, sink) };
     if !matches!(result, STATUS_OK | MEDIA_PENDING | MEDIA_BUSY) {
         return Err("capture_failed");
     }
@@ -284,12 +350,23 @@ fn capture(
         dropped: submission.called && submission.status == MEDIA_BUSY,
         submitted: submission.called && submission.status == STATUS_OK,
         repeat_attempted: false,
+        capture_reused: submission.capture_reused,
         capture_arrival: submission.capture_arrival,
         frame: (submission.called && submission.status == STATUS_OK)
             .then_some(submission.frame)
             .flatten(),
         owned_frame: submission.owned_frame,
     })
+}
+
+fn freshness_tail_available(header: AbiHeader) -> Result<bool, &'static str> {
+    if header.minor < CAPTURE_FRESHNESS_INTERFACE_MINOR {
+        return Ok(false);
+    }
+    if header.size < CAPTURE_API_V1_2_SIZE {
+        return Err("capture_interface");
+    }
+    Ok(true)
 }
 
 fn repeat(
@@ -324,6 +401,7 @@ fn repeat(
         dropped: status == MEDIA_BUSY,
         submitted: status == STATUS_OK,
         repeat_attempted: true,
+        capture_reused: false,
         capture_arrival: None,
         frame: None,
         owned_frame: None,
@@ -444,6 +522,7 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             track_wgc_arrival: true,
+            capture_reused: false,
             capture_arrival: None,
             force_idr: false,
             timestamp_us: 7,
@@ -545,6 +624,7 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             track_wgc_arrival: true,
+            capture_reused: false,
             capture_arrival: None,
             force_idr: false,
             timestamp_us: 12,
@@ -636,6 +716,7 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             track_wgc_arrival: true,
+            capture_reused: false,
             capture_arrival: None,
             force_idr: true,
             timestamp_us: 7,
@@ -649,6 +730,84 @@ mod tests {
         );
         assert_eq!(observed, 1);
         assert_eq!(submission.status, STATUS_OK);
+    }
+
+    #[test]
+    fn cached_reuse_is_not_recorded_as_a_fresh_capture_arrival() {
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: std::ptr::null_mut(),
+                release: None,
+            },
+            submit: busy,
+            receive,
+            drain,
+        };
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 60,
+            bitrate: 100_000,
+            max_reference_frames: 0,
+        };
+        let bytes = [0; 16 * 16 * 4];
+        let frame = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_BGRA8,
+            stride: 64,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut fresh_submission = Submission {
+            api: &api,
+            encoder: 1,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            track_wgc_arrival: true,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 2,
+            sequence: 2,
+            frame: None,
+            owned_frame: None,
+        };
+        let fresh_context = (&mut fresh_submission as *mut Submission<'_>).cast();
+        assert_eq!(
+            unsafe { submit_with_freshness(fresh_context, &frame, CAPTURE_FRAME_FRESH) },
+            STATUS_OK
+        );
+        assert!(fresh_submission.capture_arrival.is_some());
+        assert!(!fresh_submission.capture_reused);
+
+        let mut cached_submission = Submission {
+            api: &api,
+            encoder: 1,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            track_wgc_arrival: true,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 3,
+            sequence: 3,
+            frame: None,
+            owned_frame: None,
+        };
+        let cached_context = (&mut cached_submission as *mut Submission<'_>).cast();
+        assert_eq!(
+            unsafe { submit_with_freshness(cached_context, &frame, CAPTURE_FRAME_CACHED_REUSE) },
+            STATUS_OK
+        );
+        assert!(cached_submission.capture_arrival.is_none());
+        assert!(cached_submission.capture_reused);
+        assert_eq!(cached_submission.status, MEDIA_BUSY);
     }
 
     unsafe extern "C" fn no_frame(_: *mut c_void, _: u64, _: FrameSink) -> Status {
@@ -685,6 +844,34 @@ mod tests {
         };
         assert_eq!(
             geometry_tail_available(truncated_current),
+            Err("capture_interface")
+        );
+    }
+
+    #[test]
+    fn freshness_tail_requires_both_minor_and_full_table_size() {
+        assert_eq!(
+            freshness_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_1_SIZE,
+                major: 1,
+                minor: CAPTURE_INTERFACE_MINOR,
+            }),
+            Ok(false)
+        );
+        assert_eq!(
+            freshness_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_2_SIZE,
+                major: 1,
+                minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            freshness_tail_available(AbiHeader {
+                size: CAPTURE_API_V1_1_SIZE,
+                major: 1,
+                minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            }),
             Err("capture_interface")
         );
     }
