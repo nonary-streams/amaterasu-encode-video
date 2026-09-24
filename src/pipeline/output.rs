@@ -32,6 +32,9 @@ impl Pipeline {
             return;
         }
         if drain {
+            stream.last_pixels = None;
+            stream.last_output_at = None;
+            stream.last_repeat_attempt_at = None;
             stream.grace = Some(Grace {
                 deadline: Instant::now() + self.drain_timeout,
                 drain_sent: false,
@@ -103,6 +106,10 @@ pub(super) fn tick(
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,
         capture_due: false,
+        repeat_due: false,
+        repeat_frame: None,
+        timestamp_us: 0,
+        sequence: 0,
         force_idr: false,
     };
     if let Err(code) = plane.pump(input) {

@@ -92,12 +92,13 @@ impl Configuration {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct OpenSpec {
     pub packet_boundaries: bool,
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
     pub constant_rate: bool,
+    pub minimum_fps_target: f64,
     pub output: String,
     pub encoder: EncoderIdentity,
     pub configuration: Configuration,
@@ -115,6 +116,8 @@ pub enum Operation {
         capture_provider: CaptureProvider,
         #[serde(default)]
         constant_rate: bool,
+        #[serde(default = "default_minimum_fps_target")]
+        minimum_fps_target: f64,
         output: String,
         encoder: EncoderIdentity,
         configuration: Configuration,
@@ -139,6 +142,14 @@ pub enum Operation {
 
 pub fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
+}
+
+fn default_minimum_fps_target() -> f64 {
+    20.0
+}
+
+pub fn valid_minimum_fps_target(value: f64) -> bool {
+    value.is_finite() && (0.0..=1000.0).contains(&value)
 }
 
 #[cfg(test)]
@@ -204,21 +215,26 @@ mod tests {
             }
         });
         let legacy: Operation = serde_json::from_value(request.clone()).unwrap();
-        assert!(matches!(
-            legacy,
-            Operation::Open {
-                constant_rate: false,
-                ..
-            }
-        ));
+        let Operation::Open {
+            constant_rate,
+            minimum_fps_target,
+            ..
+        } = legacy
+        else {
+            unreachable!();
+        };
+        assert!(!constant_rate);
+        assert_eq!(minimum_fps_target, 20.0);
 
         request["capture_provider"] = json!("wgc");
         request["constant_rate"] = json!(true);
+        request["minimum_fps_target"] = json!(23.5);
         assert!(matches!(
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
                 capture_provider: CaptureProvider::Wgc,
                 constant_rate: true,
+                minimum_fps_target: 23.5,
                 ..
             }
         ));

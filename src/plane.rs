@@ -16,6 +16,10 @@ pub struct Pump<'a> {
     pub encoder: u64,
     pub configuration: &'a Configuration,
     pub capture_due: bool,
+    pub repeat_due: bool,
+    pub repeat_frame: Option<&'a OwnedFrame>,
+    pub timestamp_us: u64,
+    pub sequence: u64,
     pub force_idr: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +31,19 @@ pub enum GeometryProgress {
 pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
+    pub repeat_attempted: bool,
     pub frame: Option<FrameMetadata>,
+    pub owned_frame: Option<OwnedFrame>,
+}
+
+/// An owned copy of a previously accepted capture frame. The native capture
+/// allocation is never retained beyond its synchronous callback.
+pub struct OwnedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub stride: u32,
+    pub bytes: Vec<u8>,
 }
 
 /// Non-secret metadata from a frame accepted by the encoder. The frame bytes
@@ -89,7 +105,10 @@ struct Submission<'a> {
     status: Status,
     called: bool,
     force_idr: bool,
+    timestamp_us: u64,
+    sequence: u64,
     frame: Option<FrameMetadata>,
+    owned_frame: Option<OwnedFrame>,
 }
 
 unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Status {
@@ -106,23 +125,43 @@ unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Sta
     {
         STATUS_INVALID_ARGUMENT
     } else {
+        let mut forwarded = *frame;
+        forwarded.timestamp_us = submission.timestamp_us;
+        forwarded.sequence = submission.sequence;
         submission.frame = Some(FrameMetadata {
             width: frame.width,
             height: frame.height,
             stride: frame.stride,
-            timestamp_us: frame.timestamp_us,
-            sequence: frame.sequence,
+            timestamp_us: submission.timestamp_us,
+            sequence: submission.sequence,
         });
         // SAFETY: validated borrowed capture frame remains live; encoder copies on acceptance.
         unsafe {
             (submission.api.submit)(
                 submission.api.base.context,
                 submission.encoder,
-                frame,
+                &forwarded,
                 u32::from(submission.force_idr),
             )
         }
     };
+    if submission.status == STATUS_OK {
+        // SAFETY: capture bytes remain borrowed until read_frame returns. A failed
+        // allocation only disables repeats; the encoder already copied its input.
+        if let Ok(bytes) = unsafe { frame.bytes() } {
+            let mut owned = Vec::new();
+            if owned.try_reserve_exact(bytes.len()).is_ok() {
+                owned.extend_from_slice(bytes);
+                submission.owned_frame = Some(OwnedFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    format: frame.format,
+                    stride: frame.stride,
+                    bytes: owned,
+                });
+            }
+        }
+    }
     // Capture ownership ends here even on encoder backpressure: deliberately drop frame.
     STATUS_OK
 }
@@ -175,6 +214,15 @@ impl Plane for NativePlane {
         } else {
             Progress::default()
         };
+        let progress = if !progress.submitted && !progress.dropped && input.repeat_due {
+            if let Some(frame) = input.repeat_frame {
+                repeat(encoder_api, frame, &input)?
+            } else {
+                progress
+            }
+        } else {
+            progress
+        };
         receive(encoder_api, input.encoder, input.video, &self.queues)?;
         Ok(progress)
     }
@@ -202,7 +250,10 @@ fn capture(
         status: MEDIA_PENDING,
         called: false,
         force_idr: input.force_idr,
+        timestamp_us: input.timestamp_us,
+        sequence: input.sequence,
         frame: None,
+        owned_frame: None,
     };
     let sink = FrameSink {
         context: (&mut submission as *mut Submission<'_>).cast(),
@@ -219,9 +270,48 @@ fn capture(
     Ok(Progress {
         dropped: submission.called && submission.status == MEDIA_BUSY,
         submitted: submission.called && submission.status == STATUS_OK,
+        repeat_attempted: false,
         frame: (submission.called && submission.status == STATUS_OK)
             .then_some(submission.frame)
             .flatten(),
+        owned_frame: submission.owned_frame,
+    })
+}
+
+fn repeat(
+    api: &EncoderApi,
+    frame: &OwnedFrame,
+    input: &Pump<'_>,
+) -> Result<Progress, &'static str> {
+    let copied_frame = CpuFrame {
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        stride: frame.stride,
+        data: frame.bytes.as_ptr(),
+        len: frame.bytes.len(),
+        timestamp_us: input.timestamp_us,
+        sequence: input.sequence,
+    };
+    // SAFETY: bytes are owned by Video for the full synchronous submit callback;
+    // the encoder contract copies accepted input before returning.
+    let status = unsafe {
+        (api.submit)(
+            api.base.context,
+            input.encoder,
+            &copied_frame,
+            u32::from(input.force_idr),
+        )
+    };
+    if !matches!(status, STATUS_OK | MEDIA_BUSY) {
+        return Err("frame_rejected");
+    }
+    Ok(Progress {
+        dropped: status == MEDIA_BUSY,
+        submitted: status == STATUS_OK,
+        repeat_attempted: true,
+        frame: None,
+        owned_frame: None,
     })
 }
 
@@ -339,7 +429,10 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             force_idr: false,
+            timestamp_us: 7,
+            sequence: 3,
             frame: None,
+            owned_frame: None,
         };
         let bytes = [0; 16 * 16 * 4];
         let mut frame = CpuFrame {
@@ -355,9 +448,116 @@ mod tests {
         let context = (&mut submission as *mut Submission<'_>).cast();
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert_eq!(submission.status, MEDIA_BUSY);
+        assert!(submission.owned_frame.is_none());
         frame.width = 8;
         assert_eq!(unsafe { submit(context, &frame) }, STATUS_OK);
         assert_eq!(submission.status, STATUS_INVALID_ARGUMENT);
+    }
+
+    #[derive(Default)]
+    struct SubmittedFrames(Vec<(u64, u64, Vec<u8>)>);
+
+    unsafe extern "C" fn record_frame(
+        context: *mut c_void,
+        _: u64,
+        frame: *const CpuFrame,
+        _: u32,
+    ) -> Status {
+        if frame.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: this test callback is invoked synchronously with a live frame;
+        // the frame's allocation remains valid for the duration of the call.
+        let frame = unsafe { &*frame };
+        let Ok(bytes) = (unsafe { frame.bytes() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        // SAFETY: test context points to the live SubmittedFrames value.
+        unsafe {
+            (*context.cast::<SubmittedFrames>()).0.push((
+                frame.sequence,
+                frame.timestamp_us,
+                bytes.to_vec(),
+            ));
+        }
+        STATUS_OK
+    }
+
+    #[test]
+    fn repeats_use_owned_accepted_pixels_and_advance_video_metadata() {
+        let mut observed = SubmittedFrames::default();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: (&mut observed as *mut SubmittedFrames).cast(),
+                release: None,
+            },
+            submit: record_frame,
+            receive,
+            drain,
+        };
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 30,
+            bitrate: 100_000,
+            max_reference_frames: 0,
+        };
+        let mut source_bytes = [0x6b; 16 * 16 * 4];
+        let captured = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_BGRA8,
+            stride: 64,
+            data: source_bytes.as_ptr(),
+            len: source_bytes.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut submission = Submission {
+            api: &api,
+            encoder: 2,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            force_idr: false,
+            timestamp_us: 12,
+            sequence: 3,
+            frame: None,
+            owned_frame: None,
+        };
+        let context = (&mut submission as *mut Submission<'_>).cast();
+        assert_eq!(unsafe { submit(context, &captured) }, STATUS_OK);
+        assert_eq!(submission.status, STATUS_OK);
+        assert_eq!(submission.frame.unwrap().timestamp_us, 12);
+        assert_eq!(submission.frame.unwrap().sequence, 3);
+        let owned_frame = submission.owned_frame.as_ref().unwrap();
+        assert_eq!(owned_frame.bytes, vec![0x6b; source_bytes.len()]);
+
+        source_bytes.fill(0x19);
+        let input = Pump {
+            video: 1,
+            provider: CaptureProvider::Dxgi,
+            capture: 1,
+            encoder: 2,
+            configuration: &configuration,
+            capture_due: false,
+            repeat_due: true,
+            repeat_frame: Some(owned_frame),
+            timestamp_us: 21,
+            sequence: 4,
+            force_idr: false,
+        };
+        let repeated = repeat(&api, owned_frame, &input).unwrap();
+        assert!(repeated.submitted);
+        assert!(repeated.repeat_attempted);
+        assert_eq!(observed.0.len(), 2);
+        assert_eq!(observed.0[0].0, 3);
+        assert_eq!(observed.0[0].1, 12);
+        assert_eq!(observed.0[0].2, vec![0x6b; source_bytes.len()]);
+        assert_eq!(observed.0[1].0, 4);
+        assert_eq!(observed.0[1].1, 21);
+        assert_eq!(observed.0[1].2, vec![0x6b; source_bytes.len()]);
     }
     #[test]
     fn native_submission_passes_force_idr_as_exact_c_flag() {
@@ -409,7 +609,10 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             force_idr: true,
+            timestamp_us: 7,
+            sequence: 3,
             frame: None,
+            owned_frame: None,
         };
         assert_eq!(
             unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &frame) },

@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::EncoderIdentity;
-use crate::plane::{GeometryProgress, Progress};
+use crate::plane::{FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 #[derive(Default)]
@@ -120,7 +120,7 @@ impl Runtime {
 struct FakePlane {
     calls: usize,
     drains: usize,
-    inputs: Vec<(CaptureProvider, bool, bool)>,
+    inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
     fail: bool,
     geometry_checks: Vec<Option<CaptureGeometry>>,
@@ -142,15 +142,46 @@ impl Plane for FakePlane {
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         self.calls += 1;
-        self.inputs
-            .push((input.provider, input.capture_due, input.force_idr));
+        self.inputs.push((
+            input.provider,
+            input.capture_due,
+            input.force_idr,
+            input.repeat_due,
+            input.repeat_frame.is_some(),
+            input.sequence,
+            input.timestamp_us,
+        ));
         if self.fail {
             Err("frame_rejected")
         } else {
+            let capture_submitted = input.capture_due && !self.dropped;
+            let repeat_attempted = !capture_submitted
+                && !self.dropped
+                && input.repeat_due
+                && input.repeat_frame.is_some();
             Ok(Progress {
                 dropped: self.dropped,
-                submitted: input.capture_due && !self.dropped,
-                frame: None,
+                submitted: capture_submitted || repeat_attempted,
+                repeat_attempted,
+                frame: capture_submitted.then_some(FrameMetadata {
+                    width: input.configuration.width,
+                    height: input.configuration.height,
+                    stride: input.configuration.width * 4,
+                    timestamp_us: input.timestamp_us,
+                    sequence: input.sequence,
+                }),
+                owned_frame: capture_submitted.then_some(OwnedFrame {
+                    width: input.configuration.width,
+                    height: input.configuration.height,
+                    format: amaterasu_media::PIXEL_BGRA8,
+                    stride: input.configuration.width * 4,
+                    bytes: vec![
+                        0;
+                        input.configuration.width as usize
+                            * input.configuration.height as usize
+                            * 4
+                    ],
+                }),
             })
         }
     }
@@ -200,6 +231,7 @@ fn open() -> Operation {
         operation_id: None,
         capture_provider: CaptureProvider::Dxgi,
         constant_rate: false,
+        minimum_fps_target: 20.0,
         output: "display-1".into(),
         encoder: encoder_identity(),
         configuration: Configuration {
@@ -822,12 +854,14 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             encoder,
             configuration,
             constant_rate,
+            minimum_fps_target,
             ..
         } => Operation::Open {
             packet_boundaries: false,
             operation_id: None,
             capture_provider: CaptureProvider::Wgc,
             constant_rate,
+            minimum_fps_target,
             output,
             encoder,
             configuration,
@@ -892,6 +926,124 @@ fn force_idr_is_owned_and_survives_encoder_backpressure_until_acceptance() {
 }
 
 #[test]
+fn minimum_fps_repeats_above_capture_rate_on_independent_ticks() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        minimum_fps_target,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *minimum_fps_target = 120.0;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 30;
+    configuration.bitrate = 100_000;
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    let now = Instant::now();
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    assert!(stream.last_pixels.is_some());
+    assert_eq!(stream.configuration.fps, 30);
+    stream.last_output_at = Some(now - Duration::from_millis(15));
+    stream.last_repeat_attempt_at = None;
+    stream.next_frame = now + Duration::from_secs(30);
+    let sequence_before_repeat = stream.last_output_sequence;
+    assert!(stream.repeat_due(now));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    let input = plane.inputs.last().unwrap();
+    assert!(!input.1, "capture polling stays at the negotiated 30 FPS");
+    assert!(input.3, "the independent 120 FPS idle target is due");
+    assert!(input.4, "repeats use the owned accepted frame");
+    assert_eq!(
+        pipeline.streams[&1].last_output_sequence,
+        sequence_before_repeat + 1
+    );
+
+    let stream = &pipeline.streams[&1];
+    let accepted_at = stream.last_output_at.unwrap();
+    assert!(!stream.repeat_due(accepted_at + Duration::from_millis(8)));
+    assert!(stream.repeat_due(accepted_at + Duration::from_millis(9)));
+
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.minimum_fps_target = 0.0;
+    assert!(!stream.repeat_due(accepted_at + Duration::from_millis(33)));
+    assert!(stream.repeat_due(accepted_at + Duration::from_millis(34)));
+}
+
+#[test]
+fn accepted_fresh_capture_suppresses_a_due_repeat_on_the_same_tick() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        constant_rate,
+        minimum_fps_target,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    *constant_rate = true;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+    *minimum_fps_target = 120.0;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 30;
+    configuration.bitrate = 100_000;
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    let previous_sequence = stream.last_output_sequence;
+    let previous_submitted = stream.submitted;
+    stream.last_output_at = Some(Instant::now() - Duration::from_millis(15));
+    stream.next_frame = Instant::now();
+    assert!(stream.repeat_due(Instant::now()));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    let input = plane.inputs.last().unwrap();
+    assert!(input.1, "capture is due");
+    assert!(input.3, "the idle target is also due");
+    let stream = &pipeline.streams[&1];
+    assert_eq!(stream.last_output_sequence, previous_sequence + 1);
+    assert_eq!(stream.submitted, previous_submitted + 1);
+    assert!(stream.last_repeat_attempt_at.is_none());
+}
+
+#[test]
+fn capture_error_discards_the_repeat_cache_before_cleanup() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open { configuration, .. } = &mut request else {
+        unreachable!();
+    };
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 30;
+    configuration.bitrate = 100_000;
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(pipeline.streams[&1].last_pixels.is_some());
+
+    plane.fail = true;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::FindEncoder as u8);
+    assert!(pipeline.streams[&1].last_pixels.is_none());
+    assert!(pipeline.streams[&1].last_output_at.is_none());
+}
+
+#[test]
 fn drain_stops_capture_preserves_rejected_eos_and_cleans_after_acceptance() {
     use amaterasu_media::{CODEC_H264, EncodedPacket, FLAG_END_OF_STREAM, MEDIA_BUSY, PacketSink};
     use amaterasu_module_sdk::abi::{STATUS_OK, Status};
@@ -921,7 +1073,7 @@ fn drain_stops_capture_preserves_rejected_eos_and_cleans_after_acceptance() {
         plane
             .inputs
             .iter()
-            .all(|(_, capture, force)| !*capture && !*force)
+            .all(|(_, capture, force, ..)| !*capture && !*force)
     );
     assert!(pipeline.streams[&1].capture.is_none());
     pipeline.handle(

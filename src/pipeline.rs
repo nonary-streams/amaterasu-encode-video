@@ -5,8 +5,9 @@ mod output;
 use crate::{
     model::{
         CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation, Settings, error,
+        valid_minimum_fps_target,
     },
-    plane::{ENCODE, FrameMetadata, GeometryProgress, Plane, Pump},
+    plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
     queue::Queues,
     rpc::{self, Send},
 };
@@ -39,6 +40,7 @@ struct Stream {
     owner: String,
     provider: CaptureProvider,
     constant_rate: bool,
+    minimum_fps_target: f64,
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
@@ -58,6 +60,12 @@ struct Stream {
     retries: u8,
     error: Option<&'static str>,
     next_frame: Instant,
+    opened_at: Instant,
+    last_output_at: Option<Instant>,
+    last_repeat_attempt_at: Option<Instant>,
+    last_output_timestamp_us: Option<u64>,
+    last_output_sequence: u64,
+    last_pixels: Option<OwnedFrame>,
     dropped: u64,
     submitted: u64,
     last_frame: Option<FrameMetadata>,
@@ -65,6 +73,35 @@ struct Stream {
 }
 
 impl Stream {
+    fn repeat_due(&self, now: Instant) -> bool {
+        let target = if self.minimum_fps_target == 0.0 {
+            f64::from(self.configuration.fps)
+        } else {
+            self.minimum_fps_target
+        };
+        self.last_pixels.is_some()
+            && self
+                .last_output_at
+                .is_some_and(|last| elapsed_at_rate(now, last, target))
+            && self
+                .last_repeat_attempt_at
+                .is_none_or(|last| elapsed_at_rate(now, last, target))
+    }
+
+    fn next_frame_clock(&self, now: Instant) -> Option<(u64, u64)> {
+        let sequence = self.last_output_sequence.checked_add(1)?;
+        let elapsed = now
+            .saturating_duration_since(self.opened_at)
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let timestamp_us = self
+            .last_output_timestamp_us
+            .map(|timestamp| timestamp.checked_add(1))
+            .unwrap_or(Some(1))?
+            .max(elapsed);
+        Some((timestamp_us, sequence))
+    }
+
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
             Stage::Capture | Stage::Encoder | Stage::Activating => "opening",
@@ -84,6 +121,7 @@ impl Stream {
             "output": self.output,
             "capture_provider":self.provider,
             "constant_rate": self.constant_rate,
+            "minimum_fps_target": self.minimum_fps_target,
             "force_idr_pending":self.force_idr,
             "configuration": self.configuration,
             "dropped_frames": self.dropped,
@@ -114,6 +152,9 @@ impl Stream {
         }
         self.stage = Stage::FindEncoder;
         self.error = Some(code);
+        self.last_pixels = None;
+        self.last_output_at = None;
+        self.last_repeat_attempt_at = None;
         self.retries = 0;
         self.unresolved = false;
         self.settlement_attempts = 0;
@@ -162,6 +203,7 @@ impl Pipeline {
                 operation_id,
                 capture_provider,
                 constant_rate,
+                minimum_fps_target,
                 output,
                 encoder,
                 configuration,
@@ -173,6 +215,7 @@ impl Pipeline {
                     operation_id,
                     provider: capture_provider,
                     constant_rate,
+                    minimum_fps_target,
                     output,
                     encoder,
                     configuration,
@@ -249,6 +292,7 @@ impl Pipeline {
             operation_id,
             provider,
             constant_rate,
+            minimum_fps_target,
             output,
             encoder,
             configuration,
@@ -259,7 +303,8 @@ impl Pipeline {
             Some("capture_provider_not_allowed")
         } else if constant_rate && provider != CaptureProvider::Wgc {
             Some("constant_rate_requires_wgc")
-        } else if !configuration.validate()
+        } else if !valid_minimum_fps_target(minimum_fps_target)
+            || !configuration.validate()
             || output.is_empty()
             || output.len() > 512
             || output.chars().any(char::is_control)
@@ -288,13 +333,14 @@ impl Pipeline {
                 },
             );
         }
-        self.streams.insert(
-            id,
+        self.streams.insert(id, {
+            let opened_at = Instant::now();
             Stream {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
                 constant_rate,
+                minimum_fps_target,
                 force_idr: false,
                 grace: None,
                 output,
@@ -314,12 +360,18 @@ impl Pipeline {
                 retries: 0,
                 error: None,
                 next_frame: Instant::now(),
+                opened_at,
+                last_output_at: None,
+                last_repeat_attempt_at: None,
+                last_output_timestamp_us: None,
+                last_output_sequence: 0,
+                last_pixels: None,
                 dropped: 0,
                 submitted: 0,
                 last_frame: None,
                 unresolved: false,
-            },
-        );
+            }
+        });
     }
 
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
@@ -386,32 +438,49 @@ impl Pipeline {
     }
 }
 
+fn elapsed_at_rate(now: Instant, anchor: Instant, frames_per_second: f64) -> bool {
+    now.saturating_duration_since(anchor).as_secs_f64() * frames_per_second >= 1.0
+}
+
 fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let now = Instant::now();
-    let due = now >= stream.next_frame;
-    if due {
+    let mut capture_due = now >= stream.next_frame;
+    if capture_due {
         match plane.verify_geometry(
             stream.provider,
             stream.capture.expect("running stream owns capture"),
             stream.desktop_geometry,
         ) {
             Ok(GeometryProgress::Ready) => {}
-            Ok(GeometryProgress::Busy) => return,
+            Ok(GeometryProgress::Busy) => {
+                stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+                capture_due = false;
+            }
             Err(code) => {
                 stream.cleanup(code);
                 return;
             }
         }
-        stream.next_frame =
-            now + Duration::from_micros(1_000_000 / u64::from(stream.configuration.fps));
+        if capture_due {
+            stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+        }
     }
+    let repeat_due = stream.repeat_due(now);
+    let Some((timestamp_us, sequence)) = stream.next_frame_clock(now) else {
+        stream.cleanup("frame_clock_exhausted");
+        return;
+    };
     match plane.pump(Pump {
         video: id,
         provider: stream.provider,
         capture: stream.capture.unwrap(),
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,
-        capture_due: due,
+        capture_due,
+        repeat_due,
+        repeat_frame: stream.last_pixels.as_ref(),
+        timestamp_us,
+        sequence,
         force_idr: stream.force_idr,
     }) {
         Ok(progress) => {
@@ -419,13 +488,28 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
             stream.submitted = stream
                 .submitted
                 .saturating_add(u64::from(progress.submitted));
+            let completed_at = Instant::now();
+            if progress.repeat_attempted {
+                stream.last_repeat_attempt_at = Some(completed_at);
+            }
             if progress.submitted {
-                stream.last_frame = progress.frame;
+                stream.last_output_at = Some(completed_at);
+                stream.last_repeat_attempt_at = None;
+                stream.last_output_timestamp_us = Some(timestamp_us);
+                stream.last_output_sequence = sequence;
+                if let Some(frame) = progress.frame {
+                    stream.last_frame = Some(frame);
+                    stream.last_pixels = progress.owned_frame;
+                }
                 stream.force_idr = false;
             }
         }
         Err(code) => stream.cleanup(code),
     }
+}
+
+fn next_capture_deadline(now: Instant, fps: u32) -> Instant {
+    now + Duration::from_micros(1_000_000 / u64::from(fps))
 }
 
 fn advance(

@@ -23,7 +23,7 @@ there is no synthetic frame or software fallback.
 ## API
 
 ```json
-{"action":"open","output":"<capture enumerate output id>","encoder":0,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
+{"action":"open","output":"<capture enumerate output id>","encoder":0,"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"status"}
 {"action":"status","stream":1}
 {"action":"force_idr","stream":1}
@@ -36,11 +36,11 @@ Open optionally accepts `"capture_provider":"dxgi"` or `"wgc"`, defaulting to
 from that provider's enumeration; DXGI and WGC output IDs are not interchangeable.
 The selected service is retained for all open, lookup, close and teardown calls;
 a caller cannot supply an arbitrary service name or silently trigger a fallback.
-For WGC only, `"constant_rate":true` repeats the last completed image when a
-scheduled read finds no new frame. Video's configured FPS sets the read cadence;
-the WGC module does not busy-wait or create a timer. The default is event-driven
-WGC delivery. Product-level `capture = wgcc` routing through NVHTTP, RTSP, and
-stream-session is still pending.
+For WGC only, `"constant_rate":true` asks capture to return the latest image at
+each scheduled read when no new frame is ready. Video's configured FPS sets the
+read cadence; the WGC module does not busy-wait or create a timer. The default is
+event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP,
+RTSP, and stream-session is still pending.
 
 Open completes after both lower resources open, returning
 `{"ok":true,"stream":1,"state":"running",...}`. This state means the pipeline has
@@ -95,6 +95,18 @@ requests into a flag for the next accepted encoder input. Capture pending/busy o
 encoder backpressure leaves that flag pending; acceptance clears it. The encoder
 receives the exact native force flag. Actual keyframe generation still depends on
 the hardware encoder honoring the request.
+
+`minimum_fps_target` defaults to 20 and accepts finite values from 0 through
+1000, including fractional targets. Zero resolves to the negotiated capture FPS.
+Video submits fresh frames immediately and, while capture is idle, makes at most
+one repeat attempt per module tick using an owned copy of the last frame accepted
+by the encoder. The repeat deadline is independent of capture polling, so a
+target above negotiated FPS can receive repeats on intervening ticks when the
+host tick rate allows it. A fresh accepted capture suppresses a repeat in the
+same tick. Sequence and timestamp values are monotonic and are committed only
+after encoder acceptance; a failed stream, close, or drain releases the cached
+pixels. Capture uses the negotiated FPS, module tick cadence limits repeats,
+and the scheduler does not catch up after delays.
 
 `drain` is accepted only for an owned running stream and returns `draining`.
 Repeating it while draining preserves the original deadline. Video stops capturing,
