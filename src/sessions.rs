@@ -1,6 +1,6 @@
 use crate::{
     layout,
-    model::{Configuration, Packet},
+    model::{Configuration, EncoderIdentity, Packet},
     worker::Worker,
 };
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
@@ -46,7 +46,7 @@ pub struct Session {
 struct OpenRecord {
     packet_boundaries: bool,
     id: u64,
-    encoder: u32,
+    encoder: EncoderIdentity,
     configuration: Configuration,
 }
 
@@ -69,7 +69,7 @@ impl Sessions {
     pub fn open(
         &mut self,
         owner: &str,
-        encoder: u32,
+        encoder: EncoderIdentity,
         configuration: Configuration,
         operation: Option<String>,
         packet_boundaries: bool,
@@ -92,8 +92,8 @@ impl Sessions {
                 return Err("operation_limit");
             }
         }
-        self.validate_open(owner, &configuration)?;
-        let backend = Worker::open(encoder, configuration.clone())?;
+        self.validate_open(owner, &encoder, &configuration)?;
+        let backend = Worker::open(encoder.clone(), configuration.clone())?;
         let response = self.insert(
             owner,
             configuration.clone(),
@@ -113,11 +113,17 @@ impl Sessions {
         }
         Ok(response)
     }
-    fn validate_open(&self, owner: &str, config: &Configuration) -> Result<(), &'static str> {
+    fn validate_open(
+        &self,
+        owner: &str,
+        encoder: &EncoderIdentity,
+        config: &Configuration,
+    ) -> Result<(), &'static str> {
         if !self.enabled {
             return Err("disabled");
         }
         config.validate()?;
+        encoder.validate()?;
         if self.values.len() >= 8
             || self
                 .values

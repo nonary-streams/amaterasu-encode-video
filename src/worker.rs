@@ -1,6 +1,6 @@
 //! Dedicated threads own COM apartments; no COM pointer crosses thread boundaries.
 use crate::{
-    model::{Configuration, EncoderDescription, Packet},
+    model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
     platform,
 };
 use std::{
@@ -33,13 +33,13 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn open(index: u32, config: Configuration) -> Result<Self, &'static str> {
+    pub fn open(identity: EncoderIdentity, config: Configuration) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel::<Request>(1);
         let (ready, initialized) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("amaterasu-h264".into())
             .spawn(move || {
-                let mut encoder = match platform::Encoder::open(index, &config) {
+                let mut encoder = match platform::Encoder::open(&identity, &config) {
                     Ok(encoder) => encoder,
                     Err(error) => {
                         let _ = ready.send(Err(error));

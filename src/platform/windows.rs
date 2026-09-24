@@ -1,10 +1,10 @@
 //! COM/MF objects stay on their creating worker thread. All pointers passed to
 //! Windows reference live COM objects, stack outputs, or bounded owned buffers.
-use crate::model::{Configuration, EncoderDescription, Packet};
+use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
-    sync::atomic::{AtomicI32, AtomicU8, Ordering},
+    sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use windows::{
@@ -21,17 +21,54 @@ const STAGE_PROCESS_INPUT: u8 = 1;
 const STAGE_PROCESS_OUTPUT: u8 = 2;
 const STAGE_STREAM_CHANGE: u8 = 3;
 const STAGE_DRAIN: u8 = 4;
+const STAGE_EVENT: u8 = 5;
+const STAGE_OPEN_RUNTIME: u8 = 6;
+const STAGE_OPEN_ENUMERATE: u8 = 7;
+const STAGE_OPEN_ACTIVATE: u8 = 8;
+const STAGE_OPEN_ASYNC: u8 = 9;
+const STAGE_OPEN_CODEC: u8 = 10;
+const STAGE_OPEN_STREAMS: u8 = 11;
+const STAGE_OPEN_INPUT_TYPE: u8 = 12;
+const STAGE_OPEN_OUTPUT_TYPE: u8 = 13;
+const STAGE_OPEN_START: u8 = 14;
 
 static LAST_STAGE: AtomicU8 = AtomicU8::new(STAGE_NONE);
+static LAST_OPEN_STAGE: AtomicU8 = AtomicU8::new(STAGE_OPEN_RUNTIME);
 static LAST_HRESULT: AtomicI32 = AtomicI32::new(0);
+static NEED_INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+static HAVE_OUTPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+static OTHER_EVENTS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_INPUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_OUTPUT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Non-secret Media Foundation failure detail for an owned diagnostics query.
 /// It intentionally retains only an operation stage and HRESULT, never frame,
 /// bitstream, endpoint, or display content.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Diagnostic {
     pub stage: &'static str,
     pub hresult: u32,
+}
+
+/// Bounded event/call counters for the most recently opened encoder worker.
+/// They contain no frames, media bytes, endpoints, or user identifiers.
+#[derive(Clone, Copy)]
+pub struct Metrics {
+    pub need_input_events: u64,
+    pub have_output_events: u64,
+    pub other_events: u64,
+    pub process_input_calls: u64,
+    pub process_output_calls: u64,
+}
+
+pub fn metrics() -> Metrics {
+    Metrics {
+        need_input_events: NEED_INPUT_EVENTS.load(Ordering::Acquire),
+        have_output_events: HAVE_OUTPUT_EVENTS.load(Ordering::Acquire),
+        other_events: OTHER_EVENTS.load(Ordering::Acquire),
+        process_input_calls: PROCESS_INPUT_CALLS.load(Ordering::Acquire),
+        process_output_calls: PROCESS_OUTPUT_CALLS.load(Ordering::Acquire),
+    }
 }
 
 pub fn last_failure() -> Option<Diagnostic> {
@@ -45,6 +82,12 @@ pub fn last_failure() -> Option<Diagnostic> {
 fn clear_failure() {
     LAST_HRESULT.store(0, Ordering::Release);
     LAST_STAGE.store(STAGE_NONE, Ordering::Release);
+    LAST_OPEN_STAGE.store(STAGE_OPEN_RUNTIME, Ordering::Release);
+    NEED_INPUT_EVENTS.store(0, Ordering::Release);
+    HAVE_OUTPUT_EVENTS.store(0, Ordering::Release);
+    OTHER_EVENTS.store(0, Ordering::Release);
+    PROCESS_INPUT_CALLS.store(0, Ordering::Release);
+    PROCESS_OUTPUT_CALLS.store(0, Ordering::Release);
 }
 
 fn record_failure(stage: u8, error: &windows::core::Error) {
@@ -58,6 +101,16 @@ fn stage_name(stage: u8) -> &'static str {
         STAGE_PROCESS_OUTPUT => "process_output",
         STAGE_STREAM_CHANGE => "stream_change",
         STAGE_DRAIN => "drain",
+        STAGE_EVENT => "event",
+        STAGE_OPEN_RUNTIME => "open_runtime",
+        STAGE_OPEN_ENUMERATE => "open_enumerate",
+        STAGE_OPEN_ACTIVATE => "open_activate",
+        STAGE_OPEN_ASYNC => "open_async",
+        STAGE_OPEN_CODEC => "open_codec",
+        STAGE_OPEN_STREAMS => "open_streams",
+        STAGE_OPEN_INPUT_TYPE => "open_input_type",
+        STAGE_OPEN_OUTPUT_TYPE => "open_output_type",
+        STAGE_OPEN_START => "open_start",
         _ => "unknown",
     }
 }
@@ -131,32 +184,82 @@ fn activations() -> NativeResult<Vec<IMFActivate>> {
     }
 }
 
+fn allocated_string(
+    activation: &IMFActivate,
+    key: &windows::core::GUID,
+) -> NativeResult<Option<String>> {
+    let mut value = PWSTR::null();
+    let mut length = 0;
+    // SAFETY: Media Foundation allocates the UTF-16 string. It is copied with
+    // a bounded length and the task allocation is freed exactly once.
+    unsafe {
+        match activation.GetAllocatedString(key, &mut value, &mut length) {
+            Ok(()) => {
+                let text = (!value.is_null() && length <= 1024).then(|| {
+                    String::from_utf16_lossy(std::slice::from_raw_parts(value.0, length as usize))
+                });
+                CoTaskMemFree(Some(value.0.cast()));
+                Ok(text)
+            }
+            Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn description(activation: &IMFActivate) -> NativeResult<EncoderDescription> {
+    let name = allocated_string(activation, &MFT_FRIENDLY_NAME_Attribute)?
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Hardware H.264 encoder".into());
+    let clsid = unsafe { activation.GetGUID(&MFT_TRANSFORM_CLSID_Attribute)? };
+    Ok(EncoderDescription {
+        identity: EncoderIdentity {
+            clsid: format!("{clsid:?}"),
+            hardware_url: allocated_string(activation, &MFT_ENUM_HARDWARE_URL_Attribute)?,
+            friendly_name: name.clone(),
+        },
+        name,
+        codec: "h264",
+        hardware: true,
+        vendor_id: unsafe {
+            activation
+                .GetUINT32(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute)
+                .ok()
+        },
+    })
+}
+
+fn matching_activation(
+    values: Vec<IMFActivate>,
+    identity: &EncoderIdentity,
+) -> NativeResult<IMFActivate> {
+    values
+        .into_iter()
+        .find_map(|activation| {
+            description(&activation)
+                .ok()
+                .filter(|description| description.identity == *identity)
+                .map(|_| activation)
+        })
+        .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))
+}
+
+#[cfg(test)]
+fn matching_description<'a>(
+    values: &'a [EncoderDescription],
+    identity: &EncoderIdentity,
+) -> Option<&'a EncoderDescription> {
+    values
+        .iter()
+        .find(|description| description.identity == *identity)
+}
+
 pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
     let _runtime = Runtime::start().map_err(|_| "media_foundation_unavailable")?;
     let values = activations().map_err(|_| "encoder_enumeration_failed")?;
     let mut result = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        let mut name = PWSTR::null();
-        let mut length = 0;
-        // SAFETY: MF allocates the UTF-16 string; free after bounded copying.
-        let name = unsafe {
-            value
-                .GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut name, &mut length)
-                .map_err(|_| "encoder_enumeration_failed")?;
-            let text = if !name.is_null() && length <= 1024 {
-                String::from_utf16_lossy(std::slice::from_raw_parts(name.0, length as usize))
-            } else {
-                "Hardware H.264 encoder".into()
-            };
-            CoTaskMemFree(Some(name.0.cast()));
-            text
-        };
-        result.push(EncoderDescription {
-            index: index as u32,
-            name,
-            codec: "h264",
-            hardware: true,
-        });
+    for value in values {
+        result.push(description(&value).map_err(|_| "encoder_enumeration_failed")?);
     }
     Ok(result)
 }
@@ -164,7 +267,7 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 pub struct Encoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
-    codec: ICodecAPI,
+    codec: Option<ICodecAPI>,
     input: u32,
     output: u32,
     credits: u32,
@@ -179,21 +282,25 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn open(index: u32, config: &Configuration) -> Result<Self, &'static str> {
+    pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
         clear_failure();
-        Self::create(index, config).map_err(|_| "encoder_open_failed")
+        Self::create(identity, config).map_err(|error| {
+            record_failure(LAST_OPEN_STAGE.load(Ordering::Acquire), &error);
+            "encoder_open_failed"
+        })
     }
-    fn create(index: u32, config: &Configuration) -> NativeResult<Self> {
+    fn create(identity: &EncoderIdentity, config: &Configuration) -> NativeResult<Self> {
+        LAST_OPEN_STAGE.store(STAGE_OPEN_RUNTIME, Ordering::Release);
         let runtime = Runtime::start()?;
+        LAST_OPEN_STAGE.store(STAGE_OPEN_ENUMERATE, Ordering::Release);
         let values = activations()?;
-        let activation = values.get(index as usize).ok_or_else(|| {
-            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
-        })?;
-        let activation = Activation(activation.clone());
+        LAST_OPEN_STAGE.store(STAGE_OPEN_ACTIVATE, Ordering::Release);
+        let activation = Activation(matching_activation(values, identity)?);
         // SAFETY: generated bindings own all COM references; sample buffers remain
         // owned until ProcessInput takes its own reference. No raw vtable casts.
         unsafe {
             let transform: IMFTransform = activation.0.ActivateObject()?;
+            LAST_OPEN_STAGE.store(STAGE_OPEN_ASYNC, Ordering::Release);
             let attributes = transform.GetAttributes()?;
             if attributes.GetUINT32(&MF_TRANSFORM_ASYNC)? != 1 {
                 return Err(windows::core::Error::from_hresult(
@@ -202,10 +309,24 @@ impl Encoder {
             }
             attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
             let events = transform.cast()?;
-            let codec: ICodecAPI = transform.cast()?;
-            codec.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true))?;
-            codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32))?;
-            configure_reference_frames(&codec, config.max_reference_frames)?;
+            LAST_OPEN_STAGE.store(STAGE_OPEN_CODEC, Ordering::Release);
+            let codec = transform.cast::<ICodecAPI>().ok();
+            if let Some(codec) = &codec {
+                // These are optional encoder hints. MFTs are permitted not to
+                // expose them, and rejecting a hint must not make a valid
+                // system-memory NV12/H.264 path unavailable.
+                let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+                let _ =
+                    codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
+                if config.max_reference_frames != 0 {
+                    configure_reference_frames(codec, config.max_reference_frames)?;
+                }
+            } else if config.max_reference_frames != 0 {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_NOTIMPL,
+                ));
+            }
+            LAST_OPEN_STAGE.store(STAGE_OPEN_STREAMS, Ordering::Release);
             let mut inputs = [0];
             let mut outputs = [0];
             if let Err(error) = transform.GetStreamIDs(&mut inputs, &mut outputs)
@@ -213,14 +334,21 @@ impl Encoder {
             {
                 return Err(error);
             }
+            let input_type = media_type(config, MFVideoFormat_NV12)?;
+            input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, config.width)?;
             let output_type = media_type(config, MFVideoFormat_H264)?;
             output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate)?;
             output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
-            transform.SetOutputType(outputs[0], &output_type, 0)?;
-            let input_type = media_type(config, MFVideoFormat_NV12)?;
-            input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, config.width)?;
-            transform.SetInputType(inputs[0], &input_type, 0)?;
-            verify_reference_frames(&codec, config.max_reference_frames)?;
+            negotiate_media_types(&transform, inputs[0], outputs[0], &input_type, &output_type)?;
+            if config.max_reference_frames != 0 {
+                verify_reference_frames(
+                    codec
+                        .as_ref()
+                        .expect("reference-frame policy requires ICodecAPI"),
+                    config.max_reference_frames,
+                )?;
+            }
+            LAST_OPEN_STAGE.store(STAGE_OPEN_START, Ordering::Release);
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             Ok(Self {
@@ -263,10 +391,17 @@ impl Encoder {
         // SAFETY: buffer length equals the owned NV12 vector; Lock/Unlock are
         // balanced, and sample retains the COM buffer after this function.
         unsafe {
-            if force {
-                self.codec
-                    .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true))
-                    .map_err(|_| "force_keyframe_failed")?;
+            if force
+                && let Some(codec) = &self.codec
+                && let Err(error) =
+                    codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true))
+                && !matches!(
+                    error.code(),
+                    windows::Win32::Foundation::E_INVALIDARG
+                        | windows::Win32::Foundation::E_NOTIMPL
+                )
+            {
+                return Err("force_keyframe_failed");
             }
             let mut input_info = MFT_INPUT_STREAM_INFO::default();
             self.transform
@@ -297,6 +432,7 @@ impl Encoder {
                 record_failure(STAGE_PROCESS_INPUT, &error);
                 return Err("encoder_input_failed");
             }
+            PROCESS_INPUT_CALLS.fetch_add(1, Ordering::Release);
             self.credits -= 1;
         }
         Ok(())
@@ -340,16 +476,25 @@ impl Encoder {
                 let event = match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                     Ok(event) => event,
                     Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => break,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        record_failure(STAGE_EVENT, &error);
+                        return Err(error);
+                    }
                 };
                 event.GetStatus()?.ok()?;
                 match event.GetType()? {
                     value if value == METransformNeedInput.0 as u32 => {
+                        NEED_INPUT_EVENTS.fetch_add(1, Ordering::Release);
                         self.credits = self.credits.saturating_add(1)
                     }
-                    value if value == METransformHaveOutput.0 as u32 => self.read_output()?,
+                    value if value == METransformHaveOutput.0 as u32 => {
+                        HAVE_OUTPUT_EVENTS.fetch_add(1, Ordering::Release);
+                        self.read_output()?
+                    }
                     value if value == METransformDrainComplete.0 as u32 => self.drained = true,
-                    _ => {}
+                    _ => {
+                        OTHER_EVENTS.fetch_add(1, Ordering::Release);
+                    }
                 }
             }
         }
@@ -362,11 +507,11 @@ impl Encoder {
                     record_failure(STAGE_STREAM_CHANGE, &error);
                     return Err(error);
                 }
-                let result = self.read_output_sample();
-                if let Err(error) = &result {
-                    record_failure(STAGE_PROCESS_OUTPUT, error);
-                }
-                result
+                // An asynchronous MFT permits one ProcessOutput call for each
+                // METransformHaveOutput event. Format renegotiation consumes
+                // this event, so wait for the next event instead of issuing a
+                // second call that the MFT must reject as E_UNEXPECTED.
+                Ok(())
             }
             result => {
                 if let Err(error) = &result {
@@ -401,7 +546,14 @@ impl Encoder {
                 media.SetUINT32(&MF_MT_AVG_BITRATE, self.configuration.bitrate)?;
                 media.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
                 if self.transform.SetOutputType(self.output, &media, 0).is_ok() {
-                    verify_reference_frames(&self.codec, self.configuration.max_reference_frames)?;
+                    if self.configuration.max_reference_frames != 0 {
+                        verify_reference_frames(
+                            self.codec
+                                .as_ref()
+                                .expect("reference-frame policy requires ICodecAPI"),
+                            self.configuration.max_reference_frames,
+                        )?;
+                    }
                     return Ok(());
                 }
             }
@@ -432,6 +584,7 @@ impl Encoder {
                 pEvents: ManuallyDrop::new(None),
             }];
             let mut status = 0;
+            PROCESS_OUTPUT_CALLS.fetch_add(1, Ordering::Release);
             let result = self.transform.ProcessOutput(0, &mut output, &mut status);
             let sample = ManuallyDrop::take(&mut output[0].pSample);
             drop(ManuallyDrop::take(&mut output[0].pEvents));
@@ -488,6 +641,36 @@ impl Encoder {
         }
         Ok(())
     }
+}
+
+fn negotiate_media_types(
+    transform: &IMFTransform,
+    input: u32,
+    output: u32,
+    input_type: &IMFMediaType,
+    output_type: &IMFMediaType,
+) -> NativeResult<()> {
+    // Media Foundation permits an MFT's input and output type availability to
+    // depend on the other stream. Prefer input-first for standard encoders,
+    // then make one narrowly defined retry for MFTs that explicitly report the
+    // other type is not set (as the NVIDIA H.264 MFT does on this host).
+    unsafe {
+        LAST_OPEN_STAGE.store(STAGE_OPEN_INPUT_TYPE, Ordering::Release);
+        match transform.SetInputType(input, input_type, 0) {
+            Ok(()) => {
+                LAST_OPEN_STAGE.store(STAGE_OPEN_OUTPUT_TYPE, Ordering::Release);
+                transform.SetOutputType(output, output_type, 0)?;
+            }
+            Err(error) if error.code() == MF_E_TRANSFORM_TYPE_NOT_SET => {
+                LAST_OPEN_STAGE.store(STAGE_OPEN_OUTPUT_TYPE, Ordering::Release);
+                transform.SetOutputType(output, output_type, 0)?;
+                LAST_OPEN_STAGE.store(STAGE_OPEN_INPUT_TYPE, Ordering::Release);
+                transform.SetInputType(input, input_type, 0)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Configures the static H.264 SPS reference-frame limit before media types are
@@ -576,7 +759,41 @@ mod diagnostic_tests {
         assert_eq!(stage_name(STAGE_PROCESS_OUTPUT), "process_output");
         assert_eq!(stage_name(STAGE_STREAM_CHANGE), "stream_change");
         assert_eq!(stage_name(STAGE_DRAIN), "drain");
+        assert_eq!(stage_name(STAGE_OPEN_RUNTIME), "open_runtime");
+        assert_eq!(stage_name(STAGE_OPEN_INPUT_TYPE), "open_input_type");
+        assert_eq!(stage_name(STAGE_OPEN_OUTPUT_TYPE), "open_output_type");
+        assert_eq!(stage_name(STAGE_EVENT), "event");
         assert_eq!(stage_name(255), "unknown");
+    }
+
+    fn description(clsid: &str, name: &str) -> EncoderDescription {
+        EncoderDescription {
+            identity: EncoderIdentity {
+                clsid: clsid.into(),
+                hardware_url: Some(format!("mft://{clsid}")),
+                friendly_name: name.into(),
+            },
+            name: name.into(),
+            codec: "h264",
+            hardware: true,
+            vendor_id: None,
+        }
+    }
+
+    #[test]
+    fn exact_identity_survives_reordered_enumeration_and_rejects_mismatch() {
+        let nvidia = description("nvidia", "NVIDIA H.264");
+        let intel = description("intel", "Intel H.264");
+        let reordered = [intel.clone(), nvidia.clone()];
+        assert_eq!(
+            matching_description(&reordered, &nvidia.identity)
+                .expect("stable identity must select NVIDIA")
+                .name,
+            "NVIDIA H.264"
+        );
+        let mut changed = nvidia.identity.clone();
+        changed.hardware_url = Some("mft://different".into());
+        assert!(matching_description(&reordered, &changed).is_none());
     }
 }
 
@@ -595,7 +812,20 @@ mod tests {
             bitrate: 2_000_000,
             max_reference_frames: 0,
         };
-        let mut encoder = Encoder::open(devices[0].index, &config).unwrap();
+        let selected = devices
+            .iter()
+            .find(|device| device.name.to_ascii_lowercase().contains("nvidia"))
+            .or_else(|| devices.first())
+            .expect("enumeration was checked non-empty");
+        if devices
+            .iter()
+            .any(|device| device.name.to_ascii_lowercase().contains("nvidia"))
+        {
+            assert!(selected.name.to_ascii_lowercase().contains("nvidia"));
+        }
+        let mut encoder = Encoder::open(&selected.identity, &config).unwrap_or_else(|error| {
+            panic!("{error}: {:?}", last_failure());
+        });
         for sequence in 0..4 {
             let mut pixels = vec![128; 640 * 480 * 3 / 2];
             pixels[..640 * 480].fill(16 + sequence as u8);

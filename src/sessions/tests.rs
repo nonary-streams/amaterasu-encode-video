@@ -43,6 +43,14 @@ fn configuration() -> Configuration {
     }
 }
 
+fn encoder_identity() -> EncoderIdentity {
+    EncoderIdentity {
+        clsid: "test-clsid".into(),
+        hardware_url: Some("test://hardware-mft".into()),
+        friendly_name: "Test H.264".into(),
+    }
+}
+
 struct Sink {
     reject: bool,
     flags: Vec<u32>,
@@ -239,7 +247,7 @@ fn control_validates_limits_disabled_default_and_operation_tombstones() {
     let mut sessions = Sessions::new(false);
     assert_eq!(
         sessions
-            .open("alice", 0, configuration(), None, false)
+            .open("alice", encoder_identity(), configuration(), None, false)
             .unwrap_err(),
         "disabled"
     );
@@ -248,7 +256,7 @@ fn control_validates_limits_disabled_default_and_operation_tombstones() {
     assert!(config.validate().is_err());
     assert!(
         serde_json::from_value::<crate::model::Operation>(
-            json!({"action":"open","encoder":0,"configuration":configuration(),"owner":"bob"})
+        json!({"action":"open","encoder":encoder_identity(),"configuration":configuration(),"owner":"bob"})
         )
         .is_err()
     );
@@ -257,13 +265,19 @@ fn control_validates_limits_disabled_default_and_operation_tombstones() {
         OpenRecord {
             packet_boundaries: false,
             id: 1,
-            encoder: 0,
+            encoder: encoder_identity(),
             configuration: configuration(),
         },
     );
     assert_eq!(
         sessions
-            .open("alice", 0, configuration(), Some("one".into()), false)
+            .open(
+                "alice",
+                encoder_identity(),
+                configuration(),
+                Some("one".into()),
+                false
+            )
             .unwrap_err(),
         "session_closed"
     );
@@ -281,18 +295,24 @@ fn changing_boundary_mode_conflicts_with_existing_operation() {
         OpenRecord {
             packet_boundaries: false,
             id: 1,
-            encoder: 0,
+            encoder: encoder_identity(),
             configuration: configuration(),
         },
     );
     assert_eq!(
         sessions
-            .open("alice", 0, configuration(), Some("one".into()), true)
+            .open(
+                "alice",
+                encoder_identity(),
+                configuration(),
+                Some("one".into()),
+                true
+            )
             .unwrap_err(),
         "operation_conflict"
     );
     let operation: crate::model::Operation = serde_json::from_value(
-        json!({"action":"open","encoder":0,"configuration":configuration()}),
+        json!({"action":"open","encoder":encoder_identity(),"configuration":configuration()}),
     )
     .unwrap();
     assert!(matches!(
@@ -308,7 +328,7 @@ fn changing_boundary_mode_conflicts_with_existing_operation() {
 fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
     let operation: crate::model::Operation = serde_json::from_value(json!({
         "action":"open",
-        "encoder":0,
+        "encoder":encoder_identity(),
         "configuration":{"width":16,"height":16,"fps":60,"bitrate":1_000_000}
     }))
     .unwrap();
@@ -342,7 +362,7 @@ fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
         OpenRecord {
             packet_boundaries: false,
             id: 1,
-            encoder: 0,
+            encoder: encoder_identity(),
             configuration: configuration(),
         },
     );
@@ -351,7 +371,13 @@ fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
     assert_eq!(open_reply(7, &changed, false)["max_reference_frames"], 1);
     assert_eq!(
         sessions
-            .open("alice", 0, changed, Some("reference-limit".into()), false,)
+            .open(
+                "alice",
+                encoder_identity(),
+                changed,
+                Some("reference-limit".into()),
+                false,
+            )
             .unwrap_err(),
         "operation_conflict"
     );

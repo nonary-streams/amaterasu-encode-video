@@ -108,8 +108,12 @@ impl EncodeModule {
                 let diagnostic = platform::last_failure().map(|detail| {
                     json!({"stage":detail.stage,"hresult":format!("0x{:08x}", detail.hresult)})
                 });
+                let metrics = platform::metrics();
                 Ok(
-                    json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders,"diagnostic":diagnostic}),
+                    json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders,"diagnostic":diagnostic,
+                        "metrics":{"need_input_events":metrics.need_input_events,"have_output_events":metrics.have_output_events,
+                        "other_events":metrics.other_events,"process_input_calls":metrics.process_input_calls,
+                        "process_output_calls":metrics.process_output_calls}}),
                 )
             }
             Operation::Open {
