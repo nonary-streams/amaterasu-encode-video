@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::EncoderIdentity;
 use crate::plane::{GeometryProgress, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
@@ -149,6 +150,7 @@ impl Plane for FakePlane {
             Ok(Progress {
                 dropped: self.dropped,
                 submitted: input.capture_due && !self.dropped,
+                frame: None,
             })
         }
     }
@@ -168,6 +170,14 @@ fn geometry() -> CaptureGeometry {
         DesktopRect::new(-1920, -200, 3840, 1440).unwrap(),
     )
     .unwrap()
+}
+
+fn encoder_identity() -> EncoderIdentity {
+    EncoderIdentity {
+        clsid: "{00000000-0000-0000-0000-000000000001}".into(),
+        hardware_url: Some("test://encoder/nvidia".into()),
+        friendly_name: "Test NVIDIA H.264".into(),
+    }
 }
 fn setup() -> (Pipeline, Runtime, FakePlane) {
     (
@@ -190,7 +200,7 @@ fn open() -> Operation {
         operation_id: None,
         capture_provider: CaptureProvider::Dxgi,
         output: "display-1".into(),
-        encoder: 0,
+        encoder: encoder_identity(),
         configuration: Configuration {
             width: 1920,
             height: 1080,

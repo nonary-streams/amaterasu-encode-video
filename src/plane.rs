@@ -27,6 +27,18 @@ pub enum GeometryProgress {
 pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
+    pub frame: Option<FrameMetadata>,
+}
+
+/// Non-secret metadata from a frame accepted by the encoder. The frame bytes
+/// remain borrowed only during the native callback and are never retained.
+#[derive(Clone, Copy)]
+pub struct FrameMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub timestamp_us: u64,
+    pub sequence: u64,
 }
 pub trait Plane {
     fn verify_geometry(
@@ -77,6 +89,7 @@ struct Submission<'a> {
     status: Status,
     called: bool,
     force_idr: bool,
+    frame: Option<FrameMetadata>,
 }
 
 unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Status {
@@ -93,6 +106,13 @@ unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Sta
     {
         STATUS_INVALID_ARGUMENT
     } else {
+        submission.frame = Some(FrameMetadata {
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            timestamp_us: frame.timestamp_us,
+            sequence: frame.sequence,
+        });
         // SAFETY: validated borrowed capture frame remains live; encoder copies on acceptance.
         unsafe {
             (submission.api.submit)(
@@ -182,6 +202,7 @@ fn capture(
         status: MEDIA_PENDING,
         called: false,
         force_idr: input.force_idr,
+        frame: None,
     };
     let sink = FrameSink {
         context: (&mut submission as *mut Submission<'_>).cast(),
@@ -198,6 +219,9 @@ fn capture(
     Ok(Progress {
         dropped: submission.called && submission.status == MEDIA_BUSY,
         submitted: submission.called && submission.status == STATUS_OK,
+        frame: (submission.called && submission.status == STATUS_OK)
+            .then_some(submission.frame)
+            .flatten(),
     })
 }
 
@@ -315,6 +339,7 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             force_idr: false,
+            frame: None,
         };
         let bytes = [0; 16 * 16 * 4];
         let mut frame = CpuFrame {
@@ -384,6 +409,7 @@ mod tests {
             status: MEDIA_PENDING,
             called: false,
             force_idr: true,
+            frame: None,
         };
         assert_eq!(
             unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &frame) },

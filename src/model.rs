@@ -65,6 +65,17 @@ pub struct Configuration {
     pub max_reference_frames: u32,
 }
 
+/// Stable identity of the selected encoder MFT.  The video module passes this
+/// opaque, validated value to the encoder service; it never converts it to an
+/// enumeration ordinal.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncoderIdentity {
+    pub clsid: String,
+    pub hardware_url: Option<String>,
+    pub friendly_name: String,
+}
+
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
@@ -87,7 +98,7 @@ pub struct OpenSpec {
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
     pub output: String,
-    pub encoder: u32,
+    pub encoder: EncoderIdentity,
     pub configuration: Configuration,
 }
 
@@ -102,7 +113,7 @@ pub enum Operation {
         #[serde(default)]
         capture_provider: CaptureProvider,
         output: String,
-        encoder: u32,
+        encoder: EncoderIdentity,
         configuration: Configuration,
     },
     Lookup {

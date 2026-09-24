@@ -3,8 +3,10 @@ mod operations;
 mod output;
 
 use crate::{
-    model::{CaptureProvider, Configuration, OpenSpec, Operation, Settings, error},
-    plane::{ENCODE, GeometryProgress, Plane, Pump},
+    model::{
+        CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation, Settings, error,
+    },
+    plane::{ENCODE, FrameMetadata, GeometryProgress, Plane, Pump},
     queue::Queues,
     rpc::{self, Send},
 };
@@ -39,7 +41,7 @@ struct Stream {
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
-    encoder: u32,
+    encoder: EncoderIdentity,
     configuration: Configuration,
     parent: Option<u64>,
     ending_parent: Option<u64>,
@@ -57,6 +59,7 @@ struct Stream {
     next_frame: Instant,
     dropped: u64,
     submitted: u64,
+    last_frame: Option<FrameMetadata>,
     unresolved: bool,
 }
 
@@ -87,6 +90,15 @@ impl Stream {
         });
         if let Some(geometry) = self.desktop_geometry {
             response["desktop_geometry"] = json!(geometry);
+        }
+        if let Some(frame) = self.last_frame {
+            response["last_capture_frame"] = json!({
+                "width": frame.width,
+                "height": frame.height,
+                "stride": frame.stride,
+                "timestamp_us": frame.timestamp_us,
+                "sequence": frame.sequence,
+            });
         }
         response
     }
@@ -296,6 +308,7 @@ impl Pipeline {
                 next_frame: Instant::now(),
                 dropped: 0,
                 submitted: 0,
+                last_frame: None,
                 unresolved: false,
             },
         );
@@ -399,6 +412,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 .submitted
                 .saturating_add(u64::from(progress.submitted));
             if progress.submitted {
+                stream.last_frame = progress.frame;
                 stream.force_idr = false;
             }
         }
