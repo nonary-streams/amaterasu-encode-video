@@ -331,6 +331,13 @@ fn wgc_pacing_smoothing_is_snapshotted_and_part_of_open_retry_identity() {
         102,
         identified_wgc("wgc-smoothing-enabled", true),
     );
+    invoke(
+        &mut pipeline,
+        &mut runtime,
+        "alice",
+        103,
+        identified_wgc("wgc-smoothing-enabled", true),
+    );
     let second_response = &runtime.completed.last().unwrap().1;
     assert_eq!(second_response["stream"], 2);
     assert_eq!(second_response["wgc_pacing_smoothing"], true);
