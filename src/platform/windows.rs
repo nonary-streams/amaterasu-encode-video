@@ -284,6 +284,9 @@ pub struct Encoder {
 impl Encoder {
     pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
         clear_failure();
+        if config.nvenc_preset.is_some() {
+            return Err("nvenc_preset_unsupported");
+        }
         Self::create(identity, config).map_err(|error| {
             record_failure(LAST_OPEN_STAGE.load(Ordering::Acquire), &error);
             "encoder_open_failed"
@@ -811,6 +814,7 @@ mod tests {
             fps: 30,
             bitrate: 2_000_000,
             max_reference_frames: 0,
+            nvenc_preset: None,
         };
         let selected = devices
             .iter()

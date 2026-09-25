@@ -40,6 +40,7 @@ fn configuration() -> Configuration {
         fps: 60,
         bitrate: 1_000_000,
         max_reference_frames: 0,
+        nvenc_preset: None,
     }
 }
 
@@ -285,6 +286,22 @@ fn control_validates_limits_disabled_default_and_operation_tombstones() {
         sessions.lookup("bob", "one").unwrap_err(),
         "session_not_found"
     );
+}
+
+#[test]
+fn nvenc_preset_is_rejected_at_the_session_boundary_before_opening() {
+    let mut sessions = Sessions::new(true);
+    let mut config = configuration();
+    config.nvenc_preset = Some(crate::model::NvencPreset::P1);
+
+    assert_eq!(
+        sessions
+            .open("alice", encoder_identity(), config, None, false)
+            .unwrap_err(),
+        "nvenc_preset_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
 }
 
 #[test]

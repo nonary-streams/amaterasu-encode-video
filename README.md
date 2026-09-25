@@ -91,6 +91,15 @@ CodecAPI requests low latency, no B pictures and explicit forced keyframes.
 Strict single-reference-frame sessions use the static
 `CODECAPI_AVEncVideoMaxNumRefFrame` `VT_UI4` property, which maps to H.264 SPS
 `max_num_ref_frames`.
+
+Vibeshine documents `nvenc_preset` with numeric default `1` and choices `1` through
+`7` (P1 through P7). The request field is optional and omitted when absent to keep
+older wire payloads compatible. This NVENC-only setting applies only when NVENC is
+selected. This module currently has only a Media Foundation Transform (MFT)
+backend and no native NVENC backend, so supplying the field fails validation with
+`nvenc_preset_unsupported`; no preset is applied here. NVENC preset support remains
+pending.
+
 Buffer alignment comes from transform stream information. Sample, event and
 activation references are released on failure paths as well as normal teardown.
 
