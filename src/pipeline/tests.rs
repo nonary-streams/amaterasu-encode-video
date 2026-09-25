@@ -1198,7 +1198,7 @@ fn canonical_auto_maps_wgc_device_name_to_unique_dxgi_identity() {
 
 #[test]
 fn auto_retry_requires_clean_provider_rejection_and_allowlisted_candidate() {
-    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let providers: BTreeSet<CaptureProvider> = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
     for code in [
         "permission_denied",
         "resource_exhausted",
@@ -1267,7 +1267,7 @@ fn auto_retry_requires_clean_provider_rejection_and_allowlisted_candidate() {
 fn clean_unavailable_admission_retries_but_uncertain_admission_does_not() {
     let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
     let wgc_id = r"\\.\DISPLAY1";
-    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let providers: BTreeSet<CaptureProvider> = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
     let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers.clone());
     runtime
         .capture_admission_errors
