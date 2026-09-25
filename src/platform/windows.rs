@@ -284,6 +284,9 @@ pub struct Encoder {
 impl Encoder {
     pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
         clear_failure();
+        if config.nvenc_h264_cavlc {
+            return Err("nvenc_h264_cavlc_unsupported");
+        }
         if config.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
         }
@@ -804,6 +807,29 @@ mod diagnostic_tests {
 mod tests {
     use super::*;
     #[test]
+    fn nvenc_h264_cavlc_is_rejected_before_media_foundation_startup() {
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 60,
+            bitrate: 1_000_000,
+            max_reference_frames: 0,
+            nvenc_preset: None,
+            nvenc_h264_cavlc: true,
+        };
+        let identity = EncoderIdentity {
+            clsid: "test-clsid".into(),
+            hardware_url: Some("test://hardware-mft".into()),
+            friendly_name: "Test H.264".into(),
+        };
+
+        assert!(matches!(
+            Encoder::open(&identity, &configuration),
+            Err("nvenc_h264_cavlc_unsupported")
+        ));
+    }
+
+    #[test]
     #[ignore = "requires a Windows host with a hardware H.264 MFT; synthetic frames only"]
     fn hardware_encodes_synthetic_nv12_with_idr_and_drains() {
         let devices = enumerate().unwrap();
@@ -815,6 +841,7 @@ mod tests {
             bitrate: 2_000_000,
             max_reference_frames: 0,
             nvenc_preset: None,
+            nvenc_h264_cavlc: false,
         };
         let selected = devices
             .iter()

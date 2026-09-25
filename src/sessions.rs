@@ -74,6 +74,9 @@ impl Sessions {
         operation: Option<String>,
         packet_boundaries: bool,
     ) -> Result<Value, &'static str> {
+        if configuration.nvenc_h264_cavlc {
+            return Err("nvenc_h264_cavlc_unsupported");
+        }
         if let Some(operation) = &operation {
             validate_operation(operation)?;
             if let Some(record) = self.operations.get(&(owner.into(), operation.clone())) {

@@ -100,6 +100,22 @@ backend and no native NVENC backend, so supplying the field fails validation wit
 `nvenc_preset_unsupported`; no preset is applied here. NVENC preset support remains
 pending.
 
+Vibeshine documents `nvenc_h264_cavlc` with a `disabled` default. When H.264 and
+NVENC are selected, `enabled` requests CAVLC instead of CABAC; the reference notes
+that CAVLC can decode slightly faster in software at roughly 10% more bitrate for
+equal quality. Product configuration accepts the `enabled` and `disabled` tokens
+through its `bool_f` normalization. This module accepts only a strict JSON boolean
+at `configuration.nvenc_h264_cavlc`; the product tokens are not valid at this typed
+module boundary. The omitted field defaults to `false` and serializes omitted for
+backward compatibility. Explicit `true` is parsed and preserved as data, then
+rejected with `nvenc_h264_cavlc_unsupported` during configuration and session
+validation and before Windows Media Foundation startup. This module has only
+hardware H.264 MFTs and no NVENC/CAVLC effect, so `false` preserves current MFT
+behavior and enabling the option fails closed; NVENC CAVLC support remains pending.
+The source semantics are documented in the pinned [Vibeshine configuration
+reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_h264_cavlc)
+and its [`bool_f` configuration mapping](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/src/config.cpp#L1580).
+
 Buffer alignment comes from transform stream information. Sample, event and
 activation references are released on failure paths as well as normal teardown.
 

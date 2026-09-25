@@ -41,6 +41,7 @@ fn configuration() -> Configuration {
         bitrate: 1_000_000,
         max_reference_frames: 0,
         nvenc_preset: None,
+        nvenc_h264_cavlc: false,
     }
 }
 
@@ -299,6 +300,53 @@ fn nvenc_preset_is_rejected_at_the_session_boundary_before_opening() {
             .open("alice", encoder_identity(), config, None, false)
             .unwrap_err(),
         "nvenc_preset_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
+}
+
+#[test]
+fn nvenc_h264_cavlc_is_rejected_before_worker_creation_and_operation_lookup() {
+    let mut sessions = Sessions::new(true);
+    let mut config = configuration();
+    config.nvenc_h264_cavlc = true;
+
+    assert_eq!(
+        sessions
+            .open(
+                "alice",
+                encoder_identity(),
+                config.clone(),
+                Some("cavlc".into()),
+                false,
+            )
+            .unwrap_err(),
+        "nvenc_h264_cavlc_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
+    assert!(sessions.operations.is_empty());
+
+    sessions.operations.insert(
+        ("alice".into(), "existing".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: encoder_identity(),
+            configuration: configuration(),
+        },
+    );
+    assert_eq!(
+        sessions
+            .open(
+                "alice",
+                encoder_identity(),
+                config,
+                Some("existing".into()),
+                false,
+            )
+            .unwrap_err(),
+        "nvenc_h264_cavlc_unsupported"
     );
     assert_eq!(sessions.latest_id(), 0);
     assert!(sessions.values.is_empty());
