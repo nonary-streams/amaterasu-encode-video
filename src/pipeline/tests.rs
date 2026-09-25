@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::EncoderIdentity;
+use crate::model::{AmdAv1LatencyMode, EncoderIdentity};
 use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
@@ -333,6 +333,7 @@ fn open() -> Operation {
             fps: 60,
             bitrate: 5_000_000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         },
     }
 }
@@ -358,6 +359,38 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
         runtime.completed[0].1["configuration"]["max_reference_frames"],
         1
     );
+}
+
+#[test]
+fn unsupported_amd_av1_latency_modes_fail_before_opening_lower_resources() {
+    for mode in [
+        AmdAv1LatencyMode::None,
+        AmdAv1LatencyMode::PowerSaving,
+        AmdAv1LatencyMode::Realtime,
+        AmdAv1LatencyMode::Lowest,
+    ] {
+        let (mut pipeline, mut runtime, plane) = setup();
+        let mut operation = open();
+        let Operation::Open { configuration, .. } = &mut operation else {
+            unreachable!();
+        };
+        configuration.amd_av1_latency_mode = mode;
+
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+
+        assert_eq!(
+            runtime.completed[0].1["code"],
+            "amd_av1_latency_mode_unsupported"
+        );
+        assert!(!runtime.commands.iter().any(|command| matches!(
+            command,
+            Command::Request { service, .. } if service == CAPTURE || service == ENCODE
+        )));
+        assert_eq!(runtime.open_effects, 0);
+        assert!(pipeline.streams.is_empty());
+        assert_eq!(pipeline.next_id, 0);
+        assert_eq!(plane.calls, 0);
+    }
 }
 
 #[test]

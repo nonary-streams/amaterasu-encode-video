@@ -570,6 +570,7 @@ fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AmdAv1LatencyMode;
     use amaterasu_module_sdk::abi::AbiHeader;
     unsafe extern "C" fn busy(_: *mut c_void, _: u64, _: *const CpuFrame, _: u32) -> Status {
         MEDIA_BUSY
@@ -598,6 +599,7 @@ mod tests {
             fps: 60,
             bitrate: 100_000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
         let mut submission = Submission {
             api: &api,
@@ -663,6 +665,7 @@ mod tests {
             fps: 60,
             bitrate: 100_000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
         let bytes = [0x5a; 16 * 16 * 4];
         let captured = CaptureFrameV1_3 {
@@ -766,6 +769,7 @@ mod tests {
             fps: 30,
             bitrate: 100_000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
         let mut source_bytes = [0x6b; 16 * 16 * 4];
         let captured = CpuFrame {
@@ -862,6 +866,7 @@ mod tests {
             fps: 60,
             bitrate: 100000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
         let bytes = [0; 1024];
         let frame = CpuFrame {
@@ -915,6 +920,7 @@ mod tests {
             fps: 60,
             bitrate: 100_000,
             max_reference_frames: 0,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
         let bytes = [0; 16 * 16 * 4];
         let frame = CpuFrame {

@@ -108,6 +108,18 @@ implements this with Microsoft's documented
 [`CODECAPI_AVEncVideoMaxNumRefFrame`](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avencvideomaxnumrefframe)
 property. Real hardware and emitted bitstreams remain unqualified.
 
+`configuration.amd_av1_latency_mode` accepts only `auto`, `none`,
+`power_saving`, `realtime`, and `lowest`. Omitted values default to `auto`, which
+is omitted from serialized configuration to preserve compatibility with older
+strict consumers. The stable setting ID is `global:amd_av1_latency_mode`;
+product-level persistence, project selection, and editor integration remain
+pending. This pipeline currently opens capture and H.264 MFT resources, with no
+native AMD AMF AV1 backend. It rejects every explicit non-`auto` value with
+`amd_av1_latency_mode_unsupported` before allocating a stream or requesting
+either lower resource. Encode configuration and the Windows open boundary also
+reject the setting. AMD AMF/AV1 support and the latency policy's effect remain
+pending.
+
 Close first stops delivery, discards buffered packets, and returns `closing`.
 Status ceases to include the record after confirmed lower cleanup. A failed cleanup
 remains visible as `cleanup_failed`, consuming its bounded slot; close retries it.

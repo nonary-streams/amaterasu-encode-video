@@ -5,8 +5,8 @@ mod pacing;
 
 use crate::{
     model::{
-        CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation, Settings, error,
-        valid_minimum_fps_target,
+        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation,
+        Settings, error, valid_minimum_fps_target,
     },
     plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
     queue::Queues,
@@ -305,6 +305,10 @@ impl Pipeline {
     }
 
     fn open(&mut self, caller: &str, request: u64, specification: OpenSpec, send: &mut Send<'_>) {
+        if specification.configuration.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
+            rpc::complete(send, request, error("amd_av1_latency_mode_unsupported"));
+            return;
+        }
         if !self.admit_operation(caller, request, &specification, send) {
             return;
         }

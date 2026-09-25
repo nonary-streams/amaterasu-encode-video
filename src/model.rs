@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
@@ -15,6 +16,23 @@ impl CaptureProvider {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AmdAv1LatencyMode {
+    #[default]
+    Auto,
+    None,
+    PowerSaving,
+    Realtime,
+    Lowest,
+}
+
+impl AmdAv1LatencyMode {
+    fn is_auto(mode: &Self) -> bool {
+        *mode == Self::Auto
     }
 }
 
@@ -63,6 +81,9 @@ pub struct Configuration {
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
+    /// AMD AV1 latency policy. Current capture and H.264 MFT paths cannot apply it.
+    #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
+    pub amd_av1_latency_mode: AmdAv1LatencyMode,
 }
 
 /// Stable identity of the selected encoder MFT.  The video module passes this
@@ -89,6 +110,7 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 1
+            && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
     }
 }
 
@@ -356,6 +378,47 @@ mod tests {
         );
         required.max_reference_frames = 2;
         assert!(!required.validate());
+    }
+
+    #[test]
+    fn amd_av1_latency_mode_uses_only_pinned_tokens_and_preserves_legacy_shape() {
+        let legacy: Configuration = serde_json::from_value(json!({
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "bitrate": 5_000_000
+        }))
+        .unwrap();
+        assert_eq!(legacy.amd_av1_latency_mode, AmdAv1LatencyMode::Auto);
+        assert!(legacy.validate());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("amd_av1_latency_mode")
+                .is_none()
+        );
+
+        for token in ["auto", "none", "power_saving", "realtime", "lowest"] {
+            let mut request = serde_json::to_value(&legacy).unwrap();
+            request["amd_av1_latency_mode"] = json!(token);
+            let configuration: Configuration = serde_json::from_value(request).unwrap();
+            let serialized = serde_json::to_value(configuration).unwrap();
+            if token == "auto" {
+                assert!(serialized.get("amd_av1_latency_mode").is_none());
+            } else {
+                assert_eq!(serialized["amd_av1_latency_mode"], token);
+            }
+        }
+
+        for invalid in ["AUTO", "PowerSaving", "power-saving", "balanced"] {
+            let mut request = serde_json::to_value(&legacy).unwrap();
+            request["amd_av1_latency_mode"] = json!(invalid);
+            assert!(serde_json::from_value::<Configuration>(request).is_err());
+        }
+
+        let mut explicit = legacy;
+        explicit.amd_av1_latency_mode = AmdAv1LatencyMode::Realtime;
+        assert!(!explicit.validate());
     }
 
     #[test]
