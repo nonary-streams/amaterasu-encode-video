@@ -43,6 +43,7 @@ fn configuration() -> Configuration {
         nvenc_preset: None,
         nvenc_h264_cavlc: false,
         nvenc_spatial_aq: false,
+        amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
     }
 }
 
@@ -412,6 +413,47 @@ fn disabled_nvenc_spatial_aq_preserves_mft_configuration_validation() {
             .validate_open("alice", &encoder_identity(), &config)
             .is_ok()
     );
+}
+
+#[test]
+fn amd_av1_latency_mode_is_rejected_at_the_session_boundary_before_opening() {
+    let mut sessions = Sessions::new(true);
+    let mut config = configuration();
+    config.amd_av1_latency_mode = crate::model::AmdAv1LatencyMode::Realtime;
+
+    assert_eq!(
+        sessions
+            .open("alice", encoder_identity(), config.clone(), None, false)
+            .unwrap_err(),
+        "amd_av1_latency_mode_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
+    assert!(sessions.operations.is_empty());
+
+    sessions.operations.insert(
+        ("alice".into(), "existing".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: encoder_identity(),
+            configuration: configuration(),
+        },
+    );
+    assert_eq!(
+        sessions
+            .open(
+                "alice",
+                encoder_identity(),
+                config,
+                Some("existing".into()),
+                false,
+            )
+            .unwrap_err(),
+        "amd_av1_latency_mode_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
 }
 
 #[test]

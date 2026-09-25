@@ -290,6 +290,9 @@ impl Encoder {
         if config.nvenc_spatial_aq {
             return Err("nvenc_spatial_aq_unsupported");
         }
+        if config.amd_av1_latency_mode != crate::model::AmdAv1LatencyMode::Auto {
+            return Err("amd_av1_latency_mode_unsupported");
+        }
         if config.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
         }
@@ -820,6 +823,7 @@ mod tests {
             nvenc_preset: None,
             nvenc_h264_cavlc: true,
             nvenc_spatial_aq: false,
+            amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -844,6 +848,7 @@ mod tests {
             nvenc_preset: None,
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: true,
+            amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -854,6 +859,31 @@ mod tests {
         assert!(matches!(
             Encoder::open(&identity, &configuration),
             Err("nvenc_spatial_aq_unsupported")
+        ));
+    }
+
+    #[test]
+    fn amd_av1_latency_mode_is_rejected_before_media_foundation_startup() {
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 60,
+            bitrate: 1_000_000,
+            max_reference_frames: 0,
+            nvenc_preset: None,
+            nvenc_h264_cavlc: false,
+            nvenc_spatial_aq: false,
+            amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Realtime,
+        };
+        let identity = EncoderIdentity {
+            clsid: "test-clsid".into(),
+            hardware_url: Some("test://hardware-mft".into()),
+            friendly_name: "Test H.264".into(),
+        };
+
+        assert!(matches!(
+            Encoder::open(&identity, &configuration),
+            Err("amd_av1_latency_mode_unsupported")
         ));
     }
 
@@ -871,6 +901,7 @@ mod tests {
             nvenc_preset: None,
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,
+            amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
         };
         assert!(config.validate().is_ok());
         let selected = devices

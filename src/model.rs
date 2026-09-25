@@ -1,5 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AmdAv1LatencyMode {
+    #[default]
+    Auto,
+    None,
+    PowerSaving,
+    Realtime,
+    Lowest,
+}
+
+impl AmdAv1LatencyMode {
+    fn is_auto(mode: &Self) -> bool {
+        *mode == Self::Auto
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
@@ -20,6 +37,9 @@ pub struct Configuration {
     /// NVENC spatial adaptive quantization. The MFT-only backend does not support NVENC.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nvenc_spatial_aq: bool,
+    /// AMD AV1 latency policy. The current H.264 MFT backend cannot apply it.
+    #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
+    pub amd_av1_latency_mode: AmdAv1LatencyMode,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,6 +93,9 @@ impl Configuration {
         }
         if self.nvenc_spatial_aq {
             return Err("nvenc_spatial_aq_unsupported");
+        }
+        if self.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
+            return Err("amd_av1_latency_mode_unsupported");
         }
         if self.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
@@ -198,6 +221,7 @@ mod tests {
             serde_json::from_str(r#"{"width":16,"height":16,"fps":60,"bitrate":1000000}"#).unwrap();
 
         assert!(configuration.nvenc_preset.is_none());
+        assert_eq!(configuration.amd_av1_latency_mode, AmdAv1LatencyMode::Auto);
         assert!(!configuration.nvenc_h264_cavlc);
         assert!(!configuration.nvenc_spatial_aq);
         assert!(configuration.validate().is_ok());
@@ -205,6 +229,7 @@ mod tests {
         assert!(serialized.get("nvenc_preset").is_none());
         assert!(serialized.get("nvenc_h264_cavlc").is_none());
         assert!(serialized.get("nvenc_spatial_aq").is_none());
+        assert!(serialized.get("amd_av1_latency_mode").is_none());
     }
 
     #[test]
@@ -304,6 +329,57 @@ mod tests {
     }
 
     #[test]
+    fn amd_av1_latency_mode_uses_only_pinned_tokens_and_omits_auto() {
+        for token in ["auto", "none", "power_saving", "realtime", "lowest"] {
+            let mode: AmdAv1LatencyMode = serde_json::from_str(&format!("\"{token}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{token}\"")
+            );
+
+            let configuration: Configuration = serde_json::from_value(serde_json::json!({
+                "width": 16,
+                "height": 16,
+                "fps": 60,
+                "bitrate": 1_000_000,
+                "amd_av1_latency_mode": token
+            }))
+            .unwrap();
+            let serialized = serde_json::to_value(&configuration).unwrap();
+            if token == "auto" {
+                assert!(serialized.get("amd_av1_latency_mode").is_none());
+                assert!(configuration.validate().is_ok());
+            } else {
+                assert_eq!(serialized["amd_av1_latency_mode"], token);
+                assert_eq!(
+                    configuration.validate(),
+                    Err("amd_av1_latency_mode_unsupported")
+                );
+            }
+        }
+        for invalid in [
+            "\"AUTO\"",
+            "\"PowerSaving\"",
+            "\"power-saving\"",
+            "\"balanced\"",
+        ] {
+            assert!(serde_json::from_str::<AmdAv1LatencyMode>(invalid).is_err());
+        }
+
+        let defaulted: Configuration = serde_json::from_str(
+            r#"{"width":16,"height":16,"fps":60,"bitrate":1000000,"amd_av1_latency_mode":"auto"}"#,
+        )
+        .unwrap();
+        assert!(defaulted.validate().is_ok());
+        assert!(
+            serde_json::to_value(defaulted)
+                .unwrap()
+                .get("amd_av1_latency_mode")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn nvenc_preset_is_rejected_by_the_mft_only_configuration() {
         let configuration = Configuration {
             width: 16,
@@ -314,6 +390,7 @@ mod tests {
             nvenc_preset: Some(NvencPreset::P1),
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,
+            amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
 
         assert_eq!(configuration.validate(), Err("nvenc_preset_unsupported"));

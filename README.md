@@ -130,6 +130,15 @@ pending. The source behavior is documented in the pinned [Vibeshine
 configuration reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_spatial_aq)
 and [`bool_f` mapping](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/src/config.cpp).
 
+`configuration.amd_av1_latency_mode` accepts the exact tokens `auto`, `none`,
+`power_saving`, `realtime`, and `lowest`. It defaults to `auto`, which is omitted
+from serialized configuration for compatibility with older strict consumers.
+Every explicit non-`auto` value fails validation with
+`amd_av1_latency_mode_unsupported`; the Windows open guard rejects it before
+Media Foundation startup. This provider currently exposes only H.264 MFTs and
+has no native AMD AMF AV1 backend, so these values are never applied to H.264 or
+silently dropped. AMD AMF/AV1 support and the policy effects remain pending.
+
 Buffer alignment comes from transform stream information. Sample, event and
 activation references are released on failure paths as well as normal teardown.
 

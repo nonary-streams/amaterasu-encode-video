@@ -1,6 +1,6 @@
 use crate::{
     layout,
-    model::{Configuration, EncoderIdentity, Packet},
+    model::{AmdAv1LatencyMode, Configuration, EncoderIdentity, Packet},
     worker::Worker,
 };
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
@@ -79,6 +79,9 @@ impl Sessions {
         }
         if configuration.nvenc_spatial_aq {
             return Err("nvenc_spatial_aq_unsupported");
+        }
+        if configuration.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
+            return Err("amd_av1_latency_mode_unsupported");
         }
         if let Some(operation) = &operation {
             validate_operation(operation)?;
