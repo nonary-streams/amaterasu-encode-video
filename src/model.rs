@@ -17,6 +17,9 @@ pub struct Configuration {
     /// NVENC H.264 CAVLC selection. The MFT-only backend does not support NVENC.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nvenc_h264_cavlc: bool,
+    /// NVENC spatial adaptive quantization. The MFT-only backend does not support NVENC.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nvenc_spatial_aq: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,6 +70,9 @@ impl Configuration {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.nvenc_h264_cavlc {
             return Err("nvenc_h264_cavlc_unsupported");
+        }
+        if self.nvenc_spatial_aq {
+            return Err("nvenc_spatial_aq_unsupported");
         }
         if self.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
@@ -193,10 +199,12 @@ mod tests {
 
         assert!(configuration.nvenc_preset.is_none());
         assert!(!configuration.nvenc_h264_cavlc);
+        assert!(!configuration.nvenc_spatial_aq);
         assert!(configuration.validate().is_ok());
         let serialized = serde_json::to_value(configuration).unwrap();
         assert!(serialized.get("nvenc_preset").is_none());
         assert!(serialized.get("nvenc_h264_cavlc").is_none());
+        assert!(serialized.get("nvenc_spatial_aq").is_none());
     }
 
     #[test]
@@ -244,6 +252,58 @@ mod tests {
     }
 
     #[test]
+    fn nvenc_spatial_aq_requires_a_json_boolean_and_rejects_enabled_mode() {
+        let base = serde_json::json!({
+            "width": 16,
+            "height": 16,
+            "fps": 60,
+            "bitrate": 1_000_000
+        });
+
+        let omitted: Configuration = serde_json::from_value(base.clone()).unwrap();
+        assert!(!omitted.nvenc_spatial_aq);
+        assert!(omitted.validate().is_ok());
+        assert!(
+            serde_json::to_value(&omitted)
+                .unwrap()
+                .get("nvenc_spatial_aq")
+                .is_none()
+        );
+
+        let mut disabled = base.clone();
+        disabled["nvenc_spatial_aq"] = serde_json::json!(false);
+        let disabled: Configuration = serde_json::from_value(disabled).unwrap();
+        assert!(!disabled.nvenc_spatial_aq);
+        assert!(disabled.validate().is_ok());
+        assert!(
+            serde_json::to_value(disabled)
+                .unwrap()
+                .get("nvenc_spatial_aq")
+                .is_none()
+        );
+
+        let mut enabled = base;
+        enabled["nvenc_spatial_aq"] = serde_json::json!(true);
+        let enabled: Configuration = serde_json::from_value(enabled).unwrap();
+        assert!(enabled.nvenc_spatial_aq);
+        assert_eq!(
+            serde_json::to_value(&enabled).unwrap()["nvenc_spatial_aq"],
+            true
+        );
+        assert_eq!(enabled.validate(), Err("nvenc_spatial_aq_unsupported"));
+
+        for invalid in ["\"enabled\"", "\"disabled\"", "0", "1", "null"] {
+            let value = format!(
+                r#"{{"width":16,"height":16,"fps":60,"bitrate":1000000,"nvenc_spatial_aq":{invalid}}}"#
+            );
+            assert!(
+                serde_json::from_str::<Configuration>(&value).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn nvenc_preset_is_rejected_by_the_mft_only_configuration() {
         let configuration = Configuration {
             width: 16,
@@ -253,6 +313,7 @@ mod tests {
             max_reference_frames: 0,
             nvenc_preset: Some(NvencPreset::P1),
             nvenc_h264_cavlc: false,
+            nvenc_spatial_aq: false,
         };
 
         assert_eq!(configuration.validate(), Err("nvenc_preset_unsupported"));

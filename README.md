@@ -116,6 +116,20 @@ The source semantics are documented in the pinned [Vibeshine configuration
 reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_h264_cavlc)
 and its [`bool_f` configuration mapping](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/src/config.cpp#L1580).
 
+Vibeshine's stable setting ID `global:nvenc_spatial_aq` defaults to disabled.
+Its `bool_f` parser reads the product setting, and NVENC maps it to
+`adaptive_quantization`. This module accepts only a strict JSON boolean at
+`configuration.nvenc_spatial_aq`; product tokens are not valid at this typed
+module boundary. The omitted field defaults to `false` and serializes omitted
+for backward compatibility. Explicit `true` is parsed and retained, then
+rejected with `nvenc_spatial_aq_unsupported` during configuration and session
+validation and before Media Foundation startup. This module has only hardware
+H.264 MFTs and no NVENC spatial AQ effect, so `false` preserves current MFT
+behavior and enabling the option fails closed; NVENC spatial AQ support remains
+pending. The source behavior is documented in the pinned [Vibeshine
+configuration reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_spatial_aq)
+and [`bool_f` mapping](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/src/config.cpp).
+
 Buffer alignment comes from transform stream information. Sample, event and
 activation references are released on failure paths as well as normal teardown.
 

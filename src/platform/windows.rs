@@ -287,6 +287,9 @@ impl Encoder {
         if config.nvenc_h264_cavlc {
             return Err("nvenc_h264_cavlc_unsupported");
         }
+        if config.nvenc_spatial_aq {
+            return Err("nvenc_spatial_aq_unsupported");
+        }
         if config.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
         }
@@ -816,6 +819,7 @@ mod tests {
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: true,
+            nvenc_spatial_aq: false,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -826,6 +830,30 @@ mod tests {
         assert!(matches!(
             Encoder::open(&identity, &configuration),
             Err("nvenc_h264_cavlc_unsupported")
+        ));
+    }
+
+    #[test]
+    fn nvenc_spatial_aq_is_rejected_before_media_foundation_startup() {
+        let configuration = Configuration {
+            width: 16,
+            height: 16,
+            fps: 60,
+            bitrate: 1_000_000,
+            max_reference_frames: 0,
+            nvenc_preset: None,
+            nvenc_h264_cavlc: false,
+            nvenc_spatial_aq: true,
+        };
+        let identity = EncoderIdentity {
+            clsid: "test-clsid".into(),
+            hardware_url: Some("test://hardware-mft".into()),
+            friendly_name: "Test H.264".into(),
+        };
+
+        assert!(matches!(
+            Encoder::open(&identity, &configuration),
+            Err("nvenc_spatial_aq_unsupported")
         ));
     }
 
@@ -842,7 +870,9 @@ mod tests {
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: false,
+            nvenc_spatial_aq: false,
         };
+        assert!(config.validate().is_ok());
         let selected = devices
             .iter()
             .find(|device| device.name.to_ascii_lowercase().contains("nvidia"))

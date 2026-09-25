@@ -42,6 +42,7 @@ fn configuration() -> Configuration {
         max_reference_frames: 0,
         nvenc_preset: None,
         nvenc_h264_cavlc: false,
+        nvenc_spatial_aq: false,
     }
 }
 
@@ -350,6 +351,67 @@ fn nvenc_h264_cavlc_is_rejected_before_worker_creation_and_operation_lookup() {
     );
     assert_eq!(sessions.latest_id(), 0);
     assert!(sessions.values.is_empty());
+}
+
+#[test]
+fn nvenc_spatial_aq_is_rejected_before_worker_creation_and_operation_lookup() {
+    let mut sessions = Sessions::new(true);
+    let mut config = configuration();
+    config.nvenc_spatial_aq = true;
+
+    assert_eq!(
+        sessions
+            .open(
+                "alice",
+                encoder_identity(),
+                config.clone(),
+                Some("spatial-aq".into()),
+                false,
+            )
+            .unwrap_err(),
+        "nvenc_spatial_aq_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
+    assert!(sessions.operations.is_empty());
+
+    sessions.operations.insert(
+        ("alice".into(), "existing".into()),
+        OpenRecord {
+            packet_boundaries: false,
+            id: 1,
+            encoder: encoder_identity(),
+            configuration: configuration(),
+        },
+    );
+    assert_eq!(
+        sessions
+            .open(
+                "alice",
+                encoder_identity(),
+                config,
+                Some("existing".into()),
+                false,
+            )
+            .unwrap_err(),
+        "nvenc_spatial_aq_unsupported"
+    );
+    assert_eq!(sessions.latest_id(), 0);
+    assert!(sessions.values.is_empty());
+}
+
+#[test]
+fn disabled_nvenc_spatial_aq_preserves_mft_configuration_validation() {
+    let sessions = Sessions::new(true);
+    let config = configuration();
+
+    assert!(!config.nvenc_spatial_aq);
+    assert!(config.validate().is_ok());
+    assert!(
+        sessions
+            .validate_open("alice", &encoder_identity(), &config)
+            .is_ok()
+    );
 }
 
 #[test]
