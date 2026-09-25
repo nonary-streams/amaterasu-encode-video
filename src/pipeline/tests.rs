@@ -57,7 +57,7 @@ impl Runtime {
                     && let Some(provider) = capture_provider
                     && let Some(code) = self.capture_admission_errors.get(&provider)
                 {
-                    return Ok(Response::error(*code, ""));
+                    return Ok(Response::error(code, ""));
                 }
                 self.next += 1;
                 self.operations.insert(operation_id, self.next);

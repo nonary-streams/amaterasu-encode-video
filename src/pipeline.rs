@@ -841,14 +841,15 @@ fn apply_result(
     };
     let success = payload.get("ok").and_then(Value::as_bool) == Some(true);
     let missing = rpc::missing(&payload);
-    if stream.stage == Stage::Capture && payload.get("ok").and_then(Value::as_bool) == Some(false) {
-        if payload_error_code(&payload) == Some("unsupported_platform") {
-            stream.no_resources = true;
-            if !begin_fallback(stream, "unsupported_platform") {
-                failed_step(stream, "unsupported_platform");
-            }
-            return false;
+    if stream.stage == Stage::Capture
+        && payload.get("ok").and_then(Value::as_bool) == Some(false)
+        && payload_error_code(&payload) == Some("unsupported_platform")
+    {
+        stream.no_resources = true;
+        if !begin_fallback(stream, "unsupported_platform") {
+            failed_step(stream, "unsupported_platform");
         }
+        return false;
     }
     if !success
         && !(missing
