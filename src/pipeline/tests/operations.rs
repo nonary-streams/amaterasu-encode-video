@@ -12,6 +12,20 @@ fn identified(operation_id: &str) -> Operation {
     operation
 }
 
+fn identified_wgc(operation_id: &str, smoothing: bool) -> Operation {
+    let mut operation = identified(operation_id);
+    if let Operation::Open {
+        capture_provider,
+        wgc_pacing_smoothing,
+        ..
+    } = &mut operation
+    {
+        *capture_provider = CaptureProvider::Wgc;
+        *wgc_pacing_smoothing = smoothing;
+    }
+    operation
+}
+
 fn invoke(
     pipeline: &mut Pipeline,
     runtime: &mut Runtime,
@@ -263,4 +277,65 @@ fn opted_in_video_does_not_activate_an_encoder_without_boundary_confirmation() {
     assert_ne!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
     tick(&mut pipeline, &mut runtime, &mut plane, 10);
     assert!(pipeline.streams.is_empty());
+}
+
+#[test]
+fn wgc_pacing_smoothing_is_snapshotted_and_part_of_open_retry_identity() {
+    let (mut pipeline, mut runtime, _) = setup_with_providers([CaptureProvider::Wgc].into());
+
+    invoke(
+        &mut pipeline,
+        &mut runtime,
+        "alice",
+        99,
+        identified_wgc("wgc-smoothing", false),
+    );
+    assert_eq!(pipeline.next_id, 1);
+    assert_eq!(pipeline.streams.len(), 1);
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Wgc);
+    assert!(!pipeline.streams[&1].wgc_pacing_smoothing);
+
+    invoke(
+        &mut pipeline,
+        &mut runtime,
+        "alice",
+        100,
+        identified_wgc("wgc-smoothing", false),
+    );
+    let retry_response = &runtime.completed.last().unwrap().1;
+    assert_eq!(retry_response["stream"], 1);
+    assert_eq!(retry_response["wgc_pacing_smoothing"], false);
+    assert_eq!(pipeline.next_id, 1);
+    assert_eq!(pipeline.streams.len(), 1);
+    assert!(!pipeline.streams[&1].wgc_pacing_smoothing);
+
+    invoke(
+        &mut pipeline,
+        &mut runtime,
+        "alice",
+        101,
+        identified_wgc("wgc-smoothing", true),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "operation_conflict"
+    );
+    assert_eq!(pipeline.next_id, 1);
+    assert_eq!(pipeline.streams.len(), 1);
+    assert!(!pipeline.streams[&1].wgc_pacing_smoothing);
+
+    invoke(
+        &mut pipeline,
+        &mut runtime,
+        "alice",
+        102,
+        identified_wgc("wgc-smoothing-enabled", true),
+    );
+    let second_response = &runtime.completed.last().unwrap().1;
+    assert_eq!(second_response["stream"], 2);
+    assert_eq!(second_response["wgc_pacing_smoothing"], true);
+    assert_eq!(pipeline.next_id, 2);
+    assert_eq!(pipeline.streams.len(), 2);
+    assert!(!pipeline.streams[&1].wgc_pacing_smoothing);
+    assert!(pipeline.streams[&2].wgc_pacing_smoothing);
 }
