@@ -283,6 +283,23 @@ mod tests {
     }
 
     #[test]
+    fn disabled_smoothing_keeps_raw_source_anchor_after_a_missed_slot() {
+        let mut pacing = WgcPacing::new(false, 60);
+        assert_eq!(
+            pacing.capture_arrived(100_000, duration(0)),
+            Some(duration(16_666_666))
+        );
+        pacing.capture_missed(duration(16_666_666));
+
+        // The mapped source time is 33.5 ms even though its callback arrives 8 ms later.
+        assert_eq!(
+            pacing.capture_arrived(133_500, duration(41_500_000)),
+            Some(duration(50_166_666))
+        );
+        assert_eq!(pacing.group_anchor, Some(duration(33_500_000)));
+    }
+
+    #[test]
     fn zero_and_regressing_source_timestamps_fall_back_to_observed_time() {
         let mut pacing = WgcPacing::new(true, 60);
         pacing.capture_arrived(100_000, duration(0));
