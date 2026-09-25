@@ -97,6 +97,7 @@ pub struct OpenSpec {
     pub packet_boundaries: bool,
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
+    pub auto_capture: bool,
     pub constant_rate: bool,
     pub wgc_pacing_smoothing: bool,
     pub minimum_fps_target: f64,
@@ -110,6 +111,7 @@ pub enum Operation {
         packet_boundaries: bool,
         operation_id: Option<String>,
         capture_provider: CaptureProvider,
+        auto_capture: bool,
         constant_rate: bool,
         wgc_pacing_smoothing: bool,
         minimum_fps_target: f64,
@@ -209,14 +211,17 @@ enum CaptureMode {
 }
 
 impl CaptureMode {
-    fn selection(self, bootstrap_provider: Option<CaptureProvider>) -> (CaptureProvider, bool) {
+    fn selection(
+        self,
+        bootstrap_provider: Option<CaptureProvider>,
+    ) -> (CaptureProvider, bool, bool) {
         match self {
-            Self::Ddx => (CaptureProvider::Dxgi, false),
-            Self::Wgc => (CaptureProvider::Wgc, false),
-            Self::WgcConstant => (CaptureProvider::Wgc, true),
+            Self::Ddx => (CaptureProvider::Dxgi, false, false),
+            Self::Wgc => (CaptureProvider::Wgc, false, false),
+            Self::WgcConstant => (CaptureProvider::Wgc, true, false),
             // Auto preserves the provider selected during bootstrap, defaulting to
             // DXGI only when no bootstrap provider was supplied.
-            Self::Empty | Self::Auto => (bootstrap_provider.unwrap_or_default(), false),
+            Self::Empty | Self::Auto => (bootstrap_provider.unwrap_or_default(), false, true),
         }
     }
 }
@@ -239,7 +244,7 @@ impl<'de> Deserialize<'de> for Operation {
                 encoder,
                 configuration,
             } => {
-                let (provider, constant_rate) = if let Some(capture) = capture.0 {
+                let (provider, auto_capture, constant_rate) = if let Some(capture) = capture.0 {
                     // The canonical source mode owns its rate behavior, even when
                     // a caller also supplies the legacy constant_rate field. The
                     // legacy provider is retained as the Auto bootstrap selection.
@@ -247,6 +252,7 @@ impl<'de> Deserialize<'de> for Operation {
                 } else {
                     (
                         capture_provider.0.unwrap_or_default(),
+                        false,
                         constant_rate.0.unwrap_or(false),
                     )
                 };
@@ -254,6 +260,7 @@ impl<'de> Deserialize<'de> for Operation {
                     packet_boundaries,
                     operation_id,
                     capture_provider: provider,
+                    auto_capture,
                     constant_rate,
                     wgc_pacing_smoothing,
                     minimum_fps_target,
@@ -357,6 +364,7 @@ mod tests {
         let legacy: Operation = serde_json::from_value(request.clone()).unwrap();
         let Operation::Open {
             capture_provider,
+            auto_capture,
             constant_rate,
             wgc_pacing_smoothing,
             minimum_fps_target,
@@ -366,6 +374,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(capture_provider, CaptureProvider::Dxgi);
+        assert!(!auto_capture);
         assert!(!constant_rate);
         assert!(wgc_pacing_smoothing);
         assert_eq!(minimum_fps_target, 20.0);
@@ -388,12 +397,36 @@ mod tests {
 
     #[test]
     fn canonical_capture_modes_map_to_existing_provider_and_rate_fields() {
-        for (mode, bootstrap_provider, expected_provider, expected_rate) in [
-            ("ddx", CaptureProvider::Wgc, CaptureProvider::Dxgi, false),
-            ("wgc", CaptureProvider::Dxgi, CaptureProvider::Wgc, false),
-            ("wgcc", CaptureProvider::Dxgi, CaptureProvider::Wgc, true),
-            ("", CaptureProvider::Wgc, CaptureProvider::Wgc, false),
-            ("auto", CaptureProvider::Wgc, CaptureProvider::Wgc, false),
+        for (mode, bootstrap_provider, expected_provider, expected_rate, expected_auto) in [
+            (
+                "ddx",
+                CaptureProvider::Wgc,
+                CaptureProvider::Dxgi,
+                false,
+                false,
+            ),
+            (
+                "wgc",
+                CaptureProvider::Dxgi,
+                CaptureProvider::Wgc,
+                false,
+                false,
+            ),
+            (
+                "wgcc",
+                CaptureProvider::Dxgi,
+                CaptureProvider::Wgc,
+                true,
+                false,
+            ),
+            ("", CaptureProvider::Wgc, CaptureProvider::Wgc, false, true),
+            (
+                "auto",
+                CaptureProvider::Wgc,
+                CaptureProvider::Wgc,
+                false,
+                true,
+            ),
         ] {
             let mut request = open_request();
             request["capture"] = json!(mode);
@@ -402,6 +435,7 @@ mod tests {
 
             let Operation::Open {
                 capture_provider,
+                auto_capture,
                 constant_rate,
                 ..
             } = serde_json::from_value(request).unwrap()
@@ -409,6 +443,7 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(capture_provider, expected_provider, "mode {mode}");
+            assert_eq!(auto_capture, expected_auto, "mode {mode}");
             assert_eq!(constant_rate, expected_rate, "mode {mode}");
         }
     }
@@ -438,6 +473,7 @@ mod tests {
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
                 capture_provider: CaptureProvider::Dxgi,
+                auto_capture: true,
                 constant_rate: false,
                 ..
             }

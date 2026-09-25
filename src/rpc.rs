@@ -45,14 +45,14 @@ pub fn cancel(send: &mut Send<'_>, request: u64) -> bool {
 
 pub enum Admission {
     Accepted(u64),
-    Rejected,
+    Rejected(String),
     Uncertain,
 }
 
 pub fn deliver(send: &mut Send<'_>, command: Command) -> Admission {
     match send(command) {
         Ok(Response::Accepted { id }) => Admission::Accepted(id),
-        Ok(Response::Error { .. }) => Admission::Rejected,
+        Ok(Response::Error { code, .. }) => Admission::Rejected(code),
         _ => Admission::Uncertain,
     }
 }

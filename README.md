@@ -31,12 +31,21 @@ there is no synthetic frame or software fallback.
 {"action":"close","stream":1}
 ```
 
-Open optionally accepts `"capture_provider":"dxgi"` or `"wgc"`, defaulting to
-`dxgi`. The chosen provider must be in the startup allowlist. Obtain the output ID
-from that provider's enumeration; DXGI and WGC output IDs are not interchangeable.
-The selected service is retained for all open, lookup, close and teardown calls;
-a caller cannot supply an arbitrary service name or silently trigger a fallback.
-For WGC only, `"constant_rate":true` asks capture to return the latest image at
+Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
+`"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned
+to their provider. Empty and `auto` preserve the bootstrap provider selected by
+`capture_provider` as the first choice, defaulting to `dxgi`, and may retry once
+with the other provider only after a clean `unsupported_platform` provider reply
+or clean `unavailable` admission rejection. The alternate must be in the startup
+allowlist. Video translates provider-specific output IDs through their shared
+Windows device name and opens the alternate only when its enumeration has one
+attached exact match; missing or ambiguous matches retain the original failure.
+Uncertain requests, permission errors, capacity failures, and other backend
+errors do not trigger fallback. Status keeps the requested output ID and reports
+the provider that actually opened the stream. Legacy requests that specify only
+`capture_provider` remain pinned. `wgcc` implies WGC constant-rate delivery and
+is pinned; auto and empty modes never change rate semantics during fallback. For
+WGC only, `"constant_rate":true` asks capture to return the latest image at
 each scheduled read when no new frame is ready. Video's configured FPS sets the
 read cadence; the WGC module does not busy-wait or create a timer. The default is
 event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP,

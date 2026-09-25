@@ -22,6 +22,9 @@ struct Runtime {
     lose_result: bool,
     omit_reference_metadata: bool,
     capture_geometry: Option<Value>,
+    capture_open_errors: BTreeMap<CaptureProvider, &'static str>,
+    capture_admission_errors: BTreeMap<CaptureProvider, &'static str>,
+    capture_outputs: BTreeMap<CaptureProvider, Vec<Value>>,
 }
 
 impl Runtime {
@@ -48,23 +51,43 @@ impl Runtime {
                 if parent.is_some_and(|parent| self.ended.contains(&parent)) {
                     return Ok(Response::error("permission_denied", "parent ended"));
                 }
+                let action = payload["action"].as_str().unwrap();
+                let capture_provider = capture_provider_for_service(&service);
+                if action == "open"
+                    && let Some(provider) = capture_provider
+                    && let Some(code) = self.capture_admission_errors.get(&provider)
+                {
+                    return Ok(Response::error(*code, ""));
+                }
                 self.next += 1;
                 self.operations.insert(operation_id, self.next);
-                if payload["action"] == "open" {
+                if action == "open" {
                     self.open_effects += 1;
                 }
-                let action = payload["action"].as_str().unwrap();
                 let result = if self.fail_encoder_cleanup
                     && service == ENCODE
                     && matches!(action, "lookup" | "close")
                 {
                     error("hardware_error")
-                } else if service == CAPTURE || service == "amaterasu.capture-wgc/1" {
-                    let mut result = json!({"ok":true,"stream":41});
-                    if let Some(geometry) = &self.capture_geometry {
-                        result["desktop_geometry"] = geometry.clone();
+                } else if let Some(provider) = capture_provider {
+                    if action == "enumerate" {
+                        json!({
+                            "ok":true,
+                            "outputs":self.capture_outputs.get(&provider).cloned().unwrap_or_default()
+                        })
+                    } else if action == "open" {
+                        if let Some(code) = self.capture_open_errors.get(&provider) {
+                            error(code)
+                        } else {
+                            let mut result = json!({"ok":true,"stream":41});
+                            if let Some(geometry) = &self.capture_geometry {
+                                result["desktop_geometry"] = geometry.clone();
+                            }
+                            result
+                        }
+                    } else {
+                        json!({"ok":true,"stream":41})
                     }
-                    result
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
                     if !self.omit_reference_metadata {
@@ -114,6 +137,12 @@ impl Runtime {
             _ => Response::Ok,
         })
     }
+}
+
+fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
+    [CaptureProvider::Dxgi, CaptureProvider::Wgc]
+        .into_iter()
+        .find(|provider| provider.service() == service)
 }
 
 #[derive(Default)]
@@ -230,10 +259,17 @@ fn encoder_identity() -> EncoderIdentity {
     }
 }
 fn setup() -> (Pipeline, Runtime, FakePlane) {
+    setup_with_providers([CaptureProvider::Dxgi].into())
+}
+
+fn setup_with_providers(
+    capture_providers: BTreeSet<CaptureProvider>,
+) -> (Pipeline, Runtime, FakePlane) {
     (
         Pipeline::new(
             Settings {
                 enabled: true,
+                capture_providers,
                 ..Settings::default()
             },
             "test".into(),
@@ -244,11 +280,48 @@ fn setup() -> (Pipeline, Runtime, FakePlane) {
     )
 }
 
+fn canonical_open(capture_mode: &str, provider: CaptureProvider, output: &str) -> Operation {
+    serde_json::from_value(json!({
+        "action":"open",
+        "capture":capture_mode,
+        "capture_provider":provider,
+        "output":output,
+        "encoder":{
+            "clsid":"{00000000-0000-0000-0000-000000000001}",
+            "friendly_name":"Test NVIDIA H.264",
+            "hardware_url":"test://encoder/nvidia"
+        },
+        "configuration":{
+            "width":1920,
+            "height":1080,
+            "fps":60,
+            "bitrate":5000000
+        }
+    }))
+    .unwrap()
+}
+
+fn capture_output(id: &str, device_name: &str) -> Value {
+    json!({
+        "id": id,
+        "device_name": device_name,
+        "attached": true,
+        "left": 0,
+        "top": 0,
+        "width": 1920,
+        "height": 1080,
+        "rotation": 1,
+        "adapter_vendor_id": 0x10de,
+        "adapter_device_id": 0x1234
+    })
+}
+
 fn open() -> Operation {
     Operation::Open {
         packet_boundaries: false,
         operation_id: None,
         capture_provider: CaptureProvider::Dxgi,
+        auto_capture: false,
         constant_rate: false,
         wgc_pacing_smoothing: true,
         minimum_fps_target: 20.0,
@@ -1032,6 +1105,283 @@ fn expired_dedup_cannot_replay_open_after_parent_termination() {
 }
 
 #[test]
+fn canonical_auto_falls_back_to_the_same_output_with_fresh_operation_ids() {
+    let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
+    let wgc_id = r"\\.\DISPLAY1";
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Dxgi, "unsupported_platform");
+    runtime
+        .capture_outputs
+        .insert(CaptureProvider::Wgc, vec![capture_output(wgc_id, wgc_id)]);
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Wgc);
+    assert_eq!(runtime.completed[0].1["output"], dxgi_id);
+    assert_eq!(runtime.completed[0].1["capture_provider"], "wgc");
+    let capture_opens: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if capture_provider_for_service(service).is_some() && payload["action"] == "open" => {
+                Some((service, payload, operation_id))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(capture_opens.len(), 2);
+    assert_eq!(capture_opens[1].1["output"], wgc_id);
+    assert_ne!(
+        capture_opens[0].1["operation_id"],
+        capture_opens[1].1["operation_id"]
+    );
+    assert_ne!(capture_opens[0].2, capture_opens[1].2);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Request { service, payload, .. } if service == CaptureProvider::Wgc.service() && payload["action"] == "enumerate"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn canonical_auto_maps_wgc_device_name_to_unique_dxgi_identity() {
+    let wgc_id = r"\\.\DISPLAY1";
+    let dxgi_id = format!("00000000:00000001/{wgc_id}");
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Wgc, "unsupported_platform");
+    runtime.capture_outputs.insert(
+        CaptureProvider::Dxgi,
+        vec![capture_output(&dxgi_id, wgc_id)],
+    );
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("", CaptureProvider::Wgc, wgc_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Dxgi);
+    assert_eq!(runtime.completed[0].1["output"], wgc_id);
+    assert_eq!(runtime.completed[0].1["capture_provider"], "dxgi");
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service()
+                && payload["action"] == "open"
+                && payload["output"] == dxgi_id
+    )));
+}
+
+#[test]
+fn auto_retry_requires_clean_provider_rejection_and_allowlisted_candidate() {
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    for code in [
+        "permission_denied",
+        "resource_exhausted",
+        "invalid_request",
+        "backend_error",
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers.clone());
+        runtime
+            .capture_open_errors
+            .insert(CaptureProvider::Dxgi, code);
+        pipeline.handle(
+            "alice",
+            99,
+            canonical_open("auto", CaptureProvider::Dxgi, "LUID/display-1"),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 12);
+        assert_eq!(runtime.open_effects, 1, "error {code}");
+        assert!(
+            !runtime.commands.iter().any(|command| matches!(
+                command,
+                Command::Request { service, payload, .. }
+                    if service == CaptureProvider::Wgc.service()
+                        && matches!(payload["action"].as_str(), Some("open" | "enumerate"))
+            )),
+            "error {code}"
+        );
+    }
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Dxgi, "unsupported_platform");
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, "LUID/display-1"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(runtime.open_effects, 1);
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, .. } if service == CaptureProvider::Wgc.service()
+    )));
+
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_admission_errors
+        .insert(CaptureProvider::Dxgi, "permission_denied");
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, "LUID/display-1"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(runtime.open_effects, 0);
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, .. } if service == CaptureProvider::Wgc.service()
+    )));
+}
+
+#[test]
+fn clean_unavailable_admission_retries_but_uncertain_admission_does_not() {
+    let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
+    let wgc_id = r"\\.\DISPLAY1";
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers.clone());
+    runtime
+        .capture_admission_errors
+        .insert(CaptureProvider::Dxgi, "unavailable");
+    runtime
+        .capture_outputs
+        .insert(CaptureProvider::Wgc, vec![capture_output(wgc_id, wgc_id)]);
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Wgc);
+    assert_ne!(
+        pipeline.streams[&1].capture_operation,
+        pipeline.streams[&1].operation
+    );
+
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime.lose_accept = true;
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(runtime.open_effects, 1);
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { payload, .. } if payload["action"] == "enumerate"
+    )));
+}
+
+#[test]
+fn ambiguous_candidate_output_keeps_the_original_provider_error() {
+    let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
+    let wgc_id = r"\\.\DISPLAY1";
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Dxgi, "unsupported_platform");
+    runtime.capture_outputs.insert(
+        CaptureProvider::Wgc,
+        vec![
+            capture_output(wgc_id, wgc_id),
+            capture_output(wgc_id, wgc_id),
+        ],
+    );
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "unsupported_platform");
+    assert_eq!(runtime.open_effects, 1);
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Wgc.service() && payload["action"] == "open"
+    )));
+}
+
+#[test]
+fn explicit_capture_mode_remains_pinned_after_unsupported_provider_reply() {
+    for (mode, bootstrap, expected_provider, constant_rate) in [
+        ("ddx", CaptureProvider::Wgc, CaptureProvider::Dxgi, false),
+        ("wgc", CaptureProvider::Dxgi, CaptureProvider::Wgc, false),
+        ("wgcc", CaptureProvider::Dxgi, CaptureProvider::Wgc, true),
+    ] {
+        let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+        let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+        runtime
+            .capture_open_errors
+            .insert(expected_provider, "unsupported_platform");
+        pipeline.handle(
+            "alice",
+            99,
+            canonical_open(mode, bootstrap, "provider/output"),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 8);
+
+        assert_eq!(runtime.open_effects, 1, "mode {mode}");
+        assert!(
+            !runtime.commands.iter().any(|command| matches!(
+                command,
+                Command::Request { payload, .. } if payload["action"] == "enumerate"
+            )),
+            "mode {mode}"
+        );
+        assert!(
+            runtime.commands.iter().any(|command| matches!(
+                command,
+                Command::Request { service, payload, .. }
+                    if service == expected_provider.service()
+                        && payload["action"] == "open"
+                        && (payload.get("constant_rate").and_then(Value::as_bool) == Some(true))
+                            == constant_rate
+            )),
+            "mode {mode}"
+        );
+    }
+}
+
+#[test]
 fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     let wgc = || match open() {
@@ -1047,6 +1397,7 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             packet_boundaries: false,
             operation_id: None,
             capture_provider: CaptureProvider::Wgc,
+            auto_capture: false,
             constant_rate,
             wgc_pacing_smoothing,
             minimum_fps_target,

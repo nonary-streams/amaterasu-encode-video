@@ -68,7 +68,7 @@ pub(super) fn settle(stream: &mut Stream, send: &mut Send<'_>) -> bool {
                 stream.unsettled = Some(request);
                 stream.uncertain = None;
             }
-            rpc::Admission::Rejected => stream.uncertain = None,
+            rpc::Admission::Rejected(_) => stream.uncertain = None,
             rpc::Admission::Uncertain => return unsettled(stream),
         }
         if let Some(request) = stream.unsettled {

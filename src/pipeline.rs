@@ -14,6 +14,7 @@ use crate::{
 };
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::{Command, Response};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -24,6 +25,7 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
     Capture,
+    FallbackEnumerate,
     Encoder,
     Activating,
     Running,
@@ -40,6 +42,11 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
+    auto_capture: bool,
+    fallback_provider: Option<CaptureProvider>,
+    fallback_device_name: Option<String>,
+    fallback_error: Option<&'static str>,
+    fallback_attempted: bool,
     constant_rate: bool,
     minimum_fps_target: f64,
     wgc_pacing_smoothing: bool,
@@ -47,6 +54,7 @@ struct Stream {
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
+    capture_output: String,
     encoder: EncoderIdentity,
     configuration: Configuration,
     parent: Option<u64>,
@@ -59,6 +67,9 @@ struct Stream {
     desktop_geometry: Option<CaptureGeometry>,
     session: Option<u64>,
     operation: String,
+    capture_operation: String,
+    capture_attempt: u8,
+    no_resources: bool,
     stage: Stage,
     retries: u8,
     error: Option<&'static str>,
@@ -107,7 +118,9 @@ impl Stream {
 
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
-            Stage::Capture | Stage::Encoder | Stage::Activating => "opening",
+            Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder | Stage::Activating => {
+                "opening"
+            }
             Stage::Running => "running",
             Stage::StopCapture | Stage::Draining => "draining",
             Stage::Failed => "cleanup_failed",
@@ -206,6 +219,7 @@ impl Pipeline {
                 packet_boundaries,
                 operation_id,
                 capture_provider,
+                auto_capture,
                 constant_rate,
                 wgc_pacing_smoothing,
                 minimum_fps_target,
@@ -219,6 +233,7 @@ impl Pipeline {
                     packet_boundaries,
                     operation_id,
                     provider: capture_provider,
+                    auto_capture,
                     constant_rate,
                     wgc_pacing_smoothing,
                     minimum_fps_target,
@@ -271,6 +286,7 @@ impl Pipeline {
                 if matches!(
                     value.stage,
                     Stage::Capture
+                        | Stage::FallbackEnumerate
                         | Stage::Encoder
                         | Stage::Activating
                         | Stage::Running
@@ -297,6 +313,7 @@ impl Pipeline {
             packet_boundaries,
             operation_id,
             provider,
+            auto_capture,
             constant_rate,
             wgc_pacing_smoothing,
             minimum_fps_target,
@@ -343,16 +360,28 @@ impl Pipeline {
         self.streams.insert(id, {
             let opened_at = Instant::now();
             let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
+            let operation = format!("video-{}-{id}", self.epoch);
+            let fallback_provider = if auto_capture && !constant_rate {
+                alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
+            } else {
+                None
+            };
             Stream {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
+                auto_capture,
+                fallback_provider,
+                fallback_device_name: None,
+                fallback_error: None,
+                fallback_attempted: false,
                 constant_rate,
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 wgc_pacing,
                 force_idr: false,
                 grace: None,
+                capture_output: output.clone(),
                 output,
                 encoder,
                 configuration,
@@ -365,7 +394,10 @@ impl Pipeline {
                 capture: None,
                 desktop_geometry: None,
                 session: None,
-                operation: format!("video-{}-{id}", self.epoch),
+                capture_operation: format!("{operation}-capture-0"),
+                operation,
+                capture_attempt: 0,
+                no_resources: false,
                 stage: Stage::Capture,
                 retries: 0,
                 error: None,
@@ -601,6 +633,14 @@ fn advance(
     if !lifecycle::settle(stream, send) {
         return false;
     }
+    if stream.no_resources
+        && matches!(
+            stream.stage,
+            Stage::FindEncoder | Stage::CloseEncoder | Stage::FindCapture | Stage::CloseCapture
+        )
+    {
+        return finish_cleanup(stream);
+    }
     if let Some(request) = stream.pending {
         let Some(result) = rpc::result(send, request) else {
             return false;
@@ -628,13 +668,23 @@ fn advance(
         }
     }
     let (service, payload) = request(stream);
-    let operation = format!(
-        "{}-{}-{}",
-        stream.operation,
-        stage_name(stream.stage),
-        stream.retries
-    );
-    let parent = if matches!(stream.stage, Stage::Capture | Stage::Encoder) {
+    let operation = if stream.stage == Stage::Capture {
+        format!(
+            "{}-capture-attempt-{}",
+            stream.operation, stream.capture_attempt
+        )
+    } else {
+        format!(
+            "{}-{}-{}",
+            stream.operation,
+            stage_name(stream.stage),
+            stream.retries
+        )
+    };
+    let parent = if matches!(
+        stream.stage,
+        Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
+    ) {
         stream.parent
     } else {
         None
@@ -647,9 +697,32 @@ fn advance(
         parent,
     };
     match rpc::deliver(send, command.clone()) {
-        rpc::Admission::Accepted(request) => stream.pending = Some(request),
-        rpc::Admission::Rejected => failed_step(stream, "request_failed"),
+        rpc::Admission::Accepted(request) => {
+            if stream.stage == Stage::Capture {
+                stream.no_resources = false;
+            }
+            stream.pending = Some(request);
+        }
+        rpc::Admission::Rejected(code) => {
+            if stream.stage == Stage::Capture {
+                stream.no_resources = true;
+                if code == "unavailable" {
+                    if !begin_fallback(stream, "unavailable") {
+                        failed_step(stream, "unavailable");
+                    }
+                } else {
+                    failed_step(stream, "request_failed");
+                }
+            } else if stream.stage == Stage::FallbackEnumerate {
+                failed_step(stream, stream.fallback_error.unwrap_or("request_failed"));
+            } else {
+                failed_step(stream, "request_failed");
+            }
+        }
         rpc::Admission::Uncertain => {
+            if stream.stage == Stage::Capture {
+                stream.no_resources = false;
+            }
             stream.uncertain = Some(command);
             failed_step(stream, "request_failed");
         }
@@ -661,13 +734,23 @@ fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
         Stage::Capture => {
-            let mut request =
-                json!({"action":"open","output":stream.output,"operation_id":operation});
+            let mut request = json!({
+                "action":"open",
+                "output":stream.capture_output,
+                "operation_id":stream.capture_operation,
+            });
             if stream.constant_rate {
                 request["constant_rate"] = json!(true);
             }
             (stream.provider.service(), request)
         }
+        Stage::FallbackEnumerate => (
+            stream
+                .fallback_provider
+                .expect("fallback enumeration has a provider")
+                .service(),
+            json!({"action":"enumerate"}),
+        ),
         Stage::Encoder => (ENCODE, encoder_open_request(stream)),
         Stage::FindEncoder => (ENCODE, json!({"action":"lookup","operation_id":operation})),
         Stage::CloseEncoder => (
@@ -676,7 +759,7 @@ fn request(stream: &Stream) -> (&'static str, Value) {
         ),
         Stage::FindCapture => (
             stream.provider.service(),
-            json!({"action":"lookup","operation_id":operation}),
+            json!({"action":"lookup","operation_id":stream.capture_operation}),
         ),
         Stage::CloseCapture | Stage::StopCapture => (
             stream.provider.service(),
@@ -702,6 +785,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
         Stage::Capture => "capture",
+        Stage::FallbackEnumerate => "fallback-enumerate",
         Stage::Encoder => "encoder",
         Stage::Activating => "activating",
         Stage::FindEncoder => "find-encoder",
@@ -718,7 +802,11 @@ fn stage_name(stage: Stage) -> &'static str {
 fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
-        Stage::Capture | Stage::Encoder | Stage::Activating | Stage::StopCapture
+        Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+            | Stage::Activating
+            | Stage::StopCapture
     ) {
         stream.cleanup(code);
     } else {
@@ -753,6 +841,15 @@ fn apply_result(
     };
     let success = payload.get("ok").and_then(Value::as_bool) == Some(true);
     let missing = rpc::missing(&payload);
+    if stream.stage == Stage::Capture && payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        if payload_error_code(&payload) == Some("unsupported_platform") {
+            stream.no_resources = true;
+            if !begin_fallback(stream, "unsupported_platform") {
+                failed_step(stream, "unsupported_platform");
+            }
+            return false;
+        }
+    }
     if !success
         && !(missing
             && matches!(
@@ -764,7 +861,12 @@ fn apply_result(
                     | Stage::StopCapture
             ))
     {
-        failed_step(stream, "provider_failed");
+        let code = if stream.stage == Stage::FallbackEnumerate {
+            stream.fallback_error.unwrap_or("provider_failed")
+        } else {
+            "provider_failed"
+        };
+        failed_step(stream, code);
         return false;
     }
     let next = match stream.stage {
@@ -783,6 +885,25 @@ fn apply_result(
             };
             stream.desktop_geometry = geometry;
             Stage::Encoder
+        }
+        Stage::FallbackEnumerate => {
+            let Some(device_name) = stream.fallback_device_name.as_deref() else {
+                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                return false;
+            };
+            let Some(provider) = stream.fallback_provider else {
+                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                return false;
+            };
+            let Some(target_output) = matching_output(&payload, provider, device_name) else {
+                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                return false;
+            };
+            stream.provider = provider;
+            stream.capture_output = target_output.id;
+            stream.capture_operation = format!("{}-capture-1", stream.operation);
+            stream.capture_attempt = 1;
+            Stage::Capture
         }
         Stage::Encoder => {
             if !accept_encoder(stream, &payload) {
@@ -834,6 +955,87 @@ fn apply_result(
     stream.stage = next;
     stream.retries = 0;
     false
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CaptureOutputIdentity {
+    id: String,
+    device_name: String,
+    attached: bool,
+}
+
+fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
+    match provider {
+        CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
+        CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
+    }
+}
+
+fn begin_fallback(stream: &mut Stream, original_error: &'static str) -> bool {
+    let Some(provider) = stream.fallback_provider else {
+        return false;
+    };
+    if !stream.auto_capture || stream.constant_rate || stream.fallback_attempted {
+        return false;
+    }
+    let Some(device_name) = output_device_name(stream.provider, &stream.output) else {
+        return false;
+    };
+    stream.fallback_attempted = true;
+    stream.no_resources = true;
+    stream.fallback_error = Some(original_error);
+    stream.fallback_device_name = Some(device_name);
+    stream.stage = Stage::FallbackEnumerate;
+    stream.retries = 0;
+    debug_assert_ne!(stream.provider, provider);
+    true
+}
+
+fn payload_error_code(payload: &Value) -> Option<&str> {
+    payload
+        .get("code")
+        .or_else(|| payload.get("error").and_then(|error| error.get("code")))
+        .and_then(Value::as_str)
+}
+
+fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<String> {
+    match provider {
+        CaptureProvider::Dxgi => {
+            let (adapter_id, device_name) = output_id.split_once('/')?;
+            let (high, low) = adapter_id.split_once(':')?;
+            let luid_is_valid = high.len() == 8
+                && low.len() == 8
+                && high.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && low.bytes().all(|byte| byte.is_ascii_hexdigit());
+            (luid_is_valid && !device_name.is_empty() && !device_name.contains('/'))
+                .then(|| device_name.to_owned())
+        }
+        CaptureProvider::Wgc => {
+            (!output_id.is_empty() && !output_id.contains('/')).then(|| output_id.to_owned())
+        }
+    }
+}
+
+fn matching_output(
+    payload: &Value,
+    provider: CaptureProvider,
+    device_name: &str,
+) -> Option<CaptureOutputIdentity> {
+    let outputs: Vec<CaptureOutputIdentity> =
+        serde_json::from_value(payload.get("outputs")?.clone()).ok()?;
+    let mut matching = outputs.into_iter().filter(|output| {
+        output.attached
+            && output.device_name == device_name
+            && match provider {
+                CaptureProvider::Dxgi => {
+                    output_device_name(CaptureProvider::Dxgi, &output.id).as_deref()
+                        == Some(device_name)
+                }
+                CaptureProvider::Wgc => output.id == device_name,
+            }
+    });
+    let output = matching.next()?;
+    matching.next().is_none().then_some(output)
 }
 
 fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static str> {
