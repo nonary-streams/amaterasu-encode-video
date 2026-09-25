@@ -213,7 +213,7 @@ mod tests {
         disabled["nvenc_h264_cavlc"] = serde_json::json!(false);
         let disabled: Configuration = serde_json::from_value(disabled).unwrap();
         assert!(!disabled.nvenc_h264_cavlc);
-        assert_eq!(disabled, omitted);
+        assert!(disabled == omitted);
         assert!(disabled.validate().is_ok());
         assert!(
             serde_json::to_value(disabled)
