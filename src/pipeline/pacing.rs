@@ -69,7 +69,9 @@ impl WgcPacing {
             let mapped = clock
                 .anchor_monotonic
                 .checked_add(Duration::from_micros(elapsed_us))?;
-            (mapped.as_nanos() <= MAX_DURATION_NS).then_some(mapped)
+            (mapped.as_nanos() <= MAX_DURATION_NS
+                && mapped.as_nanos().abs_diff(observed_at.as_nanos()) <= MAX_HOLD_NS)
+                .then_some(mapped)
         });
 
         if let Some(mapped) = mapped {
@@ -339,6 +341,40 @@ mod tests {
         );
         assert_eq!(pacing.source_clock.unwrap().anchor_timestamp_us, u64::MAX);
         assert_eq!(pacing.source_clock.unwrap().anchor_monotonic, observed_at);
+    }
+
+    #[test]
+    fn discontinuous_source_clock_reanchors_before_it_can_stall_capture() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.capture_arrived(100_000, duration(10_000_000));
+
+        let observed_at = duration(30_000_000);
+        assert_eq!(
+            pacing.map_source_timestamp(10_000_000, observed_at),
+            observed_at
+        );
+        assert_eq!(pacing.source_clock.unwrap().anchor_timestamp_us, 10_000_000);
+
+        // A later timestamp from the new clock remains usable.
+        assert_eq!(
+            pacing.map_source_timestamp(10_016_000, duration(46_000_000)),
+            duration(46_000_000)
+        );
+    }
+
+    #[test]
+    fn delayed_source_clock_reanchors_to_current_observation() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.capture_arrived(100_000, duration(10_000_000));
+
+        assert_eq!(
+            pacing.map_source_timestamp(116_000, duration(500_000_000)),
+            duration(500_000_000)
+        );
+        assert_eq!(
+            pacing.source_clock.unwrap().anchor_monotonic,
+            duration(500_000_000)
+        );
     }
 
     #[test]

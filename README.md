@@ -66,6 +66,8 @@ clearing a pending re-anchor. Older capture tables cannot distinguish cached
 reuse from a fresh frame, so constant-rate streams retain their configured read
 cadence without arrival-based re-anchoring. This pump is nonblocking, so it
 does not reproduce Vibeshine's 200 ms blocking snapshot after a pacing bust.
+If a source timestamp drifts more than 200 ms from its local callback observation,
+video re-anchors to the callback time so a clock jump cannot stall future reads.
 
 Open completes after both lower resources open, returning
 `{"ok":true,"stream":1,"state":"running",...}`. This state means the pipeline has
