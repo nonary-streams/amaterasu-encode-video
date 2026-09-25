@@ -218,10 +218,10 @@ impl CaptureMode {
         match self {
             Self::Ddx => (CaptureProvider::Dxgi, false, false),
             Self::Wgc => (CaptureProvider::Wgc, false, false),
-            Self::WgcConstant => (CaptureProvider::Wgc, true, false),
+            Self::WgcConstant => (CaptureProvider::Wgc, false, true),
             // Auto preserves the provider selected during bootstrap, defaulting to
             // DXGI only when no bootstrap provider was supplied.
-            Self::Empty | Self::Auto => (bootstrap_provider.unwrap_or_default(), false, true),
+            Self::Empty | Self::Auto => (bootstrap_provider.unwrap_or_default(), true, false),
         }
     }
 }
