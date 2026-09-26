@@ -28,6 +28,7 @@ struct Runtime {
     capture_outputs: BTreeMap<CaptureProvider, Vec<Value>>,
     capture_page_size: Option<usize>,
     capture_outputs_after_first_page: Option<Vec<Value>>,
+    capture_enumeration_override: Option<Value>,
 }
 
 impl Runtime {
@@ -74,32 +75,37 @@ impl Runtime {
                     error("hardware_error")
                 } else if let Some(provider) = capture_provider {
                     if action == "enumerate" {
-                        let changed_page = payload.get("offset").is_some()
-                            && self.capture_outputs_after_first_page.is_some();
-                        let outputs = if changed_page {
-                            self.capture_outputs_after_first_page.clone().unwrap()
+                        if let Some(reply) = &self.capture_enumeration_override {
+                            reply.clone()
                         } else {
-                            self.capture_outputs
-                                .get(&provider)
-                                .cloned()
-                                .unwrap_or_default()
-                        };
-                        if let Some(page_size) = self.capture_page_size {
-                            let offset =
-                                payload.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                            let end = offset.saturating_add(page_size).min(outputs.len());
-                            let mut reply = json!({"ok":true,"outputs":outputs[offset..end]});
-                            reply["enumeration_id"] = json!(if changed_page {
-                                "b".repeat(64)
+                            let changed_page = payload.get("offset").is_some()
+                                && self.capture_outputs_after_first_page.is_some();
+                            let outputs = if changed_page {
+                                self.capture_outputs_after_first_page.clone().unwrap()
                             } else {
-                                "a".repeat(64)
-                            });
-                            if end < outputs.len() {
-                                reply["next_offset"] = json!(end);
+                                self.capture_outputs
+                                    .get(&provider)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            };
+                            if let Some(page_size) = self.capture_page_size {
+                                let offset =
+                                    payload.get("offset").and_then(Value::as_u64).unwrap_or(0)
+                                        as usize;
+                                let end = offset.saturating_add(page_size).min(outputs.len());
+                                let mut reply = json!({"ok":true,"outputs":outputs[offset..end]});
+                                reply["enumeration_id"] = json!(if changed_page {
+                                    "b".repeat(64)
+                                } else {
+                                    "a".repeat(64)
+                                });
+                                if end < outputs.len() {
+                                    reply["next_offset"] = json!(end);
+                                }
+                                reply
+                            } else {
+                                json!({"ok":true,"outputs":outputs})
                             }
-                            reply
-                        } else {
-                            json!({"ok":true,"outputs":outputs})
                         }
                     } else if action == "open" {
                         if let Some(code) = self.capture_open_errors.get(&provider) {
@@ -1854,6 +1860,43 @@ fn auto_fallback_rejects_matches_split_across_pages() {
         Command::Request { service, payload, .. }
             if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
     )));
+}
+
+#[test]
+fn malformed_fallback_pages_end_parent_without_opening_another_capture() {
+    let monitor = r"\\.\DISPLAY1";
+    let target = format!("00000000:00000001/{monitor}");
+    let output = capture_output(&target, monitor);
+    let token = "a".repeat(64);
+    let malformed_pages = [
+        json!({"ok":true}),
+        json!({"ok":true,"outputs":{}}),
+        json!({"ok":true,"outputs":[output],"next_offset":1,"enumeration_id":""}),
+        json!({"ok":true,"outputs":[output],"next_offset":0,"enumeration_id":token}),
+        json!({"ok":true,"outputs":[output],"next_offset":2,"enumeration_id":token}),
+        json!({"ok":true,"outputs":[],"next_offset":1,"enumeration_id":token}),
+        json!({"ok":true,"outputs":[output,output],"next_offset":2,"enumeration_id":token}),
+    ];
+    for page in malformed_pages {
+        let (mut pipeline, mut runtime, mut plane) =
+            setup_with_providers([CaptureProvider::Dxgi, CaptureProvider::Wgc].into());
+        runtime
+            .capture_open_errors
+            .insert(CaptureProvider::Wgc, "unsupported_platform");
+        runtime.capture_enumeration_override = Some(page.clone());
+        pipeline.handle(
+            "alice",
+            99,
+            canonical_open("auto", CaptureProvider::Wgc, monitor),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 20);
+
+        assert!(pipeline.streams.is_empty(), "page: {page}");
+        assert!(runtime.ended.contains(&99), "page: {page}");
+        assert_eq!(runtime.open_effects, 1, "page: {page}");
+        assert_eq!(pipeline.recent[0].1["error"], "unsupported_platform");
+    }
 }
 
 #[test]
