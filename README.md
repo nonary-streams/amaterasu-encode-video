@@ -40,6 +40,12 @@ or clean `unavailable` admission rejection. The alternate must be in the startup
 allowlist. Video translates provider-specific output IDs through their shared
 Windows device name and opens the alternate only when its enumeration has one
 attached exact match; missing or ambiguous matches retain the original failure.
+For paged enumeration, video follows every `next_offset` before opening the
+alternate and checks that each page reports the same full-list
+`enumeration_id`. A malformed cursor, changed revision, or duplicate match
+retains the original provider failure. Older unpaged `outputs` replies remain
+valid. Each page is a fresh device read, so hotplug after enumeration still
+requires a fresh Open attempt.
 Uncertain requests, permission errors, capacity failures, and other backend
 errors do not trigger fallback. Status keeps the requested output ID and reports
 the provider that actually opened the stream. Legacy requests that specify only

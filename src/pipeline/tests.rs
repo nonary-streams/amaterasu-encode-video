@@ -26,6 +26,8 @@ struct Runtime {
     capture_open_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_admission_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_outputs: BTreeMap<CaptureProvider, Vec<Value>>,
+    capture_page_size: Option<usize>,
+    capture_outputs_after_first_page: Option<Vec<Value>>,
 }
 
 impl Runtime {
@@ -72,10 +74,33 @@ impl Runtime {
                     error("hardware_error")
                 } else if let Some(provider) = capture_provider {
                     if action == "enumerate" {
-                        json!({
-                            "ok":true,
-                            "outputs":self.capture_outputs.get(&provider).cloned().unwrap_or_default()
-                        })
+                        let changed_page = payload.get("offset").is_some()
+                            && self.capture_outputs_after_first_page.is_some();
+                        let outputs = if changed_page {
+                            self.capture_outputs_after_first_page.clone().unwrap()
+                        } else {
+                            self.capture_outputs
+                                .get(&provider)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        if let Some(page_size) = self.capture_page_size {
+                            let offset =
+                                payload.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            let end = offset.saturating_add(page_size).min(outputs.len());
+                            let mut reply = json!({"ok":true,"outputs":outputs[offset..end]});
+                            reply["enumeration_id"] = json!(if changed_page {
+                                "b".repeat(64)
+                            } else {
+                                "a".repeat(64)
+                            });
+                            if end < outputs.len() {
+                                reply["next_offset"] = json!(end);
+                            }
+                            reply
+                        } else {
+                            json!({"ok":true,"outputs":outputs})
+                        }
                     } else if action == "open" {
                         if let Some(code) = self.capture_open_errors.get(&provider) {
                             error(code)
@@ -1630,6 +1655,132 @@ fn canonical_auto_falls_back_to_the_same_output_with_fresh_operation_ids() {
             .count(),
         1
     );
+}
+
+#[test]
+fn auto_fallback_checks_every_enumeration_page_before_opening() {
+    let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Dxgi, "unsupported_platform");
+    runtime.capture_page_size = Some(1);
+    runtime.capture_outputs.insert(
+        CaptureProvider::Wgc,
+        [r"\\.\DISPLAY0", r"\\.\DISPLAY1", r"\\.\DISPLAY2"]
+            .into_iter()
+            .map(|id| capture_output(id, id))
+            .collect(),
+    );
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Wgc);
+    let alternate_requests: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == CaptureProvider::Wgc.service() => Some((payload, operation_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alternate_requests.len(), 4);
+    assert_eq!(alternate_requests[0].0["action"], "enumerate");
+    assert!(alternate_requests[0].0.get("offset").is_none());
+    assert_eq!(alternate_requests[1].0["offset"], 1);
+    assert_eq!(alternate_requests[2].0["offset"], 2);
+    assert_eq!(alternate_requests[3].0["action"], "open");
+    assert_eq!(alternate_requests[3].0["output"], r"\\.\DISPLAY1");
+    assert_ne!(alternate_requests[0].1, alternate_requests[1].1);
+    assert_ne!(alternate_requests[1].1, alternate_requests[2].1);
+}
+
+#[test]
+fn auto_fallback_rejects_matches_split_across_pages() {
+    let wgc_id = r"\\.\DISPLAY1";
+    let first = format!("00000000:00000001/{wgc_id}");
+    let second = format!("00000000:00000002/{wgc_id}");
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Wgc, "unsupported_platform");
+    runtime.capture_page_size = Some(1);
+    runtime.capture_outputs.insert(
+        CaptureProvider::Dxgi,
+        vec![
+            capture_output(&first, wgc_id),
+            capture_output(&second, wgc_id),
+        ],
+    );
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Wgc, wgc_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "unsupported_platform");
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+}
+
+#[test]
+fn auto_fallback_rejects_hotplug_that_shifts_offset_paging() {
+    let wgc_id = r"\\.\DISPLAY1";
+    let id = |adapter: u32, device: &str| format!("00000000:{adapter:08x}/{device}");
+    let first = capture_output(&id(1, r"\\.\DISPLAY0"), r"\\.\DISPLAY0");
+    let match_one = capture_output(&id(2, wgc_id), wgc_id);
+    let match_two = capture_output(&id(3, wgc_id), wgc_id);
+    let last = capture_output(&id(4, r"\\.\DISPLAY2"), r"\\.\DISPLAY2");
+    let providers = [CaptureProvider::Dxgi, CaptureProvider::Wgc].into();
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(providers);
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Wgc, "unsupported_platform");
+    runtime.capture_page_size = Some(1);
+    runtime.capture_outputs.insert(
+        CaptureProvider::Dxgi,
+        vec![first, match_one.clone(), match_two.clone(), last.clone()],
+    );
+    // The first output disappears between pages. Offset 1 now points past
+    // match_one; IDs still ascend, so only the full-list token catches it.
+    runtime.capture_outputs_after_first_page = Some(vec![match_one, match_two, last]);
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Wgc, wgc_id),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "unsupported_platform");
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
 }
 
 #[test]

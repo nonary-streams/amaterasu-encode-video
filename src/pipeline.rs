@@ -47,6 +47,11 @@ struct Stream {
     fallback_device_name: Option<String>,
     fallback_error: Option<&'static str>,
     fallback_attempted: bool,
+    fallback_offset: usize,
+    fallback_pages: usize,
+    fallback_last_output: Option<String>,
+    fallback_match: Option<String>,
+    fallback_enumeration_id: Option<String>,
     constant_rate: bool,
     minimum_fps_target: f64,
     wgc_pacing_smoothing: bool,
@@ -383,6 +388,11 @@ impl Pipeline {
                 fallback_device_name: None,
                 fallback_error: None,
                 fallback_attempted: false,
+                fallback_offset: 0,
+                fallback_pages: 0,
+                fallback_last_output: None,
+                fallback_match: None,
+                fallback_enumeration_id: None,
                 constant_rate,
                 minimum_fps_target,
                 wgc_pacing_smoothing,
@@ -682,6 +692,11 @@ fn advance(
             "{}-capture-attempt-{}",
             stream.operation, stream.capture_attempt
         )
+    } else if stream.stage == Stage::FallbackEnumerate {
+        format!(
+            "{}-fallback-enumerate-{}-{}",
+            stream.operation, stream.fallback_offset, stream.retries
+        )
     } else {
         format!(
             "{}-{}-{}",
@@ -753,13 +768,19 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             }
             (stream.provider.service(), request)
         }
-        Stage::FallbackEnumerate => (
-            stream
-                .fallback_provider
-                .expect("fallback enumeration has a provider")
-                .service(),
-            json!({"action":"enumerate"}),
-        ),
+        Stage::FallbackEnumerate => {
+            let mut request = json!({"action":"enumerate"});
+            if stream.fallback_offset != 0 {
+                request["offset"] = json!(stream.fallback_offset);
+            }
+            (
+                stream
+                    .fallback_provider
+                    .expect("fallback enumeration has a provider")
+                    .service(),
+                request,
+            )
+        }
         Stage::Encoder => (ENCODE, encoder_open_request(stream)),
         Stage::FindEncoder => (ENCODE, json!({"action":"lookup","operation_id":operation})),
         Stage::CloseEncoder => (
@@ -908,7 +929,7 @@ fn apply_result(
             Stage::Encoder
         }
         Stage::FallbackEnumerate => {
-            let Some(device_name) = stream.fallback_device_name.as_deref() else {
+            let Some(device_name) = stream.fallback_device_name.clone() else {
                 stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
                 return false;
             };
@@ -916,12 +937,17 @@ fn apply_result(
                 stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
                 return false;
             };
-            let Some(target_output) = matching_output(&payload, provider, device_name) else {
-                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
-                return false;
-            };
+            let target_output =
+                match accumulate_fallback_page(stream, &payload, provider, &device_name) {
+                    Ok(Some(output)) => output,
+                    Ok(None) => return false,
+                    Err(()) => {
+                        stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                        return false;
+                    }
+                };
             stream.provider = provider;
-            stream.capture_output = target_output.id;
+            stream.capture_output = target_output;
             stream.capture_operation = format!("{}-capture-1", stream.operation);
             stream.capture_attempt = 1;
             Stage::Capture
@@ -1006,6 +1032,11 @@ fn begin_fallback(stream: &mut Stream, original_error: &'static str) -> bool {
     stream.no_resources = true;
     stream.fallback_error = Some(original_error);
     stream.fallback_device_name = Some(device_name);
+    stream.fallback_offset = 0;
+    stream.fallback_pages = 0;
+    stream.fallback_last_output = None;
+    stream.fallback_match = None;
+    stream.fallback_enumeration_id = None;
     stream.stage = Stage::FallbackEnumerate;
     stream.retries = 0;
     debug_assert_ne!(stream.provider, provider);
@@ -1037,15 +1068,65 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
     }
 }
 
-fn matching_output(
+const MAX_FALLBACK_ENUMERATION_PAGES: usize = 64;
+
+fn accumulate_fallback_page(
+    stream: &mut Stream,
     payload: &Value,
     provider: CaptureProvider,
     device_name: &str,
-) -> Option<CaptureOutputIdentity> {
+) -> Result<Option<String>, ()> {
     let outputs: Vec<CaptureOutputIdentity> =
-        serde_json::from_value(payload.get("outputs")?.clone()).ok()?;
-    let mut matching = outputs.into_iter().filter(|output| {
-        output.attached
+        serde_json::from_value(payload.get("outputs").ok_or(())?.clone()).map_err(|_| ())?;
+    let next_offset = payload
+        .get("next_offset")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or(())
+        })
+        .transpose()?;
+    if stream.fallback_pages >= MAX_FALLBACK_ENUMERATION_PAGES {
+        return Err(());
+    }
+    let paged = stream.fallback_offset != 0 || next_offset.is_some();
+    if paged {
+        let enumeration_id = payload
+            .get("enumeration_id")
+            .and_then(Value::as_str)
+            .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(())?;
+        if let Some(previous) = stream.fallback_enumeration_id.as_deref() {
+            if previous != enumeration_id {
+                return Err(());
+            }
+        } else {
+            stream.fallback_enumeration_id = Some(enumeration_id.to_owned());
+        }
+    }
+    if paged && outputs.is_empty() {
+        return Err(());
+    }
+    let expected_next = stream
+        .fallback_offset
+        .checked_add(outputs.len())
+        .ok_or(())?;
+    if next_offset.is_some_and(|next| next != expected_next) {
+        return Err(());
+    }
+    for output in outputs {
+        if paged {
+            if stream
+                .fallback_last_output
+                .as_deref()
+                .is_some_and(|last| output.id.as_str() <= last)
+            {
+                return Err(());
+            }
+            stream.fallback_last_output = Some(output.id.clone());
+        }
+        let matches = output.attached
             && output.device_name == device_name
             && match provider {
                 CaptureProvider::Dxgi => {
@@ -1053,10 +1134,18 @@ fn matching_output(
                         == Some(device_name)
                 }
                 CaptureProvider::Wgc => output.id == device_name,
-            }
-    });
-    let output = matching.next()?;
-    matching.next().is_none().then_some(output)
+            };
+        if matches && stream.fallback_match.replace(output.id).is_some() {
+            return Err(());
+        }
+    }
+    stream.fallback_pages += 1;
+    if let Some(next) = next_offset {
+        stream.fallback_offset = next;
+        Ok(None)
+    } else {
+        stream.fallback_match.take().map(Some).ok_or(())
+    }
 }
 
 fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static str> {
