@@ -657,6 +657,140 @@ fn touch_surface() -> Value {
     })
 }
 
+fn portrait_geometry() -> CaptureGeometry {
+    CaptureGeometry::new(
+        DesktopRect::new(-768, 0, 768, 1024).unwrap(),
+        DesktopRect::new(-768, 0, 2688, 1080).unwrap(),
+    )
+    .unwrap()
+}
+
+fn portrait_open(operation_id: &str) -> Operation {
+    let mut request = open();
+    let Operation::Open {
+        configuration,
+        operation_id: id,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    configuration.width = 768;
+    configuration.height = 1024;
+    *id = Some(operation_id.into());
+    request
+}
+
+#[test]
+fn portrait_dxgi_touch_port_tracks_verified_geometry_through_lifecycle() {
+    let geometry = portrait_geometry();
+    let surface = json!({
+        "width": 768, "height": 1024,
+        "logical_width": 768, "logical_height": 1024
+    });
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry));
+    runtime.capture_touch_surface = Some(surface.clone());
+    pipeline.handle(
+        "alice",
+        99,
+        portrait_open("portrait-dxgi"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let opened = &runtime.completed[0].1;
+    let port = json!({
+        "width": 768, "height": 1024,
+        "logical_width": 768, "logical_height": 1024,
+        "client_offset_x": 0.0, "client_offset_y": 0.0
+    });
+    assert_eq!(opened["state"], "running");
+    assert_eq!(opened["desktop_geometry"], json!(geometry));
+    assert_eq!(opened["touch_port"], port);
+    assert_eq!(plane.geometry_checks, vec![Some(geometry); 2]);
+
+    // The provider's later state cannot change the stream's advertised map.
+    runtime.capture_touch_surface = Some(json!({
+        "width": 1024, "height": 768,
+        "logical_width": 1024, "logical_height": 768
+    }));
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Lookup {
+            operation_id: "portrait-dxgi".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(runtime.completed.last().unwrap().1["touch_port"], port);
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Status { stream: Some(1) },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["streams"][0]["touch_port"],
+        port
+    );
+    pipeline.handle(
+        "bob",
+        102,
+        Operation::Lookup {
+            operation_id: "portrait-dxgi".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(runtime.completed.last().unwrap().1["code"], "not_found");
+
+    // Both the requested stream and verified physical output must match.
+    for (request, output_width, stream_width) in [
+        (portrait_open("stream-size-mismatch"), 768, 800),
+        (portrait_open("output-size-mismatch"), 800, 768),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        let output = CaptureGeometry::new(
+            DesktopRect::new(-768, 0, output_width, 1024).unwrap(),
+            geometry.virtual_desktop,
+        )
+        .unwrap();
+        runtime.capture_geometry = Some(json!(output));
+        runtime.capture_touch_surface = Some(surface.clone());
+        let mut request = request;
+        if let Operation::Open { configuration, .. } = &mut request {
+            configuration.width = stream_width;
+        }
+        pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 4);
+        assert_eq!(runtime.completed[0].1["state"], "running");
+        assert!(runtime.completed[0].1.get("touch_port").is_none());
+    }
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry));
+    runtime.capture_touch_surface = Some(json!({
+        "width": 768, "height": 1024,
+        "logical_width": 0, "logical_height": 1024
+    }));
+    pipeline.handle(
+        "alice",
+        99,
+        portrait_open("malformed-portrait"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(
+        runtime.completed[0].1["code"],
+        "invalid_capture_touch_surface"
+    );
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+    )));
+    assert!(runtime.commands.iter().all(|command| !matches!(command,
+        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "open"
+    )));
+}
+
 #[test]
 fn wgc_source_clock_ahead_of_callback_keeps_running_cadence() {
     let (mut pipeline, mut runtime, mut plane) = setup();
