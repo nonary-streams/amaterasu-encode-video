@@ -145,8 +145,9 @@ list. Close remains an explicit abort and can interrupt graceful drain.
 `force_idr` is accepted only for an owned running stream. It coalesces repeated
 requests into a flag for the next accepted encoder input. Capture pending/busy or
 encoder backpressure leaves that flag pending; acceptance clears it. The encoder
-receives the exact native force flag. Actual keyframe generation still depends on
-the hardware encoder honoring the request.
+receives the exact native force flag. Encode rejects a forced output that is not
+a keyframe; video then closes both providers and reports `encoder_failed`. Live
+hardware keyframe behavior still requires qualification.
 
 `minimum_fps_target` defaults to 20 and accepts finite values from 0 through
 1000, including fractional targets. Zero resolves to the negotiated capture FPS.

@@ -156,6 +156,7 @@ struct FakePlane {
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
     fail: bool,
+    failure_code: Option<&'static str>,
     freshness_api: bool,
     capture_timestamp_api: bool,
     capture_pacing_timestamp_us: u64,
@@ -189,7 +190,9 @@ impl Plane for FakePlane {
             input.sequence,
             input.timestamp_us,
         ));
-        if self.fail {
+        if let Some(code) = self.failure_code {
+            Err(code)
+        } else if self.fail {
             Err("frame_rejected")
         } else {
             let capture_reused = input.capture_due && input.constant_rate && self.capture_reused;
@@ -1930,6 +1933,91 @@ fn force_idr_is_owned_and_survives_encoder_backpressure_until_acceptance() {
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     assert!(!pipeline.streams[&1].force_idr);
     assert!(plane.inputs.last().unwrap().2);
+}
+
+#[test]
+fn rejected_forced_keyframe_closes_both_providers_and_reports_failure() {
+    use amaterasu_media::{EncodedPacket, MEDIA_CLOSED, PacketSink};
+    use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+
+    unsafe extern "C" fn accept(_: *mut std::ffi::c_void, _: *const EncodedPacket) -> Status {
+        STATUS_OK
+    }
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::ForceIdr { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["force_idr_pending"],
+        true
+    );
+    assert!(
+        runtime
+            .completed
+            .last()
+            .unwrap()
+            .1
+            .get("keyframe")
+            .is_none()
+    );
+
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(plane.inputs.last().unwrap().2);
+    assert!(!pipeline.streams[&1].force_idr);
+
+    // The encoder can accept the forced input, then reject its non-IDR output
+    // during a later receive. No successful keyframe is promised to the caller.
+    plane.failure_code = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::FindEncoder as u8);
+    assert_eq!(
+        unsafe {
+            pipeline.queues.lock().unwrap().receive(
+                "alice",
+                1,
+                PacketSink {
+                    context: std::ptr::null_mut(),
+                    write: accept,
+                },
+            )
+        },
+        MEDIA_CLOSED
+    );
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["state"], "failed");
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_failed");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request {service, payload, parent: None, ..}
+                    if service == ENCODE && payload["action"] == "close" && payload["session_id"] == 51
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request {service, payload, parent: None, ..}
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]
