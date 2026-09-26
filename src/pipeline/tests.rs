@@ -1674,12 +1674,11 @@ fn auto_fallback_checks_every_enumeration_page_before_opening() {
             .collect(),
     );
 
-    pipeline.handle(
-        "alice",
-        99,
-        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
-        &mut |command| runtime.send(command),
-    );
+    let mut request = canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id);
+    if let Operation::Open { operation_id, .. } = &mut request {
+        *operation_id = Some("paged-fallback".into());
+    }
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 18);
 
     assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
@@ -1706,6 +1705,119 @@ fn auto_fallback_checks_every_enumeration_page_before_opening() {
     assert_eq!(alternate_requests[3].0["output"], r"\\.\DISPLAY1");
     assert_ne!(alternate_requests[0].1, alternate_requests[1].1);
     assert_ne!(alternate_requests[1].1, alternate_requests[2].1);
+
+    let stream = &pipeline.streams[&1];
+    let operation = stream.operation.clone();
+    let capture_operation = stream.capture_operation.clone();
+    assert_eq!(capture_operation, format!("{operation}-capture-1"));
+    assert_eq!(alternate_requests[3].0["operation_id"], capture_operation);
+    assert_eq!(
+        alternate_requests[3].1,
+        &format!("{operation}-capture-attempt-1")
+    );
+
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Lookup {
+            operation_id: "paged-fallback".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    let lookup = &runtime.completed.last().unwrap().1;
+    assert_eq!(lookup["state"], "running");
+    assert_eq!(lookup["capture_provider"], "wgc");
+
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(pipeline.streams.is_empty());
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Wgc.service()
+                && payload["action"] == "lookup"
+                && payload["operation_id"] == capture_operation
+    )));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Wgc.service()
+                && payload["action"] == "close"
+                && payload["stream"] == 41
+    )));
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service()
+                && matches!(payload["action"].as_str(), Some("lookup" | "close"))
+    )));
+}
+
+#[test]
+fn lost_later_fallback_page_settles_before_any_alternate_open() {
+    let dxgi_id = format!("00000000:00000001/{}", r"\\.\DISPLAY1");
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Dxgi, CaptureProvider::Wgc].into());
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::Dxgi, "unsupported_platform");
+    runtime.capture_page_size = Some(1);
+    runtime.capture_outputs.insert(
+        CaptureProvider::Wgc,
+        [r"\\.\DISPLAY0", r"\\.\DISPLAY1"]
+            .into_iter()
+            .map(|id| capture_output(id, id))
+            .collect(),
+    );
+
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::Dxgi, &dxgi_id),
+        &mut |command| runtime.send(command),
+    );
+    for _ in 0..12 {
+        if runtime.commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::Request { service, payload, .. }
+                    if service == CaptureProvider::Wgc.service()
+                        && payload["action"] == "enumerate"
+                        && payload["offset"] == 1
+            )
+        }) {
+            break;
+        }
+        tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    }
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Wgc.service()
+                && payload["action"] == "enumerate"
+                && payload["offset"] == 1
+    )));
+    runtime.lose_result = true;
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "request_failed");
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { .. }))
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Wgc.service() && payload["action"] == "open"
+    )));
 }
 
 #[test]
