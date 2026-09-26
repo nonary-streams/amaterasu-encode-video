@@ -897,7 +897,7 @@ fn apply_result(
             stream.touch_port = match capture_touch_port(
                 &payload,
                 &stream.configuration,
-                stream.desktop_geometry.is_some(),
+                stream.desktop_geometry,
             ) {
                 Ok(touch_port) => touch_port,
                 Err(code) => {
@@ -1071,7 +1071,7 @@ fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static
 fn capture_touch_port(
     payload: &Value,
     configuration: &Configuration,
-    has_desktop_geometry: bool,
+    desktop_geometry: Option<CaptureGeometry>,
 ) -> Result<Option<Value>, &'static str> {
     let Some(value) = payload.get("touch_surface") else {
         return Ok(None);
@@ -1083,8 +1083,9 @@ fn capture_touch_port(
     }
     // Absolute input also needs the verified desktop rectangle. The current
     // media plane accepts only unscaled frames of the requested size.
-    if !has_desktop_geometry
-        || surface.width != configuration.width
+    if !desktop_geometry.is_some_and(|geometry| {
+        surface.width == geometry.output.width && surface.height == geometry.output.height
+    }) || surface.width != configuration.width
         || surface.height != configuration.height
     {
         return Ok(None);

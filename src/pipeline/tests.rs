@@ -767,6 +767,64 @@ fn capture_touch_surface_produces_port_without_inference_from_desktop_geometry()
 }
 
 #[test]
+fn capture_touch_surface_must_match_verified_output_rectangle() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mismatched_geometry = CaptureGeometry::new(
+        DesktopRect::new(-1920, 0, 1600, 900).unwrap(),
+        geometry().virtual_desktop,
+    )
+    .unwrap();
+    runtime.capture_geometry = Some(json!(mismatched_geometry));
+    runtime.capture_touch_surface = Some(touch_surface());
+    let mut request = open();
+    if let Operation::Open { operation_id, .. } = &mut request {
+        *operation_id = Some("mismatched-touch-surface".into());
+    }
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert_eq!(plane.geometry_checks, vec![Some(mismatched_geometry); 2]);
+    assert_eq!(
+        runtime.completed[0].1["desktop_geometry"],
+        json!(mismatched_geometry)
+    );
+    assert!(runtime.completed[0].1.get("touch_port").is_none());
+
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Status { stream: Some(1) },
+        &mut |command| runtime.send(command),
+    );
+    assert!(
+        runtime.completed.last().unwrap().1["streams"][0]
+            .get("touch_port")
+            .is_none()
+    );
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Lookup {
+            operation_id: "mismatched-touch-surface".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert!(
+        runtime
+            .completed
+            .last()
+            .unwrap()
+            .1
+            .get("touch_port")
+            .is_none()
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert!(pipeline.streams[&1].response(1).get("touch_port").is_none());
+}
+
+#[test]
 fn malformed_capture_touch_surface_fails_before_encoder_open_and_closes_capture() {
     let valid = touch_surface();
     let mut malformed = Vec::new();
