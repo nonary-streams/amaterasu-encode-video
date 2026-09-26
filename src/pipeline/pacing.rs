@@ -69,9 +69,13 @@ impl WgcPacing {
             let mapped = clock
                 .anchor_monotonic
                 .checked_add(Duration::from_micros(elapsed_us))?;
+            // A capture timestamp may lag its callback, but a timestamp more
+            // than one frame ahead cannot represent an already acquired frame.
+            let max_future_ns = NANOS_PER_SECOND / u128::from(self.fps.max(1));
             (mapped.as_nanos() <= MAX_DURATION_NS
-                && mapped.as_nanos().abs_diff(observed_at.as_nanos()) <= MAX_HOLD_NS)
-                .then_some(mapped)
+                && mapped.as_nanos().abs_diff(observed_at.as_nanos()) <= MAX_HOLD_NS
+                && mapped.as_nanos() <= observed_at.as_nanos().saturating_add(max_future_ns))
+            .then_some(mapped)
         });
 
         if let Some(mapped) = mapped {
@@ -374,6 +378,22 @@ mod tests {
         assert_eq!(
             pacing.source_clock.unwrap().anchor_monotonic,
             duration(500_000_000)
+        );
+    }
+
+    #[test]
+    fn source_clock_ahead_of_callback_reanchors_before_next_capture() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.capture_arrived(100_000, duration(10_000_000));
+        pacing.capture_missed(duration(26_666_666));
+
+        // This 150 ms source jump is inside the old symmetric 200 ms window,
+        // yet that frame has already arrived at the 30 ms callback.
+        let next = pacing.capture_arrived(250_000, duration(30_000_000));
+        assert_eq!(next, Some(duration(46_666_666)));
+        assert_eq!(
+            pacing.source_clock.unwrap().anchor_monotonic,
+            duration(30_000_000)
         );
     }
 

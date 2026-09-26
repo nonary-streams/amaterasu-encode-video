@@ -645,6 +645,54 @@ fn wgc_source_clock_jump_does_not_stall_running_capture() {
 }
 
 #[test]
+fn wgc_source_clock_ahead_of_callback_keeps_running_cadence() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open {
+        capture_provider,
+        configuration,
+        ..
+    } = &mut request
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Wgc;
+    configuration.width = 16;
+    configuration.height = 16;
+    configuration.fps = 60;
+    configuration.bitrate = 100_000;
+    pipeline.providers.insert(CaptureProvider::Wgc);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    let opened_at = pipeline.streams[&1].opened_at;
+    plane.capture_timestamp_api = true;
+    plane.capture_pacing_timestamp_us = 100_000;
+    plane.capture_observed_at = Some(opened_at + Duration::from_millis(10));
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    let missed_slot = pipeline.streams[&1].next_frame.duration_since(opened_at);
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .wgc_pacing
+        .capture_missed(missed_slot);
+
+    // The source clock jumps 150 ms while the next callback arrives at 30 ms.
+    // A deadline derived from that future timestamp would pause this stream.
+    plane.capture_pacing_timestamp_us = 250_000;
+    plane.capture_observed_at = Some(opened_at + Duration::from_millis(30));
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.wgc_pacing.group_frames, 1);
+    assert!(stream.next_frame < opened_at + Duration::from_millis(70));
+}
+
+#[test]
 fn legacy_capture_without_geometry_remains_supported_and_omits_metadata() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
