@@ -403,17 +403,11 @@ impl Encoder {
         // SAFETY: buffer length equals the owned NV12 vector; Lock/Unlock are
         // balanced, and sample retains the COM buffer after this function.
         unsafe {
-            if force
-                && let Some(codec) = &self.codec
-                && let Err(error) =
-                    codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true))
-                && !matches!(
-                    error.code(),
-                    windows::Win32::Foundation::E_INVALIDARG
-                        | windows::Win32::Foundation::E_NOTIMPL
-                )
-            {
-                return Err("force_keyframe_failed");
+            if force {
+                let codec = self.codec.as_ref().ok_or("force_keyframe_unsupported")?;
+                codec
+                    .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true))
+                    .map_err(|_| "force_keyframe_failed")?;
             }
             let mut input_info = MFT_INPUT_STREAM_INFO::default();
             self.transform

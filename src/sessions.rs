@@ -29,6 +29,7 @@ impl Backend for Worker {
 struct Metadata {
     timestamp: i64,
     sequence: u64,
+    force_keyframe: bool,
 }
 
 pub struct Session {
@@ -37,6 +38,7 @@ pub struct Session {
     config: Configuration,
     backend: Box<dyn Backend>,
     metadata: VecDeque<Metadata>,
+    last_input: Option<(i64, u64)>,
     pending: Option<Packet>,
     draining: bool,
     eos_sent: bool,
@@ -162,6 +164,7 @@ impl Sessions {
                 config: configuration,
                 backend,
                 metadata: VecDeque::new(),
+                last_input: None,
                 pending: None,
                 draining: false,
                 eos_sent: false,
@@ -242,9 +245,10 @@ impl Sessions {
             return STATUS_INVALID_ARGUMENT;
         };
         if session
-            .metadata
-            .back()
-            .is_some_and(|last| timestamp <= last.timestamp || frame.sequence <= last.sequence)
+            .last_input
+            .is_some_and(|(last_timestamp, last_sequence)| {
+                timestamp <= last_timestamp || frame.sequence <= last_sequence
+            })
         {
             return STATUS_INVALID_ARGUMENT;
         }
@@ -278,7 +282,9 @@ impl Sessions {
         session.metadata.push_back(Metadata {
             timestamp,
             sequence: frame.sequence,
+            force_keyframe: force != 0,
         });
+        session.last_input = Some((timestamp, frame.sequence));
         STATUS_OK
     }
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
@@ -345,6 +351,10 @@ impl Sessions {
             session.failed = true;
             return MEDIA_BACKEND_ERROR;
         };
+        if metadata.force_keyframe && !packet.keyframe {
+            session.failed = true;
+            return MEDIA_BACKEND_ERROR;
+        }
         let encoded = EncodedPacket {
             codec: CODEC_H264,
             flags: if session.packet_boundaries {
@@ -366,7 +376,7 @@ impl Sessions {
             while session
                 .metadata
                 .front()
-                .is_some_and(|metadata| metadata.timestamp < timestamp)
+                .is_some_and(|metadata| metadata.timestamp <= timestamp)
             {
                 session.metadata.pop_front();
             }

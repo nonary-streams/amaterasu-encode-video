@@ -33,6 +33,41 @@ impl Drop for Fake {
     }
 }
 
+struct StreamingFake {
+    packets: VecDeque<Packet>,
+    submissions: Arc<AtomicUsize>,
+    honor_force: bool,
+}
+
+impl Backend for StreamingFake {
+    fn submit(&mut self, _: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+        self.submissions.fetch_add(1, Ordering::SeqCst);
+        self.packets.push_back(Packet {
+            bytes: vec![
+                0,
+                0,
+                1,
+                if force && self.honor_force {
+                    0x65
+                } else {
+                    0x41
+                },
+            ],
+            timestamp_100ns: timestamp,
+            keyframe: force && self.honor_force,
+        });
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        Ok(self.packets.pop_front())
+    }
+
+    fn drain(&mut self) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
 fn configuration() -> Configuration {
     Configuration {
         width: 16,
@@ -159,7 +194,7 @@ fn exercise_packet_flags(packet_boundaries: bool) {
             MEDIA_CLOSED
         );
         assert_eq!((bob.drain)(bob.base.context, 1), MEDIA_CLOSED);
-        assert_eq!((alice.submit)(alice.base.context, 1, &frame, 1), STATUS_OK);
+        assert_eq!((alice.submit)(alice.base.context, 1, &frame, 0), STATUS_OK);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         assert_eq!(
             (alice.receive)(alice.base.context, 1, packet_sink),
@@ -244,6 +279,168 @@ fn bounded_pending_input_returns_busy_without_accepting() {
         MEDIA_BUSY
     );
     assert_eq!(submissions.load(Ordering::SeqCst), 16);
+}
+
+#[test]
+fn delivered_packet_releases_metadata_capacity_without_losing_input_order() {
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(StreamingFake {
+                packets: VecDeque::new(),
+                submissions: submissions.clone(),
+                honor_force: true,
+            }),
+            false,
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let mut frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    for sequence in 1..=16 {
+        frame.timestamp_us = sequence;
+        frame.sequence = sequence;
+        // SAFETY: the borrowed frame allocation remains live for every call.
+        assert_eq!(
+            unsafe { sessions.submit("alice", 1, &frame, u32::from(sequence == 1)) },
+            STATUS_OK
+        );
+    }
+    frame.timestamp_us = 17;
+    frame.sequence = 17;
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        MEDIA_BUSY
+    );
+    assert_eq!(submissions.load(Ordering::SeqCst), 16);
+
+    let mut sink = Sink {
+        reject: true,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    assert_eq!(
+        unsafe { sessions.receive("bob", 1, packet_sink) },
+        MEDIA_CLOSED
+    );
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_BUSY
+    );
+    assert!(sink.sequences.is_empty());
+    assert_eq!(sessions.values.get(&1).unwrap().metadata.len(), 16);
+    sink.reject = false;
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        STATUS_OK
+    );
+    assert_eq!(sink.sequences, [1]);
+    assert_eq!(sink.flags, [FLAG_KEYFRAME]);
+    assert_eq!(sessions.values.get(&1).unwrap().metadata.len(), 15);
+
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+    assert_eq!(submissions.load(Ordering::SeqCst), 17);
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        STATUS_OK
+    );
+    assert_eq!(sink.sequences, [1, 2]);
+    frame.timestamp_us = 1;
+    frame.sequence = 1;
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(submissions.load(Ordering::SeqCst), 17);
+
+    assert_eq!(sessions.drain("alice", 1), STATUS_OK);
+    for _ in 3..=17 {
+        assert_eq!(
+            unsafe { sessions.receive("alice", 1, packet_sink) },
+            STATUS_OK
+        );
+    }
+    assert_eq!(sink.sequences, (1..=17).collect::<Vec<_>>());
+    assert_eq!(sessions.values.get(&1).unwrap().metadata.len(), 0);
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        STATUS_OK
+    );
+    assert_eq!(sink.flags.last(), Some(&FLAG_END_OF_STREAM));
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_PENDING
+    );
+    sessions.close("alice", 1).unwrap();
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_CLOSED
+    );
+}
+
+#[test]
+fn forced_frame_without_keyframe_fails_before_delivery_and_closes_cleanly() {
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(StreamingFake {
+                packets: VecDeque::new(),
+                submissions: Arc::new(AtomicUsize::new(0)),
+                honor_force: false,
+            }),
+            false,
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    let mut sink = Sink {
+        reject: false,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 1) }, STATUS_OK);
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_BACKEND_ERROR
+    );
+    assert!(sink.sequences.is_empty());
+    assert_eq!(sessions.status("alice", 1).unwrap()["state"], "failed");
+    assert_eq!(sessions.drain("alice", 1), MEDIA_BACKEND_ERROR);
+    sessions.close("alice", 1).unwrap();
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_CLOSED
+    );
 }
 
 #[test]
