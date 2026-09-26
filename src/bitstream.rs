@@ -1,4 +1,6 @@
 //! Normalize length-prefixed MF samples to Annex B and retain parameter sets.
+const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct Normalizer {
     length_prefixed: bool,
@@ -23,7 +25,6 @@ impl Normalizer {
     }
     pub fn sample(&mut self, bytes: &[u8]) -> Result<(Vec<u8>, bool), &'static str> {
         let units = units(bytes, self.length_prefixed)?;
-        self.remember(&units);
         let idr = units.iter().any(|unit| unit[0] & 31 == 5);
         let mut output = Vec::new();
         if idr {
@@ -36,9 +37,10 @@ impl Normalizer {
                 }
             }
         }
-        for unit in units {
+        for unit in &units {
             append(&mut output, unit)?;
         }
+        self.remember(&units);
         Ok((output, idr))
     }
     fn remember(&mut self, units: &[&[u8]]) {
@@ -53,7 +55,7 @@ impl Normalizer {
 }
 
 fn append(output: &mut Vec<u8>, unit: &[u8]) -> Result<(), &'static str> {
-    if output.len() + 4 + unit.len() > 16 * 1024 * 1024 {
+    if output.len() + 4 + unit.len() > MAX_PACKET_BYTES {
         return Err("packet_limit");
     }
     output.extend_from_slice(&[0, 0, 0, 1]);
@@ -72,7 +74,7 @@ fn start_code(bytes: &[u8], index: usize) -> Option<usize> {
 }
 
 fn units(bytes: &[u8], length_prefixed: bool) -> Result<Vec<&[u8]>, &'static str> {
-    if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
         return Err("invalid_h264");
     }
     let mut output = Vec::new();
@@ -193,5 +195,34 @@ mod tests {
         assert!(normalizer.sample(&[0, 0, 1]).is_err());
         assert!(normalizer.sample(&[0, 0, 1, 0x65, 1]).is_err());
         assert!(normalizer.header(&[1, 66, 0, 30, 252, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn failed_update_preserves_cached_parameter_sets_and_format() {
+        let mut normalizer = Normalizer::default();
+        normalizer
+            .header(&[0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2])
+            .unwrap();
+
+        let mut oversized_output = vec![
+            0, 0, 1, 0x67, 9, // replacement SPS
+            0, 0, 1, 0x68, 8, // replacement PPS
+            0, 0, 1, 0x65, // IDR
+        ];
+        oversized_output.resize(MAX_PACKET_BYTES - 1, 0x41);
+        assert_eq!(normalizer.sample(&oversized_output), Err("packet_limit"));
+
+        assert_eq!(
+            normalizer.header(&[1, 66, 0, 30, 252, 0, 0]),
+            Err("unsupported_avcc")
+        );
+        let (packet, idr) = normalizer.sample(&[0, 0, 1, 0x65, 3]).unwrap();
+        assert!(idr);
+        assert_eq!(
+            packet,
+            [
+                0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3
+            ]
+        );
     }
 }
