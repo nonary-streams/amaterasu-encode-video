@@ -22,6 +22,7 @@ struct Runtime {
     lose_result: bool,
     omit_reference_metadata: bool,
     capture_geometry: Option<Value>,
+    capture_touch_surface: Option<Value>,
     capture_open_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_admission_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_outputs: BTreeMap<CaptureProvider, Vec<Value>>,
@@ -82,6 +83,9 @@ impl Runtime {
                             let mut result = json!({"ok":true,"stream":41});
                             if let Some(geometry) = &self.capture_geometry {
                                 result["desktop_geometry"] = geometry.clone();
+                            }
+                            if let Some(touch_surface) = &self.capture_touch_surface {
+                                result["touch_surface"] = touch_surface.clone();
                             }
                             result
                         }
@@ -644,6 +648,15 @@ fn wgc_source_clock_jump_does_not_stall_running_capture() {
     assert!(stream.next_frame < opened_at + Duration::from_millis(100));
 }
 
+fn touch_surface() -> Value {
+    json!({
+        "width": 1920,
+        "height": 1080,
+        "logical_width": 1920,
+        "logical_height": 1080
+    })
+}
+
 #[test]
 fn wgc_source_clock_ahead_of_callback_keeps_running_cadence() {
     let (mut pipeline, mut runtime, mut plane) = setup();
@@ -701,6 +714,130 @@ fn legacy_capture_without_geometry_remains_supported_and_omits_metadata() {
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
     assert_eq!(plane.geometry_checks, vec![None, None]);
     assert!(runtime.completed[0].1.get("desktop_geometry").is_none());
+    assert!(runtime.completed[0].1.get("touch_port").is_none());
+}
+
+#[test]
+fn capture_touch_surface_produces_port_without_inference_from_desktop_geometry() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry()));
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    assert_eq!(
+        runtime.completed[0].1["desktop_geometry"],
+        json!(geometry())
+    );
+    assert!(runtime.completed[0].1.get("touch_port").is_none());
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_touch_surface = Some(touch_surface());
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    assert_eq!(
+        runtime.completed[0].1["touch_port"],
+        json!({
+            "width": 1920, "height": 1080,
+            "logical_width": 1920, "logical_height": 1080,
+            "client_offset_x": 0.0, "client_offset_y": 0.0
+        })
+    );
+    assert!(runtime.completed[0].1.get("desktop_geometry").is_none());
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_touch_surface = Some(json!({
+        "width": 1440, "height": 1080,
+        "logical_width": 1440, "logical_height": 1080
+    }));
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert!(runtime.completed[0].1.get("touch_port").is_none());
+}
+
+#[test]
+fn malformed_capture_touch_surface_fails_before_encoder_open_and_closes_capture() {
+    let valid = touch_surface();
+    let mut malformed = Vec::new();
+    for field in ["width", "height", "logical_width", "logical_height"] {
+        let mut zero = valid.clone();
+        zero[field] = json!(0);
+        malformed.push(zero);
+        let mut negative = valid.clone();
+        negative[field] = json!(-1);
+        malformed.push(negative);
+        let mut too_large = valid.clone();
+        too_large[field] = json!(u64::from(u32::MAX) + 1);
+        malformed.push(too_large);
+        let mut fractional = valid.clone();
+        fractional[field] = json!(1.5);
+        malformed.push(fractional);
+    }
+    for missing in ["width", "logical_height"] {
+        let mut value = valid.clone();
+        value.as_object_mut().unwrap().remove(missing);
+        malformed.push(value);
+    }
+    let mut extra = valid.clone();
+    extra["unexpected"] = json!(true);
+    malformed.extend([extra, Value::Null, json!([])]);
+
+    for touch_surface in malformed {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        runtime.capture_touch_surface = Some(touch_surface.clone());
+        pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 12);
+        assert_eq!(
+            runtime.completed[0].1["code"], "invalid_capture_touch_surface",
+            "{touch_surface}"
+        );
+        assert!(runtime.commands.iter().all(|command| !matches!(command,
+            Command::Request { service, payload, .. }
+                if service == ENCODE && payload["action"] == "open"
+        )));
+        assert!(runtime.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+        )));
+    }
+}
+
+#[test]
+fn touch_port_is_immutable_after_capture_open() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_touch_surface = Some(touch_surface());
+    let mut request = open();
+    if let Operation::Open { operation_id, .. } = &mut request {
+        *operation_id = Some("touch-port".into());
+    }
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let original = runtime.completed[0].1["touch_port"].clone();
+
+    runtime.capture_touch_surface = Some(json!({
+        "width": 800, "height": 600, "logical_width": 800, "logical_height": 600
+    }));
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Status { stream: Some(1) },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["streams"][0]["touch_port"],
+        original
+    );
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Lookup {
+            operation_id: "touch-port".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(runtime.completed.last().unwrap().1["touch_port"], original);
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    assert_eq!(pipeline.streams[&1].response(1)["touch_port"], original);
 }
 
 #[test]

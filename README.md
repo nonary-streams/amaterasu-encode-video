@@ -75,6 +75,17 @@ resources, not that a frame, packet, client connection or full stream is ready.
 Dimensions are checked again against each actual captured frame; a mismatch starts
 cleanup. No scaling or output topology change is performed.
 
+Capture Open may also return a provider-verified `touch_surface` with nonzero
+`width`, `height`, `logical_width`, and `logical_height` (all unsigned 32-bit
+integers). Video rejects a malformed surface before encoder Open. When its
+source width and height exactly match the requested stream dimensions, video
+snapshots and returns `touch_port` in Open, lookup, and status responses: stream
+`width` and `height`, the provider's logical dimensions, and zero
+`client_offset_x` and `client_offset_y`. The mapping stays fixed for the stream.
+Without a surface, or when the source size differs from the stream size, video
+omits `touch_port`. It never infers a touch mapping from `desktop_geometry` or
+reports letterboxing that this pipeline does not produce.
+
 When the capture provider returns `desktop_geometry`, video strictly parses and
 retains the captured output and virtual desktop rectangles. Before opening the
 encoder, it requires the provider's native geometry callback to return the exact

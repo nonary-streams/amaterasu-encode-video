@@ -97,6 +97,23 @@ pub struct EncoderIdentity {
     pub friendly_name: String,
 }
 
+/// Provider-reported source size and logical touch units. Desktop geometry does
+/// not establish these dimensions, so video never derives them from that field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TouchSurface {
+    pub width: u32,
+    pub height: u32,
+    pub logical_width: u32,
+    pub logical_height: u32,
+}
+
+impl TouchSurface {
+    pub fn validate(&self) -> bool {
+        self.width != 0 && self.height != 0 && self.logical_width != 0 && self.logical_height != 0
+    }
+}
+
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }

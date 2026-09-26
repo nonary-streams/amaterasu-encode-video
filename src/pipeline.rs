@@ -6,7 +6,7 @@ mod pacing;
 use crate::{
     model::{
         AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation,
-        Settings, error, valid_minimum_fps_target,
+        Settings, TouchSurface, error, valid_minimum_fps_target,
     },
     plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
     queue::Queues,
@@ -65,6 +65,7 @@ struct Stream {
     settlement_attempts: u8,
     capture: Option<u64>,
     desktop_geometry: Option<CaptureGeometry>,
+    touch_port: Option<Value>,
     session: Option<u64>,
     operation: String,
     capture_operation: String,
@@ -147,6 +148,9 @@ impl Stream {
         });
         if let Some(geometry) = self.desktop_geometry {
             response["desktop_geometry"] = json!(geometry);
+        }
+        if let Some(touch_port) = &self.touch_port {
+            response["touch_port"] = touch_port.clone();
         }
         if let Some(frame) = self.last_frame {
             response["last_capture_frame"] = json!({
@@ -397,6 +401,7 @@ impl Pipeline {
                 settlement_attempts: 0,
                 capture: None,
                 desktop_geometry: None,
+                touch_port: None,
                 session: None,
                 capture_operation: format!("{operation}-capture-0"),
                 operation,
@@ -889,6 +894,13 @@ fn apply_result(
                 }
             };
             stream.desktop_geometry = geometry;
+            stream.touch_port = match capture_touch_port(&payload, &stream.configuration) {
+                Ok(touch_port) => touch_port,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
             Stage::Encoder
         }
         Stage::FallbackEnumerate => {
@@ -1050,6 +1062,33 @@ fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static
     serde_json::from_value(value.clone())
         .map(Some)
         .map_err(|_| "invalid_capture_geometry")
+}
+
+fn capture_touch_port(
+    payload: &Value,
+    configuration: &Configuration,
+) -> Result<Option<Value>, &'static str> {
+    let Some(value) = payload.get("touch_surface") else {
+        return Ok(None);
+    };
+    let surface: TouchSurface =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_touch_surface")?;
+    if !surface.validate() {
+        return Err("invalid_capture_touch_surface");
+    }
+    // The current media plane accepts only unscaled frames of the requested
+    // size. A different source size cannot describe the delivered video yet.
+    if surface.width != configuration.width || surface.height != configuration.height {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "width": configuration.width,
+        "height": configuration.height,
+        "logical_width": surface.logical_width,
+        "logical_height": surface.logical_height,
+        "client_offset_x": 0.0_f32,
+        "client_offset_y": 0.0_f32,
+    })))
 }
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
