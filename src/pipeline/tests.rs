@@ -734,6 +734,13 @@ fn capture_touch_surface_produces_port_without_inference_from_desktop_geometry()
     runtime.capture_touch_surface = Some(touch_surface());
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert!(runtime.completed[0].1.get("touch_port").is_none());
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry()));
+    runtime.capture_touch_surface = Some(touch_surface());
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
 
     assert_eq!(
         runtime.completed[0].1["touch_port"],
@@ -743,9 +750,13 @@ fn capture_touch_surface_produces_port_without_inference_from_desktop_geometry()
             "client_offset_x": 0.0, "client_offset_y": 0.0
         })
     );
-    assert!(runtime.completed[0].1.get("desktop_geometry").is_none());
+    assert_eq!(
+        runtime.completed[0].1["desktop_geometry"],
+        json!(geometry())
+    );
 
     let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry()));
     runtime.capture_touch_surface = Some(json!({
         "width": 1440, "height": 1080,
         "logical_width": 1440, "logical_height": 1080
@@ -805,6 +816,7 @@ fn malformed_capture_touch_surface_fails_before_encoder_open_and_closes_capture(
 #[test]
 fn touch_port_is_immutable_after_capture_open() {
     let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.capture_geometry = Some(json!(geometry()));
     runtime.capture_touch_surface = Some(touch_surface());
     let mut request = open();
     if let Operation::Open { operation_id, .. } = &mut request {

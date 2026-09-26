@@ -78,11 +78,12 @@ cleanup. No scaling or output topology change is performed.
 Capture Open may also return a provider-verified `touch_surface` with nonzero
 `width`, `height`, `logical_width`, and `logical_height` (all unsigned 32-bit
 integers). Video rejects a malformed surface before encoder Open. When its
-source width and height exactly match the requested stream dimensions, video
+source width and height exactly match the requested stream dimensions and the
+same capture Open returns valid `desktop_geometry`, video
 snapshots and returns `touch_port` in Open, lookup, and status responses: stream
 `width` and `height`, the provider's logical dimensions, and zero
 `client_offset_x` and `client_offset_y`. The mapping stays fixed for the stream.
-Without a surface, or when the source size differs from the stream size, video
+Without either field, or when the source size differs from the stream size, video
 omits `touch_port`. It never infers a touch mapping from `desktop_geometry` or
 reports letterboxing that this pipeline does not produce.
 

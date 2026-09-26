@@ -894,7 +894,11 @@ fn apply_result(
                 }
             };
             stream.desktop_geometry = geometry;
-            stream.touch_port = match capture_touch_port(&payload, &stream.configuration) {
+            stream.touch_port = match capture_touch_port(
+                &payload,
+                &stream.configuration,
+                stream.desktop_geometry.is_some(),
+            ) {
                 Ok(touch_port) => touch_port,
                 Err(code) => {
                     stream.cleanup(code);
@@ -1067,6 +1071,7 @@ fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static
 fn capture_touch_port(
     payload: &Value,
     configuration: &Configuration,
+    has_desktop_geometry: bool,
 ) -> Result<Option<Value>, &'static str> {
     let Some(value) = payload.get("touch_surface") else {
         return Ok(None);
@@ -1076,9 +1081,12 @@ fn capture_touch_port(
     if !surface.validate() {
         return Err("invalid_capture_touch_surface");
     }
-    // The current media plane accepts only unscaled frames of the requested
-    // size. A different source size cannot describe the delivered video yet.
-    if surface.width != configuration.width || surface.height != configuration.height {
+    // Absolute input also needs the verified desktop rectangle. The current
+    // media plane accepts only unscaled frames of the requested size.
+    if !has_desktop_geometry
+        || surface.width != configuration.width
+        || surface.height != configuration.height
+    {
         return Ok(None);
     }
     Ok(Some(json!({
