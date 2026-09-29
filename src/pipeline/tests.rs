@@ -1,7 +1,8 @@
 use super::*;
-use crate::model::{AmdAv1LatencyMode, EncoderIdentity};
+use crate::model::AmdAv1LatencyMode;
 use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
+use amaterasu_module_sdk::EncoderIdentity;
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 #[derive(Default)]
 struct Runtime {
@@ -29,6 +30,8 @@ struct Runtime {
     capture_page_size: Option<usize>,
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
+    encoder_enumeration: Option<Value>,
+    hold_encoder_enumeration: bool,
 }
 
 impl Runtime {
@@ -73,6 +76,15 @@ impl Runtime {
                     && matches!(action, "lookup" | "close")
                 {
                     error("hardware_error")
+                } else if service == ENCODE && action == "enumerate" {
+                    self.encoder_enumeration.clone().unwrap_or_else(|| {
+                        json!({
+                            "ok":true,"enabled":true,"encoders":[{
+                                "identity":encoder_identity(),"name":"Test NVIDIA H.264",
+                                "codec":"h264","hardware":true,"vendor_id":0x10de
+                            }]
+                        })
+                    })
                 } else if let Some(provider) = capture_provider {
                     if action == "enumerate" {
                         if let Some(reply) = &self.capture_enumeration_override {
@@ -138,6 +150,15 @@ impl Runtime {
                 Response::Accepted { id: self.next }
             }
             Command::TakeResult { request } => {
+                if self.hold_encoder_enumeration
+                    && self.commands.iter().any(|command| {
+                        matches!(command, Command::Request { service, operation_id, payload, .. }
+                        if service == ENCODE && payload["action"] == "enumerate"
+                        && self.operations.get(operation_id) == Some(&request))
+                    })
+                {
+                    return Ok(Response::Pending);
+                }
                 if std::mem::take(&mut self.lose_result) {
                     return Err("lost result reply".into());
                 }
@@ -364,7 +385,7 @@ fn open() -> Operation {
         wgc_pacing_smoothing: true,
         minimum_fps_target: 20.0,
         output: "display-1".into(),
-        encoder: encoder_identity(),
+        encoder: amaterasu_module_sdk::EncoderSelection::Identity(encoder_identity()),
         configuration: Configuration {
             width: 1920,
             height: 1080,
@@ -392,9 +413,11 @@ fn software_options_reach_encoder_open_and_stream_status_unchanged() {
     };
     configuration.sw_preset = Some("ultrafast".into());
     configuration.sw_tune = Some("grain,zerolatency".into());
-    encoder.clsid = "amaterasu.software.x264".into();
-    encoder.hardware_url = None;
-    encoder.friendly_name = "x264 software H.264".into();
+    *encoder = amaterasu_module_sdk::EncoderSelection::Identity(EncoderIdentity {
+        clsid: "amaterasu.software.x264".into(),
+        hardware_url: None,
+        friendly_name: "x264 software H.264".into(),
+    });
     pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
@@ -2633,3 +2656,147 @@ fn native_drain_error_is_visible_after_resource_cleanup() {
 }
 
 mod operations;
+
+#[test]
+fn legacy_index_resolves_once_and_freezes_identity_before_allocation() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    assert_eq!(runtime.open_effects, 0);
+    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,"encoders":[]}));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "enumerate")).count(), 1);
+    let open_position = runtime
+        .commands
+        .iter()
+        .position(|command| {
+            matches!(command,
+        Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "open")
+        })
+        .unwrap();
+    let release_position = runtime
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::ReleaseResult { request: 1 }))
+        .unwrap();
+    assert!(release_position < open_position);
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "open" && payload["encoder"] == json!(encoder_identity()))));
+    let status = pipeline.streams.values().next().unwrap().response(1);
+    assert_eq!(status["requested_encoder"], 0);
+    assert_eq!(status["encoder"], json!(encoder_identity()));
+}
+
+#[test]
+fn unavailable_selection_releases_enumeration_without_allocating_resources() {
+    for (selection, reason) in [
+        (EncoderSelection::Index(1), "encoder_unavailable"),
+        (
+            EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Software),
+            "x264_feature_disabled",
+        ),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        runtime.encoder_enumeration = Some(
+            json!({"ok":true,"enabled":true,"encoders":[],"software_encoder":{"available":false,"reason":"x264_feature_disabled"}}),
+        );
+        let mut operation = open();
+        let Operation::Open { encoder, .. } = &mut operation else {
+            unreachable!()
+        };
+        *encoder = selection;
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 5);
+        assert!(pipeline.streams.is_empty());
+        assert_eq!(runtime.open_effects, 0);
+        assert!(
+            runtime
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
+        );
+        assert_eq!(runtime.completed.last().unwrap().1["code"], reason);
+    }
+}
+
+#[test]
+fn pending_selection_deadline_and_parent_cancellation_release_without_allocation() {
+    for cancel_parent in [false, true] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        runtime.hold_encoder_enumeration = true;
+        let mut operation = open();
+        let Operation::Open { encoder, .. } = &mut operation else {
+            unreachable!()
+        };
+        *encoder = EncoderSelection::Index(0);
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 1);
+        if cancel_parent {
+            runtime.cancelled = true;
+        } else {
+            pipeline.streams.values_mut().next().unwrap().opened_at =
+                Instant::now() - Duration::from_secs(6);
+        }
+        tick(&mut pipeline, &mut runtime, &mut plane, 4);
+        assert!(pipeline.streams.is_empty());
+        assert_eq!(runtime.open_effects, 0);
+        assert!(
+            runtime
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { request: 1 }))
+        );
+        assert!(
+            runtime
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
+        );
+    }
+}
+
+#[test]
+fn selection_release_failure_blocks_allocation_until_settled() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    runtime.release_failures = 1;
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(runtime.open_effects, 0);
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(runtime.open_effects, 2);
+    assert!(pipeline.streams.values().next().unwrap().stage == Stage::Running);
+}
+
+#[test]
+fn uncertain_selection_admission_is_reconciled_and_never_allocates() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.lose_accept = true;
+    let mut operation = open();
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(runtime.open_effects, 0);
+    assert_eq!(runtime.operations.len(), 1);
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
+    );
+}

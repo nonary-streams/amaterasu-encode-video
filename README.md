@@ -32,6 +32,25 @@ there is no synthetic frame or software fallback.
 ```
 
 Encoder selection passes the complete enumeration identity unchanged. Optional
+The `encoder` selector also accepts a legacy unsigned ordinal, `"auto"`, or
+`"software"`. Video resolves these selectors against one strict H.264 encoder
+enumeration (at most 64 entries) before opening capture. It freezes the selected
+full identity for encoder Open and reports both `requested_encoder` and the
+resolved `encoder`; enumeration reorder after selection cannot change the
+allocated encoder. Full identity requests retain their existing wire shape and
+skip ordinal resolution. Invalid, disabled, or unavailable selections fail before
+capture allocation. The child enumeration has a five-second deadline, follows
+parent cancellation, and releases its result before allocation.
+
+`"auto"` selects the first registered hardware encoder, or the actual available
+x264 software backend when no hardware encoder is registered. It does not probe
+hardware usability or retry a failed hardware Open with software; that differs
+from Vibeshine's automatic probing and remains a parity gate. `"software"`
+requires the real x264 backend and preserves explicit unavailable reasons for
+disabled builds, missing headers, and missing/incompatible runtime libraries.
+Synthetic stream-source fixtures continue accepting legacy selectors and do not
+advertise real codec enumeration or software availability.
+
 `configuration.sw_preset` and `configuration.sw_tune` pass unchanged to the encoder
 service and stream status, with limits of 128 and 256 bytes and no control
 characters. Omitted fields keep the prior wire shape. The opt-in x264 provider

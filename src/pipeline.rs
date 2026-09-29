@@ -1,3 +1,4 @@
+mod encoder;
 mod lifecycle;
 mod operations;
 mod output;
@@ -5,7 +6,7 @@ mod pacing;
 
 use crate::{
     model::{
-        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation,
+        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderSelection, OpenSpec, Operation,
         Settings, TouchSurface, error, valid_minimum_fps_target,
     },
     plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
@@ -24,6 +25,7 @@ use std::{
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
+    SelectEncoder,
     Capture,
     FallbackEnumerate,
     Encoder,
@@ -60,7 +62,8 @@ struct Stream {
     grace: Option<output::Grace>,
     output: String,
     capture_output: String,
-    encoder: EncoderIdentity,
+    encoder: EncoderSelection,
+    requested_encoder: EncoderSelection,
     configuration: Configuration,
     parent: Option<u64>,
     ending_parent: Option<u64>,
@@ -124,9 +127,11 @@ impl Stream {
 
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
-            Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder | Stage::Activating => {
-                "opening"
-            }
+            Stage::SelectEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+            | Stage::Activating => "opening",
             Stage::Running => "running",
             Stage::StopCapture | Stage::Draining => "draining",
             Stage::Failed => "cleanup_failed",
@@ -138,6 +143,7 @@ impl Stream {
             "state": state,
             "stage": stage_name(self.stage),
             "encoder": self.encoder,
+            "requested_encoder": self.requested_encoder,
             "packet_boundaries": self.packet_boundaries,
             "supports_packet_boundaries": true,
             "output": self.output,
@@ -294,7 +300,8 @@ impl Pipeline {
                 };
                 if matches!(
                     value.stage,
-                    Stage::Capture
+                    Stage::SelectEncoder
+                        | Stage::Capture
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
                         | Stage::Activating
@@ -342,6 +349,7 @@ impl Pipeline {
             Some("constant_rate_requires_wgc")
         } else if !valid_minimum_fps_target(minimum_fps_target)
             || !configuration.validate()
+            || encoder.validate().is_err()
             || output.is_empty()
             || output.len() > 512
             || output.chars().any(char::is_control)
@@ -401,6 +409,12 @@ impl Pipeline {
                 grace: None,
                 capture_output: output.clone(),
                 output,
+                requested_encoder: encoder.clone(),
+                stage: if matches!(encoder, EncoderSelection::Identity(_)) {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                },
                 encoder,
                 configuration,
                 parent: Some(request),
@@ -416,8 +430,7 @@ impl Pipeline {
                 capture_operation: format!("{operation}-capture-0"),
                 operation,
                 capture_attempt: 0,
-                no_resources: false,
-                stage: Stage::Capture,
+                no_resources: true,
                 retries: 0,
                 error: None,
                 next_frame: Instant::now(),
@@ -450,6 +463,11 @@ impl Pipeline {
             )
         {
             stream.cleanup("request_ended");
+        }
+        if stream.stage == Stage::SelectEncoder
+            && stream.opened_at.elapsed() >= Duration::from_secs(5)
+        {
+            stream.cleanup("encoder_selection_timeout");
         }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
             output::tick(stream, id, &self.queues, plane);
@@ -664,7 +682,9 @@ fn advance(
         let Some(result) = rpc::result(send, request) else {
             return false;
         };
-        if result.is_err() {
+        if result.is_err() || stream.stage == Stage::SelectEncoder {
+            // Enumeration owns no native resource, but its child result must be released
+            // before capture allocation or reporting a selection failure.
             stream.unsettled = Some(request);
         }
         stream.pending = None;
@@ -707,7 +727,7 @@ fn advance(
     };
     let parent = if matches!(
         stream.stage,
-        Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
+        Stage::SelectEncoder | Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
     ) {
         stream.parent
     } else {
@@ -757,6 +777,7 @@ fn advance(
 fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
+        Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::Capture => {
             let mut request = json!({
                 "action":"open",
@@ -814,6 +835,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
 
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
+        Stage::SelectEncoder => "select-encoder",
         Stage::Capture => "capture",
         Stage::FallbackEnumerate => "fallback-enumerate",
         Stage::Encoder => "encoder",
@@ -832,7 +854,8 @@ fn stage_name(stage: Stage) -> &'static str {
 fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
-        Stage::Capture
+        Stage::SelectEncoder
+            | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::Activating
@@ -869,6 +892,17 @@ fn apply_result(
             return false;
         }
     };
+    if stream.stage == Stage::SelectEncoder {
+        match encoder::resolve(&stream.encoder, &payload) {
+            Ok(identity) => {
+                stream.encoder = EncoderSelection::Identity(identity);
+                stream.stage = Stage::Capture;
+                stream.retries = 0;
+            }
+            Err(code) => stream.cleanup(code),
+        }
+        return false;
+    }
     let success = payload.get("ok").and_then(Value::as_bool) == Some(true);
     let missing = rpc::missing(&payload);
     if stream.stage == Stage::Capture

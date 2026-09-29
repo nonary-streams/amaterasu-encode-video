@@ -1,3 +1,4 @@
+pub use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -90,17 +91,6 @@ pub struct Configuration {
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
 }
 
-/// Stable identity of the selected encoder MFT.  The video module passes this
-/// opaque, validated value to the encoder service; it never converts it to an
-/// enumeration ordinal.
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EncoderIdentity {
-    pub clsid: String,
-    pub hardware_url: Option<String>,
-    pub friendly_name: String,
-}
-
 /// Provider-reported source size and logical touch units. Desktop geometry does
 /// not establish these dimensions, so video never derives them from that field.
 #[derive(Deserialize)]
@@ -153,7 +143,7 @@ pub struct OpenSpec {
     pub wgc_pacing_smoothing: bool,
     pub minimum_fps_target: f64,
     pub output: String,
-    pub encoder: EncoderIdentity,
+    pub encoder: EncoderSelection,
     pub configuration: Configuration,
 }
 
@@ -167,7 +157,7 @@ pub enum Operation {
         wgc_pacing_smoothing: bool,
         minimum_fps_target: f64,
         output: String,
-        encoder: EncoderIdentity,
+        encoder: EncoderSelection,
         configuration: Configuration,
     },
     Lookup {
@@ -206,7 +196,7 @@ enum OperationInput {
         #[serde(default = "default_minimum_fps_target")]
         minimum_fps_target: f64,
         output: String,
-        encoder: EncoderIdentity,
+        encoder: EncoderSelection,
         configuration: Configuration,
     },
     Lookup {
