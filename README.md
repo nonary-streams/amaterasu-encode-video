@@ -127,6 +127,13 @@ with no control characters. x264 validates the strings at software Open;
 unsupported names return `invalid_software_configuration`. Native numeric
 presets and combined tunes accepted by x264 remain valid. Empty tune means no
 additional tuning; empty preset is passed unchanged for x264 validation.
+The current upstream x264 presets are `ultrafast`, `superfast`, `veryfast`,
+`faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, and `placebo`; its numeric
+indices are also accepted. Tunes include `film`, `animation`, `grain`,
+`stillimage`, `psnr`, `ssim`, `fastdecode`, and `zerolatency`. Compatible combined
+tunes such as `film,zerolatency` are accepted; incompatible combinations fail at
+Open. The product editor retains raw strings instead of narrowing them to this
+list, since installed codec vocabulary is authoritative.
 Hardware sessions preserve these fields as requested metadata without applying
 software-only policy, matching the reference's backend-specific behavior.
 
@@ -160,8 +167,10 @@ cargo test -p amaterasu-encode --features software-x264 software_ -- --ignored
 
 These tests require a matching installed x264 runtime; independent decode tests
 also require `ffmpeg`. Windows/macOS x264 packaging and runtime builds, live
-desktop capture/client playback, sustained performance, and complete product
-persistence/launch selection remain separate qualification gates. Neither
+desktop capture/client playback and sustained performance remain separate
+qualification gates. Product v19 now persists and snapshots these tuning fields
+through signed host/application/certificate-bound client policy; see the
+[NVHTTP policy](../nvhttp/README.md#software-encoder-policy). Neither
 `global:sw_preset` nor `global:sw_tune` is fully verified by this backend alone.
 
 The Windows backend uses official `windows` crate COM bindings. A dedicated
