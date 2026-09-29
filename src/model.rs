@@ -24,6 +24,11 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Software x264 preset/tune; hardware backends leave these unapplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
     /// Zero leaves reference-frame selection to the encoder; one requires a
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -87,7 +92,18 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Configuration {
+    pub fn software_preset(&self) -> &str {
+        self.sw_preset.as_deref().unwrap_or("superfast")
+    }
+    pub fn software_tune(&self) -> &str {
+        self.sw_tune.as_deref().unwrap_or("zerolatency")
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
+        for (value, maximum) in [(self.software_preset(), 128), (self.software_tune(), 256)] {
+            if value.len() > maximum || value.chars().any(char::is_control) {
+                return Err("invalid_software_configuration");
+            }
+        }
         if self.nvenc_h264_cavlc {
             return Err("nvenc_h264_cavlc_unsupported");
         }
@@ -188,6 +204,41 @@ pub struct Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_options_preserve_defaults_raw_strings_and_legacy_shape() {
+        let legacy = serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":1000000});
+        let configuration: Configuration = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(configuration.software_preset(), "superfast");
+        assert_eq!(configuration.software_tune(), "zerolatency");
+        assert_eq!(serde_json::to_value(configuration).unwrap(), legacy);
+        for (field, limit) in [("sw_preset", 128), ("sw_tune", 256)] {
+            for value in ["".to_owned(), "film,zerolatency".into(), "x".repeat(limit)] {
+                let mut request = legacy.clone();
+                request[field] = serde_json::json!(value);
+                let configuration: Configuration = serde_json::from_value(request.clone()).unwrap();
+                assert!(configuration.validate().is_ok());
+                assert_eq!(serde_json::to_value(configuration).unwrap(), request);
+            }
+            for value in [
+                "bad\0option".into(),
+                "bad\noption".into(),
+                "x".repeat(limit + 1),
+            ] {
+                let mut request = legacy.clone();
+                request[field] = serde_json::json!(value);
+                assert_eq!(
+                    serde_json::from_value::<Configuration>(request)
+                        .unwrap()
+                        .validate(),
+                    Err("invalid_software_configuration")
+                );
+            }
+            let mut request = legacy.clone();
+            request[field] = serde_json::json!(1);
+            assert!(serde_json::from_value::<Configuration>(request).is_err());
+        }
+    }
 
     #[test]
     fn encoder_identity_is_bounded_and_nonempty() {
@@ -391,6 +442,8 @@ mod tests {
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
 
         assert_eq!(configuration.validate(), Err("nvenc_preset_unsupported"));

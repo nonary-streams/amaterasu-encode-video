@@ -818,6 +818,8 @@ mod tests {
             nvenc_h264_cavlc: true,
             nvenc_spatial_aq: false,
             amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -843,6 +845,8 @@ mod tests {
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: true,
             amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -868,6 +872,8 @@ mod tests {
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,
             amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Realtime,
+            sw_preset: None,
+            sw_tune: None,
         };
         let identity = EncoderIdentity {
             clsid: "test-clsid".into(),
@@ -896,6 +902,8 @@ mod tests {
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,
             amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         assert!(config.validate().is_ok());
         let selected = devices

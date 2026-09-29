@@ -1,7 +1,9 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Encoder, enumerate, last_failure, metrics};
+use windows as hardware;
+mod x264;
+pub use x264::availability as software_availability;
 #[cfg(not(windows))]
 mod unsupported {
     use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
@@ -50,5 +52,60 @@ mod unsupported {
     }
 }
 
+pub use hardware::{last_failure, metrics};
 #[cfg(not(windows))]
-pub use unsupported::{Encoder, enumerate, last_failure, metrics};
+use unsupported as hardware;
+
+use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
+
+pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
+    let software = x264::description();
+    let mut encoders = match hardware::enumerate() {
+        Ok(encoders) => encoders,
+        // A missing hardware device must not hide an independently available
+        // software backend; diagnostics remain visible in enumeration output.
+        Err(_) if software.is_some() => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    encoders.extend(software);
+    Ok(encoders)
+}
+
+pub enum Encoder {
+    Hardware(Box<hardware::Encoder>),
+    Software(Box<x264::Encoder>),
+}
+
+impl Encoder {
+    pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
+        if x264::selected(identity) {
+            x264::Encoder::open(identity, config).map(|encoder| Self::Software(Box::new(encoder)))
+        } else {
+            hardware::Encoder::open(identity, config)
+                .map(|encoder| Self::Hardware(Box::new(encoder)))
+        }
+    }
+    pub fn submit(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<(), &'static str> {
+        match self {
+            Self::Hardware(encoder) => encoder.submit(bytes, timestamp, force),
+            Self::Software(encoder) => encoder.submit(bytes, timestamp, force),
+        }
+    }
+    pub fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        match self {
+            Self::Hardware(encoder) => encoder.receive(),
+            Self::Software(encoder) => encoder.receive(),
+        }
+    }
+    pub fn drain(&mut self) -> Result<(), &'static str> {
+        match self {
+            Self::Hardware(encoder) => encoder.drain(),
+            Self::Software(encoder) => encoder.drain(),
+        }
+    }
+}

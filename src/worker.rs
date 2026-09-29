@@ -1,4 +1,4 @@
-//! Dedicated threads own COM apartments; no COM pointer crosses thread boundaries.
+//! Dedicated threads own native codec resources; no native pointer crosses threads.
 use crate::{
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
     platform,

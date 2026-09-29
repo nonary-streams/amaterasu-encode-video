@@ -79,7 +79,156 @@ fn configuration() -> Configuration {
         nvenc_h264_cavlc: false,
         nvenc_spatial_aq: false,
         amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
+        sw_preset: None,
+        sw_tune: None,
     }
+}
+
+#[cfg(amaterasu_x264)]
+#[test]
+#[ignore = "requires matching system x264 runtime"]
+fn software_native_contract_preserves_busy_input_retry_ownership_and_eos() {
+    struct SoftwareSink {
+        reject_data_once: bool,
+        reject_eos_once: bool,
+        attempted: Option<(Vec<u8>, u64, u64, u32)>,
+        accepted: Vec<(Vec<u8>, u64, u64, u32)>,
+    }
+    unsafe extern "C" fn collect(context: *mut c_void, packet: *const EncodedPacket) -> Status {
+        // SAFETY: test supplies live callback state and borrowed packet storage.
+        let sink = unsafe { &mut *context.cast::<SoftwareSink>() };
+        let packet = unsafe { &*packet };
+        let bytes = if packet.len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: callback-lifetime bytes are owned by the encoder session.
+            unsafe { std::slice::from_raw_parts(packet.data, packet.len) }.to_vec()
+        };
+        let value = (bytes, packet.timestamp_us, packet.sequence, packet.flags);
+        if packet.flags & FLAG_END_OF_STREAM != 0 && sink.reject_eos_once {
+            sink.reject_eos_once = false;
+            return MEDIA_BUSY;
+        }
+        if sink.reject_data_once {
+            sink.reject_data_once = false;
+            sink.attempted = Some(value);
+            return MEDIA_BUSY;
+        }
+        if let Some(attempted) = sink.attempted.take() {
+            assert_eq!(value, attempted, "refused packet must be retried exactly");
+        }
+        sink.accepted.push(value);
+        STATUS_OK
+    }
+    let mut sessions = Sessions::new(true);
+    let config = configuration();
+    let identity = crate::platform::enumerate()
+        .unwrap()
+        .into_iter()
+        .find(|encoder| !encoder.hardware)
+        .expect("software backend available")
+        .identity;
+    sessions
+        .open(
+            "alice",
+            identity.clone(),
+            config.clone(),
+            Some("software-test".into()),
+            true,
+        )
+        .unwrap();
+    let mut changed = config.clone();
+    changed.sw_tune = Some("film".into());
+    assert_eq!(
+        sessions.open(
+            "alice",
+            identity,
+            changed,
+            Some("software-test".into()),
+            true
+        ),
+        Err("operation_conflict")
+    );
+    let mut sink = SoftwareSink {
+        reject_data_once: true,
+        reject_eos_once: true,
+        attempted: None,
+        accepted: Vec::new(),
+    };
+    let callback = PacketSink {
+        context: (&mut sink as *mut SoftwareSink).cast(),
+        write: collect,
+    };
+    let bytes = vec![128; 20 * 16 * 3 / 2];
+    for sequence in 0..16 {
+        let frame = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_NV12,
+            stride: 20,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: (sequence + 1) * 16667,
+            sequence,
+        };
+        // SAFETY: test retains all declared frame storage during submission.
+        assert_eq!(
+            unsafe { sessions.submit("bob", 1, &frame, 0) },
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            unsafe { sessions.submit("alice", 1, &frame, u32::from(sequence == 7)) },
+            STATUS_OK
+        );
+    }
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 20,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 17 * 16667,
+        sequence: 16,
+    };
+    // SAFETY: frame allocation and callback state remain live for this exercise.
+    unsafe {
+        assert_eq!(sessions.submit("alice", 1, &frame, 0), MEDIA_BUSY);
+        assert_eq!(sessions.receive("bob", 1, callback), MEDIA_CLOSED);
+        assert_eq!(sessions.receive("alice", 1, callback), MEDIA_BUSY);
+        while sessions.receive("alice", 1, callback) == STATUS_OK {}
+        assert!((1..=16).contains(&sink.accepted.len()));
+        // The busy submission accepted nothing; the identical input is valid now.
+        assert_eq!(sessions.submit("alice", 1, &frame, 0), STATUS_OK);
+        assert_eq!(sessions.drain("bob", 1), MEDIA_CLOSED);
+        assert_eq!(sessions.drain("alice", 1), STATUS_OK);
+        assert_eq!(sessions.submit("alice", 1, &frame, 0), MEDIA_CLOSED);
+        // Frame threads may retain bounded delayed output even for zerolatency.
+        // Drain must deliver all of it before the deliberately refused EOS.
+        loop {
+            match sessions.receive("alice", 1, callback) {
+                STATUS_OK => {}
+                MEDIA_BUSY => break,
+                status => panic!("unexpected status before refused EOS: {status}"),
+            }
+        }
+        assert_eq!(sessions.receive("alice", 1, callback), STATUS_OK);
+        assert_eq!(sessions.receive("alice", 1, callback), MEDIA_PENDING);
+    }
+    assert_eq!(sink.accepted.len(), 18);
+    for (index, (bytes, timestamp, sequence, flags)) in sink.accepted[..17].iter().enumerate() {
+        assert_eq!(*sequence, index as u64);
+        assert_eq!(*timestamp, (index as u64 + 1) * 16667);
+        assert!(bytes.starts_with(&[0, 0, 0, 1]));
+        assert_ne!(flags & FLAG_END_OF_ACCESS_UNIT, 0);
+        assert_eq!(flags & FLAG_KEYFRAME != 0, index == 0 || index == 7);
+    }
+    assert_eq!(sink.accepted[17], (Vec::new(), 0, 0, FLAG_END_OF_STREAM));
+    sessions.close("alice", 1).unwrap();
+    assert!(matches!(
+        sessions.lookup("alice", "software-test"),
+        Err("session_not_found")
+    ));
 }
 
 fn encoder_identity() -> EncoderIdentity {

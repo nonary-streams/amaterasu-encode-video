@@ -1,23 +1,32 @@
-# Hardware H.264 encoder
+# Native H.264 encoder
 
 `amaterasu-encode` provides `amaterasu.encode/1` control and the matching native
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.
-Enabling on non-Windows hosts still enumerates no hardware and opening returns
-`unsupported_platform`; there is no synthetic or software encoding fallback.
+The default build enumerates Windows hardware MFTs; non-Windows hardware opens
+return `unsupported_platform`. The opt-in `software-x264` feature adds genuine
+CPU encoding when system x264 prerequisites are present. Selection is explicit;
+hardware failure never silently substitutes software or generated frames.
 
 Control requests are strict JSON; frames and encoded bytes never use JSON:
 
 ```json
 {"action":"enumerate"}
-{"action":"open","encoder":0,"operation_id":"video-1","configuration":{"width":1920,"height":1080,"fps":60,"bitrate":15000000,"max_reference_frames":1}}
+{"action":"open","encoder":{"clsid":"amaterasu.software.x264","hardware_url":null,"friendly_name":"x264 software H.264"},"operation_id":"video-1","configuration":{"width":1920,"height":1080,"fps":60,"bitrate":15000000,"max_reference_frames":1}}
 {"action":"lookup","operation_id":"video-1"}
 {"action":"status","session_id":1}
 {"action":"close","session_id":1}
 ```
 
-Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264",hardware:true}]}`.
-An index identifies the current Media Foundation enumeration, not a stable GPU ID.
+Enumeration returns descriptions with `identity`, `name`, `codec`, `hardware`,
+and optional `vendor_id`. Hardware selection retains the registered MFT
+identity. Available x264 is appended with `hardware:false`, `vendor_id:null`,
+and the exact identity above. The response additionally reports
+`software_encoder:{available,reason}`. Missing feature, target headers, or
+version-compatible runtime produce `x264_feature_disabled`,
+`x264_headers_unavailable`, or `x264_runtime_unavailable`; the software identity
+fails Open with that code. Registered codec availability does not guarantee
+configuration Open; opening validates actual codec parameters and resources.
 Open/lookup return `{ok:true,session_id,configuration,codec:"h264",max_reference_frames}`. Status adds
 `state:"open"|"draining"|"failed"`; close returns `{ok:true,session_id,state:"closed"}`.
 Errors contain only `{ok:false,code}`; native driver messages are not exposed.
@@ -25,7 +34,7 @@ Enumeration confirms a registered hardware NV12/H.264 transform, not that every
 configuration can open. Open negotiates the actual requested configuration.
 
 The optional operation ID is 1–128 ASCII graphic bytes. Repeating it with the
-same caller, encoder index and configuration returns the original session;
+same caller, encoder identity and configuration returns the original session;
 changed inputs conflict. A closed operation returns `session_closed` on open
 and `session_not_found` on lookup; it never respawns. Up to 128 operation records
 are retained per provider instance. Lookup is immediate-caller scoped and does
@@ -74,11 +83,86 @@ widths, malformed samples, and unsupported parameter records fail closed.
 Timestamps map packets back to submitted sequence numbers; no B-frame reordering
 is supported. Buffers are limited to 16 MiB per packet and sixteen queued packets.
 
-Drain stops new input, requests Media Foundation drain, and receives pending
+Drain stops new input, requests the selected backend drain, and receives pending
 output through the normal callback API before exactly one accepted empty EOS
 marker. Rejected EOS is retried. Close discards any undelivered output and shuts
 the transform down; callers wanting all output must drain and receive first.
 Session resources are released on close or module drop.
+
+## Software x264 selection and distribution
+
+Build with `cargo build -p amaterasu-encode --features software-x264` to opt in.
+This uses a small C adapter compiled against system `x264.h`/`x264_config.h` and
+loads the matching shared library at runtime. The adapter accesses versioned
+structures; Rust never duplicates their layouts. The loader requires the
+header's exact `x264_encoder_open_<build>` symbol and all used public functions,
+and keeps that library live until the encoder is closed. No x264 library or
+FFmpeg library is bundled or linked by the build. Existing locked `cc` and
+`libloading` crates provide compilation and native library loading.
+
+Native builds discover headers with `pkg-config --variable=includedir x264`.
+If discovery fails, the module still builds and reports headers unavailable.
+`AMATERASU_X264_INCLUDE_DIR` explicitly selects target development headers,
+including paths containing spaces; an invalid explicit directory fails the
+build. Cross builds never use host headers automatically and require that
+variable. A C compiler is required when headers are selected. At runtime the
+system loader searches versioned platform x264 names and then the usual
+unversioned name, always checking the versioned open symbol. Missing or mismatched
+libraries are unavailable, with no subprocess encoder fallback.
+
+The installed x264 header identifies its license as GPL-2.0-or-later; upstream
+also offers [commercial licensing](https://x264.org/licensing/). Shipping an
+x264-enabled integration requires a deliberate compatible licensing and source
+distribution policy or a suitable commercial license, required notices, and
+platform packaging qualification. Dynamic loading does not remove those
+licensing requirements. This change does not choose a repository-wide license,
+bundle codec binaries, or authorize an x264-enabled release. Default builds omit
+the x264 adapter. See [VideoLAN's x264 project](https://images.videolan.org/developers/x264.html)
+and the [public API header](https://github.com/mirror/x264/blob/master/x264.h).
+
+`configuration.sw_preset` and `configuration.sw_tune` are optional exact strings.
+Omission resolves to `superfast` and `zerolatency`, respectively, and preserves
+the prior wire shape. Presets are bounded to 128 bytes and tunes to 256 bytes,
+with no control characters. x264 validates the strings at software Open;
+unsupported names return `invalid_software_configuration`. Native numeric
+presets and combined tunes accepted by x264 remain valid. Empty tune means no
+additional tuning; empty preset is passed unchanged for x264 validation.
+Hardware sessions preserve these fields as requested metadata without applying
+software-only policy, matching the reference's backend-specific behavior.
+
+The adapter calls x264's preset/tune initializer before applying stream limits.
+It emits progressive 8-bit limited-range BT.709 Baseline H.264, no B pictures,
+Annex B with repeated SPS/PPS and AUD, and a very long IDR interval. Explicit
+forced IDR uses x264's IDR picture type and output NAL type is verified by the
+shared normalizer. ABR/VBV follows the requested bitrate (whole kbps), with a
+one-frame VBV target and two encoder threads. Required no-B, zero frame/sync
+lookahead, Baseline, color, bitrate and optional reference-frame constraints
+take precedence over preset/tune. Their other motion-search, analysis, and
+psychovisual choices affect real encoded pictures. Open checks effective
+parameters and rejects a maximum delay of sixteen frames or more, keeping the
+sixteen-entry native metadata queue live. Frame threading may retain a small
+bounded delay even with zerolatency.
+
+Each x264 encode call returns one complete access unit. Output storage is copied
+before another native encode can invalidate it. Native 100ns input timestamps
+return unchanged with the coded picture; the session retains sequence mapping.
+Drain flushes delayed pictures before returning no packet, so existing exact
+packet retry, owner checks, packet-boundary flags, and retried EOS remain intact.
+
+Real opt-in tests on Linux have encoded synthetic NV12, independently decoded
+every picture with FFmpeg, observed decoded picture differences for changed
+presets and tunes, checked forced IDR/timestamps, filled native backpressure,
+retried refused packet/EOS, and drained delayed frame-thread output:
+
+```text
+cargo test -p amaterasu-encode --features software-x264 software_ -- --ignored
+```
+
+These tests require a matching installed x264 runtime; independent decode tests
+also require `ffmpeg`. Windows/macOS x264 packaging and runtime builds, live
+desktop capture/client playback, sustained performance, and complete product
+persistence/launch selection remain separate qualification gates. Neither
+`global:sw_preset` nor `global:sw_tune` is fully verified by this backend alone.
 
 The Windows backend uses official `windows` crate COM bindings. A dedicated
 worker thread owns each COM apartment, Media Foundation runtime guard, hardware
@@ -95,8 +179,8 @@ Strict single-reference-frame sessions use the static
 Vibeshine documents `nvenc_preset` with numeric default `1` and choices `1` through
 `7` (P1 through P7). The request field is optional and omitted when absent to keep
 older wire payloads compatible. This NVENC-only setting applies only when NVENC is
-selected. This module currently has only a Media Foundation Transform (MFT)
-backend and no native NVENC backend, so supplying the field fails validation with
+selected. This module has hardware MFT and optional x264 backends, without native NVENC,
+so supplying the field fails validation with
 `nvenc_preset_unsupported`; no preset is applied here. NVENC preset support remains
 pending.
 
@@ -109,8 +193,8 @@ at `configuration.nvenc_h264_cavlc`; the product tokens are not valid at this ty
 module boundary. The omitted field defaults to `false` and serializes omitted for
 backward compatibility. Explicit `true` is parsed and preserved as data, then
 rejected with `nvenc_h264_cavlc_unsupported` during configuration and session
-validation and before Windows Media Foundation startup. This module has only
-hardware H.264 MFTs and no NVENC/CAVLC effect, so `false` preserves current MFT
+validation and before Windows Media Foundation startup. This module has hardware H.264 MFTs and optional x264,
+without NVENC/CAVLC effect, so `false` preserves current MFT
 behavior and enabling the option fails closed; NVENC CAVLC support remains pending.
 The source semantics are documented in the pinned [Vibeshine configuration
 reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_h264_cavlc)
@@ -123,8 +207,8 @@ Its `bool_f` parser reads the product setting, and NVENC maps it to
 module boundary. The omitted field defaults to `false` and serializes omitted
 for backward compatibility. Explicit `true` is parsed and retained, then
 rejected with `nvenc_spatial_aq_unsupported` during configuration and session
-validation and before Media Foundation startup. This module has only hardware
-H.264 MFTs and no NVENC spatial AQ effect, so `false` preserves current MFT
+validation and before Media Foundation startup. This module has hardware
+H.264 MFTs and optional x264, without NVENC spatial AQ effect, so `false` preserves current MFT
 behavior and enabling the option fails closed; NVENC spatial AQ support remains
 pending. The source behavior is documented in the pinned [Vibeshine
 configuration reference](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4be21c35bb07e28d1c100eb7d/docs/configuration.md#nvenc_spatial_aq)
@@ -135,7 +219,7 @@ and [`bool_f` mapping](https://github.com/Nonary/vibeshine/blob/457237db7e57f9c4
 from serialized configuration for compatibility with older strict consumers.
 Every explicit non-`auto` value fails validation with
 `amd_av1_latency_mode_unsupported`; the Windows open guard rejects it before
-Media Foundation startup. This provider currently exposes only H.264 MFTs and
+Media Foundation startup. This provider exposes H.264 MFTs and optional x264 and
 has no native AMD AMF AV1 backend, so these values are never applied to H.264 or
 silently dropped. AMD AMF/AV1 support and the policy effects remain pending.
 
@@ -152,7 +236,8 @@ No crash recovery or durable encoder sessions are claimed.
 This implementation is not yet qualified on a Windows GPU. Host tests exercise
 layout, parameter framing, native ownership, backpressure, sink refusal, EOS,
 close/drop, strict controls and factory lifetime using a fake encoder backend.
-Windows and Linux target Clippy builds validate conditional compilation. An
+Current host validation covers Linux feature-enabled and default builds. Windows
+target compilation remains a separate required gate for this software change. An
 ignored Windows-only test encodes synthetic NV12, forces IDR and drains; run it
 explicitly on supported hardware before treating this path as usable:
 
@@ -168,8 +253,9 @@ by these tests.
 Behavioral reference review used Vibeshine `src/nvenc/nvenc_config.h` and
 `src/nvenc/nvenc_encoded_frame.h` for real encoded frame/IDR expectations and its
 larger encoder policy surface. No source was copied or translated. Native NVENC,
-AMD AMF, Intel-specific controls, Linux backends, GPU texture import, HEVC, AV1,
-HDR/10-bit, reference-frame invalidation, rate-control tuning, quality presets,
+AMD AMF, Intel-specific controls, Linux hardware backends, GPU texture import,
+HEVC, AV1, HDR/10-bit, reference-frame invalidation, extended rate-control tuning,
+hardware quality presets,
 dynamic resolution, and full streaming parity remain unimplemented.
 
 Primary API references:

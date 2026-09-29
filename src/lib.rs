@@ -1,5 +1,5 @@
-//! Hardware H.264 encoding control and native CPU-frame interface.
-#[cfg(any(windows, test))]
+//! Native hardware and opt-in software H.264 encoding with owned CPU input.
+#[cfg(any(windows, test, amaterasu_x264))]
 mod bitstream;
 mod layout;
 mod model;
@@ -109,8 +109,10 @@ impl EncodeModule {
                     json!({"stage":detail.stage,"hresult":format!("0x{:08x}", detail.hresult)})
                 });
                 let metrics = platform::metrics();
+                let software_unavailable = platform::software_availability().err();
                 Ok(
                     json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders,"diagnostic":diagnostic,
+                        "software_encoder":{"available":software_unavailable.is_none(),"reason":software_unavailable},
                         "metrics":{"need_input_events":metrics.need_input_events,"have_output_events":metrics.have_output_events,
                         "other_events":metrics.other_events,"process_input_calls":metrics.process_input_calls,
                         "process_output_calls":metrics.process_output_calls}}),
