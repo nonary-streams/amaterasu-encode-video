@@ -2,7 +2,7 @@
 
 `amaterasu_video` provides control and native service `amaterasu.video/1`. Product
 coordination stays in this independently built library. It opens an allowlisted capture
-stream and Media Foundation encoder session asynchronously, then moves borrowed
+stream and explicitly selected native encoder session asynchronously, then moves borrowed
 CPU frames directly into the encoder's copying submit API. Encoded packets reach
 consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 
@@ -23,13 +23,21 @@ there is no synthetic frame or software fallback.
 ## API
 
 ```json
-{"action":"open","output":"<capture enumerate output id>","encoder":0,"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
+{"action":"open","output":"<capture enumerate output id>","encoder":{"clsid":"<encoder enumerate identity>","hardware_url":null,"friendly_name":"<encoder enumerate name>"},"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"status"}
 {"action":"status","stream":1}
 {"action":"force_idr","stream":1}
 {"action":"drain","stream":1}
 {"action":"close","stream":1}
 ```
+
+Encoder selection passes the complete enumeration identity unchanged. Optional
+`configuration.sw_preset` and `configuration.sw_tune` pass unchanged to the encoder
+service and stream status, with limits of 128 and 256 bytes and no control
+characters. Omitted fields keep the prior wire shape. The opt-in x264 provider
+resolves its `superfast` and `zerolatency` defaults; hardware leaves these software
+options unapplied. Availability, build prerequisites, and licensing are documented
+in [the encoder README](../encode/README.md#software-x264-selection-and-distribution).
 
 Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
 `"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned

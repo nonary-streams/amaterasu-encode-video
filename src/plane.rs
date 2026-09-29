@@ -600,6 +600,8 @@ mod tests {
             bitrate: 100_000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let mut submission = Submission {
             api: &api,
@@ -666,6 +668,8 @@ mod tests {
             bitrate: 100_000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let bytes = [0x5a; 16 * 16 * 4];
         let captured = CaptureFrameV1_3 {
@@ -770,6 +774,8 @@ mod tests {
             bitrate: 100_000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let mut source_bytes = [0x6b; 16 * 16 * 4];
         let captured = CpuFrame {
@@ -867,6 +873,8 @@ mod tests {
             bitrate: 100000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let bytes = [0; 1024];
         let frame = CpuFrame {
@@ -921,6 +929,8 @@ mod tests {
             bitrate: 100_000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         };
         let bytes = [0; 16 * 16 * 4];
         let frame = CpuFrame {

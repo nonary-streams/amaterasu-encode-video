@@ -77,6 +77,10 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_tune: Option<String>,
     /// Zero leaves reference-frame selection to the encoder; one requires a
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -128,7 +132,15 @@ impl Configuration {
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 1
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
+            && valid_software_option(&self.sw_preset, 128)
+            && valid_software_option(&self.sw_tune, 256)
     }
+}
+
+fn valid_software_option(value: &Option<String>, maximum: usize) -> bool {
+    value
+        .as_deref()
+        .is_none_or(|value| value.len() <= maximum && !value.chars().any(char::is_control))
 }
 
 #[derive(Clone, PartialEq)]
@@ -336,6 +348,27 @@ pub fn valid_minimum_fps_target(value: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_encoder_configuration_preserves_options_and_rejects_invalid_bounds() {
+        let mut request = open_request();
+        request["configuration"]["sw_preset"] = json!("slower");
+        request["configuration"]["sw_tune"] = json!("film,zerolatency");
+        let Operation::Open { configuration, .. } =
+            serde_json::from_value::<Operation>(request).unwrap()
+        else {
+            panic!("open expected")
+        };
+        assert!(configuration.validate());
+        assert_eq!(configuration.sw_preset.as_deref(), Some("slower"));
+        assert_eq!(configuration.sw_tune.as_deref(), Some("film,zerolatency"));
+        let mut invalid = configuration.clone();
+        invalid.sw_preset = Some("x".repeat(129));
+        assert!(!invalid.validate());
+        invalid.sw_preset = None;
+        invalid.sw_tune = Some("bad\0option".into());
+        assert!(!invalid.validate());
+    }
 
     fn open_request() -> Value {
         json!({

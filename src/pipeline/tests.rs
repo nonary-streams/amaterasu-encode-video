@@ -372,8 +372,46 @@ fn open() -> Operation {
             bitrate: 5_000_000,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
+            sw_preset: None,
+            sw_tune: None,
         },
     }
+}
+
+#[test]
+fn software_options_reach_encoder_open_and_stream_status_unchanged() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open {
+        configuration,
+        encoder,
+        ..
+    } = &mut operation
+    else {
+        unreachable!()
+    };
+    configuration.sw_preset = Some("ultrafast".into());
+    configuration.sw_tune = Some("grain,zerolatency".into());
+    encoder.clsid = "amaterasu.software.x264".into();
+    encoder.hardware_url = None;
+    encoder.friendly_name = "x264 software H.264".into();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE
+            && payload["encoder"]["clsid"] == "amaterasu.software.x264"
+            && payload["configuration"]["sw_preset"] == "ultrafast"
+            && payload["configuration"]["sw_tune"] == "grain,zerolatency"
+    )));
+    assert_eq!(
+        runtime.completed[0].1["configuration"]["sw_preset"],
+        "ultrafast"
+    );
+    assert_eq!(
+        runtime.completed[0].1["configuration"]["sw_tune"],
+        "grain,zerolatency"
+    );
 }
 
 #[test]
