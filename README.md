@@ -72,7 +72,8 @@ selection behavior and H.264-only capabilities.
 service and stream status, with limits of 128 and 256 bytes and no control
 characters. The client-negotiated `configuration.slices_per_frame` and signed
 32-bit `configuration.min_threads` resolve to
-`max(slices_per_frame, min_threads)` for software x264. QP defaults to 28 and
+`max(slices_per_frame, min_threads)` for software x264, subject to frame-size
+and backend limits. QP defaults to 28 and
 passes through this snapshot, but x264 ABR ignores it and Amaterasu has no VAAPI
 constant-QP consumer yet. Omitted defaults preserve the prior wire shape. The
 opt-in x264 provider resolves its `superfast` and `zerolatency` defaults; hardware
