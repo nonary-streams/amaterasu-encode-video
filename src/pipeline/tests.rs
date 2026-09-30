@@ -32,6 +32,10 @@ struct Runtime {
     capture_enumeration_override: Option<Value>,
     encoder_enumeration: Option<Value>,
     hold_encoder_enumeration: bool,
+    encoder_probe_replies: BTreeMap<String, Value>,
+    hold_encoder_probes: bool,
+    lose_probe_accept: bool,
+    encoder_open_error: Option<&'static str>,
 }
 
 impl Runtime {
@@ -85,6 +89,16 @@ impl Runtime {
                             }]
                         })
                     })
+                } else if service == ENCODE && action == "probe" {
+                    self.encoder_probe_replies
+                        .get(payload["encoder"]["clsid"].as_str().unwrap())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            probe_reply(&payload["encoder"], &payload["configuration"], true)
+                        })
+                } else if service == ENCODE && action == "open" && self.encoder_open_error.is_some()
+                {
+                    error(self.encoder_open_error.unwrap())
                 } else if let Some(provider) = capture_provider {
                     if action == "enumerate" {
                         if let Some(reply) = &self.capture_enumeration_override {
@@ -144,12 +158,23 @@ impl Runtime {
                     result
                 };
                 self.pending.insert(self.next, result);
-                if std::mem::take(&mut self.lose_accept) {
+                if std::mem::take(&mut self.lose_accept)
+                    || action == "probe" && std::mem::take(&mut self.lose_probe_accept)
+                {
                     return Err("lost accepted reply".into());
                 }
                 Response::Accepted { id: self.next }
             }
             Command::TakeResult { request } => {
+                if self.hold_encoder_probes
+                    && self.commands.iter().any(|command| {
+                        matches!(command, Command::Request { service, operation_id, payload, .. }
+                        if service == ENCODE && payload["action"] == "probe"
+                        && self.operations.get(operation_id) == Some(&request))
+                    })
+                {
+                    return Ok(Response::Pending);
+                }
                 if self.hold_encoder_enumeration
                     && self.commands.iter().any(|command| {
                         matches!(command, Command::Request { service, operation_id, payload, .. }
@@ -316,6 +341,27 @@ fn encoder_identity() -> EncoderIdentity {
         hardware_url: Some("test://encoder/nvidia".into()),
         friendly_name: "Test NVIDIA H.264".into(),
     }
+}
+
+fn probe_reply(identity: &Value, configuration: &Value, usable: bool) -> Value {
+    json!({"ok":true,"codec":"h264","encoder":identity,"configuration":configuration,
+        "usable":usable,"settled":true,
+        "code":if usable { None } else { Some("encoder_unusable") },
+        "reason":if usable { None } else { Some("encoder_open_failed") }})
+}
+
+fn auto_open() -> Operation {
+    let mut operation = open();
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    operation
+}
+
+fn candidate_description(clsid: &str, hardware: bool) -> Value {
+    json!({"identity":{"clsid":clsid,"hardware_url":null,"friendly_name":"H.264"},
+        "name":"H.264","codec":"h264","hardware":hardware,"vendor_id":null})
 }
 fn setup() -> (Pipeline, Runtime, FakePlane) {
     setup_with_providers([CaptureProvider::Dxgi].into())
@@ -2722,6 +2768,191 @@ fn unavailable_selection_releases_enumeration_without_allocating_resources() {
                 .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
         );
         assert_eq!(runtime.completed.last().unwrap().1["code"], reason);
+    }
+}
+
+#[test]
+fn auto_probes_all_hardware_before_software_and_freezes_the_usable_identity() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = auto_open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    configuration.sw_preset = Some("ultrafast".into());
+    configuration.sw_tune = Some("film,zerolatency".into());
+    let frozen_configuration = json!(configuration);
+    let software = candidate_description(amaterasu_module_sdk::SOFTWARE_ENCODER_ID, false);
+    let first = candidate_description("first-hardware", true);
+    let second = candidate_description("second-hardware", true);
+    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,
+        "encoders":[software,first,second]}));
+    for candidate in [&first, &second] {
+        runtime.encoder_probe_replies.insert(
+            candidate["identity"]["clsid"].as_str().unwrap().into(),
+            probe_reply(&candidate["identity"], &frozen_configuration, false),
+        );
+    }
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+    let probes: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "probe" => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        probes
+            .iter()
+            .map(|payload| payload["encoder"]["clsid"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "first-hardware",
+            "second-hardware",
+            amaterasu_module_sdk::SOFTWARE_ENCODER_ID
+        ]
+    );
+    assert!(
+        probes
+            .iter()
+            .all(|payload| payload["configuration"] == frozen_configuration)
+    );
+    let stream = &pipeline.streams[&1];
+    assert!(stream.stage == Stage::Running);
+    assert_eq!(json!(stream.encoder), software["identity"]);
+    assert_eq!(json!(stream.requested_encoder), "auto");
+    assert_eq!(stream.encoder_probe_attempt, 3);
+    assert_eq!(runtime.open_effects, 2);
+    let capture_position = runtime.commands.iter().position(|command|
+        matches!(command, Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "open")).unwrap();
+    let last_probe_id = runtime
+        .operations
+        .iter()
+        .find(|(operation, _)| operation.ends_with("probe-encoder-3"))
+        .unwrap()
+        .1;
+    let release_position = runtime.commands.iter().position(|command|
+        matches!(command, Command::ReleaseResult {request} if request == last_probe_id)).unwrap();
+    assert!(release_position < capture_position);
+    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,"encoders":[]}));
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    assert_eq!(json!(pipeline.streams[&1].encoder), software["identity"]);
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "enumerate")).count(), 1);
+}
+
+#[test]
+fn explicit_encoder_selection_never_probes_or_substitutes_another_candidate() {
+    for selection in [
+        EncoderSelection::Identity(encoder_identity()),
+        EncoderSelection::Index(0),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        runtime.encoder_open_error = Some("encoder_open_failed");
+        let mut operation = open();
+        let Operation::Open { encoder, .. } = &mut operation else {
+            unreachable!()
+        };
+        *encoder = selection;
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 20);
+        assert!(!runtime.commands.iter().any(|command| matches!(command,
+            Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "probe")));
+        assert!(pipeline.streams.is_empty());
+        let attempts: Vec<_> = runtime
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == ENCODE && payload["action"] == "open" => Some(&payload["encoder"]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, [&json!(encoder_identity())]);
+    }
+}
+
+#[test]
+fn auto_rejects_uncorrelated_or_unsettled_probe_results_before_capture() {
+    for mutation in [
+        "configuration",
+        "identity",
+        "codec",
+        "settled",
+        "code",
+        "transport_error",
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        let operation = auto_open();
+        let Operation::Open { configuration, .. } = &operation else {
+            unreachable!()
+        };
+        let mut reply = probe_reply(&json!(encoder_identity()), &json!(configuration), false);
+        match mutation {
+            "configuration" => reply["configuration"]["sw_tune"] = json!(""),
+            "identity" => reply["encoder"]["hardware_url"] = json!("other-device"),
+            "codec" => reply["codec"] = json!("av1"),
+            "settled" => reply["settled"] = json!(false),
+            "code" => reply["code"] = json!("permission_denied"),
+            "transport_error" => reply = error("encoder_probe_cleanup_failed"),
+            _ => unreachable!(),
+        }
+        runtime
+            .encoder_probe_replies
+            .insert(encoder_identity().clsid, reply);
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 8);
+        assert_eq!(runtime.open_effects, 0, "{mutation}");
+        assert!(pipeline.streams.is_empty(), "{mutation}");
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            "invalid_encoder_probe_reply"
+        );
+    }
+}
+
+#[test]
+fn auto_probe_deadline_cancellation_uncertainty_and_result_release_gate_capture() {
+    for boundary in ["deadline", "cancel", "uncertain", "release"] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        runtime.hold_encoder_probes = true;
+        pipeline.handle("alice", 99, auto_open(), &mut |command| {
+            runtime.send(command)
+        });
+        tick(&mut pipeline, &mut runtime, &mut plane, 2);
+        assert!(pipeline.streams[&1].stage == Stage::ProbeEncoder);
+        if boundary == "uncertain" {
+            runtime.lose_probe_accept = true;
+        }
+        tick(&mut pipeline, &mut runtime, &mut plane, 1);
+        assert_eq!(runtime.open_effects, 0);
+        match boundary {
+            "deadline" => {
+                pipeline.streams.get_mut(&1).unwrap().opened_at =
+                    Instant::now() - Duration::from_secs(6)
+            }
+            "cancel" => runtime.cancelled = true,
+            "release" => {
+                runtime.hold_encoder_probes = false;
+                runtime.release_failures = 10;
+            }
+            "uncertain" => {}
+            _ => unreachable!(),
+        }
+        tick(&mut pipeline, &mut runtime, &mut plane, 6);
+        assert_eq!(runtime.open_effects, 0, "{boundary}");
+        assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+            Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "probe")).count(),
+            if boundary == "uncertain" { 2 } else { 1 }, "{boundary}");
+        if boundary == "release" {
+            assert!(pipeline.streams[&1].unsettled.is_some());
+        } else {
+            assert!(pipeline.streams.is_empty(), "{boundary}");
+        }
     }
 }
 

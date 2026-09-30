@@ -1,4 +1,5 @@
 //! Resolve a selection before allocation, then keep its stable identity frozen.
+use crate::model::Configuration;
 use amaterasu_module_sdk::{
     EncoderBackend, EncoderIdentity, EncoderSelection, SOFTWARE_ENCODER_ID,
 };
@@ -19,10 +20,7 @@ struct Description {
     _vendor_id: Option<u32>,
 }
 
-pub(super) fn resolve(
-    selection: &EncoderSelection,
-    payload: &Value,
-) -> Result<EncoderIdentity, &'static str> {
+fn descriptions(payload: &Value) -> Result<Vec<Description>, &'static str> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("encoder_enumeration_failed");
     }
@@ -53,6 +51,33 @@ pub(super) fn resolve(
         }
         encoders.push(encoder);
     }
+    Ok(encoders)
+}
+
+pub(super) fn auto_candidates(payload: &Value) -> Result<Vec<EncoderIdentity>, &'static str> {
+    let encoders = descriptions(payload)?;
+    let candidates: Vec<_> = encoders
+        .iter()
+        .filter(|entry| entry.hardware)
+        .chain(
+            encoders
+                .iter()
+                .filter(|entry| !entry.hardware && entry.identity.clsid == SOFTWARE_ENCODER_ID),
+        )
+        .map(|entry| entry.identity.clone())
+        .collect();
+    if candidates.is_empty() {
+        Err("encoder_unavailable")
+    } else {
+        Ok(candidates)
+    }
+}
+
+pub(super) fn resolve(
+    selection: &EncoderSelection,
+    payload: &Value,
+) -> Result<EncoderIdentity, &'static str> {
+    let encoders = descriptions(payload)?;
     let software = || {
         encoders
             .iter()
@@ -86,6 +111,53 @@ pub(super) fn resolve(
                 "encoder_unavailable"
             }
         })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeReply {
+    ok: bool,
+    codec: String,
+    encoder: EncoderIdentity,
+    configuration: Configuration,
+    usable: bool,
+    settled: bool,
+    code: Option<String>,
+    reason: Option<String>,
+}
+
+/// A negative result authorizes fallback only after exact correlation and teardown.
+pub(super) fn probe_result(
+    identity: &EncoderIdentity,
+    configuration: &Configuration,
+    payload: &Value,
+) -> Result<Option<String>, &'static str> {
+    let reply: ProbeReply =
+        serde_json::from_value(payload.clone()).map_err(|_| "invalid_encoder_probe_reply")?;
+    if !reply.ok
+        || !reply.settled
+        || reply.codec != "h264"
+        || &reply.encoder != identity
+        || &reply.configuration != configuration
+    {
+        return Err("invalid_encoder_probe_reply");
+    }
+    if reply.usable {
+        return (reply.code.is_none() && reply.reason.is_none())
+            .then_some(None)
+            .ok_or("invalid_encoder_probe_reply");
+    }
+    let Some(reason) = reply.reason else {
+        return Err("invalid_encoder_probe_reply");
+    };
+    if reply.code.as_deref() != Some("encoder_unusable")
+        || reason.is_empty()
+        || reason.len() > 128
+        || reason.chars().any(char::is_control)
+    {
+        return Err("invalid_encoder_probe_reply");
+    }
+    Ok(Some(reason))
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use crate::{
     rpc::{self, Send},
 };
 use amaterasu_media::CaptureGeometry;
-use amaterasu_module_sdk::{Command, Response};
+use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -26,6 +26,7 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
     SelectEncoder,
+    ProbeEncoder,
     Capture,
     FallbackEnumerate,
     Encoder,
@@ -64,6 +65,9 @@ struct Stream {
     capture_output: String,
     encoder: EncoderSelection,
     requested_encoder: EncoderSelection,
+    encoder_candidates: VecDeque<EncoderIdentity>,
+    encoder_probe_attempt: u8,
+    encoder_probe_reason: Option<String>,
     configuration: Configuration,
     parent: Option<u64>,
     ending_parent: Option<u64>,
@@ -128,6 +132,7 @@ impl Stream {
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
             Stage::SelectEncoder
+            | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
@@ -144,6 +149,8 @@ impl Stream {
             "stage": stage_name(self.stage),
             "encoder": self.encoder,
             "requested_encoder": self.requested_encoder,
+            "encoder_probe_attempts": self.encoder_probe_attempt,
+            "encoder_probe_reason": self.encoder_probe_reason,
             "packet_boundaries": self.packet_boundaries,
             "supports_packet_boundaries": true,
             "output": self.output,
@@ -410,6 +417,9 @@ impl Pipeline {
                 capture_output: output.clone(),
                 output,
                 requested_encoder: encoder.clone(),
+                encoder_candidates: VecDeque::new(),
+                encoder_probe_attempt: 0,
+                encoder_probe_reason: None,
                 stage: if matches!(encoder, EncoderSelection::Identity(_)) {
                     Stage::Capture
                 } else {
@@ -464,7 +474,7 @@ impl Pipeline {
         {
             stream.cleanup("request_ended");
         }
-        if stream.stage == Stage::SelectEncoder
+        if matches!(stream.stage, Stage::SelectEncoder | Stage::ProbeEncoder)
             && stream.opened_at.elapsed() >= Duration::from_secs(5)
         {
             stream.cleanup("encoder_selection_timeout");
@@ -682,9 +692,9 @@ fn advance(
         let Some(result) = rpc::result(send, request) else {
             return false;
         };
-        if result.is_err() || stream.stage == Stage::SelectEncoder {
-            // Enumeration owns no native resource, but its child result must be released
-            // before capture allocation or reporting a selection failure.
+        if result.is_err() || matches!(stream.stage, Stage::SelectEncoder | Stage::ProbeEncoder) {
+            // Selection children retain no codec session. Their result must be
+            // released before another probe, capture allocation or failure.
             stream.unsettled = Some(request);
         }
         stream.pending = None;
@@ -712,6 +722,11 @@ fn advance(
             "{}-capture-attempt-{}",
             stream.operation, stream.capture_attempt
         )
+    } else if stream.stage == Stage::ProbeEncoder {
+        format!(
+            "{}-probe-encoder-{}",
+            stream.operation, stream.encoder_probe_attempt
+        )
     } else if stream.stage == Stage::FallbackEnumerate {
         format!(
             "{}-fallback-enumerate-{}-{}",
@@ -727,7 +742,11 @@ fn advance(
     };
     let parent = if matches!(
         stream.stage,
-        Stage::SelectEncoder | Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
+        Stage::SelectEncoder
+            | Stage::ProbeEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
     ) {
         stream.parent
     } else {
@@ -778,6 +797,13 @@ fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
         Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
+        Stage::ProbeEncoder => (
+            ENCODE,
+            json!({
+                "action":"probe", "encoder":stream.encoder,
+                "configuration":stream.configuration,
+            }),
+        ),
         Stage::Capture => {
             let mut request = json!({
                 "action":"open",
@@ -836,6 +862,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
         Stage::SelectEncoder => "select-encoder",
+        Stage::ProbeEncoder => "probe-encoder",
         Stage::Capture => "capture",
         Stage::FallbackEnumerate => "fallback-enumerate",
         Stage::Encoder => "encoder",
@@ -855,6 +882,7 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
         Stage::SelectEncoder
+            | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
@@ -893,11 +921,45 @@ fn apply_result(
         }
     };
     if stream.stage == Stage::SelectEncoder {
+        if matches!(
+            stream.requested_encoder,
+            EncoderSelection::Backend(EncoderBackend::Auto)
+        ) {
+            match encoder::auto_candidates(&payload) {
+                Ok(candidates) => {
+                    stream.encoder_candidates = candidates.into();
+                    begin_encoder_probe(stream);
+                }
+                Err(code) => stream.cleanup(code),
+            }
+            return false;
+        }
         match encoder::resolve(&stream.encoder, &payload) {
             Ok(identity) => {
                 stream.encoder = EncoderSelection::Identity(identity);
                 stream.stage = Stage::Capture;
                 stream.retries = 0;
+            }
+            Err(code) => stream.cleanup(code),
+        }
+        return false;
+    }
+    if stream.stage == Stage::ProbeEncoder {
+        let EncoderSelection::Identity(identity) = &stream.encoder else {
+            stream.cleanup("invalid_encoder_probe_reply");
+            return false;
+        };
+        match encoder::probe_result(identity, &stream.configuration, &payload) {
+            Ok(None) => {
+                stream.stage = Stage::Capture;
+                stream.encoder_candidates.clear();
+                stream.retries = 0;
+            }
+            Ok(Some(reason)) => {
+                stream.encoder_probe_reason = Some(reason);
+                if !begin_encoder_probe(stream) {
+                    stream.cleanup("encoder_unavailable");
+                }
             }
             Err(code) => stream.cleanup(code),
         }
@@ -1036,6 +1098,17 @@ fn apply_result(
     stream.stage = next;
     stream.retries = 0;
     false
+}
+
+fn begin_encoder_probe(stream: &mut Stream) -> bool {
+    let Some(identity) = stream.encoder_candidates.pop_front() else {
+        return false;
+    };
+    stream.encoder = EncoderSelection::Identity(identity);
+    stream.encoder_probe_attempt += 1;
+    stream.stage = Stage::ProbeEncoder;
+    stream.retries = 0;
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
