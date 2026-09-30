@@ -78,7 +78,7 @@ impl Worker {
             }),
             Err(error) => {
                 drop(sender);
-                let _ = thread.join();
+                thread.join().map_err(|_| "encoder_shutdown_failed")?;
                 Err(error)
             }
         }
@@ -120,10 +120,10 @@ impl Worker {
     pub fn drain(&mut self) -> Result<(), &'static str> {
         self.request(Operation::Drain).map(|_| ())
     }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
+    pub fn shutdown(mut self) -> Result<(), &'static str> {
+        self.close_thread()
+    }
+    fn close_thread(&mut self) -> Result<(), &'static str> {
         let (reply, _) = mpsc::sync_channel(1);
         if let Some(sender) = self.sender.take() {
             let _ = sender.try_send(Request {
@@ -131,12 +131,19 @@ impl Drop for Worker {
                 reply,
             });
         }
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| "encoder_shutdown_failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
         // Native driver calls cannot safely be forcibly interrupted. A healthy
         // worker releases COM synchronously; a hung worker must keep its code
         // module loaded, so join intentionally waits rather than detaching it.
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.close_thread();
     }
 }
 

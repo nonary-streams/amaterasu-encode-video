@@ -71,3 +71,8 @@ fn start_move_and_native_bind_preserve_the_registered_factory_address() {
         api.base.release.unwrap()(api.base.context);
     }
 }
+
+mod probe_support;
+mod probing;
+#[cfg(amaterasu_x264)]
+mod software;

@@ -1,4 +1,5 @@
 use crate::{
+    factory::{Factory, NativeFactory},
     layout,
     model::{AmdAv1LatencyMode, Configuration, EncoderIdentity, Packet},
     worker::Worker,
@@ -7,11 +8,16 @@ use amaterasu_abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_media::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 pub trait Backend: Send {
     fn submit(&mut self, bytes: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
     fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
     fn drain(&mut self) -> Result<(), &'static str>;
+    fn close(self: Box<Self>) -> Result<(), &'static str> {
+        drop(self);
+        Ok(())
+    }
 }
 
 impl Backend for Worker {
@@ -23,6 +29,9 @@ impl Backend for Worker {
     }
     fn drain(&mut self) -> Result<(), &'static str> {
         self.drain()
+    }
+    fn close(self: Box<Self>) -> Result<(), &'static str> {
+        (*self).shutdown()
     }
 }
 
@@ -54,6 +63,7 @@ struct OpenRecord {
 
 pub struct Sessions {
     pub enabled: bool,
+    factory: Arc<dyn Factory>,
     next_id: u64,
     operations: BTreeMap<(String, String), OpenRecord>,
     values: BTreeMap<u64, Session>,
@@ -63,10 +73,34 @@ impl Sessions {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            factory: Arc::new(NativeFactory),
             next_id: 0,
             operations: BTreeMap::new(),
             values: BTreeMap::new(),
         }
+    }
+    #[cfg(test)]
+    pub fn with_factory(enabled: bool, factory: Arc<dyn Factory>) -> Self {
+        Self {
+            factory,
+            ..Self::new(enabled)
+        }
+    }
+    pub fn enumerate(&self) -> Result<Vec<crate::model::EncoderDescription>, &'static str> {
+        if self.enabled {
+            self.factory.enumerate()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    pub fn probe_factory(
+        &self,
+        owner: &str,
+        encoder: &EncoderIdentity,
+        configuration: &Configuration,
+    ) -> Result<Arc<dyn Factory>, &'static str> {
+        self.validate_open(owner, encoder, configuration)?;
+        Ok(self.factory.clone())
     }
     pub fn open(
         &mut self,
@@ -104,13 +138,8 @@ impl Sessions {
             }
         }
         self.validate_open(owner, &encoder, &configuration)?;
-        let backend = Worker::open(encoder.clone(), configuration.clone())?;
-        let response = self.insert(
-            owner,
-            configuration.clone(),
-            Box::new(backend),
-            packet_boundaries,
-        )?;
+        let backend = self.factory.open(encoder.clone(), configuration.clone())?;
+        let response = self.insert(owner, configuration.clone(), backend, packet_boundaries)?;
         if let Some(operation) = operation {
             self.operations.insert(
                 (owner.into(), operation),

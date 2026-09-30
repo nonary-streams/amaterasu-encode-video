@@ -12,6 +12,7 @@ Control requests are strict JSON; frames and encoded bytes never use JSON:
 
 ```json
 {"action":"enumerate"}
+{"action":"probe","encoder":{"clsid":"amaterasu.software.x264","hardware_url":null,"friendly_name":"x264 software H.264"},"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":15000000,"max_reference_frames":1}}
 {"action":"open","encoder":{"clsid":"amaterasu.software.x264","hardware_url":null,"friendly_name":"x264 software H.264"},"operation_id":"video-1","configuration":{"width":1920,"height":1080,"fps":60,"bitrate":15000000,"max_reference_frames":1}}
 {"action":"lookup","operation_id":"video-1"}
 {"action":"status","session_id":1}
@@ -32,6 +33,25 @@ Open/lookup return `{ok:true,session_id,configuration,codec:"h264",max_reference
 Errors contain only `{ok:false,code}`; native driver messages are not exposed.
 Enumeration confirms a registered hardware NV12/H.264 transform, not that every
 configuration can open. Open negotiates the actual requested configuration.
+
+`probe` validates codec viability with the exact identity and configuration. It
+opens a transient backend, submits one owned limited-range NV12 image at the
+requested geometry, requires actual Annex B IDR bytes with parameter sets and
+the submitted timestamp, drains, then closes and joins before responding.
+It never opens capture, allocates a session ID, retains an operation record, or
+returns coded bytes through JSON. Activation and probe calls run outside the
+shared session mutex so existing native bindings remain available.
+
+A completed probe returns
+`{ok:true,codec:"h264",encoder,configuration,usable,settled:true,code,reason}`.
+Success has null `code` and `reason`; a safely unusable backend has
+`code:"encoder_unusable"` and a bounded static `reason`. Validation and ambiguous
+cleanup failures return ordinary `{ok:false,code}` errors, which do not authorize
+Auto fallback. One bounded NV12 input and at most sixteen output packets limit
+work; output collection has a two-second budget. Vendor calls and synchronous
+worker teardown remain non-preemptible. A driver that does not return must keep
+the module loaded, as with normal Open/close. Probe success qualifies that
+transient configuration, while a later real Open may still fail after hotplug.
 
 The optional operation ID is 1–128 ASCII graphic bytes. Repeating it with the
 same caller, encoder identity and configuration returns the original session;

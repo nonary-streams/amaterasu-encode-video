@@ -134,6 +134,10 @@ impl Configuration {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Enumerate,
+    Probe {
+        encoder: EncoderIdentity,
+        configuration: Configuration,
+    },
     Open {
         #[serde(default)]
         packet_boundaries: bool,

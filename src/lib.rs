@@ -1,10 +1,11 @@
 //! Native hardware and opt-in software H.264 encoding with owned CPU input.
-#[cfg(any(windows, test, amaterasu_x264))]
 mod bitstream;
+mod factory;
 mod layout;
 mod model;
 mod native;
 mod platform;
+mod probe;
 mod sessions;
 mod worker;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -96,15 +97,22 @@ impl EncodeModule {
     fn control(&self, caller: &str, payload: Value) -> Result<(Value, Option<u64>), &'static str> {
         let operation: Operation =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
+        if let Operation::Probe {
+            encoder,
+            configuration,
+        } = operation
+        {
+            let factory = {
+                let sessions = self.shared.lock().map_err(|_| "encoder_state_failed")?;
+                sessions.probe_factory(caller, &encoder, &configuration)?
+            };
+            return probe::run(&*factory, encoder, configuration).map(|reply| (reply, None));
+        }
         let mut sessions = self.shared.lock().map_err(|_| "encoder_state_failed")?;
         let previous_id = sessions.latest_id();
         let payload = match operation {
             Operation::Enumerate => {
-                let encoders = if sessions.enabled {
-                    worker::enumerate()?
-                } else {
-                    Vec::new()
-                };
+                let encoders = sessions.enumerate()?;
                 let diagnostic = platform::last_failure().map(|detail| {
                     json!({"stage":detail.stage,"hresult":format!("0x{:08x}", detail.hresult)})
                 });
@@ -133,6 +141,7 @@ impl EncodeModule {
             Operation::Lookup { operation_id } => sessions.lookup(caller, &operation_id),
             Operation::Close { session_id } => sessions.close(caller, session_id),
             Operation::Status { session_id } => sessions.status(caller, session_id),
+            Operation::Probe { .. } => unreachable!("probe runs outside the session lock"),
         }?;
         let created = (sessions.latest_id() != previous_id).then_some(sessions.latest_id());
         Ok((payload, created))
