@@ -425,6 +425,33 @@ fn capture_output(id: &str, device_name: &str) -> Value {
     })
 }
 
+fn pipewire_output(
+    id: &str,
+    width: u32,
+    height: u32,
+    source_type: &str,
+    geometry_supported: bool,
+) -> Value {
+    json!({
+        "id": id,
+        "source_type": source_type,
+        "width": width,
+        "height": height,
+        "format": "bgra8",
+        "pipewire_node": 42,
+        "geometry_supported": geometry_supported
+    })
+}
+
+fn pipewire_enumeration(output: Value) -> Value {
+    json!({
+        "ok": true,
+        "outputs": [output.clone()],
+        "enumeration_id": output["id"],
+        "geometry_supported": false
+    })
+}
+
 fn open() -> Operation {
     Operation::Open {
         packet_boundaries: false,
@@ -448,6 +475,13 @@ fn open() -> Operation {
             sw_tune: None,
         },
     }
+}
+
+fn open_configuration() -> Configuration {
+    let Operation::Open { configuration, .. } = open() else {
+        unreachable!()
+    };
+    configuration
 }
 
 #[test]
@@ -1719,7 +1753,48 @@ fn expired_dedup_cannot_replay_open_after_parent_termination() {
 }
 
 #[test]
-fn pipewire_selection_required_never_opens_a_windows_fallback() {
+fn pipewire_open_reenumerates_one_current_source_and_keeps_its_id_private() {
+    let output_id = "portal-private-output-id";
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::PipeWire].into());
+    runtime.capture_enumeration_override = Some(pipewire_enumeration(pipewire_output(
+        output_id, 1920, 1080, "monitor", false,
+    )));
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open(
+            "auto",
+            CaptureProvider::PipeWire,
+            "client-output-placeholder",
+        ),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    let provider_requests: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == CaptureProvider::PipeWire.service() => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(provider_requests[0]["action"], "enumerate");
+    assert_eq!(provider_requests[1]["action"], "open");
+    assert_eq!(provider_requests[1]["output"], output_id);
+    assert_eq!(
+        runtime.completed[0].1["output"],
+        "client-output-placeholder"
+    );
+    assert!(!runtime.completed[0].1.to_string().contains(output_id));
+}
+
+#[test]
+fn pipewire_requires_one_current_matching_geometry_before_open_without_fallback() {
     let (mut pipeline, mut runtime, mut plane) = setup_with_providers(
         [
             CaptureProvider::PipeWire,
@@ -1728,38 +1803,91 @@ fn pipewire_selection_required_never_opens_a_windows_fallback() {
         ]
         .into(),
     );
-    runtime
-        .capture_open_errors
-        .insert(CaptureProvider::PipeWire, "source_selection_required");
+    runtime.capture_enumeration_override = Some(json!({
+        "ok": true,
+        "outputs": [],
+        "geometry_supported": false
+    }));
     pipeline.handle(
         "alice",
         99,
-        canonical_open("auto", CaptureProvider::PipeWire, "portal-source"),
+        canonical_open(
+            "auto",
+            CaptureProvider::PipeWire,
+            "client-output-placeholder",
+        ),
         &mut |command| runtime.send(command),
     );
     tick(&mut pipeline, &mut runtime, &mut plane, 12);
-    assert_eq!(runtime.completed[0].1["code"], "provider_failed");
+    assert_eq!(runtime.completed[0].1["code"], "source_selection_required");
     assert_eq!(plane.calls, 0);
-    let capture_services: Vec<_> = runtime
+    let capture_opens: Vec<_> = runtime
         .commands
         .iter()
         .filter_map(|command| match command {
-            Command::Request { service, .. } if capture_provider_for_service(service).is_some() => {
+            Command::Request {
+                service, payload, ..
+            } if capture_provider_for_service(service).is_some() && payload["action"] == "open" => {
                 Some(service.as_str())
             }
             _ => None,
         })
         .collect();
-    assert!(!capture_services.is_empty());
-    assert!(
-        capture_services
-            .iter()
-            .all(|service| *service == CaptureProvider::PipeWire.service())
-    );
+    assert!(capture_opens.is_empty());
+    assert_eq!(runtime.open_effects, 0);
     assert_eq!(alternate_provider(CaptureProvider::PipeWire), None);
     assert_eq!(
         output_device_name(CaptureProvider::PipeWire, "portal-source"),
         None
+    );
+}
+
+#[test]
+fn pipewire_enumeration_rejects_multiple_mismatched_and_unsupported_sources() {
+    let configuration = open_configuration();
+    let valid_output = pipewire_output("portal-1", 1920, 1080, "window", false);
+    let valid_payload = pipewire_enumeration(valid_output.clone());
+    assert_eq!(
+        pipewire_selection_output(&valid_payload, &configuration).unwrap(),
+        "portal-1"
+    );
+
+    assert_eq!(
+        pipewire_selection_output(
+            &json!({"ok":true,"outputs":[],"geometry_supported":false}),
+            &configuration
+        ),
+        Err("source_selection_required")
+    );
+    assert_eq!(
+        pipewire_selection_output(
+            &json!({"ok":true,"outputs":[valid_output.clone(),valid_output.clone()],
+                "enumeration_id":"portal-1","geometry_supported":false}),
+            &configuration
+        ),
+        Err("invalid_capture_selection")
+    );
+    assert_eq!(
+        pipewire_selection_output(
+            &pipewire_enumeration(pipewire_output("portal-1", 1280, 720, "monitor", false)),
+            &configuration
+        ),
+        Err("capture_dimensions_mismatch")
+    );
+    assert_eq!(
+        pipewire_selection_output(
+            &pipewire_enumeration(pipewire_output("portal-1", 1920, 1080, "monitor", true)),
+            &configuration
+        ),
+        Err("invalid_capture_selection")
+    );
+    assert_eq!(
+        pipewire_selection_output(
+            &json!({"ok":true,"outputs":[valid_output],"enumeration_id":"stale-output",
+                "geometry_supported":false}),
+            &configuration
+        ),
+        Err("invalid_capture_selection")
     );
 }
 

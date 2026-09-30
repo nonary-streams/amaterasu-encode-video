@@ -25,6 +25,7 @@ use std::{
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
+    PipeWireEnumerate,
     SelectEncoder,
     ProbeEncoder,
     Capture,
@@ -132,6 +133,7 @@ impl Stream {
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
             Stage::SelectEncoder
+            | Stage::PipeWireEnumerate
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -211,6 +213,16 @@ pub struct Pipeline {
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), operations::Record>,
     pub queues: Arc<Mutex<Queues>>,
+}
+
+fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
+    if provider == CaptureProvider::PipeWire {
+        Stage::PipeWireEnumerate
+    } else if matches!(encoder, EncoderSelection::Identity(_)) {
+        Stage::Capture
+    } else {
+        Stage::SelectEncoder
+    }
 }
 
 impl Pipeline {
@@ -308,6 +320,7 @@ impl Pipeline {
                 if matches!(
                     value.stage,
                     Stage::SelectEncoder
+                        | Stage::PipeWireEnumerate
                         | Stage::Capture
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
@@ -420,11 +433,7 @@ impl Pipeline {
                 encoder_candidates: VecDeque::new(),
                 encoder_probe_attempt: 0,
                 encoder_probe_reason: None,
-                stage: if matches!(encoder, EncoderSelection::Identity(_)) {
-                    Stage::Capture
-                } else {
-                    Stage::SelectEncoder
-                },
+                stage: initial_stage(provider, &encoder),
                 encoder,
                 configuration,
                 parent: Some(request),
@@ -474,10 +483,16 @@ impl Pipeline {
         {
             stream.cleanup("request_ended");
         }
-        if matches!(stream.stage, Stage::SelectEncoder | Stage::ProbeEncoder)
-            && stream.opened_at.elapsed() >= Duration::from_secs(5)
+        if matches!(
+            stream.stage,
+            Stage::PipeWireEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
+        ) && stream.opened_at.elapsed() >= Duration::from_secs(5)
         {
-            stream.cleanup("encoder_selection_timeout");
+            stream.cleanup(if stream.stage == Stage::PipeWireEnumerate {
+                "source_selection_timeout"
+            } else {
+                "encoder_selection_timeout"
+            });
         }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
             output::tick(stream, id, &self.queues, plane);
@@ -692,7 +707,12 @@ fn advance(
         let Some(result) = rpc::result(send, request) else {
             return false;
         };
-        if result.is_err() || matches!(stream.stage, Stage::SelectEncoder | Stage::ProbeEncoder) {
+        if result.is_err()
+            || matches!(
+                stream.stage,
+                Stage::PipeWireEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
+            )
+        {
             // Selection children retain no codec session. Their result must be
             // released before another probe, capture allocation or failure.
             stream.unsettled = Some(request);
@@ -742,7 +762,8 @@ fn advance(
     };
     let parent = if matches!(
         stream.stage,
-        Stage::SelectEncoder
+        Stage::PipeWireEnumerate
+            | Stage::SelectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -767,7 +788,10 @@ fn advance(
             stream.pending = Some(request);
         }
         rpc::Admission::Rejected(code) => {
-            if stream.stage == Stage::Capture {
+            if stream.stage == Stage::PipeWireEnumerate {
+                stream.no_resources = true;
+                failed_step(stream, "capture_provider_unavailable");
+            } else if stream.stage == Stage::Capture {
                 stream.no_resources = true;
                 if code == "unavailable" {
                     if !begin_fallback(stream, "unavailable") {
@@ -785,6 +809,8 @@ fn advance(
         rpc::Admission::Uncertain => {
             if stream.stage == Stage::Capture {
                 stream.no_resources = false;
+            } else if stream.stage == Stage::PipeWireEnumerate {
+                stream.no_resources = true;
             }
             stream.uncertain = Some(command);
             failed_step(stream, "request_failed");
@@ -796,6 +822,7 @@ fn advance(
 fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
+        Stage::PipeWireEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
         Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::ProbeEncoder => (
             ENCODE,
@@ -861,6 +888,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
 
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
+        Stage::PipeWireEnumerate => "pipewire-selection",
         Stage::SelectEncoder => "select-encoder",
         Stage::ProbeEncoder => "probe-encoder",
         Stage::Capture => "capture",
@@ -881,7 +909,8 @@ fn stage_name(stage: Stage) -> &'static str {
 fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
-        Stage::SelectEncoder
+        Stage::PipeWireEnumerate
+            | Stage::SelectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -916,10 +945,37 @@ fn apply_result(
     let payload = match result {
         Ok(payload) => payload,
         Err(code) => {
-            failed_step(stream, code);
+            if stream.stage == Stage::PipeWireEnumerate {
+                stream.cleanup(if code == "timeout" {
+                    "source_selection_timeout"
+                } else {
+                    "capture_provider_unavailable"
+                });
+            } else {
+                failed_step(stream, code);
+            }
             return false;
         }
     };
+    if stream.stage == Stage::PipeWireEnumerate {
+        match pipewire_selection_output(&payload, &stream.configuration) {
+            Ok(output) => {
+                stream.capture_output = output;
+                stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
+                {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                };
+                stream.retries = 0;
+            }
+            Err(code) => {
+                stream.no_resources = true;
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
     if stream.stage == Stage::SelectEncoder {
         if matches!(
             stream.requested_encoder,
@@ -1116,6 +1172,72 @@ struct CaptureOutputIdentity {
     id: String,
     device_name: String,
     attached: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipeWireOutputIdentity {
+    id: String,
+    source_type: PipeWireSourceType,
+    width: u32,
+    height: u32,
+    format: String,
+    pipewire_node: u32,
+    geometry_supported: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PipeWireSourceType {
+    Monitor,
+    Window,
+}
+
+fn pipewire_selection_output(
+    payload: &Value,
+    configuration: &Configuration,
+) -> Result<String, &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(match payload_error_code(payload) {
+            Some("source_selection_required" | "source_selection_expired") => {
+                "source_selection_required"
+            }
+            _ => "capture_provider_unavailable",
+        });
+    }
+    if payload.get("geometry_supported").and_then(Value::as_bool) != Some(false) {
+        return Err("invalid_capture_selection");
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .ok_or("invalid_capture_selection")?;
+    let [output] = outputs.as_slice() else {
+        return Err(if outputs.is_empty() {
+            "source_selection_required"
+        } else {
+            "invalid_capture_selection"
+        });
+    };
+    let output: PipeWireOutputIdentity =
+        serde_json::from_value(output.clone()).map_err(|_| "invalid_capture_selection")?;
+    let _source_type = output.source_type;
+    if output.id.is_empty()
+        || output.id.len() > 512
+        || output.id.chars().any(char::is_control)
+        || payload.get("enumeration_id").and_then(Value::as_str) != Some(&output.id)
+        || output.width == 0
+        || output.height == 0
+        || output.format != "bgra8"
+        || output.pipewire_node == 0
+        || output.geometry_supported
+    {
+        return Err("invalid_capture_selection");
+    }
+    if output.width != configuration.width || output.height != configuration.height {
+        return Err("capture_dimensions_mismatch");
+    }
+    Ok(output.id)
 }
 
 fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
