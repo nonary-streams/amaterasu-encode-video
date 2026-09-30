@@ -441,6 +441,7 @@ fn open() -> Operation {
             height: 1080,
             fps: 60,
             bitrate: 5_000_000,
+            min_threads: 2,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
             sw_preset: None,

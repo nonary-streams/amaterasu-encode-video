@@ -70,10 +70,12 @@ selection behavior and H.264-only capabilities.
 
 `configuration.sw_preset` and `configuration.sw_tune` pass unchanged to the encoder
 service and stream status, with limits of 128 and 256 bytes and no control
-characters. Omitted fields keep the prior wire shape. The opt-in x264 provider
-resolves its `superfast` and `zerolatency` defaults; hardware leaves these software
-options unapplied. Availability, build prerequisites, and licensing are documented
-in [the encoder README](../encode/README.md#software-x264-selection-and-distribution).
+characters. `configuration.min_threads` requests a software thread minimum,
+defaulting to 2 with supported values 1 through 256; x264 can use fewer threads
+under codec or frame-size limits. Omitted fields keep the prior wire shape. The
+opt-in x264 provider resolves its `superfast` and `zerolatency` defaults; hardware
+leaves these software options unapplied. Availability, build prerequisites, and
+licensing are documented in [the encoder README](../encode/README.md#software-x264-selection-and-distribution).
 
 Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
 `"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned
