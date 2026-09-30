@@ -178,7 +178,7 @@ fn software_rejects_invalid_codec_options_and_changed_identity() {
 #[test]
 #[ignore = "requires matching system x264 runtime"]
 fn software_uses_requested_effective_x264_thread_count() {
-    for min_threads in [1, 3] {
+    for min_threads in [1, 3, 256] {
         let mut config = configuration(None, None);
         config.width = 640;
         config.height = 480;
@@ -186,6 +186,13 @@ fn software_uses_requested_effective_x264_thread_count() {
         let encoder = Encoder::open(&identity(), &config).unwrap();
         // SAFETY: the live Encoder owns a native x264 encoder using this adapter.
         let effective = unsafe { amaterasu_x264_thread_count(encoder.native.as_ptr()) };
-        assert_eq!(effective, min_threads as i32);
+        if min_threads <= 3 {
+            assert_eq!(effective, min_threads as i32);
+        } else {
+            // x264 caps the effective frame-thread count for the stream's
+            // dimensions and runtime. The configured value is an upper-bound
+            // request, not a promise that the backend allocates that many.
+            assert!(effective > 0 && effective <= min_threads as i32);
+        }
     }
 }

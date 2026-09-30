@@ -157,12 +157,22 @@ list, since installed codec vocabulary is authoritative.
 Hardware sessions preserve these fields as requested metadata without applying
 software-only policy, matching the reference's backend-specific behavior.
 
+`configuration.min_threads` is an optional requested software thread minimum.
+It defaults to 2, accepts integers from 1 through 256, and is passed to x264's
+frame-thread setting. x264 may lower the effective count according to stream
+dimensions and runtime limits: on the qualified 640x480 system-x264 path, a
+request for 256 opened successfully with 7 effective threads. The setting does
+not promise a particular allocated CPU-thread count or a performance result.
+The reference parser accepts an unbounded integer; Amaterasu's upper bound is a
+deliberate allocation limit, so exact parser parity remains pending.
+
 The adapter calls x264's preset/tune initializer before applying stream limits.
 It emits progressive 8-bit limited-range BT.709 Baseline H.264, no B pictures,
 Annex B with repeated SPS/PPS and AUD, and a very long IDR interval. Explicit
 forced IDR uses x264's IDR picture type and output NAL type is verified by the
 shared normalizer. ABR/VBV follows the requested bitrate (whole kbps), with a
-one-frame VBV target and two encoder threads. Required no-B, zero frame/sync
+one-frame VBV target and the requested thread minimum, defaulting to two.
+Required no-B, zero frame/sync
 lookahead, Baseline, color, bitrate and optional reference-frame constraints
 take precedence over preset/tune. Their other motion-search, analysis, and
 psychovisual choices affect real encoded pictures. Open checks effective
