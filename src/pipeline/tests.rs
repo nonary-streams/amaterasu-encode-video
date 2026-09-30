@@ -468,6 +468,8 @@ fn open() -> Operation {
             height: 1080,
             fps: 60,
             bitrate: 5_000_000,
+            slices_per_frame: 1,
+            qp: 28,
             min_threads: 2,
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,

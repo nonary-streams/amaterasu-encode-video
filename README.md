@@ -70,9 +70,11 @@ selection behavior and H.264-only capabilities.
 
 `configuration.sw_preset` and `configuration.sw_tune` pass unchanged to the encoder
 service and stream status, with limits of 128 and 256 bytes and no control
-characters. `configuration.min_threads` requests a software thread minimum,
-defaulting to 2 with supported values 1 through 256; x264 can use fewer threads
-under codec or frame-size limits. Omitted fields keep the prior wire shape. The
+characters. The client-negotiated `configuration.slices_per_frame` and signed
+32-bit `configuration.min_threads` resolve to
+`max(slices_per_frame, min_threads)` for software x264. QP defaults to 28 and
+passes through this snapshot, but x264 ABR ignores it and Amaterasu has no VAAPI
+constant-QP consumer yet. Omitted defaults preserve the prior wire shape. The
 opt-in x264 provider resolves its `superfast` and `zerolatency` defaults; hardware
 leaves these software options unapplied. Availability, build prerequisites, and
 licensing are documented in [the encoder README](../encode/README.md#software-x264-selection-and-distribution).
