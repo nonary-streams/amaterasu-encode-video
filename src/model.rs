@@ -24,6 +24,12 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Minimum number of worker threads requested from the software encoder.
+    #[serde(
+        default = "default_min_threads",
+        skip_serializing_if = "is_default_min_threads"
+    )]
+    pub min_threads: u32,
     /// Software x264 preset/tune; hardware backends leave these unapplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
@@ -87,6 +93,14 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+fn default_min_threads() -> u32 {
+    2
+}
+
+fn is_default_min_threads(value: &u32) -> bool {
+    *value == default_min_threads()
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -122,6 +136,7 @@ impl Configuration {
             || !self.height.is_multiple_of(2)
             || !(1..=120).contains(&self.fps)
             || !(100_000..=100_000_000).contains(&self.bitrate)
+            || !(1..=256).contains(&self.min_threads)
             || self.max_reference_frames > 1
         {
             return Err("invalid_configuration");
@@ -213,6 +228,7 @@ mod tests {
     fn software_options_preserve_defaults_raw_strings_and_legacy_shape() {
         let legacy = serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":1000000});
         let configuration: Configuration = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(configuration.min_threads, 2);
         assert_eq!(configuration.software_preset(), "superfast");
         assert_eq!(configuration.software_tune(), "zerolatency");
         assert_eq!(serde_json::to_value(configuration).unwrap(), legacy);
@@ -441,6 +457,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 1_000_000,
+            min_threads: 2,
             max_reference_frames: 0,
             nvenc_preset: Some(NvencPreset::P1),
             nvenc_h264_cavlc: false,
@@ -451,5 +468,44 @@ mod tests {
         };
 
         assert_eq!(configuration.validate(), Err("nvenc_preset_unsupported"));
+    }
+
+    #[test]
+    fn min_threads_defaults_omits_two_and_accepts_only_one_through_256() {
+        let legacy = serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":1000000});
+        let defaulted: Configuration = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(defaulted.min_threads, 2);
+        assert_eq!(serde_json::to_value(defaulted).unwrap(), legacy);
+
+        for value in [1, 2, 256] {
+            let mut request = legacy.clone();
+            request["min_threads"] = serde_json::json!(value);
+            let configuration: Configuration = serde_json::from_value(request.clone()).unwrap();
+            assert_eq!(configuration.min_threads, value);
+            assert!(configuration.validate().is_ok());
+            let serialized = serde_json::to_value(configuration).unwrap();
+            if value == 2 {
+                assert_eq!(serialized, legacy);
+            } else {
+                assert_eq!(serialized, request);
+            }
+        }
+
+        for value in [0, 257] {
+            let mut request = legacy.clone();
+            request["min_threads"] = serde_json::json!(value);
+            let configuration: Configuration = serde_json::from_value(request).unwrap();
+            assert_eq!(configuration.validate(), Err("invalid_configuration"));
+        }
+
+        for invalid in ["-1", "1.0", "\"2\"", "null"] {
+            let request = format!(
+                r#"{{"width":16,"height":16,"fps":60,"bitrate":1000000,"min_threads":{invalid}}}"#
+            );
+            assert!(
+                serde_json::from_str::<Configuration>(&request).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }

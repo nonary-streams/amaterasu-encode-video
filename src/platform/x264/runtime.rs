@@ -37,6 +37,7 @@ struct NativeConfiguration {
     fps: u32,
     bitrate: u32,
     reference_frames: u32,
+    min_threads: u32,
 }
 
 #[repr(C)]
@@ -160,6 +161,7 @@ impl Encoder {
             fps: config.fps,
             bitrate: config.bitrate,
             reference_frames: config.max_reference_frames,
+            min_threads: config.min_threads,
         };
         let mut status = 0;
         // SAFETY: functions belong to the retained library; config and strings

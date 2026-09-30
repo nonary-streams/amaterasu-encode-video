@@ -74,6 +74,7 @@ fn configuration() -> Configuration {
         height: 16,
         fps: 60,
         bitrate: 1_000_000,
+        min_threads: 2,
         max_reference_frames: 0,
         nvenc_preset: None,
         nvenc_h264_cavlc: false,

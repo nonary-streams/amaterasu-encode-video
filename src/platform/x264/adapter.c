@@ -23,7 +23,7 @@ struct amaterasu_x264_functions {
 };
 
 struct amaterasu_x264_configuration {
-    uint32_t width, height, fps, bitrate, reference_frames;
+    uint32_t width, height, fps, bitrate, reference_frames, min_threads;
 };
 
 struct amaterasu_x264_output {
@@ -36,6 +36,7 @@ struct amaterasu_x264_encoder {
     struct amaterasu_x264_functions functions;
     x264_t *encoder;
     int width, height;
+    int effective_threads;
 };
 
 int amaterasu_x264_build(void) { return X264_BUILD; }
@@ -74,7 +75,7 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
     /* These streaming constraints take precedence over preset/tune choices.
      * No B pictures or unbounded lookahead may violate the native queue ABI. */
     parameters.i_bframe = 0;
-    parameters.i_threads = 2;
+    parameters.i_threads = (int)configuration->min_threads;
     parameters.i_lookahead_threads = 1;
     parameters.i_sync_lookahead = 0;
     parameters.rc.i_lookahead = 0;
@@ -117,8 +118,14 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
     result->encoder = encoder;
     result->width = (int)configuration->width;
     result->height = (int)configuration->height;
+    result->effective_threads = effective.i_threads;
     *status = 0;
     return result;
+}
+
+int amaterasu_x264_thread_count(struct amaterasu_x264_encoder *encoder)
+{
+    return encoder->effective_threads;
 }
 
 void amaterasu_x264_close(struct amaterasu_x264_encoder *encoder)

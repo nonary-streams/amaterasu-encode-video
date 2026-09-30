@@ -4,6 +4,10 @@ use std::{
     process::{Command, Stdio},
 };
 
+unsafe extern "C" {
+    fn amaterasu_x264_thread_count(encoder: *mut std::ffi::c_void) -> i32;
+}
+
 #[test]
 fn missing_runtime_library_is_explicitly_unavailable() {
     // SAFETY: adapter returns only its compile-time header ABI version.
@@ -169,4 +173,19 @@ fn software_rejects_invalid_codec_options_and_changed_identity() {
         Encoder::open(&changed, &configuration(None, None)),
         Err("encoder_identity_changed")
     ));
+}
+
+#[test]
+#[ignore = "requires matching system x264 runtime"]
+fn software_uses_requested_effective_x264_thread_count() {
+    for min_threads in [1, 3] {
+        let mut config = configuration(None, None);
+        config.width = 640;
+        config.height = 480;
+        config.min_threads = min_threads;
+        let encoder = Encoder::open(&identity(), &config).unwrap();
+        // SAFETY: the live Encoder owns a native x264 encoder using this adapter.
+        let effective = unsafe { amaterasu_x264_thread_count(encoder.native.as_ptr()) };
+        assert_eq!(effective, min_threads as i32);
+    }
 }
