@@ -1,5 +1,7 @@
 //! Version-matched x264 ABI adapter. The worker owns all native resources.
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
+#[cfg(not(amaterasu_x264))]
+use amaterasu_module_sdk::LogEmitter;
 
 const SOFTWARE_ID: &str = "amaterasu.software.x264";
 const SOFTWARE_NAME: &str = "x264 software H.264";
@@ -40,7 +42,11 @@ pub struct Encoder;
 
 #[cfg(not(amaterasu_x264))]
 impl Encoder {
-    pub fn open(_: &EncoderIdentity, _: &Configuration) -> Result<Self, &'static str> {
+    pub fn open_with_log_emitter(
+        _: &EncoderIdentity,
+        _: &Configuration,
+        _: Option<LogEmitter>,
+    ) -> Result<Self, &'static str> {
         Err(availability().unwrap_err())
     }
     pub fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
@@ -76,6 +82,9 @@ mod tests {
             serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":1000000}),
         )
         .unwrap();
-        assert!(matches!(Encoder::open(&identity(), &config), Err(error) if error == reason));
+        assert!(matches!(
+            Encoder::open_with_log_emitter(&identity(), &config, None),
+            Err(error) if error == reason
+        ));
     }
 }

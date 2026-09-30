@@ -57,6 +57,7 @@ pub use hardware::{last_failure, metrics};
 use unsupported as hardware;
 
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
+use amaterasu_module_sdk::LogEmitter;
 
 pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
     let software = x264::description();
@@ -78,8 +79,17 @@ pub enum Encoder {
 
 impl Encoder {
     pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
+        Self::open_with_log_emitter(identity, config, None)
+    }
+
+    pub fn open_with_log_emitter(
+        identity: &EncoderIdentity,
+        config: &Configuration,
+        emitter: Option<LogEmitter>,
+    ) -> Result<Self, &'static str> {
         if x264::selected(identity) {
-            x264::Encoder::open(identity, config).map(|encoder| Self::Software(Box::new(encoder)))
+            x264::Encoder::open_with_log_emitter(identity, config, emitter)
+                .map(|encoder| Self::Software(Box::new(encoder)))
         } else {
             hardware::Encoder::open(identity, config)
                 .map(|encoder| Self::Hardware(Box::new(encoder)))

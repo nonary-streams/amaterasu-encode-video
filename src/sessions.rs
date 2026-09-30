@@ -1,5 +1,5 @@
 use crate::{
-    factory::{Factory, NativeFactory},
+    factory::{Factory, LogForwardingFactory, NativeFactory},
     layout,
     model::{AmdAv1LatencyMode, Configuration, EncoderIdentity, Packet},
     worker::Worker,
@@ -78,6 +78,11 @@ impl Sessions {
             operations: BTreeMap::new(),
             values: BTreeMap::new(),
         }
+    }
+    pub fn with_log_emitter(enabled: bool, emitter: amaterasu_module_sdk::LogEmitter) -> Self {
+        let mut sessions = Self::new(enabled);
+        sessions.factory = Arc::new(LogForwardingFactory::new(emitter));
+        sessions
     }
     #[cfg(test)]
     pub fn with_factory(enabled: bool, factory: Arc<dyn Factory>) -> Self {

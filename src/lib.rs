@@ -8,7 +8,9 @@ mod platform;
 mod probe;
 mod sessions;
 mod worker;
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use model::Operation;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ struct Settings {
 struct EncodeModule {
     runtime: RuntimeClient,
     shared: native::Shared,
+    log_queue: LogQueue,
     _registration: Box<native::Registration>,
 }
 
@@ -34,7 +37,11 @@ impl ManagedModule for EncodeModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid encoder settings")?;
-        let shared = Arc::new(Mutex::new(sessions::Sessions::new(settings.enabled)));
+        let (log_emitter, log_queue) = runtime.log_emitter();
+        let shared = Arc::new(Mutex::new(sessions::Sessions::with_log_emitter(
+            settings.enabled,
+            log_emitter,
+        )));
         let registration = Box::new(native::Registration::new(shared.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -47,10 +54,12 @@ impl ManagedModule for EncodeModule {
         Ok(Self {
             runtime,
             shared,
+            log_queue,
             _registration: registration,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        self.log_queue.flush(&self.runtime);
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -153,6 +162,7 @@ impl Drop for EncodeModule {
         if let Ok(mut sessions) = self.shared.lock() {
             sessions.clear();
         }
+        self.log_queue.flush(&self.runtime);
     }
 }
 

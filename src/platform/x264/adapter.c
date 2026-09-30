@@ -7,7 +7,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <x264.h>
+
+typedef void (*amaterasu_x264_log_callback)(void *, int, const char *);
+
+struct amaterasu_x264_log_context {
+    amaterasu_x264_log_callback callback;
+    void *context;
+};
+
+static void amaterasu_x264_log(void *private, int level, const char *format, va_list arguments)
+{
+    struct amaterasu_x264_log_context *context = private;
+    if (context == NULL || context->callback == NULL || format == NULL)
+        return;
+    char message[2048];
+    int written = vsnprintf(message, sizeof(message), format, arguments);
+    if (written < 0)
+        return;
+    message[sizeof(message) - 1] = '\0';
+    context->callback(context->context, level, message);
+}
 
 struct amaterasu_x264_functions {
     int (*default_preset)(x264_param_t *, const char *, const char *);
@@ -35,6 +57,7 @@ struct amaterasu_x264_output {
 
 struct amaterasu_x264_encoder {
     struct amaterasu_x264_functions functions;
+    struct amaterasu_x264_log_context log_context;
     x264_t *encoder;
     int width, height;
     int effective_threads, sliced_threads, slice_count;
@@ -45,7 +68,8 @@ int amaterasu_x264_build(void) { return X264_BUILD; }
 struct amaterasu_x264_encoder *amaterasu_x264_open(
     const struct amaterasu_x264_functions *functions,
     const struct amaterasu_x264_configuration *configuration,
-    const char *preset, const char *tune, int *status)
+    const char *preset, const char *tune,
+    amaterasu_x264_log_callback log_callback, void *log_context, int *status)
 {
     x264_param_t parameters;
     memset(&parameters, 0, sizeof(parameters));
@@ -54,7 +78,7 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
         functions->param_cleanup(&parameters);
         return NULL;
     }
-    parameters.i_log_level = X264_LOG_NONE;
+    parameters.i_log_level = log_callback == NULL ? X264_LOG_NONE : X264_LOG_DEBUG;
     parameters.i_width = (int)configuration->width;
     parameters.i_height = (int)configuration->height;
     parameters.i_csp = X264_CSP_NV12;
@@ -103,11 +127,25 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
         functions->param_cleanup(&parameters);
         return NULL;
     }
+    struct amaterasu_x264_encoder *result = calloc(1, sizeof(*result));
+    if (result == NULL) {
+        functions->param_cleanup(&parameters);
+        return NULL;
+    }
+    result->functions = *functions;
+    result->log_context.callback = log_callback;
+    result->log_context.context = log_context;
+    if (log_callback != NULL) {
+        parameters.pf_log = amaterasu_x264_log;
+        parameters.p_log_private = &result->log_context;
+    }
     *status = 2;
     x264_t *encoder = functions->encoder_open(&parameters);
     functions->param_cleanup(&parameters);
-    if (encoder == NULL)
+    if (encoder == NULL) {
+        free(result);
         return NULL;
+    }
     x264_param_t effective;
     functions->encoder_parameters(encoder, &effective);
     if (effective.i_bframe != 0 || effective.b_interlaced || !effective.b_annexb ||
@@ -115,14 +153,9 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
         (configuration->reference_frames != 0 &&
          effective.i_frame_reference != (int)configuration->reference_frames)) {
         functions->encoder_close(encoder);
+        free(result);
         return NULL;
     }
-    struct amaterasu_x264_encoder *result = malloc(sizeof(*result));
-    if (result == NULL) {
-        functions->encoder_close(encoder);
-        return NULL;
-    }
-    result->functions = *functions;
     result->encoder = encoder;
     result->width = (int)configuration->width;
     result->height = (int)configuration->height;

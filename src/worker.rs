@@ -3,6 +3,7 @@ use crate::{
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
     platform,
 };
+use amaterasu_module_sdk::LogEmitter;
 use std::{
     sync::mpsc::{self, SyncSender},
     thread::{self, JoinHandle},
@@ -34,12 +35,34 @@ pub struct Worker {
 
 impl Worker {
     pub fn open(identity: EncoderIdentity, config: Configuration) -> Result<Self, &'static str> {
+        Self::open_inner(identity, config, None)
+    }
+
+    pub fn open_with_log_emitter(
+        identity: EncoderIdentity,
+        config: Configuration,
+        emitter: LogEmitter,
+    ) -> Result<Self, &'static str> {
+        Self::open_inner(identity, config, Some(emitter))
+    }
+
+    fn open_inner(
+        identity: EncoderIdentity,
+        config: Configuration,
+        emitter: Option<LogEmitter>,
+    ) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel::<Request>(1);
         let (ready, initialized) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("amaterasu-h264".into())
             .spawn(move || {
-                let mut encoder = match platform::Encoder::open(&identity, &config) {
+                let opened = match emitter {
+                    Some(emitter) => {
+                        platform::Encoder::open_with_log_emitter(&identity, &config, Some(emitter))
+                    }
+                    None => platform::Encoder::open(&identity, &config),
+                };
+                let mut encoder = match opened {
                     Ok(encoder) => encoder,
                     Err(error) => {
                         let _ = ready.send(Err(error));
