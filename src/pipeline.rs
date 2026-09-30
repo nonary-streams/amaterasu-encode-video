@@ -1122,6 +1122,7 @@ fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
     match provider {
         CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
         CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
+        CaptureProvider::PipeWire => None,
     }
 }
 
@@ -1172,6 +1173,8 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
         CaptureProvider::Wgc => {
             (!output_id.is_empty() && !output_id.contains('/')).then(|| output_id.to_owned())
         }
+        // Portal IDs are scoped to a selected session and have no Windows alias.
+        CaptureProvider::PipeWire => None,
     }
 }
 
@@ -1241,6 +1244,7 @@ fn accumulate_fallback_page(
                         == Some(device_name)
                 }
                 CaptureProvider::Wgc => output.id == device_name,
+                CaptureProvider::PipeWire => false,
             };
         if matches && stream.fallback_match.replace(output.id).is_some() {
             return Err(());

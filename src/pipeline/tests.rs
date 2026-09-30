@@ -221,9 +221,13 @@ impl Runtime {
 }
 
 fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
-    [CaptureProvider::Dxgi, CaptureProvider::Wgc]
-        .into_iter()
-        .find(|provider| provider.service() == service)
+    [
+        CaptureProvider::Dxgi,
+        CaptureProvider::Wgc,
+        CaptureProvider::PipeWire,
+    ]
+    .into_iter()
+    .find(|provider| provider.service() == service)
 }
 
 #[derive(Default)]
@@ -1711,6 +1715,51 @@ fn expired_dedup_cannot_replay_open_after_parent_termination() {
     assert!(runtime.ended.contains(&99));
     assert_eq!(runtime.open_effects, 1);
     assert!(pipeline.streams.is_empty());
+}
+
+#[test]
+fn pipewire_selection_required_never_opens_a_windows_fallback() {
+    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(
+        [
+            CaptureProvider::PipeWire,
+            CaptureProvider::Dxgi,
+            CaptureProvider::Wgc,
+        ]
+        .into(),
+    );
+    runtime
+        .capture_open_errors
+        .insert(CaptureProvider::PipeWire, "source_selection_required");
+    pipeline.handle(
+        "alice",
+        99,
+        canonical_open("auto", CaptureProvider::PipeWire, "portal-source"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(runtime.completed[0].1["code"], "provider_failed");
+    assert_eq!(plane.calls, 0);
+    let capture_services: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request { service, .. } if capture_provider_for_service(service).is_some() => {
+                Some(service.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!capture_services.is_empty());
+    assert!(
+        capture_services
+            .iter()
+            .all(|service| *service == CaptureProvider::PipeWire.service())
+    );
+    assert_eq!(alternate_provider(CaptureProvider::PipeWire), None);
+    assert_eq!(
+        output_device_name(CaptureProvider::PipeWire, "portal-source"),
+        None
+    );
 }
 
 #[test]

@@ -9,6 +9,9 @@ pub enum CaptureProvider {
     #[default]
     Dxgi,
     Wgc,
+    /// An explicitly selected current-user portal source.
+    #[serde(rename = "pipewire")]
+    PipeWire,
 }
 
 impl CaptureProvider {
@@ -16,6 +19,7 @@ impl CaptureProvider {
         match self {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
+            Self::PipeWire => "amaterasu.capture-pipewire/1",
         }
     }
 }
@@ -523,6 +527,13 @@ mod tests {
                 false,
             ),
             ("", CaptureProvider::Wgc, CaptureProvider::Wgc, false, true),
+            (
+                "auto",
+                CaptureProvider::PipeWire,
+                CaptureProvider::PipeWire,
+                false,
+                true,
+            ),
             (
                 "auto",
                 CaptureProvider::Wgc,
