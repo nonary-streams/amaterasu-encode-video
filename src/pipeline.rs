@@ -26,6 +26,8 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
     PipeWireEnumerate,
+    X11Enumerate,
+    KmsEnumerate,
     SelectEncoder,
     ProbeEncoder,
     Capture,
@@ -134,6 +136,8 @@ impl Stream {
         let state = match self.stage {
             Stage::SelectEncoder
             | Stage::PipeWireEnumerate
+            | Stage::X11Enumerate
+            | Stage::KmsEnumerate
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -218,6 +222,10 @@ pub struct Pipeline {
 fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
     if provider == CaptureProvider::PipeWire {
         Stage::PipeWireEnumerate
+    } else if provider == CaptureProvider::X11 {
+        Stage::X11Enumerate
+    } else if provider == CaptureProvider::Kms {
+        Stage::KmsEnumerate
     } else if matches!(encoder, EncoderSelection::Identity(_)) {
         Stage::Capture
     } else {
@@ -321,6 +329,8 @@ impl Pipeline {
                     value.stage,
                     Stage::SelectEncoder
                         | Stage::PipeWireEnumerate
+                        | Stage::X11Enumerate
+                        | Stage::KmsEnumerate
                         | Stage::Capture
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
@@ -485,11 +495,17 @@ impl Pipeline {
         }
         if matches!(
             stream.stage,
-            Stage::PipeWireEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
+            Stage::PipeWireEnumerate
+                | Stage::X11Enumerate
+                | Stage::KmsEnumerate
+                | Stage::SelectEncoder
+                | Stage::ProbeEncoder
         ) && stream.opened_at.elapsed() >= Duration::from_secs(5)
         {
             stream.cleanup(if stream.stage == Stage::PipeWireEnumerate {
                 "source_selection_timeout"
+            } else if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
+                "capture_provider_unavailable"
             } else {
                 "encoder_selection_timeout"
             });
@@ -710,7 +726,11 @@ fn advance(
         if result.is_err()
             || matches!(
                 stream.stage,
-                Stage::PipeWireEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
+                Stage::PipeWireEnumerate
+                    | Stage::X11Enumerate
+                    | Stage::KmsEnumerate
+                    | Stage::SelectEncoder
+                    | Stage::ProbeEncoder
             )
         {
             // Selection children retain no codec session. Their result must be
@@ -763,6 +783,8 @@ fn advance(
     let parent = if matches!(
         stream.stage,
         Stage::PipeWireEnumerate
+            | Stage::X11Enumerate
+            | Stage::KmsEnumerate
             | Stage::SelectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
@@ -788,7 +810,10 @@ fn advance(
             stream.pending = Some(request);
         }
         rpc::Admission::Rejected(code) => {
-            if stream.stage == Stage::PipeWireEnumerate {
+            if matches!(
+                stream.stage,
+                Stage::PipeWireEnumerate | Stage::X11Enumerate | Stage::KmsEnumerate
+            ) {
                 stream.no_resources = true;
                 failed_step(stream, "capture_provider_unavailable");
             } else if stream.stage == Stage::Capture {
@@ -809,7 +834,10 @@ fn advance(
         rpc::Admission::Uncertain => {
             if stream.stage == Stage::Capture {
                 stream.no_resources = false;
-            } else if stream.stage == Stage::PipeWireEnumerate {
+            } else if matches!(
+                stream.stage,
+                Stage::PipeWireEnumerate | Stage::X11Enumerate | Stage::KmsEnumerate
+            ) {
                 stream.no_resources = true;
             }
             stream.uncertain = Some(command);
@@ -823,6 +851,8 @@ fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
         Stage::PipeWireEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
+        Stage::X11Enumerate => (stream.provider.service(), json!({"action":"enumerate"})),
+        Stage::KmsEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
         Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::ProbeEncoder => (
             ENCODE,
@@ -889,6 +919,8 @@ fn encoder_open_request(stream: &Stream) -> Value {
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
         Stage::PipeWireEnumerate => "pipewire-selection",
+        Stage::X11Enumerate => "x11-output-selection",
+        Stage::KmsEnumerate => "kms-output-selection",
         Stage::SelectEncoder => "select-encoder",
         Stage::ProbeEncoder => "probe-encoder",
         Stage::Capture => "capture",
@@ -910,6 +942,8 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
         Stage::PipeWireEnumerate
+            | Stage::X11Enumerate
+            | Stage::KmsEnumerate
             | Stage::SelectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
@@ -945,12 +979,17 @@ fn apply_result(
     let payload = match result {
         Ok(payload) => payload,
         Err(code) => {
-            if stream.stage == Stage::PipeWireEnumerate {
-                stream.cleanup(if code == "timeout" {
-                    "source_selection_timeout"
-                } else {
-                    "capture_provider_unavailable"
-                });
+            if matches!(
+                stream.stage,
+                Stage::PipeWireEnumerate | Stage::X11Enumerate | Stage::KmsEnumerate
+            ) {
+                stream.cleanup(
+                    if code == "timeout" && stream.stage == Stage::PipeWireEnumerate {
+                        "source_selection_timeout"
+                    } else {
+                        "capture_provider_unavailable"
+                    },
+                );
             } else {
                 failed_step(stream, code);
             }
@@ -961,6 +1000,42 @@ fn apply_result(
         match pipewire_selection_output(&payload, &stream.configuration) {
             Ok(output) => {
                 stream.capture_output = output;
+                stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
+                {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                };
+                stream.retries = 0;
+            }
+            Err(code) => {
+                stream.no_resources = true;
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
+    if stream.stage == Stage::X11Enumerate {
+        match x11_selection_output(&payload, &stream.capture_output, &stream.configuration) {
+            Ok(()) => {
+                stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
+                {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                };
+                stream.retries = 0;
+            }
+            Err(code) => {
+                stream.no_resources = true;
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
+    if stream.stage == Stage::KmsEnumerate {
+        match kms_selection_output(&payload, &stream.capture_output, &stream.configuration) {
+            Ok(()) => {
                 stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
                 {
                     Stage::Capture
@@ -1240,11 +1315,202 @@ fn pipewire_selection_output(
     Ok(output.id)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct X11OutputIdentity {
+    id: String,
+    adapter: String,
+    adapter_vendor_id: Option<u32>,
+    adapter_device_id: Option<u32>,
+    adapter_description: Option<String>,
+    device_name: String,
+    attached: bool,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rotation: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KmsOutputIdentity {
+    id: String,
+    adapter: String,
+    adapter_vendor_id: Option<u32>,
+    adapter_device_id: Option<u32>,
+    adapter_description: Option<String>,
+    device_name: String,
+    attached: bool,
+    framebuffer_export_supported: bool,
+    readback_reason: Option<String>,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rotation: u32,
+}
+
+fn x11_selection_output(
+    payload: &Value,
+    selected_id: &str,
+    configuration: &Configuration,
+) -> Result<(), &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("capture_provider_unavailable");
+    }
+    if payload
+        .get("next_offset")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("invalid_capture_selection");
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid_capture_selection")?;
+    let selected: Vec<_> = outputs
+        .iter()
+        .filter(|output| output.get("id").and_then(Value::as_str) == Some(selected_id))
+        .collect();
+    let selected = match selected.as_slice() {
+        [] => return Err("capture_output_unavailable"),
+        [selected] => selected,
+        _ => return Err("invalid_capture_selection"),
+    };
+    let output: X11OutputIdentity =
+        serde_json::from_value((*selected).clone()).map_err(|_| "invalid_capture_selection")?;
+    if output.id != selected_id
+        || output.adapter != "x11"
+        || output.adapter_vendor_id.is_some()
+        || output.adapter_device_id.is_some()
+        || output.adapter_description.is_some()
+        || output.device_name.is_empty()
+        || output.device_name.len() > 127
+        || output.device_name.chars().any(char::is_control)
+        || !output.attached
+        || output.left < 0
+        || output.top < 0
+        || output.rotation != 1
+        || output.width != configuration.width
+        || output.height != configuration.height
+    {
+        return Err(
+            if output.width != configuration.width || output.height != configuration.height {
+                "capture_dimensions_mismatch"
+            } else {
+                "invalid_capture_selection"
+            },
+        );
+    }
+    Ok(())
+}
+
+fn kms_selection_output(
+    payload: &Value,
+    selected_id: &str,
+    configuration: &Configuration,
+) -> Result<(), &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("capture_provider_unavailable");
+    }
+    if payload
+        .get("next_offset")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("invalid_capture_selection");
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid_capture_selection")?;
+    let selected: Vec<_> = outputs
+        .iter()
+        .filter(|output| output.get("id").and_then(Value::as_str) == Some(selected_id))
+        .collect();
+    let selected = match selected.as_slice() {
+        [] => return Err("capture_output_unavailable"),
+        [selected] => selected,
+        _ => return Err("invalid_capture_selection"),
+    };
+    let output: KmsOutputIdentity =
+        serde_json::from_value((*selected).clone()).map_err(|_| "invalid_capture_selection")?;
+    if output.id != selected_id
+        || !valid_kms_output_id(&output.id)
+        || output.adapter
+            != format!(
+                "/dev/dri/{}",
+                output.id[4..].split('/').next().unwrap_or("")
+            )
+        || output.adapter_vendor_id.is_some()
+        || output.adapter_device_id.is_some()
+        || output.adapter_description.as_deref() != Some("DRM/KMS primary plane")
+        || output.device_name.is_empty()
+        || output.device_name.len() > 127
+        || output.device_name.chars().any(char::is_control)
+        || !output.attached
+        || !output.framebuffer_export_supported
+        || output.readback_reason.is_some()
+        || output.left < 0
+        || output.top < 0
+        || output.rotation != 1
+        || output.width != configuration.width
+        || output.height != configuration.height
+    {
+        return Err(
+            if output.width != configuration.width || output.height != configuration.height {
+                "capture_dimensions_mismatch"
+            } else {
+                "capture_output_unavailable"
+            },
+        );
+    }
+    Ok(())
+}
+
+fn valid_kms_output_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("kms:") else {
+        return false;
+    };
+    let Some((card, identity)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some(card_number) = card.strip_prefix("card") else {
+        return false;
+    };
+    if card_number.is_empty()
+        || !card_number.bytes().all(|byte| byte.is_ascii_digit())
+        || (card_number.len() > 1 && card_number.starts_with('0'))
+        || card_number.parse::<u32>().is_err()
+    {
+        return false;
+    }
+    let Some((connector, identity)) = identity
+        .strip_prefix("conn=")
+        .and_then(|rest| rest.split_once("/crtc="))
+    else {
+        return false;
+    };
+    let Some((crtc, plane)) = identity.split_once("/plane=") else {
+        return false;
+    };
+    [connector, crtc, plane].into_iter().all(|value| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+            && value.parse::<u32>().is_ok_and(|number| number > 0)
+    })
+}
+
 fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
     match provider {
         CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
         CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
         CaptureProvider::PipeWire => None,
+        CaptureProvider::X11 => None,
+        CaptureProvider::Kms => None,
     }
 }
 
@@ -1297,6 +1563,10 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
         }
         // Portal IDs are scoped to a selected session and have no Windows alias.
         CaptureProvider::PipeWire => None,
+        CaptureProvider::X11 => output_id
+            .strip_prefix("x11:")
+            .and_then(|value| value.rsplit_once('/').map(|(name, _)| name.to_owned())),
+        CaptureProvider::Kms => None,
     }
 }
 
@@ -1367,6 +1637,8 @@ fn accumulate_fallback_page(
                 }
                 CaptureProvider::Wgc => output.id == device_name,
                 CaptureProvider::PipeWire => false,
+                CaptureProvider::X11 => false,
+                CaptureProvider::Kms => false,
             };
         if matches && stream.fallback_match.replace(output.id).is_some() {
             return Err(());

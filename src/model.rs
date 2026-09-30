@@ -12,6 +12,10 @@ pub enum CaptureProvider {
     /// An explicitly selected current-user portal source.
     #[serde(rename = "pipewire")]
     PipeWire,
+    /// An explicitly selected XRandR output captured from the X11 root.
+    X11,
+    /// An explicitly selected physical KMS primary-plane framebuffer.
+    Kms,
 }
 
 impl CaptureProvider {
@@ -20,6 +24,8 @@ impl CaptureProvider {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
             Self::PipeWire => "amaterasu.capture-pipewire/1",
+            Self::X11 => "amaterasu.capture-x11/1",
+            Self::Kms => "amaterasu.capture-kms/1",
         }
     }
 }
@@ -658,6 +664,42 @@ mod tests {
             assert_eq!(auto_capture, expected_auto, "mode {mode}");
             assert_eq!(constant_rate, expected_rate, "mode {mode}");
         }
+    }
+
+    #[test]
+    fn x11_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
+        assert_eq!(CaptureProvider::X11.service(), "amaterasu.capture-x11/1");
+        assert_eq!(serde_json::to_value(CaptureProvider::X11).unwrap(), "x11");
+
+        let settings = Settings {
+            enabled: true,
+            capture_providers: [CaptureProvider::X11].into(),
+            drain_timeout_ms: 5000,
+        };
+        assert!(settings.validate().is_ok());
+        let empty = Settings {
+            capture_providers: BTreeSet::new(),
+            ..settings
+        };
+        assert_eq!(empty.validate(), Err("invalid_video_settings"));
+    }
+
+    #[test]
+    fn kms_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
+        assert_eq!(CaptureProvider::Kms.service(), "amaterasu.capture-kms/1");
+        assert_eq!(serde_json::to_value(CaptureProvider::Kms).unwrap(), "kms");
+
+        let settings = Settings {
+            enabled: true,
+            capture_providers: [CaptureProvider::Kms].into(),
+            drain_timeout_ms: 5000,
+        };
+        assert!(settings.validate().is_ok());
+        let empty = Settings {
+            capture_providers: BTreeSet::new(),
+            ..settings
+        };
+        assert_eq!(empty.validate(), Err("invalid_video_settings"));
     }
 
     #[test]

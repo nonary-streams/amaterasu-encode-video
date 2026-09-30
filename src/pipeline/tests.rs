@@ -225,6 +225,8 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
         CaptureProvider::Dxgi,
         CaptureProvider::Wgc,
         CaptureProvider::PipeWire,
+        CaptureProvider::X11,
+        CaptureProvider::Kms,
     ]
     .into_iter()
     .find(|provider| provider.service() == service)
@@ -449,6 +451,42 @@ fn pipewire_enumeration(output: Value) -> Value {
         "outputs": [output.clone()],
         "enumeration_id": output["id"],
         "geometry_supported": false
+    })
+}
+
+fn x11_output(id: &str, device_name: &str, width: u32, height: u32) -> Value {
+    json!({
+        "id": id,
+        "adapter": "x11",
+        "adapter_vendor_id": null,
+        "adapter_device_id": null,
+        "adapter_description": null,
+        "device_name": device_name,
+        "attached": true,
+        "left": 0,
+        "top": 0,
+        "width": width,
+        "height": height,
+        "rotation": 1
+    })
+}
+
+fn kms_output(id: &str, card: &str, width: u32, height: u32) -> Value {
+    json!({
+        "id": id,
+        "adapter": format!("/dev/dri/{card}"),
+        "adapter_vendor_id": null,
+        "adapter_device_id": null,
+        "adapter_description": "DRM/KMS primary plane",
+        "device_name": format!("HDMI-A-1 ({card})"),
+        "attached": true,
+        "framebuffer_export_supported": true,
+        "readback_reason": null,
+        "left": 0,
+        "top": 0,
+        "width": width,
+        "height": height,
+        "rotation": 1
     })
 }
 
@@ -1894,6 +1932,187 @@ fn pipewire_enumeration_rejects_multiple_mismatched_and_unsupported_sources() {
         ),
         Err("invalid_capture_selection")
     );
+}
+
+#[test]
+fn x11_open_reenumerates_exact_current_output_and_never_falls_back() {
+    let output_id = "x11:DP-1/000000a4";
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::X11, CaptureProvider::Wgc].into());
+    runtime.capture_enumeration_override = Some(json!({
+        "ok": true,
+        "outputs": [x11_output(output_id, "DP-1", 1920, 1080)],
+        "total": 1,
+        "next_offset": null
+    }));
+    let mut operation = open();
+    let Operation::Open {
+        capture_provider,
+        output,
+        ..
+    } = &mut operation
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::X11;
+    *output = output_id.into();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    let output_requests: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == CaptureProvider::X11.service() => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(output_requests[0]["action"], "enumerate");
+    assert_eq!(output_requests[1]["action"], "open");
+    assert_eq!(output_requests[1]["output"], output_id);
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Request { service, .. }
+            if service == CaptureProvider::Wgc.service()))
+    );
+}
+
+#[test]
+fn x11_selection_rejects_stale_geometry_and_does_not_select_an_alternate_output() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::X11, CaptureProvider::Wgc].into());
+    runtime.capture_enumeration_override = Some(json!({
+        "ok": true,
+        "outputs": [x11_output("x11:DP-1/000000a4", "DP-1", 1280, 720)],
+        "total": 1,
+        "next_offset": null
+    }));
+    let mut operation = open();
+    let Operation::Open {
+        capture_provider,
+        output,
+        ..
+    } = &mut operation
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::X11;
+    *output = "x11:DP-1/000000a4".into();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert_eq!(
+        runtime.completed[0].1["code"],
+        "capture_dimensions_mismatch"
+    );
+    assert_eq!(plane.calls, 0);
+    assert_eq!(runtime.open_effects, 0);
+    assert_eq!(alternate_provider(CaptureProvider::X11), None);
+}
+
+#[test]
+fn kms_open_reenumerates_exact_exportable_current_output_without_fallback() {
+    let output_id = "kms:card1/conn=34/crtc=56/plane=78";
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Kms, CaptureProvider::Wgc].into());
+    runtime.capture_enumeration_override = Some(json!({
+        "ok": true,
+        "outputs": [kms_output(output_id, "card1", 1920, 1080)],
+        "total": 1,
+        "next_offset": null
+    }));
+    let mut operation = open();
+    let Operation::Open {
+        capture_provider,
+        output,
+        ..
+    } = &mut operation
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::Kms;
+    *output = output_id.into();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    let output_requests: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == CaptureProvider::Kms.service() => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(output_requests[0]["action"], "enumerate");
+    assert_eq!(output_requests[1]["action"], "open");
+    assert_eq!(output_requests[1]["output"], output_id);
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Request { service, .. }
+            if service == CaptureProvider::Wgc.service()))
+    );
+}
+
+#[test]
+fn kms_selection_rejects_non_exportable_or_stale_outputs() {
+    let configuration = open_configuration();
+    let output_id = "kms:card1/conn=34/crtc=56/plane=78";
+    let valid = kms_output(
+        output_id,
+        "card1",
+        configuration.width,
+        configuration.height,
+    );
+    assert_eq!(
+        kms_selection_output(
+            &json!({"ok": true, "outputs": [valid.clone()], "next_offset": null}),
+            output_id,
+            &configuration
+        ),
+        Ok(())
+    );
+
+    let mut unsupported = valid.clone();
+    unsupported["framebuffer_export_supported"] = json!(false);
+    unsupported["readback_reason"] = json!("drm_format_or_geometry_unsupported");
+    assert_eq!(
+        kms_selection_output(
+            &json!({"ok": true, "outputs": [unsupported], "next_offset": null}),
+            output_id,
+            &configuration
+        ),
+        Err("capture_output_unavailable")
+    );
+    assert_eq!(
+        kms_selection_output(
+            &json!({"ok": true, "outputs": [valid.clone(), valid], "next_offset": null}),
+            output_id,
+            &configuration
+        ),
+        Err("invalid_capture_selection")
+    );
+    assert_eq!(
+        kms_selection_output(
+            &json!({"ok": true, "outputs": [kms_output(output_id, "card1", 1280, 720)], "next_offset": null}),
+            output_id,
+            &configuration
+        ),
+        Err("capture_dimensions_mismatch")
+    );
+    assert_eq!(alternate_provider(CaptureProvider::Kms), None);
+    assert_eq!(output_device_name(CaptureProvider::Kms, output_id), None);
+    assert!(!valid_kms_output_id("kms:card00/conn=34/crtc=56/plane=78"));
+    assert!(!valid_kms_output_id("kms:card1/conn=034/crtc=56/plane=78"));
 }
 
 #[test]
