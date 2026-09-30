@@ -78,6 +78,12 @@ impl Settings {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
+    #[serde(
+        default = "default_video_stream_format",
+        skip_serializing_if = "is_default_video_stream_format"
+    )]
+    pub video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -101,8 +107,8 @@ pub struct Configuration {
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
-    /// Zero leaves reference-frame selection to the encoder; one requires a
-    /// single H.264 reference frame.
+    /// Zero leaves H.264 reference-frame selection to the encoder; a positive
+    /// value requests the exact maximum in the stream's H.264 SPS.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
     /// Frozen host hardware-encoder controls resolved before stream activation.
@@ -113,6 +119,14 @@ pub struct Configuration {
     /// AMD AV1 latency policy. Current capture and H.264 MFT paths cannot apply it.
     #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
+}
+
+fn default_video_stream_format() -> amaterasu_module_sdk::VideoStreamFormat {
+    amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+}
+
+fn is_default_video_stream_format(format: &amaterasu_module_sdk::VideoStreamFormat) -> bool {
+    *format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
 }
 
 /// Provider-reported source size and logical touch units. Desktop geometry does
@@ -166,7 +180,9 @@ fn is_default_qp(value: &i32) -> bool {
 
 impl Configuration {
     pub fn validate(&self) -> bool {
-        (16..=3840).contains(&self.width)
+        self.video_stream_format.validate().is_ok()
+            && self.video_stream_format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+            && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
@@ -412,6 +428,34 @@ mod tests {
         invalid.sw_preset = None;
         invalid.sw_tune = Some("bad\0option".into());
         assert!(!invalid.validate());
+    }
+
+    #[test]
+    fn negotiated_video_format_defaults_to_h264_sdr_and_fails_closed_for_hevc() {
+        let mut request = open_request();
+        let Operation::Open { configuration, .. } =
+            serde_json::from_value::<Operation>(request.clone()).unwrap()
+        else {
+            panic!("open expected")
+        };
+        assert_eq!(
+            configuration.video_stream_format,
+            amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+        );
+        assert!(
+            serde_json::to_value(&configuration)
+                .unwrap()
+                .get("video_stream_format")
+                .is_none()
+        );
+
+        request["configuration"]["video_stream_format"] = json!({
+            "codec":"hevc", "bit_depth":8, "dynamic_range":"sdr"
+        });
+        let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
+            panic!("open expected")
+        };
+        assert!(!configuration.validate());
     }
 
     fn open_request() -> Value {

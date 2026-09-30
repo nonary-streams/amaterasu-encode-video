@@ -464,6 +464,7 @@ fn open() -> Operation {
         output: "display-1".into(),
         encoder: amaterasu_module_sdk::EncoderSelection::Identity(encoder_identity()),
         configuration: Box::new(Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 1920,
             height: 1080,
             fps: 60,

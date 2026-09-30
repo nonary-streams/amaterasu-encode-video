@@ -594,6 +594,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -667,6 +668,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -778,6 +780,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 30,
@@ -882,6 +885,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -943,6 +947,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
