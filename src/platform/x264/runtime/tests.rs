@@ -154,7 +154,9 @@ fn independently_decode(packets: &[Packet]) -> Vec<u8> {
 #[test]
 #[ignore = "requires matching system x264 runtime and independent FFmpeg decoder"]
 fn software_encodes_real_nv12_with_timestamps_forced_idr_and_independent_decode() {
-    let packets = encoded_stream(configuration(None, None));
+    let mut configuration = configuration(None, None);
+    configuration.max_reference_frames = 3;
+    let packets = encoded_stream(configuration);
     let decoded = independently_decode(&packets);
     let original = synthetic_frame(0, 128, 96);
     let error: usize = decoded[..original.len()]

@@ -48,6 +48,9 @@ pub struct Configuration {
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
+    /// Frozen host hardware-encoder controls resolved before stream activation.
+    #[serde(default, skip_serializing_if = "is_default_nvenc_settings")]
+    pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
     /// NVENC quality preset. This MFT-only backend does not support NVENC presets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_preset: Option<NvencPreset>,
@@ -60,6 +63,10 @@ pub struct Configuration {
     /// AMD AV1 latency policy. The current H.264 MFT backend cannot apply it.
     #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
+}
+
+fn is_default_nvenc_settings(settings: &amaterasu_module_sdk::NvencSettings) -> bool {
+    settings == &amaterasu_module_sdk::NvencSettings::default()
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -138,6 +145,7 @@ impl Configuration {
         self.sw_tune.as_deref().unwrap_or("zerolatency")
     }
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.nvenc_settings.validate()?;
         for (value, maximum) in [(self.software_preset(), 128), (self.software_tune(), 256)] {
             if value.len() > maximum || value.chars().any(char::is_control) {
                 return Err("invalid_software_configuration");
@@ -162,7 +170,7 @@ impl Configuration {
             || !(1..=120).contains(&self.fps)
             || !(100_000..=100_000_000).contains(&self.bitrate)
             || self.slices_per_frame < 1
-            || self.max_reference_frames > 1
+            || self.max_reference_frames > 16
         {
             return Err("invalid_configuration");
         }
@@ -329,6 +337,25 @@ mod tests {
     }
 
     #[test]
+    fn encode_boundary_rejects_out_of_range_nvenc_settings() {
+        for (nvenc_preset, nvenc_vbv_increase) in [(8, 0), (1, 401)] {
+            let mut configuration: Configuration = serde_json::from_value(serde_json::json!({
+                "width": 16,
+                "height": 16,
+                "fps": 60,
+                "bitrate": 1_000_000
+            }))
+            .unwrap();
+            configuration.nvenc_settings = amaterasu_module_sdk::NvencSettings {
+                nvenc_preset,
+                nvenc_vbv_increase,
+                ..Default::default()
+            };
+            assert_eq!(configuration.validate(), Err("invalid_nvenc_settings"));
+        }
+    }
+
+    #[test]
     fn nvenc_h264_cavlc_requires_a_json_boolean_and_rejects_enabled_mode() {
         let base = serde_json::json!({
             "width": 16,
@@ -486,6 +513,7 @@ mod tests {
             min_threads: 2,
             qp: 28,
             max_reference_frames: 0,
+            nvenc_settings: amaterasu_module_sdk::NvencSettings::default(),
             nvenc_preset: Some(NvencPreset::P1),
             nvenc_h264_cavlc: false,
             nvenc_spatial_aq: false,

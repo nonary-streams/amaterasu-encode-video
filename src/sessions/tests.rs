@@ -78,6 +78,7 @@ fn configuration() -> Configuration {
         min_threads: 2,
         qp: 28,
         max_reference_frames: 0,
+        nvenc_settings: amaterasu_module_sdk::NvencSettings::default(),
         nvenc_preset: None,
         nvenc_h264_cavlc: false,
         nvenc_spatial_aq: false,
@@ -864,14 +865,14 @@ fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
     );
 
     let mut strict = legacy.clone();
-    strict.max_reference_frames = 1;
+    strict.max_reference_frames = 3;
     assert_eq!(
         serde_json::to_value(&strict).unwrap()["max_reference_frames"],
-        1
+        3
     );
 
     let mut invalid = configuration();
-    invalid.max_reference_frames = 2;
+    invalid.max_reference_frames = 17;
     assert_eq!(invalid.validate(), Err("invalid_configuration"));
 
     let mut sessions = Sessions::new(true);
@@ -885,8 +886,8 @@ fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
         },
     );
     let mut changed = configuration();
-    changed.max_reference_frames = 1;
-    assert_eq!(open_reply(7, &changed, false)["max_reference_frames"], 1);
+    changed.max_reference_frames = 3;
+    assert_eq!(open_reply(7, &changed, false)["max_reference_frames"], 3);
     assert_eq!(
         sessions
             .open(
