@@ -23,7 +23,8 @@ struct amaterasu_x264_functions {
 };
 
 struct amaterasu_x264_configuration {
-    uint32_t width, height, fps, bitrate, reference_frames, min_threads;
+    uint32_t width, height, fps, bitrate, reference_frames;
+    int32_t slices_per_frame, min_threads;
 };
 
 struct amaterasu_x264_output {
@@ -36,7 +37,7 @@ struct amaterasu_x264_encoder {
     struct amaterasu_x264_functions functions;
     x264_t *encoder;
     int width, height;
-    int effective_threads;
+    int effective_threads, sliced_threads, slice_count;
 };
 
 int amaterasu_x264_build(void) { return X264_BUILD; }
@@ -75,7 +76,14 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
     /* These streaming constraints take precedence over preset/tune choices.
      * No B pictures or unbounded lookahead may violate the native queue ABI. */
     parameters.i_bframe = 0;
-    parameters.i_threads = (int)configuration->min_threads;
+    /* FFmpeg's libx264 maps thread_count to i_threads, FF_THREAD_SLICE to
+     * b_sliced_threads, and avctx->slices to i_slice_count. The reference sets
+     * all three from max(client slices, configured min_threads). */
+    int effective_slices = configuration->slices_per_frame > configuration->min_threads
+        ? configuration->slices_per_frame : configuration->min_threads;
+    parameters.i_threads = effective_slices;
+    parameters.b_sliced_threads = 1;
+    parameters.i_slice_count = effective_slices;
     parameters.i_lookahead_threads = 1;
     parameters.i_sync_lookahead = 0;
     parameters.rc.i_lookahead = 0;
@@ -119,13 +127,21 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
     result->width = (int)configuration->width;
     result->height = (int)configuration->height;
     result->effective_threads = effective.i_threads;
+    result->sliced_threads = effective.b_sliced_threads;
+    result->slice_count = effective.i_slice_count;
     *status = 0;
     return result;
 }
 
-int amaterasu_x264_thread_count(struct amaterasu_x264_encoder *encoder)
+int amaterasu_x264_threading(struct amaterasu_x264_encoder *encoder,
+    int *threads, int *sliced_threads, int *slices)
 {
-    return encoder->effective_threads;
+    if (encoder == NULL || threads == NULL || sliced_threads == NULL || slices == NULL)
+        return -1;
+    *threads = encoder->effective_threads;
+    *sliced_threads = encoder->sliced_threads;
+    *slices = encoder->slice_count;
+    return 0;
 }
 
 void amaterasu_x264_close(struct amaterasu_x264_encoder *encoder)

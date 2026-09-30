@@ -5,7 +5,12 @@ use std::{
 };
 
 unsafe extern "C" {
-    fn amaterasu_x264_thread_count(encoder: *mut std::ffi::c_void) -> i32;
+    fn amaterasu_x264_threading(
+        encoder: *mut std::ffi::c_void,
+        threads: *mut i32,
+        sliced_threads: *mut i32,
+        slices: *mut i32,
+    ) -> i32;
 }
 
 #[test]
@@ -76,6 +81,34 @@ fn encoded_stream(config: Configuration) -> Vec<Packet> {
             .is_err()
     );
     packets
+}
+
+fn h264_slice_count(bytes: &[u8]) -> usize {
+    let mut nal_units = Vec::new();
+    let mut offset = 0;
+    while offset + 3 < bytes.len() {
+        let start_code_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            offset += 1;
+            continue;
+        };
+        let nal_start = offset + start_code_length;
+        let next_start = (nal_start..bytes.len().saturating_sub(2)).find(|index| {
+            bytes[*index..].starts_with(&[0, 0, 1]) || bytes[*index..].starts_with(&[0, 0, 0, 1])
+        });
+        let nal_end = next_start.unwrap_or(bytes.len());
+        if nal_start < nal_end {
+            nal_units.push(bytes[nal_start] & 0x1f);
+        }
+        offset = nal_end;
+    }
+    nal_units
+        .into_iter()
+        .filter(|nal_type| matches!(nal_type, 1 | 5))
+        .count()
 }
 
 fn independently_decode(packets: &[Packet]) -> Vec<u8> {
@@ -177,22 +210,40 @@ fn software_rejects_invalid_codec_options_and_changed_identity() {
 
 #[test]
 #[ignore = "requires matching system x264 runtime"]
-fn software_uses_requested_effective_x264_thread_count() {
-    for min_threads in [1, 3, 256] {
+fn software_emits_the_maximum_of_client_and_minimum_slice_counts() {
+    for (client_slices, min_threads, expected_slices) in
+        [(1, 1, 1), (1, 3, 3), (4, 3, 4), (4, -9, 4)]
+    {
         let mut config = configuration(None, None);
         config.width = 640;
         config.height = 480;
+        config.slices_per_frame = client_slices;
+        config.min_threads = min_threads;
+        let packets = encoded_stream(config);
+        for packet in packets {
+            assert_eq!(h264_slice_count(&packet.bytes), expected_slices);
+        }
+        let mut config = configuration(None, None);
+        config.width = 640;
+        config.height = 480;
+        config.slices_per_frame = client_slices;
         config.min_threads = min_threads;
         let encoder = Encoder::open(&identity(), &config).unwrap();
-        // SAFETY: the live Encoder owns a native x264 encoder using this adapter.
-        let effective = unsafe { amaterasu_x264_thread_count(encoder.native.as_ptr()) };
-        if min_threads <= 3 {
-            assert_eq!(effective, min_threads as i32);
-        } else {
-            // x264 caps the effective frame-thread count for the stream's
-            // dimensions and runtime. The configured value is an upper-bound
-            // request, not a promise that the backend allocates that many.
-            assert!(effective > 0 && effective <= min_threads as i32);
-        }
+        let (mut threads, mut sliced_threads, mut slices) = (0, 0, 0);
+        // SAFETY: encoder owns a live adapter handle and all output pointers are valid.
+        assert_eq!(
+            unsafe {
+                amaterasu_x264_threading(
+                    encoder.native.as_ptr(),
+                    &mut threads,
+                    &mut sliced_threads,
+                    &mut slices,
+                )
+            },
+            0
+        );
+        assert_eq!(threads, expected_slices as i32);
+        assert_eq!(sliced_threads, i32::from(expected_slices > 1));
+        assert_eq!(slices, expected_slices as i32);
     }
 }
