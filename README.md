@@ -161,10 +161,11 @@ software-only policy, matching the reference's backend-specific behavior.
 Moonlight's `videoEncoderSlicesPerFrame`; `configuration.min_threads` preserves
 the reference signed 32-bit request (default 2). The adapter passes
 `max(slices_per_frame, min_threads)` to x264's `i_threads`, enables sliced
-threading, and sets `i_slice_count` to the same value, matching FFmpeg's
+threading, and sets `i_slice_count` to the same requested value, matching FFmpeg's
 `thread_count`, `FF_THREAD_SLICE`, and `slices` mapping. An opt-in native test
-checks those effective parameters and counts H.264 slice NAL units in actual
-encoded output. QP defaults to 28 but x264 ABR ignores it; it remains metadata
+checks the effective parameters and counts H.264 slice NAL units in actual
+encoded output. x264 can cap effective thread or slice counts based on frame
+dimensions and backend limits. QP defaults to 28 but x264 ABR ignores it; it remains metadata
 until Amaterasu has a VAAPI constant-QP consumer.
 
 The adapter calls x264's preset/tune initializer before applying stream limits.
