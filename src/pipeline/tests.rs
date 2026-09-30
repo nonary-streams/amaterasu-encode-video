@@ -463,7 +463,7 @@ fn open() -> Operation {
         minimum_fps_target: 20.0,
         output: "display-1".into(),
         encoder: amaterasu_module_sdk::EncoderSelection::Identity(encoder_identity()),
-        configuration: Configuration {
+        configuration: Box::new(Configuration {
             width: 1920,
             height: 1080,
             fps: 60,
@@ -472,10 +472,12 @@ fn open() -> Operation {
             qp: 28,
             min_threads: 2,
             max_reference_frames: 0,
+            nvenc_settings: amaterasu_module_sdk::NvencSettings::default(),
+            nvenc_spatial_aq: false,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
             sw_preset: None,
             sw_tune: None,
-        },
+        }),
     }
 }
 
@@ -483,7 +485,7 @@ fn open_configuration() -> Configuration {
     let Operation::Open { configuration, .. } = open() else {
         unreachable!()
     };
-    configuration
+    *configuration
 }
 
 #[test]
@@ -531,7 +533,7 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
     let Operation::Open { configuration, .. } = &mut operation else {
         unreachable!();
     };
-    configuration.max_reference_frames = 1;
+    configuration.max_reference_frames = 3;
     pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
@@ -539,11 +541,11 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
         command,
         Command::Request { service, payload, .. }
             if service == ENCODE
-                && payload["configuration"]["max_reference_frames"] == 1
+                && payload["configuration"]["max_reference_frames"] == 3
     )));
     assert_eq!(
         runtime.completed[0].1["configuration"]["max_reference_frames"],
-        1
+        3
     );
 }
 

@@ -273,7 +273,7 @@ impl Pipeline {
                     minimum_fps_target,
                     output,
                     encoder,
-                    configuration,
+                    configuration: *configuration,
                 },
                 send,
             ),

@@ -105,6 +105,11 @@ pub struct Configuration {
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
+    /// Frozen host hardware-encoder controls resolved before stream activation.
+    #[serde(default, skip_serializing_if = "is_default_nvenc_settings")]
+    pub nvenc_settings: amaterasu_module_sdk::NvencSettings,
+    #[serde(default)]
+    pub nvenc_spatial_aq: bool,
     /// AMD AV1 latency policy. Current capture and H.264 MFT paths cannot apply it.
     #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
@@ -129,6 +134,10 @@ impl TouchSurface {
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_default_nvenc_settings(settings: &amaterasu_module_sdk::NvencSettings) -> bool {
+    settings == &amaterasu_module_sdk::NvencSettings::default()
 }
 
 fn default_slices_per_frame() -> i32 {
@@ -164,8 +173,9 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.slices_per_frame >= 1
-            && self.max_reference_frames <= 1
+            && self.max_reference_frames <= 16
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
+            && self.nvenc_settings.validate().is_ok()
             && valid_software_option(&self.sw_preset, 128)
             && valid_software_option(&self.sw_tune, 256)
     }
@@ -202,7 +212,7 @@ pub enum Operation {
         minimum_fps_target: f64,
         output: String,
         encoder: EncoderSelection,
-        configuration: Configuration,
+        configuration: Box<Configuration>,
     },
     Lookup {
         operation_id: String,
@@ -241,7 +251,7 @@ enum OperationInput {
         minimum_fps_target: f64,
         output: String,
         encoder: EncoderSelection,
-        configuration: Configuration,
+        configuration: Box<Configuration>,
     },
     Lookup {
         operation_id: String,
@@ -461,6 +471,10 @@ mod tests {
             1
         );
         required.max_reference_frames = 2;
+        assert!(required.validate());
+        required.max_reference_frames = 16;
+        assert!(required.validate());
+        required.max_reference_frames = 17;
         assert!(!required.validate());
     }
 
