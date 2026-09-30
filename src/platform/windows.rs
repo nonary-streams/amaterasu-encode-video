@@ -809,6 +809,7 @@ mod tests {
     #[test]
     fn nvenc_h264_cavlc_is_rejected_before_media_foundation_startup() {
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -837,6 +838,7 @@ mod tests {
     #[test]
     fn nvenc_spatial_aq_is_rejected_before_media_foundation_startup() {
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -865,6 +867,7 @@ mod tests {
     #[test]
     fn amd_av1_latency_mode_is_rejected_before_media_foundation_startup() {
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
@@ -896,6 +899,7 @@ mod tests {
         let devices = enumerate().unwrap();
         assert!(!devices.is_empty(), "no hardware NV12/H264 MFT available");
         let config = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 640,
             height: 480,
             fps: 30,

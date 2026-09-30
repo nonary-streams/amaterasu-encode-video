@@ -70,6 +70,7 @@ impl Backend for StreamingFake {
 
 fn configuration() -> Configuration {
     Configuration {
+        video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
         width: 16,
         height: 16,
         fps: 60,

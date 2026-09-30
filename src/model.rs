@@ -20,6 +20,12 @@ impl AmdAv1LatencyMode {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
+    #[serde(
+        default = "default_video_stream_format",
+        skip_serializing_if = "is_default_video_stream_format"
+    )]
+    pub video_stream_format: amaterasu_module_sdk::VideoStreamFormat,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -44,8 +50,8 @@ pub struct Configuration {
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
-    /// Zero leaves reference-frame selection to the encoder; one requires a
-    /// single H.264 reference frame.
+    /// Zero leaves H.264 reference-frame selection to the encoder; a positive
+    /// value requests the exact maximum in the stream's H.264 SPS.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
     /// Frozen host hardware-encoder controls resolved before stream activation.
@@ -63,6 +69,14 @@ pub struct Configuration {
     /// AMD AV1 latency policy. The current H.264 MFT backend cannot apply it.
     #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
+}
+
+fn default_video_stream_format() -> amaterasu_module_sdk::VideoStreamFormat {
+    amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+}
+
+fn is_default_video_stream_format(format: &amaterasu_module_sdk::VideoStreamFormat) -> bool {
+    *format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
 }
 
 fn is_default_nvenc_settings(settings: &amaterasu_module_sdk::NvencSettings) -> bool {
@@ -145,6 +159,10 @@ impl Configuration {
         self.sw_tune.as_deref().unwrap_or("zerolatency")
     }
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.video_stream_format.validate()?;
+        if self.video_stream_format != amaterasu_module_sdk::VideoStreamFormat::H264_SDR {
+            return Err("video_format_unsupported_by_encoder");
+        }
         self.nvenc_settings.validate()?;
         for (value, maximum) in [(self.software_preset(), 128), (self.software_tune(), 256)] {
             if value.len() > maximum || value.chars().any(char::is_control) {
@@ -337,6 +355,31 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_video_format_defaults_to_h264_sdr_and_backend_rejects_hevc() {
+        let mut request = serde_json::json!({
+            "width":16,"height":16,"fps":60,"bitrate":1000000
+        });
+        let legacy: Configuration = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            legacy.video_stream_format,
+            amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+        );
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("video_stream_format")
+                .is_none()
+        );
+        assert!(legacy.validate().is_ok());
+
+        request["video_stream_format"] = serde_json::json!({
+            "codec":"hevc", "bit_depth":8, "dynamic_range":"sdr"
+        });
+        let hevc: Configuration = serde_json::from_value(request).unwrap();
+        assert_eq!(hevc.validate(), Err("video_format_unsupported_by_encoder"));
+    }
+
+    #[test]
     fn encode_boundary_rejects_out_of_range_nvenc_settings() {
         for (nvenc_preset, nvenc_vbv_increase) in [(8, 0), (1, 401)] {
             let mut configuration: Configuration = serde_json::from_value(serde_json::json!({
@@ -505,6 +548,7 @@ mod tests {
     #[test]
     fn nvenc_preset_is_rejected_by_the_mft_only_configuration() {
         let configuration = Configuration {
+            video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
             fps: 60,
