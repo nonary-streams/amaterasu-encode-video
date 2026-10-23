@@ -6,8 +6,9 @@ mod portal;
 
 use crate::{
     model::{
-        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderIdentity, OpenSpec, Operation,
-        Settings, TouchSurface, error, valid_minimum_fps_target,
+        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderBackend, EncoderIdentity,
+        EncoderSelection, OpenSpec, Operation, Settings, TouchSurface, error,
+        valid_minimum_fps_target,
     },
     plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
     queue::Queues,
@@ -25,6 +26,7 @@ use std::{
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
+    SelectEncoder,
     Capture,
     FallbackEnumerate,
     Encoder,
@@ -61,7 +63,8 @@ struct Stream {
     grace: Option<output::Grace>,
     output: String,
     capture_output: String,
-    encoder: EncoderIdentity,
+    encoder: Option<EncoderIdentity>,
+    encoder_index: Option<u32>,
     configuration: Configuration,
     parent: Option<u64>,
     ending_parent: Option<u64>,
@@ -125,9 +128,11 @@ impl Stream {
 
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
-            Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder | Stage::Activating => {
-                "opening"
-            }
+            Stage::SelectEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+            | Stage::Activating => "opening",
             Stage::Running => "running",
             Stage::StopCapture | Stage::Draining => "draining",
             Stage::Failed => "cleanup_failed",
@@ -138,7 +143,6 @@ impl Stream {
             "stream": id,
             "state": state,
             "stage": stage_name(self.stage),
-            "encoder": self.encoder,
             "packet_boundaries": self.packet_boundaries,
             "supports_packet_boundaries": true,
             "output": self.output,
@@ -152,6 +156,9 @@ impl Stream {
             "submitted_frames": self.submitted,
             "error": self.error,
         });
+        if let Some(encoder) = &self.encoder {
+            response["encoder"] = json!(encoder);
+        }
         if let Some(geometry) = self.desktop_geometry {
             response["desktop_geometry"] = json!(geometry);
         }
@@ -322,7 +329,8 @@ impl Pipeline {
                 };
                 if matches!(
                     value.stage,
-                    Stage::Capture
+                    Stage::SelectEncoder
+                        | Stage::Capture
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
                         | Stage::Activating
@@ -415,6 +423,13 @@ impl Pipeline {
             let opened_at = Instant::now();
             let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
             let operation = format!("video-{}-{id}", self.epoch);
+            let (encoder, encoder_index, stage) = match encoder {
+                EncoderSelection::Identity(identity) => (Some(identity), None, Stage::Capture),
+                EncoderSelection::Index(index) => (None, Some(index), Stage::SelectEncoder),
+                EncoderSelection::Backend(EncoderBackend::Auto) => {
+                    (None, None, Stage::SelectEncoder)
+                }
+            };
             let fallback_provider = if auto_capture && !constant_rate {
                 alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
             } else {
@@ -443,6 +458,7 @@ impl Pipeline {
                 capture_output: output.clone(),
                 output,
                 encoder,
+                encoder_index,
                 configuration,
                 parent: Some(request),
                 ending_parent: None,
@@ -457,8 +473,8 @@ impl Pipeline {
                 capture_operation: format!("{operation}-capture-0"),
                 operation,
                 capture_attempt: 0,
-                no_resources: false,
-                stage: Stage::Capture,
+                no_resources: stage == Stage::SelectEncoder,
+                stage,
                 retries: 0,
                 error: None,
                 next_frame: Instant::now(),
@@ -749,7 +765,7 @@ fn advance(
     };
     let parent = if matches!(
         stream.stage,
-        Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
+        Stage::SelectEncoder | Stage::Capture | Stage::FallbackEnumerate | Stage::Encoder
     ) {
         stream.parent
     } else {
@@ -799,6 +815,7 @@ fn advance(
 fn request(stream: &Stream) -> (&'static str, Value) {
     let operation = &stream.operation;
     match stream.stage {
+        Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::Capture => {
             let mut request = json!({
                 "action":"open",
@@ -844,7 +861,10 @@ fn request(stream: &Stream) -> (&'static str, Value) {
 fn encoder_open_request(stream: &Stream) -> Value {
     let mut request = json!({
         "action": "open",
-        "encoder": stream.encoder,
+        "encoder": stream
+            .encoder
+            .as_ref()
+            .expect("encoder stage follows encoder selection"),
         "configuration": stream.configuration,
         "operation_id": stream.operation,
     });
@@ -856,6 +876,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
 
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
+        Stage::SelectEncoder => "select-encoder",
         Stage::Capture => "capture",
         Stage::FallbackEnumerate => "fallback-enumerate",
         Stage::Encoder => "encoder",
@@ -874,7 +895,8 @@ fn stage_name(stage: Stage) -> &'static str {
 fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
-        Stage::Capture
+        Stage::SelectEncoder
+            | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::Activating
@@ -934,7 +956,9 @@ fn apply_result(
                     | Stage::StopCapture
             ))
     {
-        let code = if stream.stage == Stage::Encoder {
+        let code = if stream.stage == Stage::SelectEncoder {
+            encoder_selection_error(payload_error_code(&payload))
+        } else if stream.stage == Stage::Encoder {
             encoder_failure_code(payload_error_code(&payload))
         } else if stream.stage == Stage::FallbackEnumerate {
             stream.fallback_error.unwrap_or("provider_failed")
@@ -945,6 +969,16 @@ fn apply_result(
         return false;
     }
     let next = match stream.stage {
+        Stage::SelectEncoder => match resolve_encoder_selection(stream.encoder_index, &payload) {
+            Ok(identity) => {
+                stream.encoder = Some(identity);
+                Stage::Capture
+            }
+            Err(code) => {
+                stream.cleanup(code);
+                return false;
+            }
+        },
         Stage::Capture => {
             let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
                 stream.cleanup("invalid_capture_reply");
@@ -1093,6 +1127,93 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
         .get("code")
         .or_else(|| payload.get("error").and_then(|error| error.get("code")))
         .and_then(Value::as_str)
+}
+
+const MAX_ENCODER_ENTRIES: usize = 64;
+
+/// Resolve profile indices against the current bounded H.264 registry before
+/// capture is opened. `None` means explicit `auto`: hardware first, then the
+/// registered software encoder. No missing/out-of-range selection is guessed.
+fn resolve_encoder_selection(
+    index: Option<u32>,
+    payload: &Value,
+) -> Result<EncoderIdentity, &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(encoder_selection_error(payload_error_code(payload)));
+    }
+    if payload.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Err("encoder_disabled");
+    }
+    let entries = payload
+        .get("encoders")
+        .and_then(Value::as_array)
+        .ok_or("invalid_encoder_enumeration")?;
+    if entries.len() > MAX_ENCODER_ENTRIES {
+        return Err("invalid_encoder_enumeration");
+    }
+    if entries.is_empty() {
+        return Err("h264_encoder_unavailable");
+    }
+
+    let mut identities = Vec::with_capacity(entries.len());
+    let mut hardware = Vec::new();
+    let mut software = Vec::new();
+    for entry in entries {
+        let identity: EncoderIdentity = serde_json::from_value(
+            entry
+                .get("identity")
+                .cloned()
+                .ok_or("invalid_encoder_enumeration")?,
+        )
+        .map_err(|_| "invalid_encoder_enumeration")?;
+        if !valid_encoder_identity(&identity)
+            || entry.get("codec").and_then(Value::as_str) != Some("h264")
+        {
+            return Err("invalid_encoder_enumeration");
+        }
+        let is_hardware = entry
+            .get("hardware")
+            .and_then(Value::as_bool)
+            .ok_or("invalid_encoder_enumeration")?;
+        if is_hardware {
+            hardware.push(identity.clone());
+        } else {
+            software.push(identity.clone());
+        }
+        identities.push(identity);
+    }
+
+    if let Some(index) = index {
+        return identities
+            .get(index as usize)
+            .cloned()
+            .ok_or("encoder_unavailable");
+    }
+    hardware
+        .into_iter()
+        .next()
+        .or_else(|| software.into_iter().next())
+        .ok_or("encoder_unavailable")
+}
+
+fn valid_encoder_identity(identity: &EncoderIdentity) -> bool {
+    let valid_text = |value: &str, maximum: usize| {
+        !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+    };
+    valid_text(&identity.clsid, 128)
+        && valid_text(&identity.friendly_name, 512)
+        && identity
+            .hardware_url
+            .as_deref()
+            .is_none_or(|value| valid_text(value, 2048))
+}
+
+fn encoder_selection_error(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("disabled") => "encoder_disabled",
+        Some("unsupported_platform") => "encoder_unavailable",
+        _ => "encoder_enumeration_failed",
+    }
 }
 
 fn encoder_failure_code(reason: Option<&str>) -> &'static str {
