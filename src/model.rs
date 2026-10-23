@@ -538,7 +538,7 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(capture_provider, CaptureProvider::Dxgi);
+        assert_eq!(capture_provider, CaptureProvider::default());
         assert!(!auto_capture);
         assert!(!constant_rate);
         assert!(wgc_pacing_smoothing);
@@ -637,11 +637,11 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
-                capture_provider: CaptureProvider::default(),
+                capture_provider,
                 auto_capture: true,
                 constant_rate: false,
                 ..
-            }
+            } if capture_provider == CaptureProvider::default()
         ));
     }
 

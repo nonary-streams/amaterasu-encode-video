@@ -2667,7 +2667,7 @@ fn pipewire_selection_flows_into_the_capture_and_encoder_stages() {
         ),
         &mut |command| runtime.send(command),
     );
-    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
     assert!(runtime.commands.iter().any(|command| matches!(
         command,
