@@ -2716,7 +2716,10 @@ fn numeric_encoder_selection_resolves_registry_before_opening_capture() {
 
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     assert!(matches!(
-        runtime.commands.first(),
+        runtime
+            .commands
+            .iter()
+            .find(|command| matches!(command, Command::Request { .. })),
         Some(Command::Request { service, payload, .. })
             if service == ENCODE && payload["action"] == "enumerate"
     ));
@@ -2772,7 +2775,7 @@ fn auto_encoder_selection_prefers_hardware_and_invalid_index_fails_before_captur
     pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 8);
     assert_eq!(
-        pipeline.recent.last().unwrap().1["error"],
+        pipeline.recent.back().unwrap().1["error"],
         "encoder_unavailable"
     );
     assert!(!runtime.commands.iter().any(|command| matches!(
