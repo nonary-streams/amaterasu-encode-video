@@ -29,6 +29,7 @@ struct Runtime {
     capture_page_size: Option<usize>,
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
+    encoder_open_error: Option<&'static str>,
 }
 
 impl Runtime {
@@ -120,9 +121,20 @@ impl Runtime {
                             }
                             result
                         }
+                    } else if action == "select_source" {
+                        json!({
+                            "ok":true,"selection_state":"ready",
+                            "output":{"id":"portal-test-output","source_type":"monitor","width":1920,"height":1080,
+                                "format":"bgra8","pipewire_node":77,"geometry_supported":false}
+                        })
                     } else {
                         json!({"ok":true,"stream":41})
                     }
+                } else if service == ENCODE
+                    && action == "open"
+                    && let Some(code) = self.encoder_open_error
+                {
+                    error(code)
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
                     if !self.omit_reference_metadata {
@@ -175,9 +187,13 @@ impl Runtime {
 }
 
 fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
-    [CaptureProvider::Dxgi, CaptureProvider::Wgc]
-        .into_iter()
-        .find(|provider| provider.service() == service)
+    [
+        CaptureProvider::Dxgi,
+        CaptureProvider::Wgc,
+        CaptureProvider::Pipewire,
+    ]
+    .into_iter()
+    .find(|provider| provider.service() == service)
 }
 
 #[derive(Default)]
@@ -2592,6 +2608,90 @@ fn native_drain_error_is_visible_after_resource_cleanup() {
     assert!(pipeline.streams.is_empty());
     assert_eq!(pipeline.recent[0].1["error"], "encoder_drain_failed");
     assert_eq!(plane.drains, 1);
+}
+
+#[test]
+fn pipewire_sentinel_requires_an_explicit_ready_portal_selection() {
+    let (mut pipeline, mut runtime, _) = setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "alice",
+        91,
+        canonical_open(
+            "",
+            CaptureProvider::Pipewire,
+            "portal-selected-session-source",
+        ),
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "portal_source_selection_required"
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, .. } if service == CaptureProvider::Pipewire.service()
+    )));
+    assert_eq!(runtime.open_effects, 0);
+}
+
+#[test]
+fn pipewire_selection_flows_into_the_capture_and_encoder_stages() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "amaterasu.management",
+        90,
+        Operation::SelectPortalSource {
+            source_type: crate::model::PortalSourceType::Monitor,
+            operation_id: "desktop-pick".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    assert_eq!(
+        runtime.completed.last().unwrap().1["selection_state"],
+        "ready"
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["output"].get("pipewire_node"),
+        None
+    );
+
+    pipeline.handle(
+        "amaterasu.stream-session",
+        91,
+        canonical_open(
+            "",
+            CaptureProvider::Pipewire,
+            "portal-selected-session-source",
+        ),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Pipewire.service()
+                && payload["action"] == "open"
+                && payload["output"] == "portal-test-output"
+    )));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+    )));
+    assert_eq!(plane.inputs.last().unwrap().0, CaptureProvider::Pipewire);
+}
+
+#[test]
+fn unavailable_software_h264_fails_video_open_with_a_specific_error() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_open_error = Some("x264_feature_disabled");
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "h264_encoder_unavailable");
 }
 
 mod operations;

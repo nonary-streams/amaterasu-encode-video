@@ -2,27 +2,35 @@
 
 `amaterasu_video` provides control and native service `amaterasu.video/1`. Product
 coordination stays in this independently built library. It opens an allowlisted capture
-stream and Media Foundation encoder session asynchronously, then moves borrowed
+stream and H.264 encoder session asynchronously, then moves borrowed
 CPU frames directly into the encoder's copying submit API. Encoded packets reach
 consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 
-Settings default to:
+Linux settings default to:
 
 ```json
-{"enabled":false,"capture_providers":["dxgi"],"drain_timeout_ms":5000}
+{"enabled":false,"capture_providers":["pipewire"],"drain_timeout_ms":5000}
 ```
 
-Capture providers are finite identifiers: `dxgi` maps to
-`amaterasu.capture-dxgi/1`; `wgc` maps to `amaterasu.capture-wgc/1`. An empty
-allowlist, unknown identifier, or drain timeout outside 100–30000 ms is rejected.
+Linux defaults to the finite `pipewire` provider,
+`amaterasu.capture-pipewire/1`; other platforms retain the `dxgi` default.
+`wgc` maps to `amaterasu.capture-wgc/1`. An empty allowlist, unknown
+identifier, or drain timeout outside 100–30000 ms is rejected.
 Enabled startup binds every configured native capture provider and the encoder.
 Disabled startup registers services but binds no lower interface and opens no
 devices. Unsupported hardware/platforms fail through real provider responses;
-there is no synthetic frame or software fallback.
+there is no synthetic frame or implicit software fallback. Linux H.264 requires
+the opt-in `software-x264` feature, x264 development headers, and a matching
+runtime library. If no H.264 backend is available, Open fails with
+`h264_encoder_unavailable` after resource cleanup.
 
 ## API
 
 ```json
+{"action":"select_portal_source","source_type":"monitor","operation_id":"desktop-1"}
+{"action":"poll_portal_selection","operation_id":"desktop-1"}
+{"action":"cancel_portal_selection","operation_id":"desktop-1"}
+{"action":"open","capture_provider":"pipewire","output":"portal-selected-session-source","encoder":{"clsid":"amaterasu.software.x264","friendly_name":"x264 software H.264","hardware_url":null},"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"open","output":"<capture enumerate output id>","encoder":0,"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"status"}
 {"action":"status","stream":1}
@@ -34,12 +42,14 @@ there is no synthetic frame or software fallback.
 Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
 `"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned
 to their provider. Empty and `auto` preserve the bootstrap provider selected by
-`capture_provider` as the first choice, defaulting to `dxgi`, and may retry once
+`capture_provider` as the first choice, defaulting to `pipewire` on Linux and
+`dxgi` elsewhere, and may retry once
 with the other provider only after a clean `unsupported_platform` provider reply
 or clean `unavailable` admission rejection. The alternate must be in the startup
 allowlist. Video translates provider-specific output IDs through their shared
 Windows device name and opens the alternate only when its enumeration has one
 attached exact match; missing or ambiguous matches retain the original failure.
+PipeWire has no alternate provider and never falls back to KMS.
 For paged enumeration, video follows every `next_offset` before opening the
 alternate and checks that each page reports the same full-list
 `enumeration_id`. A malformed cursor, changed revision, or duplicate match
@@ -56,6 +66,21 @@ each scheduled read when no new frame is ready. Video's configured FPS sets the
 read cadence; the WGC module does not busy-wait or create a timer. The default is
 event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP,
 RTSP, and stream-session is still pending.
+
+Linux PipeWire capture requires `pipewire` in the startup provider allowlist.
+Call `select_portal_source` with `source_type` `monitor` or `window`, then
+poll `poll_portal_selection` using the same caller-owned operation ID until the
+selection state is `ready`. Open the profile's
+`portal-selected-session-source` sentinel; video resolves it to the current
+management-selected output. Portal control operation IDs remain scoped to the
+principal that started them, while the one current selected output can be used by
+an authorized streaming caller without passing the operation ID to that caller.
+Direct opaque output IDs are accepted only when they match the current ready
+selection. Startup and Open never launch a chooser. Cancel with
+`cancel_portal_selection`. Public selection replies omit PipeWire node handles
+and replace the provider's internal operation ID with the caller's operation ID.
+Permission denial, cancellation, provider unavailability, and revocation fail
+closed; there is no KMS or synthetic fallback.
 
 Video Open accepts `"wgc_pacing_smoothing"`, defaulting to `true`, to snapshot
 the global Windows policy. On WGC streams, a fresh frame after a missed capture

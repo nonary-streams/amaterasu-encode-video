@@ -2,12 +2,25 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
-    #[default]
     Dxgi,
     Wgc,
+    Pipewire,
+}
+
+impl Default for CaptureProvider {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Pipewire
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Dxgi
+        }
+    }
 }
 
 impl CaptureProvider {
@@ -15,8 +28,16 @@ impl CaptureProvider {
         match self {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
+            Self::Pipewire => "amaterasu.capture-pipewire/1",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalSourceType {
+    Monitor,
+    Window,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,7 +68,14 @@ pub struct Settings {
     pub drain_timeout_ms: u64,
 }
 fn default_providers() -> BTreeSet<CaptureProvider> {
-    [CaptureProvider::Dxgi].into()
+    #[cfg(target_os = "linux")]
+    {
+        [CaptureProvider::Pipewire].into()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        [CaptureProvider::Dxgi].into()
+    }
 }
 fn default_drain_timeout() -> u64 {
     5000
@@ -146,6 +174,16 @@ pub struct OpenSpec {
 }
 
 pub enum Operation {
+    SelectPortalSource {
+        source_type: PortalSourceType,
+        operation_id: String,
+    },
+    PollPortalSelection {
+        operation_id: String,
+    },
+    CancelPortalSelection {
+        operation_id: String,
+    },
     Open {
         packet_boundaries: bool,
         operation_id: Option<String>,
@@ -178,6 +216,16 @@ pub enum Operation {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum OperationInput {
+    SelectPortalSource {
+        source_type: PortalSourceType,
+        operation_id: String,
+    },
+    PollPortalSelection {
+        operation_id: String,
+    },
+    CancelPortalSelection {
+        operation_id: String,
+    },
     Open {
         #[serde(default)]
         packet_boundaries: bool,
@@ -271,6 +319,19 @@ impl<'de> Deserialize<'de> for Operation {
         D: Deserializer<'de>,
     {
         Ok(match OperationInput::deserialize(deserializer)? {
+            OperationInput::SelectPortalSource {
+                source_type,
+                operation_id,
+            } => Self::SelectPortalSource {
+                source_type,
+                operation_id,
+            },
+            OperationInput::PollPortalSelection { operation_id } => {
+                Self::PollPortalSelection { operation_id }
+            }
+            OperationInput::CancelPortalSelection { operation_id } => {
+                Self::CancelPortalSelection { operation_id }
+            }
             OperationInput::Open {
                 packet_boundaries,
                 operation_id,
@@ -357,6 +418,12 @@ mod tests {
     #[test]
     fn provider_identifiers_are_finite_and_settings_have_bounded_deadline() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            settings.capture_providers,
+            [CaptureProvider::Pipewire].into()
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(settings.capture_providers, [CaptureProvider::Dxgi].into());
         for input in [
             r#"{"capture_providers":["arbitrary/service"]}"#,
@@ -371,6 +438,24 @@ mod tests {
             );
         }
         assert!(serde_json::from_value::<Operation>(json!({"action":"open","capture_provider":"other","output":"x","encoder":0,"configuration":{"width":16,"height":16,"fps":1,"bitrate":100000}})).is_err());
+        for source_type in ["monitor", "window"] {
+            assert!(
+                serde_json::from_value::<Operation>(json!({
+                    "action": "select_portal_source",
+                    "source_type": source_type,
+                    "operation_id": "choose-1"
+                }))
+                .is_ok()
+            );
+        }
+        assert!(
+            serde_json::from_value::<Operation>(json!({
+                "action": "select_portal_source",
+                "source_type": "virtual_display",
+                "operation_id": "choose-1"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -545,14 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_auto_defaults_to_dxgi_when_no_bootstrap_provider_is_supplied() {
+    fn canonical_auto_defaults_to_platform_provider_when_none_is_supplied() {
         let mut request = open_request();
         request["capture"] = json!("auto");
 
         assert!(matches!(
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
-                capture_provider: CaptureProvider::Dxgi,
+                capture_provider: CaptureProvider::default(),
                 auto_capture: true,
                 constant_rate: false,
                 ..

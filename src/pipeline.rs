@@ -2,6 +2,7 @@ mod lifecycle;
 mod operations;
 mod output;
 mod pacing;
+mod portal;
 
 use crate::{
     model::{
@@ -197,6 +198,7 @@ pub struct Pipeline {
     cursor: usize,
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), operations::Record>,
+    portal: portal::Control,
     pub queues: Arc<Mutex<Queues>>,
 }
 
@@ -212,6 +214,7 @@ impl Pipeline {
             cursor: 0,
             streams: BTreeMap::new(),
             operations: BTreeMap::new(),
+            portal: portal::Control::default(),
             queues,
         }
     }
@@ -224,6 +227,31 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) {
         match operation {
+            Operation::SelectPortalSource {
+                source_type,
+                operation_id,
+            } => self.portal.select(
+                caller,
+                request,
+                source_type,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
+            Operation::PollPortalSelection { operation_id } => self.portal.poll(
+                caller,
+                request,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
+            Operation::CancelPortalSelection { operation_id } => self.portal.cancel(
+                caller,
+                request,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
             Operation::Open {
                 packet_boundaries,
                 operation_id,
@@ -313,7 +341,20 @@ impl Pipeline {
         }
     }
 
-    fn open(&mut self, caller: &str, request: u64, specification: OpenSpec, send: &mut Send<'_>) {
+    fn open(
+        &mut self,
+        caller: &str,
+        request: u64,
+        mut specification: OpenSpec,
+        send: &mut Send<'_>,
+    ) {
+        if specification.provider == CaptureProvider::Pipewire {
+            let Some(output) = self.portal.resolve_output(&specification.output) else {
+                rpc::complete(send, request, error("portal_source_selection_required"));
+                return;
+            };
+            specification.output = output;
+        }
         if specification.configuration.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
             rpc::complete(send, request, error("amd_av1_latency_mode_unsupported"));
             return;
@@ -436,6 +477,7 @@ impl Pipeline {
     }
 
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
+        self.portal.tick(send);
         if self.streams.is_empty() {
             return;
         }
@@ -892,7 +934,9 @@ fn apply_result(
                     | Stage::StopCapture
             ))
     {
-        let code = if stream.stage == Stage::FallbackEnumerate {
+        let code = if stream.stage == Stage::Encoder {
+            encoder_failure_code(payload_error_code(&payload))
+        } else if stream.stage == Stage::FallbackEnumerate {
             stream.fallback_error.unwrap_or("provider_failed")
         } else {
             "provider_failed"
@@ -1015,6 +1059,7 @@ fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
     match provider {
         CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
         CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
+        CaptureProvider::Pipewire => None,
     }
 }
 
@@ -1050,6 +1095,45 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn encoder_failure_code(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(
+            "disabled"
+            | "unsupported_platform"
+            | "software_encoder_unavailable"
+            | "encoder_identity_changed"
+            | "x264_feature_disabled"
+            | "x264_headers_unavailable"
+            | "x264_runtime_unavailable",
+        ) => "h264_encoder_unavailable",
+        _ => "encoder_failed",
+    }
+}
+
+#[cfg(test)]
+mod integration_contract_tests {
+    use super::*;
+
+    #[test]
+    fn missing_linux_h264_backend_has_a_specific_pipeline_failure() {
+        for reason in [
+            "disabled",
+            "unsupported_platform",
+            "software_encoder_unavailable",
+            "encoder_identity_changed",
+            "x264_feature_disabled",
+            "x264_headers_unavailable",
+            "x264_runtime_unavailable",
+        ] {
+            assert_eq!(
+                encoder_failure_code(Some(reason)),
+                "h264_encoder_unavailable"
+            );
+        }
+        assert_eq!(encoder_failure_code(Some("driver_error")), "encoder_failed");
+    }
+}
+
 fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<String> {
     match provider {
         CaptureProvider::Dxgi => {
@@ -1065,6 +1149,7 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
         CaptureProvider::Wgc => {
             (!output_id.is_empty() && !output_id.contains('/')).then(|| output_id.to_owned())
         }
+        CaptureProvider::Pipewire => None,
     }
 }
 
@@ -1134,6 +1219,7 @@ fn accumulate_fallback_page(
                         == Some(device_name)
                 }
                 CaptureProvider::Wgc => output.id == device_name,
+                CaptureProvider::Pipewire => false,
             };
         if matches && stream.fallback_match.replace(output.id).is_some() {
             return Err(());
