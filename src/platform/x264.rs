@@ -1,7 +1,5 @@
 //! Version-matched x264 ABI adapter. The worker owns all native resources.
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
-#[cfg(not(amaterasu_x264))]
-use amaterasu_module_sdk::LogEmitter;
 
 const SOFTWARE_ID: &str = "amaterasu.software.x264";
 const SOFTWARE_NAME: &str = "x264 software H.264";
@@ -42,11 +40,7 @@ pub struct Encoder;
 
 #[cfg(not(amaterasu_x264))]
 impl Encoder {
-    pub fn open_with_log_emitter(
-        _: &EncoderIdentity,
-        _: &Configuration,
-        _: Option<LogEmitter>,
-    ) -> Result<Self, &'static str> {
+    pub fn open(_: &EncoderIdentity, _: &Configuration) -> Result<Self, &'static str> {
         Err(availability().unwrap_err())
     }
     pub fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
@@ -70,7 +64,7 @@ pub fn open(
     identity: &EncoderIdentity,
     configuration: &Configuration,
 ) -> Result<Encoder, &'static str> {
-    Encoder::open_with_log_emitter(identity, configuration, None)
+    Encoder::open(identity, configuration)
 }
 
 #[cfg(not(amaterasu_x264))]
@@ -78,7 +72,7 @@ pub fn open(
     identity: &EncoderIdentity,
     configuration: &Configuration,
 ) -> Result<Encoder, &'static str> {
-    Encoder::open_with_log_emitter(identity, configuration, None)
+    Encoder::open(identity, configuration)
 }
 
 #[cfg(all(test, not(amaterasu_x264)))]
@@ -99,7 +93,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            Encoder::open_with_log_emitter(&identity(), &config, None),
+            Encoder::open(&identity(), &config),
             Err(error) if error == reason
         ));
     }

@@ -1,11 +1,9 @@
 use super::*;
 use crate::bitstream::Normalizer;
-use amaterasu_module_sdk::{LogEmitter, LogLevel};
 use libloading::Library;
 use std::{
     collections::VecDeque,
-    ffi::{CStr, CString, c_char, c_int, c_void},
-    panic::{AssertUnwindSafe, catch_unwind},
+    ffi::{CString, c_char, c_int, c_void},
     ptr::NonNull,
 };
 
@@ -145,7 +143,6 @@ pub fn availability() -> Result<(), &'static str> {
 pub struct Encoder {
     native: NonNull<c_void>,
     _library: CodecLibrary,
-    _log_emitter: Option<Box<LogEmitter>>,
     input_bytes: usize,
     normalizer: Normalizer,
     packets: VecDeque<Packet>,
@@ -153,16 +150,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    #[cfg(test)]
     pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
-        Self::open_with_log_emitter(identity, config, None)
-    }
-
-    pub fn open_with_log_emitter(
-        identity: &EncoderIdentity,
-        config: &Configuration,
-        emitter: Option<LogEmitter>,
-    ) -> Result<Self, &'static str> {
         if identity != &super::identity() {
             return Err("encoder_identity_changed");
         }
@@ -179,14 +167,6 @@ impl Encoder {
             slices_per_frame: 1,
             min_threads: 2,
         };
-        let log_emitter = emitter.map(Box::new);
-        let (log_callback, log_context) = match &log_emitter {
-            Some(emitter) => (
-                Some(x264_log_callback as X264LogCallback),
-                (emitter.as_ref() as *const LogEmitter as *mut LogEmitter).cast(),
-            ),
-            None => (None, std::ptr::null_mut()),
-        };
         let mut status = 0;
         // SAFETY: functions belong to the retained library; config and strings
         // remain live during open. The adapter copies parameters and functions.
@@ -196,8 +176,8 @@ impl Encoder {
                 &native_config,
                 preset.as_ptr(),
                 tune.as_ptr(),
-                log_callback,
-                log_context,
+                None,
+                std::ptr::null_mut(),
                 &mut status,
             )
         };
@@ -209,7 +189,6 @@ impl Encoder {
         Ok(Self {
             native,
             _library: library,
-            _log_emitter: log_emitter,
             input_bytes: config.width as usize * config.height as usize * 3 / 2,
             normalizer: Normalizer::default(),
             packets: VecDeque::new(),
@@ -309,32 +288,6 @@ impl Encoder {
         self.draining = true;
         Ok(())
     }
-}
-
-fn x264_level(level: c_int) -> LogLevel {
-    match level {
-        0 => LogLevel::Error,
-        1 => LogLevel::Warning,
-        2 => LogLevel::Info,
-        _ => LogLevel::Debug,
-    }
-}
-
-unsafe extern "C" fn x264_log_callback(context: *mut c_void, level: c_int, message: *const c_char) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if context.is_null() || message.is_null() {
-            return;
-        }
-        // SAFETY: the C adapter invokes this only with its live boxed LogEmitter
-        // and a NUL-terminated stack message valid until the callback returns.
-        let emitter = unsafe { &*context.cast::<LogEmitter>() };
-        // SAFETY: the adapter terminates its fixed-size message buffer.
-        let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
-        let message = message.trim_end_matches(['\r', '\n']);
-        if !message.is_empty() {
-            let _ = emitter.emit(x264_level(level), "encode.x264", message);
-        }
-    }));
 }
 
 impl Drop for Encoder {

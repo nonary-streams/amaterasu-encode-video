@@ -160,15 +160,19 @@ or runtime libraries leave x264 unavailable, with no subprocess or generated
 frame fallback. The Linux path accepts the same owned BGRA/NV12 CPU frames and
 returns normalized Annex B H.264 packets through the encoder ABI. Its preset and
 tune are fixed to `superfast` and `zerolatency` for this first integration.
+Linux desktop-stream release artifacts must enable `software-x264` for
+`amaterasu-encode` and provide a compatible x264 runtime library. The feature
+does not bundle the runtime; the artifact must provide the matching
+`libx264.so.<ABI version>` or `libx264.so` to the platform loader.
 
 x264 is GPL-2.0-or-later or commercially licensed. Enabling it for distribution
 requires a compatible licensing and source distribution policy or a suitable
 commercial license. Dynamic loading does not change those obligations.
 
-The Windows backend remains unchanged. This lane does not connect the video
-pipeline to the new PipeWire provider; `modules/video` still selects only DXGI
-and WGC, so a separate integration change must add explicit portal source
-selection and bind `amaterasu.capture-pipewire/1`.
+The Windows backend remains unchanged. The video pipeline binds PipeWire only
+when it is allowlisted, and selection must be completed through the explicit
+portal control operations before Open. Missing Linux H.264 support is surfaced
+as `h264_encoder_unavailable`.
 
 This implementation is not yet qualified on a Windows GPU or a Linux x264
 installation. Host tests exercise

@@ -84,7 +84,7 @@ impl Encoder {
         configuration: &Configuration,
     ) -> Result<Self, &'static str> {
         if x264::selected(identity) {
-            return x264::Encoder::open(identity, configuration).map(Self::Software);
+            return x264::open(identity, configuration).map(Self::Software);
         }
 
         #[cfg(windows)]
