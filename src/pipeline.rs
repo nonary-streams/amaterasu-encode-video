@@ -1130,6 +1130,7 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
 }
 
 const MAX_ENCODER_ENTRIES: usize = 64;
+const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
 
 /// Resolve profile indices against the current bounded H.264 registry before
 /// capture is opened. `None` means explicit `auto`: hardware first, then the
@@ -1171,13 +1172,27 @@ fn resolve_encoder_selection(
         {
             return Err("invalid_encoder_enumeration");
         }
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("invalid_encoder_enumeration")?;
+        if name.is_empty()
+            || name.len() > 512
+            || name.chars().any(char::is_control)
+            || identities.contains(&identity)
+        {
+            return Err("invalid_encoder_enumeration");
+        }
         let is_hardware = entry
             .get("hardware")
             .and_then(Value::as_bool)
             .ok_or("invalid_encoder_enumeration")?;
+        if identity.clsid == SOFTWARE_ENCODER_ID && is_hardware {
+            return Err("invalid_encoder_enumeration");
+        }
         if is_hardware {
             hardware.push(identity.clone());
-        } else {
+        } else if identity.clsid == SOFTWARE_ENCODER_ID {
             software.push(identity.clone());
         }
         identities.push(identity);
@@ -1235,6 +1250,15 @@ fn encoder_failure_code(reason: Option<&str>) -> &'static str {
 mod integration_contract_tests {
     use super::*;
 
+    fn description(clsid: &str, name: &str, hardware: bool) -> Value {
+        json!({
+            "identity":{"clsid":clsid,"hardware_url":null,"friendly_name":name},
+            "name":name,
+            "codec":"h264",
+            "hardware":hardware
+        })
+    }
+
     #[test]
     fn missing_linux_h264_backend_has_a_specific_pipeline_failure() {
         for reason in [
@@ -1252,6 +1276,70 @@ mod integration_contract_tests {
             );
         }
         assert_eq!(encoder_failure_code(Some("driver_error")), "encoder_failed");
+    }
+
+    #[test]
+    fn registry_selection_preserves_ordinals_and_rejects_out_of_range() {
+        let payload = json!({
+            "ok":true,"enabled":true,"encoders":[
+                description("first-software", "First software", false),
+                description("second-hardware", "Second hardware", true)
+            ]
+        });
+        assert_eq!(
+            resolve_encoder_selection(Some(0), &payload).unwrap().clsid,
+            "first-software"
+        );
+        assert_eq!(
+            resolve_encoder_selection(Some(2), &payload),
+            Err("encoder_unavailable")
+        );
+    }
+
+    #[test]
+    fn enumeration_rejects_malformed_names_and_duplicate_identities() {
+        let overlong_name = "x".repeat(513);
+        for malformed_name in ["", overlong_name.as_str(), "bad\nname"] {
+            let payload = json!({
+                "ok":true,"enabled":true,
+                "encoders":[description("hardware", malformed_name, true)]
+            });
+            assert_eq!(
+                resolve_encoder_selection(Some(0), &payload),
+                Err("invalid_encoder_enumeration")
+            );
+        }
+
+        let duplicate = description("hardware", "Hardware", true);
+        let payload = json!({
+            "ok":true,"enabled":true,
+            "encoders":[duplicate.clone(), duplicate]
+        });
+        assert_eq!(
+            resolve_encoder_selection(None, &payload),
+            Err("invalid_encoder_enumeration")
+        );
+    }
+
+    #[test]
+    fn auto_uses_only_registered_x264_after_hardware_is_absent() {
+        let arbitrary_software = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description("other.software", "Other software", false)]
+        });
+        assert_eq!(
+            resolve_encoder_selection(None, &arbitrary_software),
+            Err("encoder_unavailable")
+        );
+
+        let x264 = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
+        });
+        assert_eq!(
+            resolve_encoder_selection(None, &x264).unwrap().clsid,
+            SOFTWARE_ENCODER_ID
+        );
     }
 }
 
