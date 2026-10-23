@@ -1290,10 +1290,10 @@ mod integration_contract_tests {
             resolve_encoder_selection(Some(0), &payload).unwrap().clsid,
             "first-software"
         );
-        assert_eq!(
+        assert!(matches!(
             resolve_encoder_selection(Some(2), &payload),
             Err("encoder_unavailable")
-        );
+        ));
     }
 
     #[test]
@@ -1304,10 +1304,10 @@ mod integration_contract_tests {
                 "ok":true,"enabled":true,
                 "encoders":[description("hardware", malformed_name, true)]
             });
-            assert_eq!(
+            assert!(matches!(
                 resolve_encoder_selection(Some(0), &payload),
                 Err("invalid_encoder_enumeration")
-            );
+            ));
         }
 
         let duplicate = description("hardware", "Hardware", true);
@@ -1315,10 +1315,10 @@ mod integration_contract_tests {
             "ok":true,"enabled":true,
             "encoders":[duplicate.clone(), duplicate]
         });
-        assert_eq!(
+        assert!(matches!(
             resolve_encoder_selection(None, &payload),
             Err("invalid_encoder_enumeration")
-        );
+        ));
     }
 
     #[test]
@@ -1327,10 +1327,10 @@ mod integration_contract_tests {
             "ok":true,"enabled":true,
             "encoders":[description("other.software", "Other software", false)]
         });
-        assert_eq!(
+        assert!(matches!(
             resolve_encoder_selection(None, &arbitrary_software),
             Err("encoder_unavailable")
-        );
+        ));
 
         let x264 = json!({
             "ok":true,"enabled":true,
