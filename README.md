@@ -68,8 +68,9 @@ event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP
 RTSP, and stream-session is still pending.
 
 Linux PipeWire capture requires `pipewire` in the startup provider allowlist.
-Call `select_portal_source` with `source_type` `monitor` or `window`, then
-poll `poll_portal_selection` using the same caller-owned operation ID until the
+An authenticated management client calls `/v1/capture/select_portal_source`
+with `source_type` `monitor` or `window`, then polls
+`/v1/capture/poll_portal_selection` using the same caller-owned operation ID until the
 selection state is `ready`. Open the profile's
 `portal-selected-session-source` sentinel; video resolves it to the current
 management-selected output. Portal control operation IDs remain scoped to the
@@ -77,7 +78,7 @@ principal that started them, while the one current selected output can be used b
 an authorized streaming caller without passing the operation ID to that caller.
 Direct opaque output IDs are accepted only when they match the current ready
 selection. Startup and Open never launch a chooser. Cancel with
-`cancel_portal_selection`. Public selection replies omit PipeWire node handles
+`/v1/capture/cancel_portal_selection`. Public selection replies omit PipeWire node handles
 and replace the provider's internal operation ID with the caller's operation ID.
 Permission denial, cancellation, provider unavailability, and revocation fail
 closed; there is no KMS or synthetic fallback.
