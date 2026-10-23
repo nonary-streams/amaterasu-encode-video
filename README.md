@@ -1,10 +1,11 @@
-# Hardware H.264 encoder
+# H.264 encoder
 
 `amaterasu-encode` provides `amaterasu.encode/1` control and the matching native
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.
-Enabling on non-Windows hosts still enumerates no hardware and opening returns
-`unsupported_platform`; there is no synthetic or software encoding fallback.
+The default build remains hardware-only on Windows and has no Linux encoder.
+An explicit build feature can add real software x264 encoding; no generated
+frames or automatic hardware-to-software fallback are used.
 
 Control requests are strict JSON; frames and encoded bytes never use JSON:
 
@@ -149,7 +150,28 @@ inside an unloadable module would be unsafe, so shutdown waits for its worker.
 The host's external supervision is the recovery boundary for a hung driver.
 No crash recovery or durable encoder sessions are claimed.
 
-This implementation is not yet qualified on a Windows GPU. Host tests exercise
+## Linux software x264
+
+The optional `software-x264` feature compiles a small C adapter against the
+system `x264.h` and dynamically loads a matching x264 runtime. The default build
+does not enable the feature. Native builds discover headers through
+`pkg-config`; cross builds require `AMATERASU_X264_INCLUDE_DIR`. Missing headers
+or runtime libraries leave x264 unavailable, with no subprocess or generated
+frame fallback. The Linux path accepts the same owned BGRA/NV12 CPU frames and
+returns normalized Annex B H.264 packets through the encoder ABI. Its preset and
+tune are fixed to `superfast` and `zerolatency` for this first integration.
+
+x264 is GPL-2.0-or-later or commercially licensed. Enabling it for distribution
+requires a compatible licensing and source distribution policy or a suitable
+commercial license. Dynamic loading does not change those obligations.
+
+The Windows backend remains unchanged. This lane does not connect the video
+pipeline to the new PipeWire provider; `modules/video` still selects only DXGI
+and WGC, so a separate integration change must add explicit portal source
+selection and bind `amaterasu.capture-pipewire/1`.
+
+This implementation is not yet qualified on a Windows GPU or a Linux x264
+installation. Host tests exercise
 layout, parameter framing, native ownership, backpressure, sink refusal, EOS,
 close/drop, strict controls and factory lifetime using a fake encoder backend.
 Windows and Linux target Clippy builds validate conditional compilation. An

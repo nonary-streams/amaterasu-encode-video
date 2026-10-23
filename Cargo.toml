@@ -7,12 +7,20 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# x264 is GPL-2.0-or-later or commercially licensed. Distribution is explicit.
+software-x264 = ["dep:libloading"]
+
 [dependencies]
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true
 amaterasu-abi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+libloading = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Ole"] }

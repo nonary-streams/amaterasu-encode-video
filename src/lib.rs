@@ -1,5 +1,5 @@
-//! Hardware H.264 encoding control and native CPU-frame interface.
-#[cfg(any(windows, test))]
+//! H.264 encoding control and native CPU-frame interface.
+#[cfg(any(windows, test, amaterasu_x264))]
 mod bitstream;
 mod layout;
 mod model;
