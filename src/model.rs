@@ -125,6 +125,23 @@ pub struct EncoderIdentity {
     pub friendly_name: String,
 }
 
+/// Encoder profile selection accepted by stream-session. Numeric selections
+/// are ordinals from the encode service's current H.264 enumeration and must
+/// be resolved before capture resources are allocated.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EncoderSelection {
+    Identity(EncoderIdentity),
+    Index(u32),
+    Backend(EncoderBackend),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderBackend {
+    Auto,
+}
+
 /// Provider-reported source size and logical touch units. Desktop geometry does
 /// not establish these dimensions, so video never derives them from that field.
 #[derive(Deserialize)]
@@ -169,7 +186,7 @@ pub struct OpenSpec {
     pub wgc_pacing_smoothing: bool,
     pub minimum_fps_target: f64,
     pub output: String,
-    pub encoder: EncoderIdentity,
+    pub encoder: EncoderSelection,
     pub configuration: Configuration,
 }
 
@@ -193,7 +210,7 @@ pub enum Operation {
         wgc_pacing_smoothing: bool,
         minimum_fps_target: f64,
         output: String,
-        encoder: EncoderIdentity,
+        encoder: EncoderSelection,
         configuration: Configuration,
     },
     Lookup {
@@ -242,7 +259,7 @@ enum OperationInput {
         #[serde(default = "default_minimum_fps_target")]
         minimum_fps_target: f64,
         output: String,
-        encoder: EncoderIdentity,
+        encoder: EncoderSelection,
         configuration: Configuration,
     },
     Lookup {
@@ -456,6 +473,39 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn open_accepts_numeric_encoder_indices_and_explicit_identities() {
+        let mut request = open_request();
+        request["encoder"] = json!(0);
+        let Operation::Open { encoder, .. } = serde_json::from_value::<Operation>(request).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(encoder, EncoderSelection::Index(0)));
+
+        let mut request = open_request();
+        request["encoder"] = json!("auto");
+        let Operation::Open { encoder, .. } = serde_json::from_value::<Operation>(request).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(
+            encoder,
+            EncoderSelection::Backend(EncoderBackend::Auto)
+        ));
+
+        let Operation::Open { encoder, .. } =
+            serde_json::from_value::<Operation>(open_request()).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(encoder, EncoderSelection::Identity(_)));
+
+        let mut invalid = open_request();
+        invalid["encoder"] = json!(-1);
+        assert!(serde_json::from_value::<Operation>(invalid).is_err());
     }
 
     #[test]

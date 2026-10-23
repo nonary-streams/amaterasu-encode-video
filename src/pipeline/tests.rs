@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{AmdAv1LatencyMode, EncoderIdentity};
+use crate::model::{AmdAv1LatencyMode, EncoderIdentity, EncoderSelection};
 use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
@@ -30,6 +30,7 @@ struct Runtime {
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
     encoder_open_error: Option<&'static str>,
+    encoder_enumeration_override: Option<Value>,
 }
 
 impl Runtime {
@@ -130,6 +131,15 @@ impl Runtime {
                     } else {
                         json!({"ok":true,"stream":41})
                     }
+                } else if service == ENCODE && action == "enumerate" {
+                    self.encoder_enumeration_override
+                        .clone()
+                        .unwrap_or_else(|| {
+                            json!({"ok":true,"enabled":true,"encoders":[{
+                                "identity":encoder_identity(),"name":"Test H.264","codec":"h264",
+                                "hardware":true,"vendor_id":null
+                            }]})
+                        })
                 } else if service == ENCODE
                     && action == "open"
                     && let Some(code) = self.encoder_open_error
@@ -380,7 +390,7 @@ fn open() -> Operation {
         wgc_pacing_smoothing: true,
         minimum_fps_target: 20.0,
         output: "display-1".into(),
-        encoder: encoder_identity(),
+        encoder: EncoderSelection::Identity(encoder_identity()),
         configuration: Configuration {
             width: 1920,
             height: 1080,
@@ -2692,6 +2702,84 @@ fn unavailable_software_h264_fails_video_open_with_a_specific_error() {
     tick(&mut pipeline, &mut runtime, &mut plane, 12);
     assert!(pipeline.streams.is_empty());
     assert_eq!(pipeline.recent[0].1["error"], "h264_encoder_unavailable");
+}
+
+#[test]
+fn numeric_encoder_selection_resolves_registry_before_opening_capture() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(
+        runtime.commands.first(),
+        Some(Command::Request { service, payload, .. })
+            if service == ENCODE && payload["action"] == "enumerate"
+    ));
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 6);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+                && payload["encoder"]["clsid"] == encoder_identity().clsid
+    )));
+}
+
+#[test]
+fn auto_encoder_selection_prefers_hardware_and_invalid_index_fails_before_capture() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok":true,"enabled":true,"encoders":[
+            {"identity":{"clsid":"software","hardware_url":null,"friendly_name":"Software"},"name":"Software","codec":"h264","hardware":false,"vendor_id":null},
+            {"identity":{"clsid":"hardware","hardware_url":"test://hardware","friendly_name":"Hardware"},"name":"Hardware","codec":"h264","hardware":true,"vendor_id":null}
+        ]
+    }));
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(crate::model::EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+                && payload["encoder"]["clsid"] == "hardware"
+    )));
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(1);
+    pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(
+        pipeline.recent.last().unwrap().1["error"],
+        "encoder_unavailable"
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
 }
 
 mod operations;
