@@ -1,4 +1,6 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
+#[cfg(amaterasu_swscale)]
+mod preprocess;
 mod resize;
 use crate::{
     model::{CaptureProvider, Configuration},
@@ -44,6 +46,9 @@ pub struct CaptureArrival {
 pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
+    /// A bounded asynchronous processor is still busy; retain the due capture
+    /// slot so the next available frame does not wait an additional period.
+    pub capture_deferred: bool,
     pub repeat_attempted: bool,
     /// The capture provider delivered cached pixels for this scheduled slot.
     /// This is only known when the provider exposes a v1.2-or-newer freshness tail.
@@ -59,6 +64,7 @@ pub struct Progress {
     pub capture_frame_count: u64,
     pub encoder_submit_us: u64,
     pub frame_copy_us: u64,
+    pub preprocessing_us: u64,
     pub encoder_poll_us: u64,
     pub transport_admission_us: u64,
     pub transport_admission_count: u64,
@@ -93,12 +99,15 @@ pub trait Plane {
     ) -> Result<GeometryProgress, &'static str>;
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str>;
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str>;
+    fn release_stream(&mut self, _: u64) {}
 }
 
 pub struct NativePlane {
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     encoder: NativeBinding,
     queues: Arc<Mutex<Queues>>,
+    #[cfg(amaterasu_swscale)]
+    processors: preprocess::Processors,
 }
 
 impl NativePlane {
@@ -121,6 +130,8 @@ impl NativePlane {
                 captures,
                 encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
                 queues,
+                #[cfg(amaterasu_swscale)]
+                processors: preprocess::Processors::default(),
             })
         }
     }
@@ -360,7 +371,27 @@ impl Plane for NativePlane {
         // SAFETY: configured services promise these layouts; bindings remain live.
         let encoder_api =
             unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
-        let progress = if input.capture_due {
+        #[cfg(amaterasu_swscale)]
+        let processed = if input.provider == CaptureProvider::Pipewire
+            && input.configuration.color_mode.is_default()
+            && input.capture != 0
+        {
+            let binding = self
+                .captures
+                .get(&input.provider)
+                .ok_or("capture_provider_unavailable")?;
+            // SAFETY: this binding retained its validated capture prefix.
+            let capture_api =
+                unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+            Some(self.processors.pump(capture_api, encoder_api, &input)?)
+        } else {
+            None
+        };
+        #[cfg(not(amaterasu_swscale))]
+        let processed: Option<Progress> = None;
+        let progress = if let Some(progress) = processed {
+            progress
+        } else if input.capture_due {
             let binding = self
                 .captures
                 .get(&input.provider)
@@ -428,6 +459,13 @@ impl Plane for NativePlane {
             MEDIA_BUSY | MEDIA_PENDING => Ok(false),
             _ => Err("encoder_drain_failed"),
         }
+    }
+
+    fn release_stream(&mut self, video: u64) {
+        #[cfg(amaterasu_swscale)]
+        self.processors.remove(video);
+        #[cfg(not(amaterasu_swscale))]
+        let _ = video;
     }
 }
 

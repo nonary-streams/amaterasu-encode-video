@@ -121,6 +121,7 @@ struct StageTimings {
     capture_callback: TimingMetric,
     encoder_submit: TimingMetric,
     frame_copy: TimingMetric,
+    preprocessing: TimingMetric,
     encoder_poll: TimingMetric,
     transport_admission: TimingMetric,
     captured_frames: u64,
@@ -134,8 +135,11 @@ impl StageTimings {
                 .captured_frames
                 .saturating_add(progress.capture_frame_count);
         }
-        if progress.capture_frame_count > 0 || progress.repeat_attempted {
+        if progress.submitted || progress.dropped || progress.repeat_attempted {
             self.encoder_submit.record(progress.encoder_submit_us);
+        }
+        if progress.preprocessing_us > 0 {
+            self.preprocessing.record(progress.preprocessing_us);
         }
         if progress.owned_frame.is_some() {
             self.frame_copy.record(progress.frame_copy_us);
@@ -218,6 +222,7 @@ impl Stream {
                 "capture_callback": {"calls":self.timing.capture_callback.calls,"total":self.timing.capture_callback.total_us,"max":self.timing.capture_callback.max_us,"frames":self.timing.captured_frames},
                 "encoder_submit": {"calls":self.timing.encoder_submit.calls,"total":self.timing.encoder_submit.total_us,"max":self.timing.encoder_submit.max_us},
                 "frame_copy": {"calls":self.timing.frame_copy.calls,"total":self.timing.frame_copy.total_us,"max":self.timing.frame_copy.max_us},
+                "preprocessing": {"calls":self.timing.preprocessing.calls,"total":self.timing.preprocessing.total_us,"max":self.timing.preprocessing.max_us},
                 "encoder_poll": {"calls":self.timing.encoder_poll.calls,"total":self.timing.encoder_poll.total_us,"max":self.timing.encoder_poll.max_us},
                 "transport_admission": {"calls":self.timing.transport_admission.calls,"total":self.timing.transport_admission.total_us,"max":self.timing.transport_admission.max_us}
             },
@@ -588,6 +593,9 @@ impl Pipeline {
         {
             stream.cleanup("request_ended");
         }
+        if stream.stage != Stage::Running {
+            plane.release_stream(id);
+        }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
             output::tick(stream, id, &self.queues, plane);
             if !matches!(stream.stage, Stage::StopCapture | Stage::Draining)
@@ -670,7 +678,11 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
             }
         }
         if capture_due && (stream.provider != CaptureProvider::Wgc || stream.constant_rate) {
-            stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+            stream.next_frame = if stream.provider == CaptureProvider::Pipewire {
+                periodic_capture_deadline(stream.next_frame, now, stream.configuration.fps)
+            } else {
+                next_capture_deadline(now, stream.configuration.fps)
+            };
         }
     }
     let repeat_due = stream.repeat_due(now);
@@ -695,6 +707,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         Ok(progress) => {
             let completed_at = Instant::now();
             stream.timing.record(&progress);
+            if stream.provider == CaptureProvider::Pipewire && progress.capture_deferred {
+                stream.next_frame = capture_slot.expect("deferred capture retained its due slot");
+            }
             if capture_due
                 && stream.provider == CaptureProvider::Wgc
                 && (!stream.constant_rate
@@ -780,6 +795,17 @@ fn schedule_wgc_after_completion(
 
 fn next_capture_deadline(now: Instant, fps: u32) -> Instant {
     now + Duration::from_micros(1_000_000 / u64::from(fps))
+}
+
+fn periodic_capture_deadline(previous: Instant, now: Instant, fps: u32) -> Instant {
+    let period = Duration::from_secs_f64(1.0 / f64::from(fps));
+    let elapsed = now.saturating_duration_since(previous);
+    let periods = elapsed.as_nanos() / period.as_nanos() + 1;
+    u32::try_from(periods)
+        .ok()
+        .and_then(|count| period.checked_mul(count))
+        .and_then(|advance| previous.checked_add(advance))
+        .unwrap_or_else(|| next_capture_deadline(now, fps))
 }
 
 fn advance(

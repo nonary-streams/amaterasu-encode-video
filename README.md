@@ -54,6 +54,14 @@ and centered black bars when needed to preserve its aspect ratio. This does not
 change monitor positions, resolution or scaling, and does not grant absolute
 pointer mapping without authoritative capture geometry.
 
+The Linux `linux-ffmpeg-convert` feature moves default BT.709-limited portal
+resizing and color conversion to a joined worker using system libswscale.
+Only one frame may be outstanding, so slow conversion cannot build an input-loop
+stall or an unbounded queue. The worker returns fitted NV12 pixels, preserving the
+encoder's existing range contract. Other color modes retain the BGRA path.
+The video artifact embeds its required swscale/avutil ABI majors; Linux packaging
+and user-service preflight check those exact system loader dependencies.
+
 The optional configuration.color_mode selects the SDR matrix/range used for
 BGRA conversion and encoder signaling: bt601_limited, bt601_full,
 bt709_limited, or bt709_full. It defaults to bt709_limited. Windows continues to

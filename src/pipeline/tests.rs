@@ -3425,3 +3425,24 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
 }
 
 mod operations;
+
+#[test]
+fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
+    let start = Instant::now();
+    let mut deadline = start;
+    let mut frames = 0;
+    for tick in 0..1000 {
+        let now = start + Duration::from_millis(tick * 10);
+        if now >= deadline {
+            frames += 1;
+            deadline = periodic_capture_deadline(deadline, now, 60);
+        }
+    }
+    assert!(
+        (599..=601).contains(&frames),
+        "captured {frames} frames in ten seconds"
+    );
+    let stalled = start + Duration::from_secs(20);
+    let next = periodic_capture_deadline(deadline, stalled, 60);
+    assert!(next > stalled && next - stalled <= Duration::from_secs_f64(1.0 / 60.0));
+}
