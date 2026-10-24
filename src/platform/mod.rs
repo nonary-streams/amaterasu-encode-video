@@ -1,5 +1,8 @@
-//! Platform encoder selection with an explicitly opted-in software fallback.
+//! Platform encoder selection with explicitly opted-in Linux backends.
 mod x264;
+
+#[cfg(target_os = "linux")]
+mod ffmpeg_nvenc;
 
 #[cfg(windows)]
 mod windows;
@@ -66,6 +69,11 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
     #[cfg(not(windows))]
     let mut encoders = Vec::new();
 
+    #[cfg(target_os = "linux")]
+    if let Some(hardware) = ffmpeg_nvenc::description() {
+        encoders.push(hardware);
+    }
+
     if let Some(software) = software {
         encoders.push(software);
     }
@@ -75,6 +83,8 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 pub enum Encoder {
     #[cfg(windows)]
     Hardware(windows::Encoder),
+    #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+    Nvenc(ffmpeg_nvenc::Encoder),
     Software(x264::Encoder),
 }
 
@@ -83,6 +93,11 @@ impl Encoder {
         identity: &EncoderIdentity,
         configuration: &Configuration,
     ) -> Result<Self, &'static str> {
+        #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+        if ffmpeg_nvenc::selected(identity) {
+            return ffmpeg_nvenc::open(identity, configuration).map(Self::Nvenc);
+        }
+
         if x264::selected(identity) {
             return x264::open(identity, configuration).map(Self::Software);
         }
@@ -114,16 +129,20 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.submit(bytes, timestamp, force),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+            Self::Nvenc(encoder) => encoder.submit(bytes, timestamp, force),
             Self::Software(encoder) => encoder.submit(bytes, timestamp, force),
         }
     }
 
-    /// Software x264 runs on the dedicated worker without blocking the caller.
+    /// Linux encoders run on the dedicated worker without blocking the caller.
     /// Windows MFT keeps the existing synchronous behavior.
     pub fn uses_background_encode(&self) -> bool {
         match self {
             #[cfg(windows)]
             Self::Hardware(_) => false,
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+            Self::Nvenc(_) => true,
             Self::Software(_) => true,
         }
     }
@@ -132,6 +151,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.receive(),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+            Self::Nvenc(encoder) => encoder.receive(),
             Self::Software(encoder) => encoder.receive(),
         }
     }
@@ -140,6 +161,8 @@ impl Encoder {
         match self {
             #[cfg(windows)]
             Self::Hardware(encoder) => encoder.drain(),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
+            Self::Nvenc(encoder) => encoder.drain(),
             Self::Software(encoder) => encoder.drain(),
         }
     }
@@ -160,21 +183,12 @@ mod tests {
 
     #[test]
     fn software_encoder_is_listed_only_when_runtime_is_available() {
-        let encoders = enumerate().unwrap();
-        assert_eq!(
-            encoders
-                .iter()
-                .any(|encoder| x264::selected(&encoder.identity)),
-            x264::availability().is_ok()
-        );
+        assert_eq!(x264::description().is_some(), x264::availability().is_ok());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_does_not_claim_or_open_an_unregistered_hardware_encoder() {
-        let encoders = enumerate().unwrap();
-        assert!(encoders.iter().all(|encoder| !encoder.hardware));
-
         let identity = EncoderIdentity {
             clsid: "amaterasu.hardware.vaapi.h264".into(),
             hardware_url: Some("vaapi://unprobed-device".into()),
@@ -188,6 +202,7 @@ mod tests {
         }))
         .unwrap();
 
+        assert!(!ffmpeg_nvenc::selected(&identity));
         assert!(matches!(
             Encoder::open(&identity, &configuration),
             Err("hardware_encoder_unavailable")

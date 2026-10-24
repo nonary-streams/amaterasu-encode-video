@@ -4,14 +4,11 @@
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.
 The default build remains hardware-only on Windows and has no Linux encoder.
-An explicit build feature can add real software x264 encoding; no generated
-frames or automatic hardware-to-software fallback are used.
-Linux hardware encoders are not advertised or opened by this provider. Finding
-libva or NVENC loader libraries on the host is not a capability check: a usable
-backend must also verify an H.264 encode profile/entrypoint, configure the
-requested session, and produce output. Until such a backend is integrated,
-opening an unregistered Linux hardware identity returns
-`hardware_encoder_unavailable`.
+Explicit build features can add real Linux hardware NVENC or software x264
+encoding; no generated frames or automatic hardware-to-software fallback are
+used. Linux NVENC is advertised only after FFmpeg opens a real `h264_nvenc`
+session with the supported SDR H.264 settings. Opening an unregistered Linux
+hardware identity returns `hardware_encoder_unavailable`.
 
 Control requests are strict JSON; frames and encoded bytes never use JSON:
 
@@ -115,10 +112,9 @@ Strict single-reference-frame sessions use the static
 Vibeshine documents `nvenc_preset` with numeric default `1` and choices `1` through
 `7` (P1 through P7). The request field is optional and omitted when absent to keep
 older wire payloads compatible. This NVENC-only setting applies only when NVENC is
-selected. This module currently has only a Media Foundation Transform (MFT)
-backend and no native NVENC backend, so supplying the field fails validation with
-`nvenc_preset_unsupported`; no preset is applied here. NVENC preset support remains
-pending.
+selected. The initial FFmpeg NVENC backend uses a fixed P1 low-latency preset;
+supplying this field fails validation with `nvenc_preset_unsupported`, and no
+caller-selected preset is applied.
 
 Vibeshine documents `nvenc_h264_cavlc` with a `disabled` default. When H.264 and
 NVENC are selected, `enabled` requests CAVLC instead of CABAC; the reference notes
@@ -169,6 +165,28 @@ inside an unloadable module would be unsafe, so shutdown waits for its worker.
 The host's external supervision is the recovery boundary for a hung driver.
 No crash recovery or durable encoder sessions are claimed.
 
+## Linux hardware NVENC
+
+The opt-in `linux-ffmpeg-nvenc` feature uses the system FFmpeg `libavcodec`
+`h264_nvenc` encoder and `libavutil`. Build integration must compile
+`src/platform/ffmpeg_nvenc.c` against the target FFmpeg development headers and
+link the matching libraries. Runtime packaging must provide compatible FFmpeg
+libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes a
+small throwaway H.264 encoder context; a missing encoder, driver, device, or
+supported baseline configuration keeps the backend out of discovery. This is
+a capability probe, not a guarantee that every requested resolution or bitrate
+will open.
+
+The first backend supports 8-bit NV12 input, H.264 Baseline, no B frames,
+BT.709 limited-range SDR, and a fixed low-latency CBR configuration. Other
+color modes and explicit reference-frame/NVENC controls fail closed. Frames
+are copied into FFmpeg-owned NV12 storage; packets are copied and normalized to
+Annex B before the borrowed FFmpeg packet is released. Packet PTS remains in
+100-nanosecond units. The worker owns the FFmpeg context, submit queue is
+bounded by the existing encoder worker, and drain flushes delayed packets
+before session EOS. No CUDA-frame import, HDR, HEVC, AV1, or dynamic device
+selection is claimed.
+
 ## Linux software x264
 
 The optional `software-x264` feature compiles a small C adapter against the
@@ -200,8 +218,8 @@ when it is allowlisted, and selection must be completed through the explicit
 portal control operations before Open. Missing Linux H.264 support is surfaced
 as `h264_encoder_unavailable`.
 
-This implementation is not yet qualified on a Windows GPU or a Linux x264
-installation. Host tests exercise
+This implementation is not yet qualified on a Windows GPU, a Linux x264
+installation, or Linux NVENC hardware. Host tests exercise
 layout, parameter framing, native ownership, backpressure, sink refusal, EOS,
 close/drop, strict controls and factory lifetime using a fake encoder backend.
 Windows and Linux target Clippy builds validate conditional compilation. An
@@ -219,21 +237,10 @@ by these tests.
 
 Behavioral reference review used Vibeshine `src/nvenc/nvenc_config.h` and
 `src/nvenc/nvenc_encoded_frame.h` for real encoded frame/IDR expectations and its
-larger encoder policy surface. No source was copied or translated. Native NVENC,
-AMD AMF, Intel-specific controls, Linux backends, GPU texture import, HEVC, AV1,
+larger encoder policy surface. No source was copied or translated. AMD AMF,
+Intel-specific controls, GPU texture import, HEVC, AV1,
 HDR/10-bit, reference-frame invalidation, rate-control tuning, quality presets,
 dynamic resolution, and full streaming parity remain unimplemented.
-
-A future Linux hardware backend needs an explicit module feature/build profile
-and vetted bindings for the selected native API. VA-API requires libva headers
-and runtime plus a driver that exposes the requested H.264 encode profile and
-entrypoint. NVENC requires NVIDIA's Video Codec SDK ABI and a compatible
-`libnvidia-encode` runtime/device. The provider must retain the chosen device
-and API resources on its encoder worker, upload the existing owned NV12 input
-or convert BGRA, normalize complete H.264 access units to the existing packet
-contract, and enumerate only after a real H.264 encode capability check.
-Integration owns the Cargo feature/dependency and Linux release profile; this
-source slice adds neither.
 
 Primary API references:
 
