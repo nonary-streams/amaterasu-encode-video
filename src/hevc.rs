@@ -476,7 +476,10 @@ fn annex_b_units(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
 }
 
 fn supported_nal_type(kind: u8) -> bool {
-    matches!(kind, 0..=7 | 19 | 20 | 32..=35 | 39 | 40)
+    // Admit unsupported random-access types to the access-unit classifier so
+    // it can report the specific closed-GOP limitation instead of a framing
+    // error. Other unhandled types remain rejected here.
+    matches!(kind, 0..=7 | 16..=20 | 21..=23 | 32..=35 | 39 | 40)
 }
 
 #[cfg(test)]
