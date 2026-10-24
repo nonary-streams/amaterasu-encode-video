@@ -764,7 +764,7 @@ mod tests {
         let encoder = description_with_probe(|| true).unwrap();
         assert!(encoder.hardware);
         assert_eq!(encoder.codec, "h264");
-        assert_eq!(encoder.identity, identity());
+        assert!(encoder.identity == identity());
     }
 
     #[test]
@@ -812,8 +812,12 @@ mod tests {
         let mut unconstrained_profile = limited.clone();
         unconstrained_profile[2] = 0;
         assert_eq!(
-            validate_header_color(&unconstrained_profile, ColorMode::Bt709Limited),
+            parse_sps_color_signal(&unconstrained_profile),
             Err("vaapi_h264_profile_unsupported")
+        );
+        assert_eq!(
+            validate_header_color(&unconstrained_profile, ColorMode::Bt709Limited),
+            Err("vaapi_vui_mismatch")
         );
         assert_eq!(
             validate_header_color(&full, ColorMode::Bt709Limited),

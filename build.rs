@@ -99,9 +99,7 @@ fn main() {
 fn build_linux_ffmpeg_nvenc() -> Option<(u32, u32)> {
     println!("cargo:rustc-check-cfg=cfg(amaterasu_ffmpeg_nvenc)");
     println!("cargo:rerun-if-changed=src/platform/ffmpeg_nvenc.c");
-    if env::var_os("CARGO_FEATURE_LINUX_FFMPEG_NVENC").is_none() {
-        return None;
-    }
+    env::var_os("CARGO_FEATURE_LINUX_FFMPEG_NVENC")?;
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo:warning=FFmpeg NVENC encoding is supported only on Linux");
         return None;
@@ -141,9 +139,7 @@ fn build_linux_ffmpeg_nvenc() -> Option<(u32, u32)> {
 fn build_linux_ffmpeg_vaapi(emit_abi_marker: bool) -> Option<(u32, u32)> {
     println!("cargo:rustc-check-cfg=cfg(amaterasu_ffmpeg_vaapi)");
     println!("cargo:rerun-if-changed=src/platform/ffmpeg_vaapi.c");
-    if env::var_os("CARGO_FEATURE_LINUX_FFMPEG_VAAPI").is_none() {
-        return None;
-    }
+    env::var_os("CARGO_FEATURE_LINUX_FFMPEG_VAAPI")?;
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo:warning=FFmpeg VAAPI encoding is supported only on Linux");
         return None;
