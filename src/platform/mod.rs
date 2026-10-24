@@ -111,6 +111,16 @@ impl Encoder {
         }
     }
 
+    /// Software x264 runs on the dedicated worker without blocking the caller.
+    /// Windows MFT keeps the existing synchronous behavior.
+    pub fn uses_background_encode(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Self::Hardware(_) => false,
+            Self::Software(_) => true,
+        }
+    }
+
     pub fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
         match self {
             #[cfg(windows)]

@@ -7,22 +7,41 @@ use amaterasu_abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_media::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
+
+use crate::worker::{Metrics as WorkerMetrics, ReceiveResult, SubmitResult};
 
 pub trait Backend: Send {
-    fn submit(&mut self, bytes: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
-    fn drain(&mut self) -> Result<(), &'static str>;
+    fn submit(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str>;
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str>;
+    fn drain(&mut self) -> Result<bool, &'static str>;
+    fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
+        Ok(None)
+    }
 }
 
 impl Backend for Worker {
-    fn submit(&mut self, bytes: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
         self.submit(bytes, timestamp, force)
     }
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
         self.receive()
     }
-    fn drain(&mut self) -> Result<(), &'static str> {
+    fn drain(&mut self) -> Result<bool, &'static str> {
         self.drain()
+    }
+    fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
+        self.metrics().map(Some)
     }
 }
 
@@ -43,6 +62,9 @@ pub struct Session {
     draining: bool,
     eos_sent: bool,
     failed: bool,
+    color_conversion_total_us: u64,
+    color_conversion_max_us: u64,
+    color_conversion_frames: u64,
 }
 
 struct OpenRecord {
@@ -169,6 +191,9 @@ impl Sessions {
                 draining: false,
                 eos_sent: false,
                 failed: false,
+                color_conversion_total_us: 0,
+                color_conversion_max_us: 0,
+                color_conversion_frames: 0,
             },
         );
         Ok(response)
@@ -181,6 +206,13 @@ impl Sessions {
     }
     pub fn status(&mut self, owner: &str, id: u64) -> Result<Value, &'static str> {
         let session = self.owned(owner, id)?;
+        let encoder_metrics = match session.backend.metrics() {
+            Ok(metrics) => metrics,
+            Err(_) => {
+                session.failed = true;
+                None
+            }
+        };
         let state = if session.failed {
             "failed"
         } else if session.draining {
@@ -189,7 +221,7 @@ impl Sessions {
             "open"
         };
         Ok(
-            json!({"ok":true,"session_id":id,"state":state,"configuration":session.config,"packet_boundaries":session.packet_boundaries,"supports_packet_boundaries":true}),
+            json!({"ok":true,"session_id":id,"state":state,"configuration":session.config,"packet_boundaries":session.packet_boundaries,"supports_packet_boundaries":true,"timing":{"color_conversion_frames":session.color_conversion_frames,"color_conversion_total_us":session.color_conversion_total_us,"color_conversion_max_us":session.color_conversion_max_us},"encoder_timing":encoder_metrics}),
         )
     }
     pub fn close(&mut self, owner: &str, id: u64) -> Result<Value, &'static str> {
@@ -260,6 +292,7 @@ impl Sessions {
         if !layout::input_color_supported(frame.format, session.config.color_mode) {
             return STATUS_INVALID_ARGUMENT;
         }
+        let conversion_started = Instant::now();
         let bytes = match frame.format {
             PIXEL_BGRA8 => layout::bgra(
                 bytes,
@@ -280,13 +313,24 @@ impl Sessions {
             Ok(bytes) => bytes,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };
-        if session
-            .backend
-            .submit(bytes, timestamp, force != 0)
-            .is_err()
-        {
-            session.failed = true;
-            return MEDIA_BACKEND_ERROR;
+        if frame.format == PIXEL_BGRA8 {
+            let conversion_us = conversion_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            session.color_conversion_frames = session.color_conversion_frames.saturating_add(1);
+            session.color_conversion_total_us = session
+                .color_conversion_total_us
+                .saturating_add(conversion_us);
+            session.color_conversion_max_us = session.color_conversion_max_us.max(conversion_us);
+        }
+        match session.backend.submit(bytes, timestamp, force != 0) {
+            Ok(SubmitResult::Accepted) => {}
+            Ok(SubmitResult::Busy) => return MEDIA_BUSY,
+            Err(_) => {
+                session.failed = true;
+                return MEDIA_BACKEND_ERROR;
+            }
         }
         session.metadata.push_back(Metadata {
             timestamp,
@@ -304,9 +348,13 @@ impl Sessions {
             return MEDIA_BACKEND_ERROR;
         }
         if !session.draining {
-            if session.backend.drain().is_err() {
-                session.failed = true;
-                return MEDIA_BACKEND_ERROR;
+            match session.backend.drain() {
+                Ok(true) => {}
+                Ok(false) => return MEDIA_BUSY,
+                Err(_) => {
+                    session.failed = true;
+                    return MEDIA_BACKEND_ERROR;
+                }
             }
             session.draining = true;
         }
@@ -326,7 +374,8 @@ impl Sessions {
         }
         if session.pending.is_none() {
             match session.backend.receive() {
-                Ok(packet) => session.pending = packet,
+                Ok(ReceiveResult::Ready(packet)) => session.pending = packet,
+                Ok(ReceiveResult::Pending) => return MEDIA_PENDING,
                 Err(_) => {
                     session.failed = true;
                     return MEDIA_BACKEND_ERROR;

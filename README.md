@@ -66,9 +66,19 @@ reject raw NV12 input. NV12 uses contiguous Y/UV planes with the same stride.
 Padding is removed, strides are limited to 16,384 bytes, and dimensions must
 match the session. Timestamps and sequence numbers must strictly increase and
 fit signed Media Foundation 100ns time after conversion from microseconds.
-Sixteen retained input metadata entries bound queued input; `MEDIA_BUSY` accepts
-nothing. `MEDIA_BACKEND_ERROR` makes the session terminal until close, since a
-hardware call may already have accepted its sample before failing or timing out.
+Sixteen retained input metadata entries bound queued input. Windows MFT submissions
+remain synchronous. Software x264 runs on the encoder worker and accepts at most
+three outstanding operations (one running and two queued); `MEDIA_BUSY` accepts
+nothing, and dropped input retains neither sequence nor timestamp. Close cancels
+queued operations after the current native call returns, then joins the worker so
+module-owned code cannot be unloaded while native code is running.
+`MEDIA_BACKEND_ERROR` makes the session terminal until close, since a hardware
+call may already have accepted its sample before failing or timing out.
+
+Owner-scoped `status` reports numeric `timing` counters for BGRA-to-NV12 conversion
+and `encoder_timing` counters for worker queue wait, submit/receive/drain duration,
+busy submissions, and pending operations. Counters update when the caller polls
+status or the media API; no per-frame timing logs or frame content are emitted.
 
 Receive delivers at most one borrowed packet. A rejected sink retains the exact
 packet for retry. Samples are normalized to Annex B; IDR is determined from NAL

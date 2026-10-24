@@ -15,15 +15,15 @@ struct Fake {
 }
 
 impl Backend for Fake {
-    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(SubmitResult::Accepted)
     }
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
-        Ok(self.packets.pop_front())
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(self.packets.pop_front()))
     }
-    fn drain(&mut self) -> Result<(), &'static str> {
-        Ok(())
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
     }
 }
 
@@ -39,8 +39,57 @@ struct StreamingFake {
     honor_force: bool,
 }
 
+struct BusyOnceFake {
+    busy: bool,
+}
+
+struct DeferredReceiveFake {
+    pending_once: bool,
+}
+
+impl Backend for DeferredReceiveFake {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
+        Ok(SubmitResult::Accepted)
+    }
+
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        if std::mem::replace(&mut self.pending_once, false) {
+            Ok(ReceiveResult::Pending)
+        } else {
+            Ok(ReceiveResult::Ready(None))
+        }
+    }
+
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+}
+
+impl Backend for BusyOnceFake {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
+        if std::mem::replace(&mut self.busy, false) {
+            Ok(SubmitResult::Busy)
+        } else {
+            Ok(SubmitResult::Accepted)
+        }
+    }
+
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(None))
+    }
+
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+}
+
 impl Backend for StreamingFake {
-    fn submit(&mut self, _: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        _: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         self.packets.push_back(Packet {
             bytes: vec![
@@ -56,15 +105,15 @@ impl Backend for StreamingFake {
             timestamp_100ns: timestamp,
             keyframe: force && self.honor_force,
         });
-        Ok(())
+        Ok(SubmitResult::Accepted)
     }
 
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
-        Ok(self.packets.pop_front())
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(self.packets.pop_front()))
     }
 
-    fn drain(&mut self) -> Result<(), &'static str> {
-        Ok(())
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
     }
 }
 
@@ -280,6 +329,76 @@ fn bounded_pending_input_returns_busy_without_accepting() {
         MEDIA_BUSY
     );
     assert_eq!(submissions.load(Ordering::SeqCst), 16);
+}
+
+#[test]
+fn asynchronous_encoder_backpressure_does_not_consume_frame_sequence_or_timestamp() {
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(BusyOnceFake { busy: true }),
+            false,
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 100,
+        sequence: 7,
+    };
+    // SAFETY: frame storage remains live and immutable for both submit attempts.
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        MEDIA_BUSY
+    );
+    let session = sessions.values.get(&1).unwrap();
+    assert!(session.metadata.is_empty());
+    assert!(session.last_input.is_none());
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+    let session = sessions.values.get(&1).unwrap();
+    assert_eq!(session.metadata.len(), 1);
+    assert_eq!(session.last_input, Some((1000, 7)));
+}
+
+#[test]
+fn asynchronous_drain_waits_for_encoder_poll_before_emitting_eos() {
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(DeferredReceiveFake { pending_once: true }),
+            false,
+        )
+        .unwrap();
+    sessions.values.get_mut(&1).unwrap().draining = true;
+    let mut sink = Sink {
+        reject: false,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // SAFETY: packet sink context remains live through both receive callbacks.
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_PENDING
+    );
+    assert!(sink.flags.is_empty());
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        STATUS_OK
+    );
+    assert_eq!(sink.flags, [FLAG_END_OF_STREAM]);
 }
 
 #[test]
