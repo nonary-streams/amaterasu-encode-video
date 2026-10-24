@@ -10,6 +10,9 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # x264 is GPL-2.0-or-later or commercially licensed. Distribution is explicit.
 software-x264 = ["dep:libloading"]
+# Explicit Linux FFmpeg/NVIDIA hardware path; runtime discovery still requires
+# a successful encoder open before it is offered to a stream.
+linux-ffmpeg-nvenc = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
@@ -21,6 +24,7 @@ libloading = { workspace = true, optional = true }
 
 [build-dependencies]
 cc = "1"
+pkg-config = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Ole"] }

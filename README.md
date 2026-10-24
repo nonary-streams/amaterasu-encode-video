@@ -5,8 +5,12 @@
 Disabled enumeration returns an empty list and opening returns `disabled`.
 The default build remains hardware-only on Windows and has no Linux encoder.
 Explicit build features can add real Linux hardware NVENC or software x264
-encoding; no generated frames or automatic hardware-to-software fallback are
-used. Linux NVENC is advertised only after FFmpeg opens a real `h264_nvenc`
+encoding; no generated frames are used. Automatic video selection chooses x264
+when the requested color or reference mode is unsupported by Linux NVENC. If a
+probed NVENC open later fails with a confirmed availability/configuration error,
+automatic selection retries x264 once using a distinct operation ID. Explicit
+encoder selections and uncertain opens do not fall back. Linux NVENC is advertised
+only after FFmpeg opens a real `h264_nvenc`
 session with the supported SDR H.264 settings. Opening an unregistered Linux
 hardware identity returns `hardware_encoder_unavailable`.
 
@@ -168,9 +172,9 @@ No crash recovery or durable encoder sessions are claimed.
 ## Linux hardware NVENC
 
 The opt-in `linux-ffmpeg-nvenc` feature uses the system FFmpeg `libavcodec`
-`h264_nvenc` encoder and `libavutil`. Build integration must compile
-`src/platform/ffmpeg_nvenc.c` against the target FFmpeg development headers and
-link the matching libraries. Runtime packaging must provide compatible FFmpeg
+`h264_nvenc` encoder and `libavutil`. The build script compiles
+`src/platform/ffmpeg_nvenc.c` against target FFmpeg development headers and
+links the matching libraries through pkg-config. Runtime packaging must provide compatible FFmpeg
 libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes a
 small throwaway H.264 encoder context; a missing encoder, driver, device, or
 supported baseline configuration keeps the backend out of discovery. This is

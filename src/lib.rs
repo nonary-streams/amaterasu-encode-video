@@ -1,5 +1,5 @@
 //! H.264 encoding control and native CPU-frame interface.
-#[cfg(any(windows, test, amaterasu_x264))]
+#[cfg(any(windows, test, amaterasu_x264, amaterasu_ffmpeg_nvenc))]
 mod bitstream;
 mod layout;
 mod model;

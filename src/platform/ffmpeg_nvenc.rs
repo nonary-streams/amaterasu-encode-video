@@ -29,6 +29,8 @@ const RECEIVE_AGAIN: i32 = 0;
 const RECEIVE_PACKET: i32 = 1;
 #[cfg(amaterasu_ffmpeg_nvenc)]
 const RECEIVE_EOF: i32 = 2;
+#[cfg(amaterasu_ffmpeg_nvenc)]
+const SEND_RETRY_AFTER_RECEIVE: i32 = 3;
 
 #[cfg(amaterasu_ffmpeg_nvenc)]
 unsafe extern "C" {
@@ -59,6 +61,7 @@ unsafe extern "C" {
         data: *mut *const u8,
         length: *mut usize,
         timestamp_100ns: *mut i64,
+        keyframe: *mut i32,
     ) -> i32;
 }
 
@@ -85,7 +88,7 @@ fn description_with_probe(probe: impl FnOnce() -> bool) -> Option<EncoderDescrip
 pub fn description() -> Option<EncoderDescription> {
     #[cfg(amaterasu_ffmpeg_nvenc)]
     {
-        return description_with_probe(probe_hardware);
+        description_with_probe(probe_hardware)
     }
     #[cfg(not(amaterasu_ffmpeg_nvenc))]
     None
@@ -231,15 +234,23 @@ impl Encoder {
         }
         // SAFETY: the frame bytes remain live until FFmpeg has copied them to
         // its owned AVFrame and the synchronous send call has returned.
-        let result = unsafe {
+        let native = self.native.as_ptr();
+        let send = || unsafe {
             amaterasu_ffmpeg_nvenc_submit(
-                self.native.as_ptr(),
+                native,
                 bytes.as_ptr(),
                 bytes.len(),
                 timestamp_100ns,
                 i32::from(force_idr),
             )
         };
+        let mut result = send();
+        if result == SEND_RETRY_AFTER_RECEIVE {
+            // FFmpeg has not consumed the frame. Read its pending output before
+            // retrying the same owned input exactly once.
+            self.collect_available_packets()?;
+            result = send();
+        }
         if result != 0 {
             return Err("nvenc_submit_failed");
         }
@@ -263,6 +274,7 @@ impl Encoder {
         let mut data = std::ptr::null();
         let mut length = 0usize;
         let mut timestamp_100ns = 0i64;
+        let mut native_keyframe = 0i32;
         // SAFETY: output pointers are valid for this call. FFmpeg retains the
         // AVPacket until its next receive; packet bytes are copied below now.
         let status = unsafe {
@@ -271,6 +283,7 @@ impl Encoder {
                 &mut data,
                 &mut length,
                 &mut timestamp_100ns,
+                &mut native_keyframe,
             )
         };
         match status {
@@ -285,6 +298,9 @@ impl Encoder {
                 // next native receive call. Normalize copies it before then.
                 let borrowed = unsafe { std::slice::from_raw_parts(data, length) };
                 let (bytes, keyframe) = self.normalizer.sample(borrowed)?;
+                if keyframe != (native_keyframe != 0) {
+                    return Err("nvenc_keyframe_mismatch");
+                }
                 Ok(NativeReceive::Packet(Packet {
                     bytes,
                     timestamp_100ns,
@@ -315,7 +331,12 @@ impl Encoder {
         // Submission drains available FFmpeg packets on every frame, so the
         // null-frame send can enter draining mode without discarding output.
         // SAFETY: native remains exclusively owned by this worker.
-        if unsafe { amaterasu_ffmpeg_nvenc_drain(self.native.as_ptr()) } != 0 {
+        let mut result = unsafe { amaterasu_ffmpeg_nvenc_drain(self.native.as_ptr()) };
+        if result == SEND_RETRY_AFTER_RECEIVE {
+            self.collect_available_packets()?;
+            result = unsafe { amaterasu_ffmpeg_nvenc_drain(self.native.as_ptr()) };
+        }
+        if result != 0 {
             return Err("nvenc_drain_failed");
         }
         self.draining = true;
@@ -349,7 +370,7 @@ mod tests {
         let encoder = description_with_probe(|| true).unwrap();
         assert!(encoder.hardware);
         assert_eq!(encoder.codec, "h264");
-        assert_eq!(encoder.identity, identity());
+        assert!(encoder.identity == identity());
     }
 
     #[test]

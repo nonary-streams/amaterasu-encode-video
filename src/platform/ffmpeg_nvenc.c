@@ -18,6 +18,7 @@ enum {
     AMATERASU_NVENC_AGAIN = 0,
     AMATERASU_NVENC_PACKET = 1,
     AMATERASU_NVENC_EOF = 2,
+    AMATERASU_NVENC_RETRY = 3,
 };
 
 struct amaterasu_ffmpeg_nvenc {
@@ -72,7 +73,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     context->rc_buffer_size = bitrate / fps > 0 ? bitrate / fps : 1;
     context->gop_size = fps * 2;
     context->max_b_frames = 0;
-    context->profile = FF_PROFILE_H264_BASELINE;
+    context->profile = AV_PROFILE_H264_BASELINE;
     context->thread_count = 1;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_GLOBAL_HEADER;
     context->color_range = AVCOL_RANGE_MPEG;
@@ -97,7 +98,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     av_dict_free(&options);
 
     if (context->pix_fmt != AV_PIX_FMT_NV12 || context->max_b_frames != 0 ||
-        context->profile != FF_PROFILE_H264_BASELINE ||
+        context->profile != AV_PROFILE_H264_BASELINE ||
         context->extradata == NULL || context->extradata_size <= 0 ||
         context->color_range != AVCOL_RANGE_MPEG ||
         context->color_primaries != AVCOL_PRI_BT709 ||
@@ -190,8 +191,10 @@ int amaterasu_ffmpeg_nvenc_submit(void *opaque, const uint8_t *nv12,
 
     encoder->frame->pts = timestamp_100ns;
     encoder->frame->pict_type = force_idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
-    return avcodec_send_frame(encoder->context, encoder->frame) == 0
-        ? 0 : AMATERASU_NVENC_ERROR;
+    int status = avcodec_send_frame(encoder->context, encoder->frame);
+    if (status == AVERROR(EAGAIN))
+        return AMATERASU_NVENC_RETRY;
+    return status == 0 ? 0 : AMATERASU_NVENC_ERROR;
 }
 
 int amaterasu_ffmpeg_nvenc_drain(void *opaque)
@@ -203,6 +206,8 @@ int amaterasu_ffmpeg_nvenc_drain(void *opaque)
     if (encoder->draining)
         return 0;
     int status = avcodec_send_frame(encoder->context, NULL);
+    if (status == AVERROR(EAGAIN))
+        return AMATERASU_NVENC_RETRY;
     if (status < 0 && status != AVERROR_EOF)
         return AMATERASU_NVENC_ERROR;
     encoder->draining = 1;

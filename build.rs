@@ -11,6 +11,7 @@ fn x264_build_version(header: &str) -> Option<u32> {
 }
 
 fn main() {
+    build_linux_ffmpeg_nvenc();
     println!("cargo:rustc-check-cfg=cfg(amaterasu_x264)");
     println!("cargo:rerun-if-changed=src/platform/x264/adapter.c");
     println!("cargo:rerun-if-env-changed=AMATERASU_X264_INCLUDE_DIR");
@@ -86,4 +87,33 @@ fn main() {
     // ABI build from the encoder artifact it is about to sign.
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_x264_build_marker");
     println!("cargo:rustc-cfg=amaterasu_x264");
+}
+
+fn build_linux_ffmpeg_nvenc() {
+    println!("cargo:rustc-check-cfg=cfg(amaterasu_ffmpeg_nvenc)");
+    println!("cargo:rerun-if-changed=src/platform/ffmpeg_nvenc.c");
+    if env::var_os("CARGO_FEATURE_LINUX_FFMPEG_NVENC").is_none() {
+        return;
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo:warning=FFmpeg NVENC encoding is supported only on Linux");
+        return;
+    }
+
+    // This opt-in backend requires target FFmpeg development headers and
+    // loader libraries. pkg-config honors the target sysroot for cross builds.
+    let avcodec = pkg_config::Config::new()
+        .atleast_version("59")
+        .probe("libavcodec")
+        .expect("linux-ffmpeg-nvenc requires target libavcodec headers and library");
+    let avutil = pkg_config::Config::new()
+        .atleast_version("57")
+        .probe("libavutil")
+        .expect("linux-ffmpeg-nvenc requires target libavutil headers and library");
+    cc::Build::new()
+        .includes(avcodec.include_paths)
+        .includes(avutil.include_paths)
+        .file("src/platform/ffmpeg_nvenc.c")
+        .compile("amaterasu_ffmpeg_nvenc_adapter");
+    println!("cargo:rustc-cfg=amaterasu_ffmpeg_nvenc");
 }
