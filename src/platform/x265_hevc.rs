@@ -340,7 +340,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn rejects_non_hevc_and_unsupported_color_or_reference_configuration() {
         let mut configuration = probe_configuration();
         assert!(validate_configuration(&configuration).is_ok());

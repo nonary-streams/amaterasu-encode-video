@@ -504,7 +504,11 @@ mod tests {
                 if self.bit_count % 8 == 0 {
                     self.bytes.push(0);
                 }
-                let bit = (value >> shift) & 1;
+                let bit = if shift < u32::BITS as usize {
+                    (value >> shift) & 1
+                } else {
+                    0
+                };
                 let offset = 7 - self.bit_count % 8;
                 *self.bytes.last_mut().unwrap() |= (bit as u8) << offset;
                 self.bit_count += 1;
@@ -525,6 +529,24 @@ mod tests {
             }
             self.bytes
         }
+    }
+
+    #[test]
+    fn bit_writer_bounds_shifts_for_wide_zero_fields() {
+        let mut bits = BitWriter::new();
+        bits.bits(0, 48);
+        assert_eq!(bits.bit_count, 48);
+        assert_eq!(bits.bytes.as_slice(), &[0; 6]);
+    }
+
+    #[test]
+    fn bit_reader_accepts_u32_width_and_rejects_oversized_reads() {
+        let mut bits = BitReader::new(&[u8::MAX; 4]);
+        assert_eq!(bits.read_bits(32), Ok(u32::MAX));
+        assert_eq!(bits.read_bits(1), Err("invalid_hevc_sps"));
+
+        let mut bits = BitReader::new(&[u8::MAX; 5]);
+        assert_eq!(bits.read_bits(33), Err("invalid_hevc_sps"));
     }
 
     fn escaped_sps(
