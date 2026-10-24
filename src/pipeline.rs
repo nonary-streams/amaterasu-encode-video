@@ -91,6 +91,7 @@ struct Stream {
     opened_at: Instant,
     last_output_at: Option<Instant>,
     last_repeat_attempt_at: Option<Instant>,
+    next_repeat_at: Option<Instant>,
     last_output_timestamp_us: Option<u64>,
     last_output_sequence: u64,
     last_pixels: Option<OwnedFrame>,
@@ -160,7 +161,30 @@ impl Stream {
         )
     }
 
+    fn repeat_rate(&self) -> f64 {
+        if self.minimum_fps_target == 0.0 {
+            f64::from(self.configuration.fps)
+        } else {
+            self.minimum_fps_target
+        }
+    }
+    fn record_repeat_deadline(&mut self, now: Instant, repeated: bool, submitted: bool) {
+        if self.provider != CaptureProvider::Pipewire {
+            return;
+        }
+        let period = Duration::from_secs_f64(1.0 / self.repeat_rate());
+        if repeated {
+            let previous = self.next_repeat_at.unwrap_or(now);
+            self.next_repeat_at = Some(periodic_deadline(previous, now, period));
+        } else if submitted {
+            self.next_repeat_at = now.checked_add(period);
+        }
+    }
     fn repeat_due(&self, now: Instant) -> bool {
+        if self.provider == CaptureProvider::Pipewire {
+            return self.last_pixels.is_some()
+                && self.next_repeat_at.is_some_and(|deadline| now >= deadline);
+        }
         let target = if self.minimum_fps_target == 0.0 {
             f64::from(self.configuration.fps)
         } else {
@@ -432,11 +456,14 @@ impl Pipeline {
         if specification.provider == CaptureProvider::Pipewire {
             // A sentinel is resolved by the trusted provider, which may restore
             // an earlier portal approval without a management selection RPC.
-            let output = if specification.output == "portal-selected-session-source" {
-                Some(specification.output.clone())
-            } else {
-                self.portal.resolve_output(&specification.output)
-            };
+            let named_owned_output =
+                (1..=8).any(|index| specification.output == format!("kwin:Virtual-{index}"));
+            let output =
+                if specification.output == "portal-selected-session-source" || named_owned_output {
+                    Some(specification.output.clone())
+                } else {
+                    self.portal.resolve_output(&specification.output)
+                };
             let Some(output) = output else {
                 rpc::complete(send, request, error("portal_source_selection_required"));
                 return;
@@ -564,6 +591,7 @@ impl Pipeline {
                 opened_at,
                 last_output_at: None,
                 last_repeat_attempt_at: None,
+                next_repeat_at: None,
                 last_output_timestamp_us: None,
                 last_output_sequence: 0,
                 last_pixels: None,
@@ -609,6 +637,9 @@ impl Pipeline {
         }
         if stream.stage == Stage::Running {
             pump(plane, stream, id);
+            if let Ok(mut queues) = self.queues.lock() {
+                queues.set_geometry(id, stream.desktop_geometry);
+            }
             if stream.stage != Stage::Running
                 && stream.stage != Stage::RestartCloseEncoder
                 && let Ok(mut queues) = self.queues.lock()
@@ -618,13 +649,7 @@ impl Pipeline {
             return;
         }
         if stream.stage == Stage::Activating {
-            match plane.verify_geometry(
-                stream.provider,
-                stream
-                    .capture
-                    .expect("activation follows capture admission"),
-                stream.desktop_geometry,
-            ) {
+            match verify_stream_geometry(plane, stream) {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, &self.queues, send),
                 Ok(GeometryProgress::Busy) => return,
                 Err(code) => stream.cleanup(code),
@@ -645,6 +670,30 @@ impl Pipeline {
     }
 }
 
+fn verify_stream_geometry(
+    plane: &mut dyn Plane,
+    stream: &mut Stream,
+) -> Result<GeometryProgress, &'static str> {
+    let capture = stream.capture.expect("geometry follows capture admission");
+    if stream.provider == CaptureProvider::Pipewire && stream.capture_output.starts_with("kwin:") {
+        let Some(actual) = plane.geometry(stream.provider, capture)? else {
+            return Ok(GeometryProgress::Busy);
+        };
+        actual.validate().map_err(|_| "invalid_capture_geometry")?;
+        // Owned KWin outputs use scale one. A new peer can expand the desktop
+        // or move an output without invalidating its captured pixel dimensions.
+        if actual.output.width != stream.configuration.width
+            || actual.output.height != stream.configuration.height
+        {
+            return Err("capture_geometry_changed");
+        }
+        stream.desktop_geometry = Some(actual);
+        Ok(GeometryProgress::Ready)
+    } else {
+        plane.verify_geometry(stream.provider, capture, stream.desktop_geometry)
+    }
+}
+
 fn elapsed_at_rate(now: Instant, anchor: Instant, frames_per_second: f64) -> bool {
     now.saturating_duration_since(anchor).as_secs_f64() * frames_per_second >= 1.0
 }
@@ -654,11 +703,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let mut capture_due = now >= stream.next_frame;
     let mut capture_slot = capture_due.then_some(stream.next_frame);
     if capture_due {
-        match plane.verify_geometry(
-            stream.provider,
-            stream.capture.expect("running stream owns capture"),
-            stream.desktop_geometry,
-        ) {
+        match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => {
                 if stream.provider == CaptureProvider::Wgc && !stream.constant_rate {
@@ -751,6 +796,11 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
             stream.submitted = stream
                 .submitted
                 .saturating_add(u64::from(progress.submitted));
+            stream.record_repeat_deadline(
+                completed_at,
+                progress.repeat_attempted,
+                progress.submitted,
+            );
             if progress.repeat_attempted {
                 stream.last_repeat_attempt_at = Some(completed_at);
             }
@@ -798,14 +848,17 @@ fn next_capture_deadline(now: Instant, fps: u32) -> Instant {
 }
 
 fn periodic_capture_deadline(previous: Instant, now: Instant, fps: u32) -> Instant {
-    let period = Duration::from_secs_f64(1.0 / f64::from(fps));
+    periodic_deadline(previous, now, Duration::from_secs_f64(1.0 / f64::from(fps)))
+}
+
+fn periodic_deadline(previous: Instant, now: Instant, period: Duration) -> Instant {
     let elapsed = now.saturating_duration_since(previous);
     let periods = elapsed.as_nanos() / period.as_nanos() + 1;
     u32::try_from(periods)
         .ok()
         .and_then(|count| period.checked_mul(count))
         .and_then(|advance| previous.checked_add(advance))
-        .unwrap_or_else(|| next_capture_deadline(now, fps))
+        .unwrap_or_else(|| now + period)
 }
 
 fn advance(
@@ -837,13 +890,7 @@ fn advance(
         return apply_result(stream, id, queues, plane, result, send);
     }
     if stream.stage == Stage::Encoder {
-        match plane.verify_geometry(
-            stream.provider,
-            stream
-                .capture
-                .expect("encoder stage follows capture admission"),
-            stream.desktop_geometry,
-        ) {
+        match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => return false,
             Err(code) => {
@@ -1183,11 +1230,7 @@ fn apply_result(
             if !accept_encoder(stream, &payload) {
                 return false;
             }
-            match plane.verify_geometry(
-                stream.provider,
-                stream.capture.expect("encoder follows capture admission"),
-                stream.desktop_geometry,
-            ) {
+            match verify_stream_geometry(plane, stream) {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                 Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
                 Err(code) => stream.cleanup(code),
@@ -1960,6 +2003,7 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
         return;
     };
     guard.open(id, &stream.owner);
+    guard.set_geometry(id, stream.desktop_geometry);
     drop(guard);
     stream.stage = Stage::Running;
     if let Some(parent) = stream.parent.take()

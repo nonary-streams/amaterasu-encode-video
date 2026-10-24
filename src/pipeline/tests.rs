@@ -3446,3 +3446,76 @@ fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
     let next = periodic_capture_deadline(deadline, stalled, 60);
     assert!(next > stalled && next - stalled <= Duration::from_secs_f64(1.0 / 60.0));
 }
+
+#[test]
+fn named_virtual_output_reaches_the_authorized_provider_without_a_portal_selection() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "amaterasu.stream-session",
+        91,
+        canonical_open("", CaptureProvider::Pipewire, "kwin:Virtual-2"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(runtime.commands.iter().any(|command|matches!(command,Command::Request { service,payload,.. } if service==CaptureProvider::Pipewire.service() && payload["action"]=="open" && payload["output"]=="kwin:Virtual-2")));
+    for output in [
+        "kwin:HDMI-A-1",
+        "kwin:Virtual-0",
+        "kwin:Virtual-01",
+        "kwin:Virtual-9",
+    ] {
+        let (mut pipeline, mut runtime, _) =
+            setup_with_providers([CaptureProvider::Pipewire].into());
+        pipeline.handle(
+            "amaterasu.stream-session",
+            91,
+            canonical_open("", CaptureProvider::Pipewire, output),
+            &mut |command| runtime.send(command),
+        );
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            "portal_source_selection_required"
+        );
+    }
+}
+
+#[test]
+fn pipewire_idle_repeats_keep_sixty_fps_phase_on_two_ms_host_ticks() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle(
+        "alice",
+        91,
+        canonical_open("", CaptureProvider::Dxgi, "LUID/display-1"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.provider = CaptureProvider::Pipewire;
+    stream.minimum_fps_target = 60.0;
+    stream.last_pixels = Some(OwnedFrame {
+        width: 16,
+        height: 16,
+        stride: 64,
+        format: 1,
+        bytes: vec![0; 1024],
+    });
+    let start = Instant::now();
+    stream.record_repeat_deadline(start, false, true);
+    let mut frames = 1;
+    for millis in (2..10000).step_by(2) {
+        let now = start + Duration::from_millis(millis);
+        if stream.repeat_due(now) {
+            frames += 1;
+            stream.record_repeat_deadline(now, true, true);
+        }
+    }
+    assert_eq!(frames, 600, "idle output lost rate to host-tick rounding");
+    let stalled = start + Duration::from_secs(20);
+    assert!(stream.repeat_due(stalled));
+    stream.record_repeat_deadline(stalled, true, true);
+    assert!(
+        !stream.repeat_due(stalled),
+        "missed output slots were replayed as a burst"
+    );
+}

@@ -100,6 +100,13 @@ pub trait Plane {
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str>;
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str>;
     fn release_stream(&mut self, _: u64) {}
+    fn geometry(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<CaptureGeometry>, &'static str> {
+        Ok(None)
+    }
 }
 
 pub struct NativePlane {
@@ -365,6 +372,37 @@ impl Plane for NativePlane {
             .get(&provider)
             .ok_or("capture_provider_unavailable")?;
         verify_capture_geometry(binding, capture, expected)
+    }
+
+    fn geometry(
+        &mut self,
+        provider: CaptureProvider,
+        capture: u64,
+    ) -> Result<Option<CaptureGeometry>, &'static str> {
+        let binding = self
+            .captures
+            .get(&provider)
+            .ok_or("capture_provider_unavailable")?;
+        // SAFETY: the validated binding retains the complete capture table.
+        let prefix =
+            unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+        if !geometry_tail_available(prefix.base.header)? {
+            return Ok(None);
+        }
+        let api = unsafe { binding.table::<CaptureApi>() }.map_err(|_| "capture_interface")?;
+        let mut geometry = std::mem::MaybeUninit::uninit();
+        // SAFETY: the provider initializes this output only on STATUS_OK.
+        match unsafe { (api.geometry)(api.base.context, capture, geometry.as_mut_ptr()) } {
+            STATUS_OK => {
+                let geometry = unsafe { geometry.assume_init() };
+                geometry
+                    .validate()
+                    .map_err(|_| "invalid_capture_geometry")?;
+                Ok(Some(geometry))
+            }
+            MEDIA_BUSY | MEDIA_PENDING | MEDIA_UNSUPPORTED => Ok(None),
+            _ => Err("capture_geometry_failed"),
+        }
     }
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {

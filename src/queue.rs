@@ -16,6 +16,7 @@ struct Packet {
 
 struct Stream {
     owner: String,
+    geometry: Option<amaterasu_media::CaptureGeometry>,
     packets: VecDeque<Packet>,
     bytes: usize,
     eos_queued: bool,
@@ -37,12 +38,31 @@ impl Queues {
             id,
             Stream {
                 owner: owner.into(),
+                geometry: None,
                 packets: VecDeque::new(),
                 bytes: 0,
                 eos_queued: false,
                 eos_accepted: false,
             },
         );
+    }
+
+    pub fn set_geometry(&mut self, id: u64, geometry: Option<amaterasu_media::CaptureGeometry>) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.geometry = geometry;
+        }
+    }
+
+    pub fn geometry(
+        &self,
+        owner: &str,
+        id: u64,
+    ) -> Result<Option<amaterasu_media::CaptureGeometry>, Status> {
+        self.streams
+            .get(&id)
+            .filter(|stream| stream.owner == owner)
+            .map(|stream| stream.geometry)
+            .ok_or(MEDIA_CLOSED)
     }
 
     pub fn close(&mut self, id: u64) {
@@ -242,5 +262,31 @@ mod tests {
         assert_eq!(count_value, 1);
         assert!(queues.eos_accepted(1));
         assert_eq!(unsafe { queues.receive("alice", 1, sink) }, MEDIA_CLOSED);
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use amaterasu_media::{CaptureGeometry, DesktopRect};
+    #[test]
+    fn geometry_tracks_the_owned_stream_and_peer_topology_without_crossing_callers() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice");
+        let first = CaptureGeometry::new(
+            DesktopRect::new(1536, 0, 1920, 1080).unwrap(),
+            DesktopRect::new(0, 0, 3456, 1080).unwrap(),
+        )
+        .unwrap();
+        queues.set_geometry(1, Some(first));
+        assert_eq!(queues.geometry("alice", 1).unwrap(), Some(first));
+        assert_eq!(queues.geometry("bob", 1), Err(MEDIA_CLOSED));
+        let expanded =
+            CaptureGeometry::new(first.output, DesktopRect::new(0, 0, 5376, 1080).unwrap())
+                .unwrap();
+        queues.set_geometry(1, Some(expanded));
+        assert_eq!(queues.geometry("alice", 1).unwrap(), Some(expanded));
+        queues.close(1);
+        assert_eq!(queues.geometry("alice", 1), Err(MEDIA_CLOSED));
     }
 }
