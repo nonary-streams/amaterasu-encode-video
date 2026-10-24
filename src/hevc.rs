@@ -2,6 +2,7 @@
 use amaterasu_media::ColorMode;
 
 const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SPS_BYTES: usize = 1024 * 1024;
 const MAX_NALS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +231,22 @@ pub fn parse_sps_signal(nal: &[u8]) -> Result<SpsSignal, &'static str> {
     let color_primaries = bits.read_bits(8)? as u8;
     let transfer_characteristics = bits.read_bits(8)? as u8;
     let matrix_coefficients = bits.read_bits(8)? as u8;
+    skip_vui_tail(&mut bits, max_sub_layers_minus1)?;
+
+    if bits.read_flag()? {
+        let range_extension = bits.read_flag()?;
+        let multilayer_extension = bits.read_flag()?;
+        let extension_3d = bits.read_flag()?;
+        let scc_extension = bits.read_flag()?;
+        if range_extension || multilayer_extension || extension_3d || scc_extension {
+            return Err("hevc_sps_extension_unsupported");
+        }
+        if bits.read_bits(4)? != 0 {
+            return Err("hevc_sps_extension_unsupported");
+        }
+    }
+    bits.read_rbsp_trailing_bits()?;
+
     Ok(SpsSignal {
         profile_idc,
         chroma_format_idc,
@@ -243,16 +260,23 @@ pub fn parse_sps_signal(nal: &[u8]) -> Result<SpsSignal, &'static str> {
 }
 
 fn unescape_rbsp(ebsp: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if ebsp.is_empty() || ebsp.len() > MAX_SPS_BYTES {
+        return Err("invalid_hevc_sps");
+    }
     let mut rbsp = Vec::with_capacity(ebsp.len());
     let mut zero_count = 0usize;
     let mut index = 0usize;
     while index < ebsp.len() {
         let byte = ebsp[index];
-        if zero_count >= 2 && byte == 3 {
+        if zero_count >= 2 && byte <= 3 {
+            if byte != 3 {
+                return Err("invalid_hevc_sps");
+            }
             let next = *ebsp.get(index + 1).ok_or("invalid_hevc_sps")?;
             if next > 3 {
                 return Err("invalid_hevc_sps");
             }
+            zero_count = 0;
             index += 1;
             continue;
         }
@@ -331,6 +355,23 @@ impl<'a> BitReader<'a> {
             magnitude as i32
         })
     }
+
+    fn read_rbsp_trailing_bits(&mut self) -> Result<(), &'static str> {
+        if !self.read_flag()? {
+            return Err("invalid_hevc_sps");
+        }
+        let alignment_zeroes = (8 - self.position % 8) % 8;
+        let remaining = self.bytes.len() * 8 - self.position;
+        if remaining != alignment_zeroes {
+            return Err("invalid_hevc_sps");
+        }
+        for _ in 0..alignment_zeroes {
+            if self.read_flag()? {
+                return Err("invalid_hevc_sps");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn skip_scaling_list_data(bits: &mut BitReader<'_>) -> Result<(), &'static str> {
@@ -399,6 +440,108 @@ fn skip_vui_prefix(bits: &mut BitReader<'_>) -> Result<(), &'static str> {
     }
     if !bits.read_flag()? {
         return Err("hevc_sps_color_signal_missing");
+    }
+    Ok(())
+}
+
+fn skip_vui_tail(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: usize,
+) -> Result<(), &'static str> {
+    if bits.read_flag()? {
+        bits.read_ue()?; // chroma_sample_loc_type_top_field
+        bits.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    bits.skip(3)?; // neutral_chroma, field_seq, frame_field_info
+    if bits.read_flag()? {
+        for _ in 0..4 {
+            bits.read_ue()?; // default_display_window offsets
+        }
+    }
+    if bits.read_flag()? {
+        bits.skip(64)?; // vui_num_units_in_tick, vui_time_scale
+        if bits.read_flag()? {
+            bits.read_ue()?; // vui_num_ticks_poc_diff_one_minus1
+        }
+        if bits.read_flag()? {
+            skip_hrd_parameters(bits, max_sub_layers_minus1)?;
+        }
+    }
+    if bits.read_flag()? {
+        bits.skip(3)?; // tiles_fixed_structure, motion_vectors, restricted_lists
+        bits.read_ue()?; // min_spatial_segmentation_idc
+        bits.read_ue()?; // max_bytes_per_pic_denom
+        bits.read_ue()?; // max_bits_per_min_cu_denom
+        bits.read_ue()?; // log2_max_mv_length_horizontal
+        bits.read_ue()?; // log2_max_mv_length_vertical
+    }
+    Ok(())
+}
+
+fn skip_hrd_parameters(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: usize,
+) -> Result<(), &'static str> {
+    let nal_hrd_present = bits.read_flag()?;
+    let vcl_hrd_present = bits.read_flag()?;
+    let mut sub_pic_hrd_present = false;
+    if nal_hrd_present || vcl_hrd_present {
+        sub_pic_hrd_present = bits.read_flag()?;
+        if sub_pic_hrd_present {
+            bits.skip(8 + 5 + 1 + 5)?;
+        }
+        bits.skip(4 + 4)?;
+        if sub_pic_hrd_present {
+            bits.skip(4)?;
+        }
+        bits.skip(5 * 3)?;
+    }
+
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_pic_rate_general = bits.read_flag()?;
+        let fixed_pic_rate_within_cvs = if fixed_pic_rate_general {
+            true
+        } else {
+            bits.read_flag()?
+        };
+        let low_delay_hrd = if fixed_pic_rate_within_cvs {
+            bits.read_ue()?; // elemental_duration_in_tc_minus1
+            false
+        } else {
+            bits.read_flag()?
+        };
+        let cpb_count_minus1 = if low_delay_hrd {
+            0
+        } else {
+            let count = bits.read_ue()?;
+            if count > 31 {
+                return Err("invalid_hevc_sps");
+            }
+            count as usize
+        };
+        if nal_hrd_present {
+            skip_sub_layer_hrd_parameters(bits, cpb_count_minus1, sub_pic_hrd_present)?;
+        }
+        if vcl_hrd_present {
+            skip_sub_layer_hrd_parameters(bits, cpb_count_minus1, sub_pic_hrd_present)?;
+        }
+    }
+    Ok(())
+}
+
+fn skip_sub_layer_hrd_parameters(
+    bits: &mut BitReader<'_>,
+    cpb_count_minus1: usize,
+    sub_pic_hrd_present: bool,
+) -> Result<(), &'static str> {
+    for _ in 0..=cpb_count_minus1 {
+        bits.read_ue()?; // bit_rate_value_minus1
+        bits.read_ue()?; // cpb_size_value_minus1
+        if sub_pic_hrd_present {
+            bits.read_ue()?; // cpb_size_du_value_minus1
+            bits.read_ue()?; // bit_rate_du_value_minus1
+        }
+        bits.skip(1)?; // cbr_flag
     }
     Ok(())
 }
@@ -612,6 +755,7 @@ mod tests {
         bits.bits(1, 8); // colour_primaries: BT.709
         bits.bits(1, 8); // transfer_characteristics: BT.709
         bits.bits(u32::from(matrix), 8);
+        bits.bits(0, 8); // VUI tail flags and sps_extension_present_flag
         let rbsp = bits.finish();
         let mut nal = vec![33 << 1, 1];
         let mut zero_count = 0;
@@ -687,6 +831,15 @@ mod tests {
     }
 
     #[test]
+    fn rbsp_unescape_requires_well_formed_emulation_prevention() {
+        assert_eq!(unescape_rbsp(&[0, 0, 3, 1]), Ok(vec![0, 0, 1]));
+        assert_eq!(unescape_rbsp(&[0, 3, 1]), Ok(vec![0, 3, 1]));
+        assert_eq!(unescape_rbsp(&[0, 0, 4]), Ok(vec![0, 0, 4]));
+        assert_eq!(unescape_rbsp(&[0, 0, 1]), Err("invalid_hevc_sps"));
+        assert_eq!(unescape_rbsp(&[0, 0, 3, 4]), Err("invalid_hevc_sps"));
+    }
+
+    #[test]
     fn rejects_cra_and_nonzero_layer_ids_instead_of_claiming_closed_gop_recovery() {
         let mut all = nal(32, 1);
         all.extend(nal(33, 2));
@@ -753,6 +906,48 @@ mod tests {
         let sps = escaped_sps_with_video_format(1, 0, false, 1, 0);
         let signal = parse_sps_signal(&sps).unwrap();
         assert_eq!(signal.profile_idc, 1);
+        assert_eq!(signal.color_primaries, 1);
+        assert_eq!(signal.transfer_characteristics, 1);
+        assert_eq!(signal.matrix_coefficients, 1);
+        assert!(!signal.full_range);
+    }
+
+    #[test]
+    fn rejects_truncated_extra_and_bad_trailing_sps_data() {
+        let valid = escaped_sps(1, 0, false, 1);
+
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert_eq!(parse_sps_signal(&truncated), Err("invalid_hevc_sps"));
+
+        let mut missing_stop_bit = valid.clone();
+        *missing_stop_bit.last_mut().unwrap() = 0;
+        assert_eq!(parse_sps_signal(&missing_stop_bit), Err("invalid_hevc_sps"));
+
+        let mut trailing_byte = valid;
+        trailing_byte.push(0x80);
+        assert_eq!(parse_sps_signal(&trailing_byte), Err("invalid_hevc_sps"));
+
+        let mut oversized = vec![33 << 1, 1];
+        oversized.resize(MAX_SPS_BYTES + 3, 0x55);
+        assert_eq!(parse_sps_signal(&oversized), Err("invalid_hevc_sps"));
+    }
+
+    #[test]
+    fn parses_complete_checked_in_x265_main_sps_vui_and_trailing_bits() {
+        let access_unit = include_bytes!(
+            "../../../crates/gamestream/src/video/fixtures/x265_shim_main_black_64.hevc"
+        );
+        let units = annex_b_units(access_unit).unwrap();
+        let sps = units
+            .into_iter()
+            .find(|unit| nal_type(unit) == 33)
+            .expect("checked-in x265 access unit contains SPS");
+        let signal = parse_sps_signal(sps).unwrap();
+        assert_eq!(signal.profile_idc, 1);
+        assert_eq!(signal.chroma_format_idc, 1);
+        assert_eq!(signal.bit_depth_luma_minus8, 0);
+        assert_eq!(signal.bit_depth_chroma_minus8, 0);
         assert_eq!(signal.color_primaries, 1);
         assert_eq!(signal.transfer_characteristics, 1);
         assert_eq!(signal.matrix_coefficients, 1);
