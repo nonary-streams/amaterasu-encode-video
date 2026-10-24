@@ -610,7 +610,16 @@ fn slow_worker_bounds_real_queue_preserves_retry_metadata_and_orders_drain_eos()
             std::thread::yield_now();
         }
     }
-    assert_eq!(sink.sequences, [1, 2, 3, 4]);
+    assert_eq!(sink.sequences.len(), 5);
+    assert_eq!(&sink.sequences[..4], &[1_u64, 2, 3, 4]);
+    assert_eq!(sink.sequences[4], 0);
+    assert_eq!(sink.flags.len(), 5);
+    assert!(
+        sink.flags[..4]
+            .iter()
+            .all(|flags| flags & FLAG_END_OF_STREAM == 0)
+    );
+    assert_eq!(sink.flags[4], FLAG_END_OF_STREAM);
     assert_eq!(
         sink.flags
             .iter()
