@@ -39,7 +39,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
         *error_code = 1;
     if (width < 16 || height < 16 || (width & 1) != 0 || (height & 1) != 0 ||
         fps < 1 || fps > 120 || bitrate < 100000 || bitrate > 100000000 ||
-        max_reference_frames != 0 || (full_range != 0 && full_range != 1))
+        max_reference_frames < 0 || max_reference_frames > 1 || (full_range != 0 && full_range != 1))
         return NULL;
 
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
@@ -74,6 +74,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     context->rc_buffer_size = bitrate / fps > 0 ? bitrate / fps : 1;
     context->gop_size = fps * 2;
     context->max_b_frames = 0;
+    context->refs = 1;
     context->profile = AV_PROFILE_H264_BASELINE;
     context->thread_count = 1;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -85,11 +86,15 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     int option_status = 0;
     option_status |= av_dict_set(&options, "preset", "p1", 0);
     option_status |= av_dict_set(&options, "tune", "ull", 0);
+    option_status |= av_dict_set(&options, "profile", "baseline", 0);
     option_status |= av_dict_set(&options, "rc", "cbr", 0);
     option_status |= av_dict_set(&options, "zerolatency", "1", 0);
     option_status |= av_dict_set(&options, "forced-idr", "1", 0);
     option_status |= av_dict_set(&options, "rc-lookahead", "0", 0);
     option_status |= av_dict_set(&options, "delay", "0", 0);
+    /* Moonlight's constrained clients permit one reference picture. Bound the
+     * decoded-picture buffer as well as FFmpeg's active reference lists. */
+    option_status |= av_dict_set(&options, "dpb_size", "1", 0);
     if (option_status < 0 || avcodec_open2(context, codec, &options) < 0 || options != NULL) {
         av_dict_free(&options);
         if (error_code != NULL)
@@ -104,6 +109,11 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
         context->color_range != (full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG) ||
         context->color_primaries != AVCOL_PRI_BT709 ||
         context->color_trc != AVCOL_TRC_BT709 || context->colorspace != AVCOL_SPC_BT709) {
+        av_log(context, AV_LOG_ERROR,
+            "Amaterasu NVENC negotiated unsupported format: pixel=%d bframes=%d profile=%d header=%d range=%d primaries=%d transfer=%d matrix=%d\n",
+            context->pix_fmt, context->max_b_frames, context->profile,
+            context->extradata_size, context->color_range, context->color_primaries,
+            context->color_trc, context->colorspace);
         if (error_code != NULL)
             *error_code = 4;
         goto fail;

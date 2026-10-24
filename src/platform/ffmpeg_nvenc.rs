@@ -150,9 +150,6 @@ fn validate_configuration(configuration: &Configuration) -> Result<(), &'static 
     ) {
         return Err("nvenc_color_mode_unsupported");
     }
-    if configuration.max_reference_frames != 0 {
-        return Err("nvenc_reference_frames_unsupported");
-    }
     Ok(())
 }
 
@@ -377,7 +374,9 @@ fn parse_sps_color_signal(nal: &[u8]) -> Result<SpsColorSignal, &'static str> {
         2 => {}
         _ => return Err("invalid_h264_sps"),
     }
-    bits.read_ue()?; // max_num_ref_frames
+    if bits.read_ue()? > 1 {
+        return Err("nvenc_reference_frames_unsupported");
+    }
     bits.read_bit()?; // gaps_in_frame_num_value_allowed_flag
     bits.read_ue()?; // pic_width_in_mbs_minus1
     bits.read_ue()?; // pic_height_in_map_units_minus1
@@ -814,10 +813,9 @@ mod tests {
         );
         configuration.color_mode = ColorMode::Bt709Limited;
         configuration.max_reference_frames = 1;
-        assert_eq!(
-            validate_configuration(&configuration),
-            Err("nvenc_reference_frames_unsupported")
-        );
+        assert_eq!(validate_configuration(&configuration), Ok(()));
+        configuration.max_reference_frames = 2;
+        assert!(validate_configuration(&configuration).is_err());
     }
 
     #[test]
@@ -936,11 +934,79 @@ mod tests {
         baseline_sps_with_vui(Some(full_range), [1, 1, 1])
     }
 
+    #[cfg(amaterasu_ffmpeg_nvenc)]
+    #[test]
+    #[ignore = "opens the native NVIDIA encoder and submits real 1080p frames"]
+    fn encodes_one_reference_frames_on_native_nvidia_hardware() {
+        assert_eq!(std::env::var("AMATERASU_NATIVE_NVENC").as_deref(), Ok("1"));
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":1920,"height":1080,"fps":60,"bitrate":15000000,"max_reference_frames":1
+        }))
+        .unwrap();
+        let mut encoder = open(&identity(), &configuration).unwrap();
+        let mut pixels = vec![128; 1920 * 1080 * 3 / 2];
+        pixels[..1920 * 1080].fill(32);
+        let started = std::time::Instant::now();
+        let mut packets = Vec::new();
+        for index in 0..120 {
+            encoder
+                .submit(pixels.clone(), index * 10_000_000 / 60, index == 0)
+                .unwrap();
+            while let Some(packet) = encoder.receive().unwrap() {
+                packets.push(packet);
+            }
+        }
+        encoder.drain().unwrap();
+        while let Some(packet) = encoder.receive().unwrap() {
+            packets.push(packet);
+        }
+        assert_eq!(packets.len(), 120);
+        assert!(packets[0].keyframe);
+        assert!(
+            packets
+                .windows(2)
+                .all(|pair| pair[0].timestamp_100ns < pair[1].timestamp_100ns)
+        );
+        eprintln!(
+            "encoded 120 real 1080p one-reference frames in {:?}",
+            started.elapsed()
+        );
+        if let Some(path) = std::env::var_os("AMATERASU_NVENC_EVIDENCE_FILE") {
+            use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            for packet in packets {
+                output.write_all(&packet.bytes).unwrap();
+            }
+        }
+    }
+
     fn baseline_sps_without_vui() -> Vec<u8> {
         baseline_sps_with_vui(None, [1, 1, 1])
     }
 
     fn baseline_sps_with_vui(full_range: Option<bool>, color_ids: [u8; 3]) -> Vec<u8> {
+        baseline_sps_with_references(full_range, color_ids, 1)
+    }
+
+    #[test]
+    fn rejects_sps_that_exceeds_moonlight_reference_limit() {
+        let nal = baseline_sps_with_references(Some(false), [1, 1, 1], 2);
+        assert_eq!(
+            parse_sps_color_signal(&nal),
+            Err("nvenc_reference_frames_unsupported")
+        );
+    }
+
+    fn baseline_sps_with_references(
+        full_range: Option<bool>,
+        color_ids: [u8; 3],
+        references: u32,
+    ) -> Vec<u8> {
         let mut bits = TestBitWriter::default();
         bits.write_bits(66, 8); // Baseline profile
         bits.write_bits(0, 8); // constraint flags
@@ -949,7 +1015,7 @@ mod tests {
         bits.write_ue(0); // log2_max_frame_num_minus4
         bits.write_ue(0); // pic_order_cnt_type
         bits.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
-        bits.write_ue(1); // max_num_ref_frames
+        bits.write_ue(references); // max_num_ref_frames
         bits.write_bit(false); // gaps_in_frame_num_value_allowed_flag
         bits.write_ue(119); // width: 1920
         bits.write_ue(67); // height in 16-line macroblock map units

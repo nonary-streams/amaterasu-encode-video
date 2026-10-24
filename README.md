@@ -188,11 +188,15 @@ resolution or bitrate will open.
 
 The first backend supports 8-bit NV12 input, H.264 Baseline, no B frames,
 BT.709 limited-range and full-range SDR, and a fixed low-latency CBR
-configuration. It sets FFmpeg's full-range color metadata for full-range input
+configuration. Baseline is explicitly selected through the encoder's private
+profile option as well as the codec context; the active reference lists and
+decoded-picture buffer are limited to one frame. Both default and one-reference
+Moonlight requests are supported, and SPS validation rejects larger reference
+requirements. It sets FFmpeg's full-range color metadata for full-range input
 and parses the opened encoder's actual SPS VUI to require the requested range
 flag plus BT.709 primaries, transfer, and matrix identifiers. Any mismatched or
 missing VUI rejects Open, and repeated SPS units in output packets are checked
-again before delivery. Other color modes and explicit reference-frame/NVENC
+again before delivery. Other color modes and explicit NVENC
 controls fail closed. Frames are copied into FFmpeg-owned NV12 storage; packets
 are copied and normalized to Annex B before the borrowed FFmpeg packet is
 released. Packet PTS remains in 100-nanosecond units. The worker owns the
