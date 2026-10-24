@@ -46,6 +46,7 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
 struct Runtime {
     next: u64,
     operations: BTreeMap<String, u64>,
+    failed_encoder_operations: std::collections::BTreeSet<String>,
     ended: std::collections::BTreeSet<u64>,
     cancel_failures: usize,
     release_failures: usize,
@@ -70,6 +71,7 @@ struct Runtime {
     capture_enumeration_override: Option<Value>,
     encoder_open_error: Option<&'static str>,
     encoder_open_error_once: Option<&'static str>,
+    encoder_close_error_once: Option<&'static str>,
     encoder_enumeration_override: Option<Value>,
 }
 
@@ -106,11 +108,16 @@ impl Runtime {
                     return Ok(Response::error(code, ""));
                 }
                 self.next += 1;
-                self.operations.insert(operation_id, self.next);
+                self.operations.insert(operation_id.clone(), self.next);
                 if action == "open" {
                     self.open_effects += 1;
                 }
-                let result = if self.fail_encoder_cleanup
+                let result = if service == ENCODE
+                    && action == "close"
+                    && let Some(code) = self.encoder_close_error_once.take()
+                {
+                    error(code)
+                } else if self.fail_encoder_cleanup
                     && service == ENCODE
                     && matches!(action, "lookup" | "close")
                 {
@@ -186,6 +193,7 @@ impl Runtime {
                         .take()
                         .or(self.encoder_open_error)
                     {
+                        self.failed_encoder_operations.insert(operation_id);
                         error(code)
                     } else {
                         let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
@@ -195,6 +203,14 @@ impl Runtime {
                         }
                         result
                     }
+                } else if service == ENCODE
+                    && action == "lookup"
+                    && payload
+                        .get("operation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|operation| self.failed_encoder_operations.contains(operation))
+                {
+                    error("not_found")
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
                     if !self.omit_reference_metadata {
@@ -3104,6 +3120,300 @@ fn auto_restarts_encoder_once_after_runtime_failure_and_forces_idr() {
             .count(),
         2
     );
+}
+
+fn vaapi_and_x264_registry() -> Value {
+    json!({
+        "ok": true,
+        "enabled": true,
+        "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_VAAPI_ID,"hardware_url":"ffmpeg://h264_vaapi","friendly_name":"VAAPI"},"name":"VAAPI","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    })
+}
+
+fn auto_open_request() -> Operation {
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    request
+}
+
+#[test]
+fn runtime_failure_after_preopen_hardware_fallback_does_not_retry_x264() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    runtime.encoder_open_error_once = Some("vaapi_device_unavailable");
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 14);
+
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.encoder_attempt, 1);
+    assert_eq!(stream.encoder.as_ref().unwrap().clsid, SOFTWARE_ENCODER_ID);
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::FindEncoder));
+    tick(&mut pipeline, &mut runtime, &mut plane, 14);
+
+    let encoder_opens: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => {
+                Some(payload["encoder"]["clsid"].as_str().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_opens, [LINUX_FFMPEG_VAAPI_ID, SOFTWARE_ENCODER_ID]);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_failed");
+    assert_eq!(
+        runtime.commands.iter().filter(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == ENCODE && payload["action"] == "close" && payload["session_id"] == 51
+        )).count(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_old_encoder_close_aborts_fallback_and_cleans_exact_resources() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    runtime.encoder_close_error_once = Some("hardware_error");
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 16);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_restart_failed");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        1,
+        "fallback must not open after the old encoder close failed"
+    );
+    let encoder_closes: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "close" => {
+                Some(payload["session_id"].as_u64().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_closes, [51, 51]);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn x264_open_failure_after_runtime_restart_closes_only_reported_resources() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    runtime.encoder_open_error_once = Some("x264_runtime_unavailable");
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "h264_encoder_unavailable");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        2
+    );
+    let encoder_closes: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "close" => {
+                Some(payload["session_id"].as_u64().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_closes, [51]);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
+    use amaterasu_media::{
+        CODEC_H264, EncodedPacket, FLAG_END_OF_ACCESS_UNIT, FLAG_KEYFRAME, PacketSink,
+    };
+    use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+    use std::ffi::c_void;
+
+    #[derive(Default)]
+    struct Received(Vec<(u64, u64, u32, Vec<u8>)>);
+
+    unsafe extern "C" fn accept_packet(
+        context: *mut c_void,
+        packet: *const EncodedPacket,
+    ) -> Status {
+        // SAFETY: the callback context and packet remain valid for this synchronous call.
+        let received = unsafe { &mut *context.cast::<Received>() };
+        // SAFETY: the queue owns the packet bytes during the callback.
+        let packet = unsafe { &*packet };
+        // SAFETY: EncodedPacket::bytes validates the borrowed queue allocation.
+        let bytes = unsafe { packet.bytes() }.unwrap().to_vec();
+        received
+            .0
+            .push((packet.sequence, packet.timestamp_us, packet.flags, bytes));
+        STATUS_OK
+    }
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let old_packets = [([0x11], 1, 10), ([0x22], 2, 20)];
+    {
+        let mut queues = pipeline.queues.lock().unwrap();
+        for (bytes, sequence, timestamp_us) in old_packets {
+            let packet = EncodedPacket {
+                codec: CODEC_H264,
+                flags: FLAG_END_OF_ACCESS_UNIT,
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+                timestamp_us,
+                sequence,
+            };
+            // SAFETY: packet data stays alive through the synchronous queue copy.
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        }
+    }
+    pipeline.streams.get_mut(&1).unwrap().last_output_sequence = 2;
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert!(pipeline.streams[&1].force_idr);
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(plane.inputs.last().unwrap().5, 3);
+    assert!(
+        plane.inputs.last().unwrap().2,
+        "fallback frame must request IDR"
+    );
+
+    // Reuse the exact tiny Annex B SPS/PPS/IDR fixture used by the pure H.264
+    // normalizer fixture; this test never invokes x264 or a hardware encoder.
+    let fallback_idr = [
+        0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
+    ];
+    {
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_END_OF_ACCESS_UNIT | FLAG_KEYFRAME,
+            data: fallback_idr.as_ptr(),
+            len: fallback_idr.len(),
+            timestamp_us: 30,
+            sequence: 3,
+        };
+        let mut queues = pipeline.queues.lock().unwrap();
+        // SAFETY: packet data stays alive through the synchronous queue copy.
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+    }
+
+    let mut received = Received::default();
+    let sink = PacketSink {
+        context: (&mut received as *mut Received).cast(),
+        write: accept_packet,
+    };
+    let mut queues = pipeline.queues.lock().unwrap();
+    for _ in 0..3 {
+        // SAFETY: sink and context remain valid through each synchronous receive.
+        assert_eq!(unsafe { queues.receive("alice", 1, sink) }, STATUS_OK);
+    }
+    assert_eq!(
+        received.0.iter().map(|packet| packet.0).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        received.0.iter().map(|packet| packet.1).collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+    assert_eq!(received.0[0].3, [0x11]);
+    assert_eq!(received.0[1].3, [0x22]);
+    assert_eq!(received.0[2].2, FLAG_END_OF_ACCESS_UNIT | FLAG_KEYFRAME);
+    assert_eq!(received.0[2].3, fallback_idr);
 }
 
 mod operations;
