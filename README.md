@@ -58,8 +58,11 @@ runtime consumers release their bindings. Binding calls are serialized through
 session state; concurrent or reentrant calls return `MEDIA_BUSY`.
 
 Submit copies a validated CPU frame before returning. BGRA8 is converted to
-8-bit limited-range BT.709 NV12, ignoring alpha; NV12 input is assumed to use that
-same color interpretation. NV12 uses contiguous Y/UV planes with the same stride.
+8-bit NV12 using the session's SDR color_mode (bt601_limited, bt601_full,
+bt709_limited, or bt709_full); alpha is ignored. The default is bt709_limited
+and is omitted from serialized configuration. NV12 input is assumed to use the
+session color mode; because its color cannot be verified, non-default modes
+reject raw NV12 input. NV12 uses contiguous Y/UV planes with the same stride.
 Padding is removed, strides are limited to 16,384 bytes, and dimensions must
 match the session. Timestamps and sequence numbers must strictly increase and
 fit signed Media Foundation 100ns time after conversion from microseconds.
@@ -158,8 +161,12 @@ does not enable the feature. Native builds discover headers through
 `pkg-config`; cross builds require `AMATERASU_X264_INCLUDE_DIR`. Missing headers
 or runtime libraries leave x264 unavailable, with no subprocess or generated
 frame fallback. The Linux path accepts the same owned BGRA/NV12 CPU frames and
-returns normalized Annex B H.264 packets through the encoder ABI. Its preset and
+returns normalized Annex B H.264 packets through the encoder ABI. Non-default
+color modes require BGRA input because raw NV12 has no verified color metadata.
+Its preset and
 tune are fixed to `superfast` and `zerolatency` for this first integration.
+The encoder sets H.264 VUI range and color description to match the selected
+mode. BT.601 uses SMPTE 170M identifiers; BT.709 uses BT.709 identifiers.
 Linux desktop-stream release artifacts must enable `software-x264` for
 `amaterasu-encode` and provide a compatible x264 runtime library. The feature
 does not bundle the runtime; the artifact must provide the matching

@@ -74,6 +74,7 @@ fn configuration() -> Configuration {
         height: 16,
         fps: 60,
         bitrate: 1_000_000,
+        color_mode: amaterasu_media::ColorMode::default(),
         max_reference_frames: 0,
         nvenc_preset: None,
         nvenc_h264_cavlc: false,
@@ -279,6 +280,44 @@ fn bounded_pending_input_returns_busy_without_accepting() {
         MEDIA_BUSY
     );
     assert_eq!(submissions.load(Ordering::SeqCst), 16);
+}
+
+#[test]
+fn nondefault_color_rejects_nv12_without_submitting_ambiguous_pixels() {
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    let mut configuration = configuration();
+    configuration.color_mode = amaterasu_media::ColorMode::Bt601Limited;
+    sessions
+        .insert(
+            "alice",
+            configuration,
+            Box::new(Fake {
+                packets: VecDeque::new(),
+                submissions: submissions.clone(),
+                drops: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+
+    // SAFETY: owned data remains live and immutable for the submit call.
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(submissions.load(Ordering::SeqCst), 0);
 }
 
 #[test]

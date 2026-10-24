@@ -1,3 +1,4 @@
+use amaterasu_media::ColorMode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -24,6 +25,9 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// SDR Y'CbCr interpretation used by the input pixels and encoded stream.
+    #[serde(default, skip_serializing_if = "ColorMode::is_default")]
+    pub color_mode: ColorMode,
     /// Zero leaves reference-frame selection to the encoder; one requires a
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -88,6 +92,9 @@ fn is_false(value: &bool) -> bool {
 
 impl Configuration {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if cfg!(windows) && !self.color_mode.is_default() {
+            return Err("color_mode_unsupported");
+        }
         if self.nvenc_h264_cavlc {
             return Err("nvenc_h264_cavlc_unsupported");
         }
@@ -230,6 +237,45 @@ mod tests {
         assert!(serialized.get("nvenc_h264_cavlc").is_none());
         assert!(serialized.get("nvenc_spatial_aq").is_none());
         assert!(serialized.get("amd_av1_latency_mode").is_none());
+        assert!(serialized.get("color_mode").is_none());
+    }
+
+    #[test]
+    fn color_mode_defaults_to_709_limited_and_is_serialized_when_selected() {
+        let configuration: Configuration =
+            serde_json::from_str(r#"{"width":16,"height":16,"fps":60,"bitrate":1000000}"#).unwrap();
+        assert_eq!(configuration.color_mode, ColorMode::Bt709Limited);
+        assert!(
+            serde_json::to_value(&configuration)
+                .unwrap()
+                .get("color_mode")
+                .is_none()
+        );
+
+        let explicit: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,
+            "height":16,
+            "fps":60,
+            "bitrate":1_000_000,
+            "color_mode":"bt601_limited"
+        }))
+        .unwrap();
+        assert_eq!(explicit.color_mode, ColorMode::Bt601Limited);
+        assert_eq!(
+            serde_json::to_value(explicit).unwrap()["color_mode"],
+            "bt601_limited"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_nondefault_color_mode() {
+        let mut configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,"height":16,"fps":60,"bitrate":1_000_000
+        }))
+        .unwrap();
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(configuration.validate(), Err("color_mode_unsupported"));
     }
 
     #[test]
@@ -386,6 +432,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 1_000_000,
+            color_mode: ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: Some(NvencPreset::P1),
             nvenc_h264_cavlc: false,

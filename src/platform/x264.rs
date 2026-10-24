@@ -1,5 +1,29 @@
 //! Version-matched x264 ABI adapter. The worker owns all native resources.
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
+use amaterasu_media::ColorMode;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VuiColor {
+    color_primaries: u32,
+    transfer_characteristics: u32,
+    matrix_coefficients: u32,
+    full_range: u32,
+}
+
+fn vui_color(mode: ColorMode) -> VuiColor {
+    let (color, full_range) = match mode {
+        ColorMode::Bt601Limited => (6, 0),
+        ColorMode::Bt601Full => (6, 1),
+        ColorMode::Bt709Limited => (1, 0),
+        ColorMode::Bt709Full => (1, 1),
+    };
+    VuiColor {
+        color_primaries: color,
+        transfer_characteristics: color,
+        matrix_coefficients: color,
+        full_range,
+    }
+}
 
 const SOFTWARE_ID: &str = "amaterasu.software.x264";
 const SOFTWARE_NAME: &str = "x264 software H.264";
@@ -14,6 +38,31 @@ pub fn identity() -> EncoderIdentity {
 
 pub fn selected(identity: &EncoderIdentity) -> bool {
     identity.clsid == SOFTWARE_ID
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn vui_signaling_matches_sdr_matrix_and_range() {
+        for (mode, color, full_range) in [
+            (ColorMode::Bt601Limited, 6, 0),
+            (ColorMode::Bt601Full, 6, 1),
+            (ColorMode::Bt709Limited, 1, 0),
+            (ColorMode::Bt709Full, 1, 1),
+        ] {
+            assert_eq!(
+                vui_color(mode),
+                VuiColor {
+                    color_primaries: color,
+                    transfer_characteristics: color,
+                    matrix_coefficients: color,
+                    full_range,
+                }
+            );
+        }
+    }
 }
 
 pub fn description() -> Option<EncoderDescription> {

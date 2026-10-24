@@ -257,17 +257,26 @@ impl Sessions {
             Ok(bytes) => bytes,
             Err(status) => return status,
         };
-        let convert = match frame.format {
-            PIXEL_BGRA8 => layout::bgra,
-            PIXEL_NV12 => layout::nv12,
+        if !layout::input_color_supported(frame.format, session.config.color_mode) {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let bytes = match frame.format {
+            PIXEL_BGRA8 => layout::bgra(
+                bytes,
+                frame.width as usize,
+                frame.height as usize,
+                frame.stride as usize,
+                session.config.color_mode,
+            ),
+            PIXEL_NV12 => layout::nv12(
+                bytes,
+                frame.width as usize,
+                frame.height as usize,
+                frame.stride as usize,
+            ),
             _ => return MEDIA_UNSUPPORTED,
         };
-        let bytes = match convert(
-            bytes,
-            frame.width as usize,
-            frame.height as usize,
-            frame.stride as usize,
-        ) {
+        let bytes = match bytes {
             Ok(bytes) => bytes,
             Err(_) => return STATUS_INVALID_ARGUMENT,
         };

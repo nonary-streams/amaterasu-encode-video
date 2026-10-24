@@ -41,6 +41,10 @@ struct NativeConfiguration {
     reference_frames: u32,
     slices_per_frame: i32,
     min_threads: i32,
+    color_primaries: u32,
+    transfer_characteristics: u32,
+    matrix_coefficients: u32,
+    full_range: u32,
 }
 
 #[repr(C)]
@@ -158,6 +162,7 @@ impl Encoder {
         let library = CodecLibrary::load()?;
         let preset = CString::new("superfast").expect("static x264 preset has no NUL");
         let tune = CString::new("zerolatency").expect("static x264 tune has no NUL");
+        let vui = super::vui_color(config.color_mode);
         let native_config = NativeConfiguration {
             width: config.width,
             height: config.height,
@@ -166,6 +171,10 @@ impl Encoder {
             reference_frames: config.max_reference_frames,
             slices_per_frame: 1,
             min_threads: 2,
+            color_primaries: vui.color_primaries,
+            transfer_characteristics: vui.transfer_characteristics,
+            matrix_coefficients: vui.matrix_coefficients,
+            full_range: vui.full_range,
         };
         let mut status = 0;
         // SAFETY: functions belong to the retained library; config and strings
