@@ -13,6 +13,9 @@ software-x264 = ["dep:libloading"]
 # Explicit Linux FFmpeg/NVIDIA hardware path; runtime discovery still requires
 # a successful encoder open before it is offered to a stream.
 linux-ffmpeg-nvenc = []
+# Explicit Linux FFmpeg/VA-API hardware path; runtime discovery requires a
+# successful encoder/device probe before it can be offered to a stream.
+linux-ffmpeg-vaapi = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
