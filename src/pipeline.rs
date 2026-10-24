@@ -10,7 +10,7 @@ use crate::{
         EncoderSelection, OpenSpec, Operation, Settings, TouchSurface, error,
         valid_minimum_fps_target,
     },
-    plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Pump},
+    plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Progress, Pump},
     queue::Queues,
     rpc::{self, Send},
 };
