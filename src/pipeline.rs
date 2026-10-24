@@ -14,7 +14,7 @@ use crate::{
     queue::Queues,
     rpc::{self, Send},
 };
-use amaterasu_media::CaptureGeometry;
+use amaterasu_media::{CaptureGeometry, ColorMode};
 use amaterasu_module_sdk::{Command, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -64,7 +64,9 @@ struct Stream {
     output: String,
     capture_output: String,
     encoder: Option<EncoderIdentity>,
+    fallback_encoder: Option<EncoderIdentity>,
     encoder_index: Option<u32>,
+    encoder_attempt: u8,
     configuration: Configuration,
     parent: Option<u64>,
     ending_parent: Option<u64>,
@@ -145,6 +147,13 @@ impl StageTimings {
 }
 
 impl Stream {
+    fn encoder_operation(&self) -> String {
+        format!(
+            "{}-encoder-attempt-{}",
+            self.operation, self.encoder_attempt
+        )
+    }
+
     fn repeat_due(&self, now: Instant) -> bool {
         let target = if self.minimum_fps_target == 0.0 {
             f64::from(self.configuration.fps)
@@ -513,7 +522,9 @@ impl Pipeline {
                 capture_output: output.clone(),
                 output,
                 encoder,
+                fallback_encoder: None,
                 encoder_index,
+                encoder_attempt: 0,
                 configuration,
                 parent: Some(request),
                 ending_parent: None,
@@ -807,6 +818,8 @@ fn advance(
             "{}-capture-attempt-{}",
             stream.operation, stream.capture_attempt
         )
+    } else if stream.stage == Stage::Encoder {
+        stream.encoder_operation()
     } else if stream.stage == Stage::FallbackEnumerate {
         format!(
             "{}-fallback-enumerate-{}-{}",
@@ -870,7 +883,6 @@ fn advance(
 }
 
 fn request(stream: &Stream) -> (&'static str, Value) {
-    let operation = &stream.operation;
     match stream.stage {
         Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::Capture => {
@@ -898,7 +910,10 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             )
         }
         Stage::Encoder => (ENCODE, encoder_open_request(stream)),
-        Stage::FindEncoder => (ENCODE, json!({"action":"lookup","operation_id":operation})),
+        Stage::FindEncoder => (
+            ENCODE,
+            json!({"action":"lookup","operation_id":stream.encoder_operation()}),
+        ),
         Stage::CloseEncoder => (
             ENCODE,
             json!({"action":"close","session_id":stream.session}),
@@ -923,7 +938,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
             .as_ref()
             .expect("encoder stage follows encoder selection"),
         "configuration": stream.configuration,
-        "operation_id": stream.operation,
+        "operation_id": stream.encoder_operation(),
     });
     if stream.packet_boundaries {
         request["packet_boundaries"] = json!(true);
@@ -1013,6 +1028,11 @@ fn apply_result(
                     | Stage::StopCapture
             ))
     {
+        if stream.stage == Stage::Encoder
+            && begin_encoder_fallback(stream, payload_error_code(&payload))
+        {
+            return false;
+        }
         let code = if stream.stage == Stage::SelectEncoder {
             encoder_selection_error(payload_error_code(&payload))
         } else if stream.stage == Stage::Encoder {
@@ -1026,16 +1046,20 @@ fn apply_result(
         return false;
     }
     let next = match stream.stage {
-        Stage::SelectEncoder => match resolve_encoder_selection(stream.encoder_index, &payload) {
-            Ok(identity) => {
-                stream.encoder = Some(identity);
-                Stage::Capture
+        Stage::SelectEncoder => {
+            match resolve_encoder_selection(stream.encoder_index, &stream.configuration, &payload) {
+                Ok(identity) => {
+                    stream.fallback_encoder =
+                        x264_fallback_for_auto(stream.encoder_index, &identity, &payload);
+                    stream.encoder = Some(identity);
+                    Stage::Capture
+                }
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
             }
-            Err(code) => {
-                stream.cleanup(code);
-                return false;
-            }
-        },
+        }
         Stage::Capture => {
             let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
                 stream.cleanup("invalid_capture_reply");
@@ -1188,12 +1212,68 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
 
 const MAX_ENCODER_ENTRIES: usize = 64;
 const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
+const LINUX_FFMPEG_NVENC_ID: &str = "amaterasu.hardware.nvidia.nvenc.ffmpeg";
+
+fn x264_fallback_for_auto(
+    index: Option<u32>,
+    selected: &EncoderIdentity,
+    payload: &Value,
+) -> Option<EncoderIdentity> {
+    if index.is_some() || selected.clsid != LINUX_FFMPEG_NVENC_ID {
+        return None;
+    }
+    payload
+        .get("encoders")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            let identity: EncoderIdentity =
+                serde_json::from_value(entry.get("identity")?.clone()).ok()?;
+            (identity.clsid == SOFTWARE_ENCODER_ID
+                && entry.get("hardware")?.as_bool() == Some(false))
+            .then_some(identity)
+        })
+}
+
+fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
+    if !matches!(
+        reason,
+        Some(
+            "nvenc_device_unavailable"
+                | "nvenc_allocation_failed"
+                | "nvenc_open_failed"
+                | "nvenc_configuration_unsupported"
+                | "nvenc_headers_unavailable"
+                | "nvenc_headers_unsupported"
+        )
+    ) || stream.encoder_attempt != 0
+    {
+        return false;
+    }
+    let Some(fallback) = stream.fallback_encoder.take() else {
+        return false;
+    };
+    stream.encoder = Some(fallback);
+    stream.encoder_attempt = 1;
+    stream.retries = 0;
+    true
+}
+
+fn encoder_supports_configuration(
+    identity: &EncoderIdentity,
+    configuration: &Configuration,
+) -> bool {
+    identity.clsid != LINUX_FFMPEG_NVENC_ID
+        || (configuration.color_mode == ColorMode::Bt709Limited
+            && configuration.max_reference_frames == 0)
+}
 
 /// Resolve profile indices against the current bounded H.264 registry before
 /// capture is opened. `None` means explicit `auto`: hardware first, then the
 /// registered software encoder. No missing/out-of-range selection is guessed.
 fn resolve_encoder_selection(
     index: Option<u32>,
+    configuration: &Configuration,
     payload: &Value,
 ) -> Result<EncoderIdentity, &'static str> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -1256,14 +1336,17 @@ fn resolve_encoder_selection(
     }
 
     if let Some(index) = index {
-        return identities
+        let selected = identities
             .get(index as usize)
-            .cloned()
-            .ok_or("encoder_unavailable");
+            .ok_or("encoder_unavailable")?;
+        if !encoder_supports_configuration(selected, configuration) {
+            return Err("encoder_configuration_unsupported");
+        }
+        return Ok(selected.clone());
     }
     hardware
         .into_iter()
-        .next()
+        .find(|identity| encoder_supports_configuration(identity, configuration))
         .or_else(|| software.into_iter().next())
         .ok_or("encoder_unavailable")
 }
@@ -1307,6 +1390,13 @@ fn encoder_failure_code(reason: Option<&str>) -> &'static str {
 mod integration_contract_tests {
     use super::*;
 
+    fn default_configuration() -> Configuration {
+        serde_json::from_value(json!({
+            "width": 1920, "height": 1080, "fps": 60, "bitrate": 15_000_000
+        }))
+        .unwrap()
+    }
+
     fn description(clsid: &str, name: &str, hardware: bool) -> Value {
         json!({
             "identity":{"clsid":clsid,"hardware_url":null,"friendly_name":name},
@@ -1344,11 +1434,13 @@ mod integration_contract_tests {
             ]
         });
         assert_eq!(
-            resolve_encoder_selection(Some(0), &payload).unwrap().clsid,
+            resolve_encoder_selection(Some(0), &default_configuration(), &payload)
+                .unwrap()
+                .clsid,
             "first-software"
         );
         assert!(matches!(
-            resolve_encoder_selection(Some(2), &payload),
+            resolve_encoder_selection(Some(2), &default_configuration(), &payload),
             Err("encoder_unavailable")
         ));
     }
@@ -1362,7 +1454,7 @@ mod integration_contract_tests {
                 "encoders":[description("hardware", malformed_name, true)]
             });
             assert!(matches!(
-                resolve_encoder_selection(Some(0), &payload),
+                resolve_encoder_selection(Some(0), &default_configuration(), &payload),
                 Err("invalid_encoder_enumeration")
             ));
         }
@@ -1373,7 +1465,7 @@ mod integration_contract_tests {
             "encoders":[duplicate.clone(), duplicate]
         });
         assert!(matches!(
-            resolve_encoder_selection(None, &payload),
+            resolve_encoder_selection(None, &default_configuration(), &payload),
             Err("invalid_encoder_enumeration")
         ));
     }
@@ -1385,7 +1477,7 @@ mod integration_contract_tests {
             "encoders":[description("other.software", "Other software", false)]
         });
         assert!(matches!(
-            resolve_encoder_selection(None, &arbitrary_software),
+            resolve_encoder_selection(None, &default_configuration(), &arbitrary_software),
             Err("encoder_unavailable")
         ));
 
@@ -1394,7 +1486,45 @@ mod integration_contract_tests {
             "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
         });
         assert_eq!(
-            resolve_encoder_selection(None, &x264).unwrap().clsid,
+            resolve_encoder_selection(None, &default_configuration(), &x264)
+                .unwrap()
+                .clsid,
+            SOFTWARE_ENCODER_ID
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_x264_when_nvenc_cannot_encode_selected_color() {
+        let payload = json!({
+            "ok": true, "enabled": true, "encoders": [
+                description(LINUX_FFMPEG_NVENC_ID, "NVENC", true),
+                description(SOFTWARE_ENCODER_ID, "x264", false)
+            ]
+        });
+        let mut configuration = default_configuration();
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            LINUX_FFMPEG_NVENC_ID
+        );
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            SOFTWARE_ENCODER_ID
+        );
+        assert!(matches!(
+            resolve_encoder_selection(Some(0), &configuration, &payload),
+            Err("encoder_configuration_unsupported")
+        ));
+        configuration.color_mode = ColorMode::Bt709Limited;
+        configuration.max_reference_frames = 1;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
             SOFTWARE_ENCODER_ID
         );
     }

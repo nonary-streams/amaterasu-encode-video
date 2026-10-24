@@ -69,6 +69,7 @@ struct Runtime {
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
     encoder_open_error: Option<&'static str>,
+    encoder_open_error_once: Option<&'static str>,
     encoder_enumeration_override: Option<Value>,
 }
 
@@ -179,11 +180,21 @@ impl Runtime {
                                 "hardware":true,"vendor_id":null
                             }]})
                         })
-                } else if service == ENCODE
-                    && action == "open"
-                    && let Some(code) = self.encoder_open_error
-                {
-                    error(code)
+                } else if service == ENCODE && action == "open" {
+                    if let Some(code) = self
+                        .encoder_open_error_once
+                        .take()
+                        .or(self.encoder_open_error)
+                    {
+                        error(code)
+                    } else {
+                        let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                        if !self.omit_reference_metadata {
+                            result["max_reference_frames"] =
+                                payload["configuration"]["max_reference_frames"].clone();
+                        }
+                        result
+                    }
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
                     if !self.omit_reference_metadata {
@@ -2848,6 +2859,87 @@ fn auto_encoder_selection_prefers_hardware_and_invalid_index_fails_before_captur
         Command::Request { service, payload, .. }
             if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
     )));
+}
+
+#[test]
+fn auto_retries_confirmed_nvenc_open_failure_with_distinct_x264_operation() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let attempts: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == ENCODE && payload["action"] == "open" => Some((
+                payload["encoder"]["clsid"].as_str().unwrap(),
+                operation_id.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, LINUX_FFMPEG_NVENC_ID);
+    assert_eq!(attempts[1].0, SOFTWARE_ENCODER_ID);
+    assert_ne!(attempts[0].1, attempts[1].1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 30);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE && payload["action"] == "open"
+    )).count(), 1);
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("permission_denied");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 30);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE && payload["action"] == "open"
+    )).count(), 1);
 }
 
 mod operations;
