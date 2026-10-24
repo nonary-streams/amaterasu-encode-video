@@ -2727,8 +2727,9 @@ fn native_drain_error_is_visible_after_resource_cleanup() {
 }
 
 #[test]
-fn pipewire_sentinel_requires_an_explicit_ready_portal_selection() {
-    let (mut pipeline, mut runtime, _) = setup_with_providers([CaptureProvider::Pipewire].into());
+fn pipewire_sentinel_delegates_restoration_to_the_authorized_provider() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
     pipeline.handle(
         "alice",
         91,
@@ -2739,15 +2740,11 @@ fn pipewire_sentinel_requires_an_explicit_ready_portal_selection() {
         ),
         &mut |command| runtime.send(command),
     );
-    assert_eq!(
-        runtime.completed.last().unwrap().1["code"],
-        "portal_source_selection_required"
-    );
-    assert!(!runtime.commands.iter().any(|command| matches!(
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert!(runtime.commands.iter().any(|command| matches!(
         command,
-        Command::Request { service, .. } if service == CaptureProvider::Pipewire.service()
+        Command::Request { service, payload, .. } if service == CaptureProvider::Pipewire.service() && payload["action"] == "open" && payload["output"] == "portal-selected-session-source"
     )));
-    assert_eq!(runtime.open_effects, 0);
 }
 
 #[test]
@@ -2790,7 +2787,7 @@ fn pipewire_selection_flows_into_the_capture_and_encoder_stages() {
         Command::Request { service, payload, .. }
             if service == CaptureProvider::Pipewire.service()
                 && payload["action"] == "open"
-                && payload["output"] == "portal-test-output"
+                && payload["output"] == "portal-selected-session-source"
     )));
     assert!(runtime.commands.iter().any(|command| matches!(
         command,

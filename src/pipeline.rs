@@ -425,7 +425,14 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) {
         if specification.provider == CaptureProvider::Pipewire {
-            let Some(output) = self.portal.resolve_output(&specification.output) else {
+            // A sentinel is resolved by the trusted provider, which may restore
+            // an earlier portal approval without a management selection RPC.
+            let output = if specification.output == "portal-selected-session-source" {
+                Some(specification.output.clone())
+            } else {
+                self.portal.resolve_output(&specification.output)
+            };
+            let Some(output) = output else {
                 rpc::complete(send, request, error("portal_source_selection_required"));
                 return;
             };
