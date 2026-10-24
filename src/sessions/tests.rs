@@ -313,6 +313,186 @@ fn hevc_marks_complete_access_unit_and_eos_with_hevc_codec() {
     exercise_packet_flags(false, VideoCodec::Hevc);
 }
 
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+#[test]
+fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
+    let mut config = configuration();
+    config.width = 64;
+    config.height = 64;
+    config.fps = 30;
+    config.bitrate = 500_000;
+    config.codec = VideoCodec::Hevc;
+    config.color_mode = amaterasu_media::ColorMode::Bt709Limited;
+
+    let identity = EncoderIdentity {
+        clsid: "amaterasu.software.linux.x265.hevc".into(),
+        hardware_url: Some("x265://libx265".into()),
+        friendly_name: "x265 software HEVC Main (8-bit)".into(),
+    };
+    let worker = Worker::open(identity, config.clone())
+        .expect("feature-gated test requires an operational software x265 runtime");
+    let mut sessions = Sessions::new(true);
+    let reply = sessions
+        .insert("x265-smoke", config, Box::new(worker), false)
+        .unwrap();
+    assert_eq!(reply["codec"], "hevc");
+    assert_eq!(reply["packet_boundaries"], true);
+
+    let mut nv12 = vec![16; 64 * 64];
+    nv12.resize(64 * 64 * 3 / 2, 128);
+    let frame = CpuFrame {
+        width: 64,
+        height: 64,
+        format: PIXEL_NV12,
+        stride: 64,
+        data: nv12.as_ptr(),
+        len: nv12.len(),
+        timestamp_us: 100_000,
+        sequence: 1,
+    };
+    // SAFETY: `nv12` remains alive while Sessions copies the borrowed frame.
+    assert_eq!(
+        unsafe { sessions.submit("x265-smoke", 1, &frame, 1) },
+        STATUS_OK
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match sessions.drain("x265-smoke", 1) {
+            STATUS_OK => break,
+            MEDIA_BUSY if Instant::now() < deadline => std::thread::yield_now(),
+            status => panic!("x265 drain failed or timed out: {status}"),
+        }
+    }
+
+    let mut sink = HevcSmokeSink::default();
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut HevcSmokeSink).cast(),
+        write: capture_hevc_smoke_packet,
+    };
+    loop {
+        // SAFETY: the sink and callback context remain live for the full drain.
+        let status = unsafe { sessions.receive("x265-smoke", 1, packet_sink) };
+        if status == STATUS_OK && sink.flags.last() == Some(&FLAG_END_OF_STREAM) {
+            break;
+        }
+        if (status == MEDIA_PENDING || status == MEDIA_BUSY) && Instant::now() < deadline {
+            std::thread::yield_now();
+            continue;
+        }
+        assert!(Instant::now() < deadline, "x265 receive timed out");
+        assert_eq!(status, STATUS_OK, "x265 receive failed: {status}");
+    }
+
+    assert_eq!(sink.codecs, vec![CODEC_HEVC; sink.codecs.len()]);
+    assert!(sink.data.len() >= 1, "expected an encoded HEVC access unit");
+    assert_eq!(sink.flags.last(), Some(&FLAG_END_OF_STREAM));
+    assert!(
+        sink.flags[..sink.flags.len() - 1]
+            .iter()
+            .all(|flags| flags & FLAG_END_OF_ACCESS_UNIT != 0)
+    );
+    assert_eq!(
+        sink.flags
+            .iter()
+            .filter(|flags| **flags & FLAG_END_OF_STREAM != 0)
+            .count(),
+        1
+    );
+
+    for access_unit in &sink.data {
+        let units = split_hevc_annex_b(access_unit).expect("valid Annex-B access unit");
+        let types = units
+            .iter()
+            .map(|nal| (nal[0] >> 1) & 0x3f)
+            .collect::<Vec<_>>();
+        let vps = types.iter().position(|kind| *kind == 32).unwrap();
+        let sps = types.iter().position(|kind| *kind == 33).unwrap();
+        let pps = types.iter().position(|kind| *kind == 34).unwrap();
+        let idr = types
+            .iter()
+            .position(|kind| matches!(*kind, 19 | 20))
+            .expect("expected closed-GOP IDR");
+        assert!(vps < sps && sps < pps && pps < idr);
+        let signal = crate::hevc::parse_sps_signal(units[sps]).unwrap();
+        assert_eq!(signal.profile_idc, 1);
+        assert_eq!(signal.chroma_format_idc, 1);
+        assert_eq!(signal.bit_depth_luma_minus8, 0);
+        assert_eq!(signal.bit_depth_chroma_minus8, 0);
+        assert_eq!(signal.color_primaries, 1);
+        assert_eq!(signal.transfer_characteristics, 1);
+        assert_eq!(signal.matrix_coefficients, 1);
+        assert!(!signal.full_range);
+    }
+}
+
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+#[derive(Default)]
+struct HevcSmokeSink {
+    data: Vec<Vec<u8>>,
+    flags: Vec<u32>,
+    codecs: Vec<u32>,
+}
+
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+unsafe extern "C" fn capture_hevc_smoke_packet(
+    context: *mut c_void,
+    packet: *const EncodedPacket,
+) -> Status {
+    // SAFETY: the feature-gated test owns a live sink and callback packet.
+    let sink = unsafe { &mut *context.cast::<HevcSmokeSink>() };
+    let packet = unsafe { &*packet };
+    if packet.len > 0 {
+        if packet.data.is_null() {
+            return MEDIA_BACKEND_ERROR;
+        }
+        // SAFETY: the packet ABI lends this byte range for the callback.
+        let bytes = unsafe { std::slice::from_raw_parts(packet.data, packet.len) };
+        sink.data.push(bytes.to_vec());
+    }
+    sink.flags.push(packet.flags);
+    sink.codecs.push(packet.codec);
+    STATUS_OK
+}
+
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+fn split_hevc_annex_b(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
+            starts.push(offset);
+            offset += 4;
+        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
+            starts.push(offset);
+            offset += 3;
+        } else {
+            offset += 1;
+        }
+    }
+    if starts.first() != Some(&0) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(starts.len());
+    for (index, start) in starts.iter().copied().enumerate() {
+        let code_len = if bytes[start..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else {
+            3
+        };
+        let payload_start = start + code_len;
+        let mut payload_end = starts.get(index + 1).copied().unwrap_or(bytes.len());
+        while payload_end > payload_start && bytes[payload_end - 1] == 0 {
+            payload_end -= 1;
+        }
+        if payload_end - payload_start < 2 {
+            return None;
+        }
+        units.push(&bytes[payload_start..payload_end]);
+    }
+    Some(units)
+}
+
 fn exercise_packet_flags(packet_boundaries: bool, codec: VideoCodec) {
     let submissions = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
