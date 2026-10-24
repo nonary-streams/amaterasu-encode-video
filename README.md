@@ -174,7 +174,10 @@ No crash recovery or durable encoder sessions are claimed.
 The opt-in `linux-ffmpeg-nvenc` feature uses the system FFmpeg `libavcodec`
 `h264_nvenc` encoder and `libavutil`. The build script compiles
 `src/platform/ffmpeg_nvenc.c` against target FFmpeg development headers and
-links the matching libraries through pkg-config. Runtime packaging must provide compatible FFmpeg
+links the matching libraries through pkg-config. The encoder artifact embeds the
+compiled avcodec/avutil ABI majors; LinuxSession packaging and user-service
+preflight require those exact loader sonames and API symbols when this feature
+is present. Runtime packaging must provide compatible FFmpeg
 libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes a
 small throwaway H.264 encoder context; a missing encoder, driver, device, or
 supported baseline configuration keeps the backend out of discovery. This is

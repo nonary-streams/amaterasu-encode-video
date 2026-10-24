@@ -110,10 +110,31 @@ fn build_linux_ffmpeg_nvenc() {
         .atleast_version("57")
         .probe("libavutil")
         .expect("linux-ffmpeg-nvenc requires target libavutil headers and library");
+    let abi_major = |version: &str| -> u32 {
+        version
+            .split('.')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .expect("FFmpeg pkg-config version must start with a positive ABI major")
+    };
+    let avcodec_major = abi_major(&avcodec.version);
+    let avutil_major = abi_major(&avutil.version);
+    let marker_source = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is unset"))
+        .join("ffmpeg_abi_marker.c");
+    std::fs::write(
+        &marker_source,
+        format!(
+            "__attribute__((used)) const char amaterasu_ffmpeg_abi_marker[] = \"AMATERASU_FFMPEG_ABI={avcodec_major},{avutil_major}\";\n"
+        ),
+    )
+    .expect("could not write the FFmpeg ABI marker source");
     cc::Build::new()
         .includes(avcodec.include_paths)
         .includes(avutil.include_paths)
         .file("src/platform/ffmpeg_nvenc.c")
+        .file(&marker_source)
         .compile("amaterasu_ffmpeg_nvenc_adapter");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_ffmpeg_abi_marker");
     println!("cargo:rustc-cfg=amaterasu_ffmpeg_nvenc");
 }
