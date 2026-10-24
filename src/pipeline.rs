@@ -1451,7 +1451,11 @@ fn resolve_encoder_selection(
     hardware
         .into_iter()
         .find(|identity| encoder_supports_configuration(identity, configuration))
-        .or_else(|| software.into_iter().next())
+        .or_else(|| {
+            software
+                .into_iter()
+                .find(|identity| encoder_supports_configuration(identity, configuration))
+        })
         .ok_or_else(|| codec_unavailable(configuration.codec))
 }
 
@@ -1617,7 +1621,7 @@ mod integration_contract_tests {
         });
         assert!(matches!(
             resolve_encoder_selection(None, &default_configuration(), &arbitrary_software),
-            Err("encoder_unavailable")
+            Err("h264_encoder_unavailable")
         ));
 
         let x264 = json!({
