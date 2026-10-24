@@ -668,6 +668,44 @@ fn nondefault_color_rejects_nv12_without_submitting_ambiguous_pixels() {
 }
 
 #[test]
+fn status_reports_bgra_conversion_timing_as_numeric_counters() {
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(Fake {
+                packets: VecDeque::new(),
+                submissions,
+                drops: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .unwrap();
+    let data = vec![127; 16 * 16 * 4];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_BGRA8,
+        stride: 64,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    // SAFETY: frame allocation remains alive and immutable through submission.
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+
+    let status = sessions.status("alice", 1).unwrap();
+    let timing = &status["timing"];
+    assert_eq!(timing["color_conversion_frames"], 1);
+    assert!(timing["color_conversion_total_us"].as_u64().is_some());
+    assert!(timing["color_conversion_max_us"].as_u64().is_some());
+    assert!(status.get("frame").is_none());
+}
+
+#[test]
 fn delivered_packet_releases_metadata_capacity_without_losing_input_order() {
     let submissions = Arc::new(AtomicUsize::new(0));
     let mut sessions = Sessions::new(true);
