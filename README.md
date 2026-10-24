@@ -6,6 +6,12 @@ Disabled enumeration returns an empty list and opening returns `disabled`.
 The default build remains hardware-only on Windows and has no Linux encoder.
 An explicit build feature can add real software x264 encoding; no generated
 frames or automatic hardware-to-software fallback are used.
+Linux hardware encoders are not advertised or opened by this provider. Finding
+libva or NVENC loader libraries on the host is not a capability check: a usable
+backend must also verify an H.264 encode profile/entrypoint, configure the
+requested session, and produce output. Until such a backend is integrated,
+opening an unregistered Linux hardware identity returns
+`hardware_encoder_unavailable`.
 
 Control requests are strict JSON; frames and encoded bytes never use JSON:
 
@@ -217,6 +223,17 @@ larger encoder policy surface. No source was copied or translated. Native NVENC,
 AMD AMF, Intel-specific controls, Linux backends, GPU texture import, HEVC, AV1,
 HDR/10-bit, reference-frame invalidation, rate-control tuning, quality presets,
 dynamic resolution, and full streaming parity remain unimplemented.
+
+A future Linux hardware backend needs an explicit module feature/build profile
+and vetted bindings for the selected native API. VA-API requires libva headers
+and runtime plus a driver that exposes the requested H.264 encode profile and
+entrypoint. NVENC requires NVIDIA's Video Codec SDK ABI and a compatible
+`libnvidia-encode` runtime/device. The provider must retain the chosen device
+and API resources on its encoder worker, upload the existing owned NV12 input
+or convert BGRA, normalize complete H.264 access units to the existing packet
+contract, and enumerate only after a real H.264 encode capability check.
+Integration owns the Cargo feature/dependency and Linux release profile; this
+source slice adds neither.
 
 Primary API references:
 

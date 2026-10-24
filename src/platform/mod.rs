@@ -94,7 +94,14 @@ impl Encoder {
         #[cfg(not(windows))]
         {
             let _ = configuration;
-            Err("unsupported_platform")
+            #[cfg(target_os = "linux")]
+            {
+                Err("hardware_encoder_unavailable")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err("unsupported_platform")
+            }
         }
     }
 
@@ -160,6 +167,31 @@ mod tests {
                 .any(|encoder| x264::selected(&encoder.identity)),
             x264::availability().is_ok()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_does_not_claim_or_open_an_unregistered_hardware_encoder() {
+        let encoders = enumerate().unwrap();
+        assert!(encoders.iter().all(|encoder| !encoder.hardware));
+
+        let identity = EncoderIdentity {
+            clsid: "amaterasu.hardware.vaapi.h264".into(),
+            hardware_url: Some("vaapi://unprobed-device".into()),
+            friendly_name: "VA-API H.264".into(),
+        };
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "bitrate": 15_000_000
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            Encoder::open(&identity, &configuration),
+            Err("hardware_encoder_unavailable")
+        ));
     }
 
     #[cfg(not(amaterasu_x264))]
