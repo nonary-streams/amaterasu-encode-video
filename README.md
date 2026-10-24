@@ -310,8 +310,11 @@ ID is an `operation_conflict`. The mode does not relax backend output-boundary
 verification or promise a stream is ready before open succeeds.
 # Linux HEVC software encoding
 
-The optional `linux-x265-hevc` feature registers `amaterasu.software.linux.x265.hevc`
-only after an 8-bit x265 Main encoder opens and emits bounded Annex B VPS/SPS/PPS.
+The optional `linux-x265-hevc` feature enables direct open by the exact identity
+`amaterasu.software.linux.x265.hevc` after an 8-bit x265 Main encoder opens and
+emits bounded Annex B VPS/SPS/PPS. It is not added to public encoder enumeration,
+so automatic selection and advertisement remain disabled pending end-to-end
+stream validation.
 The backend accepts BT.709 limited SDR NV12 input, configured as progressive 8-bit
 4:2:0, and returns one complete Annex B HEVC access unit per media packet. The
 packet codec is `CODEC_HEVC`; timestamps remain in 100 ns units. x265 is configured
@@ -327,6 +330,8 @@ The feature requires target `x265` development headers and library through
 runtime dependency and is GPL-2.0-or-later or commercially licensed. H.264 remains the default codec,
 and Windows does not opt into this backend.
 
-The source backend is intentionally not included in encoder enumeration yet.
-Enable registry advertisement only after the HEVC packet-fragment transport and
-end-to-end stream path have passed integration validation.
+Central feature-on validation passed 70 encode and 124 video tests. The real
+x265 smoke access unit was identified by ffprobe as Main, 8-bit 4:2:0, BT.709
+limited, decoded by FFmpeg, and passed the GameStream fixture using the exact
+shim output. Actual Moonlight streaming remains unqualified; keep public
+registry advertisement disabled until that path is validated.
