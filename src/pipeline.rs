@@ -1356,7 +1356,7 @@ fn encoder_supports_configuration(
                     configuration.color_mode,
                     ColorMode::Bt709Limited | ColorMode::Bt709Full
                 )
-                && configuration.max_reference_frames == 0
+                && configuration.max_reference_frames <= 1
         }
         LINUX_FFMPEG_VAAPI_ID => {
             configuration.codec == VideoCodec::H264
@@ -1685,7 +1685,7 @@ mod integration_contract_tests {
             resolve_encoder_selection(None, &configuration, &payload)
                 .unwrap()
                 .clsid,
-            SOFTWARE_ENCODER_ID
+            LINUX_FFMPEG_NVENC_ID
         );
     }
 
