@@ -184,7 +184,7 @@ fn expected_color_signal(color_mode: ColorMode) -> Result<SpsColorSignal, &'stat
 #[cfg(any(amaterasu_ffmpeg_nvenc, test))]
 fn validate_header_color(data: &[u8], color_mode: ColorMode) -> Result<(), &'static str> {
     let expected = expected_color_signal(color_mode)?;
-    let sps_units = sps_units(data)?;
+    let sps_units = sps_units(data, None)?;
     if sps_units.is_empty()
         || sps_units
             .iter()
@@ -196,9 +196,13 @@ fn validate_header_color(data: &[u8], color_mode: ColorMode) -> Result<(), &'sta
 }
 
 #[cfg(any(amaterasu_ffmpeg_nvenc, test))]
-fn validate_packet_color(data: &[u8], color_mode: ColorMode) -> Result<(), &'static str> {
+fn validate_packet_color(
+    data: &[u8],
+    color_mode: ColorMode,
+    length_prefixed: bool,
+) -> Result<(), &'static str> {
     let expected = expected_color_signal(color_mode)?;
-    for sps in sps_units(data)? {
+    for sps in sps_units(data, Some(length_prefixed))? {
         if parse_sps_color_signal(sps)? != expected {
             return Err("nvenc_vui_mismatch");
         }
@@ -207,12 +211,18 @@ fn validate_packet_color(data: &[u8], color_mode: ColorMode) -> Result<(), &'sta
 }
 
 #[cfg(any(amaterasu_ffmpeg_nvenc, test))]
-fn sps_units(data: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
+// None selects the extradata format; samples must use the format established
+// by that extradata. A four-byte AVCC length can resemble an Annex B prefix.
+fn sps_units(
+    data: &[u8],
+    sample_length_prefixed: Option<bool>,
+) -> Result<Vec<&[u8]>, &'static str> {
     if data.is_empty() || data.len() > MAX_PACKET_BYTES {
         return Err("invalid_h264_header");
     }
     let mut units = Vec::new();
-    if let Some(mut offset) = start_code(data, 0) {
+    if sample_length_prefixed != Some(true) && start_code(data, 0).is_some() {
+        let mut offset = start_code(data, 0).ok_or("invalid_h264_header")?;
         let mut nal_count = 0;
         while offset < data.len() {
             nal_count += 1;
@@ -243,7 +253,7 @@ fn sps_units(data: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
         return Ok(units);
     }
 
-    if data[0] == 1 {
+    if sample_length_prefixed.is_none() && data[0] == 1 {
         if data.len() < 7 || data[4] & 3 != 3 {
             return Err("invalid_h264_header");
         }
@@ -273,7 +283,7 @@ fn sps_units(data: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
         };
     }
 
-    if data[0] & 31 == 7 {
+    if sample_length_prefixed.is_none() && data[0] & 31 == 7 {
         return Ok(vec![data]);
     }
 
@@ -322,10 +332,16 @@ fn parse_sps_color_signal(nal: &[u8]) -> Result<SpsColorSignal, &'static str> {
     }
     let mut rbsp = Vec::with_capacity(nal.len() - 1);
     let mut zeroes = 0;
-    for byte in &nal[1..] {
+    for (index, byte) in nal[1..].iter().enumerate() {
         if zeroes >= 2 && *byte == 3 {
+            if nal.get(index + 2).is_none_or(|next| *next > 3) {
+                return Err("invalid_h264_sps");
+            }
             zeroes = 0;
             continue;
+        }
+        if zeroes >= 2 && *byte < 3 {
+            return Err("invalid_h264_sps");
         }
         rbsp.push(*byte);
         zeroes = if *byte == 0 { zeroes + 1 } else { 0 };
@@ -391,12 +407,55 @@ fn parse_sps_color_signal(nal: &[u8]) -> Result<SpsColorSignal, &'static str> {
     if !bits.read_bit()? {
         return Err("nvenc_vui_missing_color_description");
     }
-    Ok(SpsColorSignal {
+    let color = SpsColorSignal {
         full_range,
         primaries: bits.read_bits(8)? as u8,
         transfer: bits.read_bits(8)? as u8,
         matrix: bits.read_bits(8)? as u8,
-    })
+    };
+    if bits.read_bit()? {
+        bits.read_ue()?; // chroma_sample_loc_type_top_field
+        bits.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    if bits.read_bit()? {
+        bits.skip_bits(64)?; // num_units_in_tick and time_scale
+        bits.read_bit()?; // fixed_frame_rate_flag
+    }
+    let nal_hrd = bits.read_bit()?;
+    if nal_hrd {
+        parse_hrd(&mut bits)?;
+    }
+    let vcl_hrd = bits.read_bit()?;
+    if vcl_hrd {
+        parse_hrd(&mut bits)?;
+    }
+    if nal_hrd || vcl_hrd {
+        bits.read_bit()?; // low_delay_hrd_flag
+    }
+    bits.read_bit()?; // pic_struct_present_flag
+    if bits.read_bit()? {
+        bits.read_bit()?; // motion_vectors_over_pic_boundaries_flag
+        for _ in 0..6 {
+            bits.read_ue()?;
+        }
+    }
+    bits.finish_rbsp()?;
+    Ok(color)
+}
+
+#[cfg(any(amaterasu_ffmpeg_nvenc, test))]
+fn parse_hrd(bits: &mut BitReader<'_>) -> Result<(), &'static str> {
+    let cpb_count_minus_one = bits.read_ue()?;
+    if cpb_count_minus_one > 31 {
+        return Err("invalid_h264_sps");
+    }
+    bits.skip_bits(8)?; // bit_rate_scale and cpb_size_scale
+    for _ in 0..=cpb_count_minus_one {
+        bits.read_ue()?; // bit_rate_value_minus1
+        bits.read_ue()?; // cpb_size_value_minus1
+        bits.read_bit()?; // cbr_flag
+    }
+    bits.skip_bits(20) // four five-bit delay/offset lengths
 }
 
 #[cfg(any(amaterasu_ffmpeg_nvenc, test))]
@@ -456,12 +515,27 @@ impl<'a> BitReader<'a> {
 
     fn read_se(&mut self) -> Result<i32, &'static str> {
         let code_num = self.read_ue()?;
-        let magnitude = code_num.div_ceil(2) as i32;
+        let magnitude = i32::try_from(code_num.div_ceil(2)).map_err(|_| "invalid_h264_sps")?;
         Ok(if code_num % 2 == 0 {
             -magnitude
         } else {
             magnitude
         })
+    }
+
+    fn finish_rbsp(&mut self) -> Result<(), &'static str> {
+        if !self.read_bit()? {
+            return Err("invalid_h264_sps");
+        }
+        while !self.bit_offset.is_multiple_of(8) {
+            if self.read_bit()? {
+                return Err("invalid_h264_sps");
+            }
+        }
+        if self.bit_offset != self.bytes.len() * 8 {
+            return Err("invalid_h264_sps");
+        }
+        Ok(())
     }
 }
 
@@ -473,6 +547,7 @@ pub struct Encoder {
     input_bytes: usize,
     draining: bool,
     color_mode: ColorMode,
+    length_prefixed: bool,
 }
 
 #[cfg(amaterasu_ffmpeg_nvenc)]
@@ -545,6 +620,7 @@ pub fn open(
         input_bytes,
         draining: false,
         color_mode: configuration.color_mode,
+        length_prefixed: header.first() == Some(&1),
     })
 }
 
@@ -628,7 +704,7 @@ impl Encoder {
                 // SAFETY: C guarantees this borrowed range is valid until the
                 // next native receive call. Normalize copies it before then.
                 let borrowed = unsafe { std::slice::from_raw_parts(data, length) };
-                validate_packet_color(borrowed, self.color_mode)?;
+                validate_packet_color(borrowed, self.color_mode, self.length_prefixed)?;
                 let (bytes, keyframe) = self.normalizer.sample(borrowed)?;
                 if keyframe != (native_keyframe != 0) {
                     return Err("nvenc_keyframe_mismatch");
@@ -766,13 +842,16 @@ mod tests {
 
         let mut packet = vec![0, 0, 0, 1];
         packet.extend_from_slice(&full);
-        assert_eq!(validate_packet_color(&packet, ColorMode::Bt709Full), Ok(()));
         assert_eq!(
-            validate_packet_color(&packet, ColorMode::Bt709Limited),
+            validate_packet_color(&packet, ColorMode::Bt709Full, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_packet_color(&packet, ColorMode::Bt709Limited, false),
             Err("nvenc_vui_mismatch")
         );
         assert_eq!(
-            validate_packet_color(&[0, 0, 0, 2, 0x65, 0x80], ColorMode::Bt709Full),
+            validate_packet_color(&[0, 0, 0, 2, 0x65, 0x80], ColorMode::Bt709Full, true),
             Ok(())
         );
     }
@@ -794,6 +873,26 @@ mod tests {
             validate_header_color(&wrong_primaries, ColorMode::Bt709Full),
             Err("nvenc_vui_mismatch")
         );
+
+        let full = baseline_sps(true);
+        assert!(parse_sps_color_signal(&full[..full.len() - 1]).is_err());
+        let mut malformed_tail = full.clone();
+        *malformed_tail.last_mut().unwrap() = 0;
+        assert!(parse_sps_color_signal(&malformed_tail).is_err());
+        let mut malformed_prevention = full.clone();
+        malformed_prevention.extend_from_slice(&[0, 0, 3, 4]);
+        assert!(parse_sps_color_signal(&malformed_prevention).is_err());
+        malformed_prevention.pop();
+        assert!(parse_sps_color_signal(&malformed_prevention).is_err());
+    }
+
+    #[test]
+    fn signed_exp_golomb_rejects_unsupported_code_width_without_panicking() {
+        let maximum_code_number = [0, 0, 0, 0, 0x80];
+        assert_eq!(
+            BitReader::new(&maximum_code_number).read_se(),
+            Err("invalid_h264_sps")
+        );
     }
 
     #[test]
@@ -808,9 +907,24 @@ mod tests {
         let mut packet = vec![0, 0, 0, 1];
         packet.extend_from_slice(&sps);
         packet.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x80]);
-        assert_eq!(validate_packet_color(&packet, ColorMode::Bt709Full), Ok(()));
         assert_eq!(
-            validate_packet_color(&packet, ColorMode::Bt709Limited),
+            validate_packet_color(&packet, ColorMode::Bt709Full, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_packet_color(&packet, ColorMode::Bt709Limited, false),
+            Err("nvenc_vui_mismatch")
+        );
+
+        // The first four-byte AVCC length resembles an Annex B start code;
+        // framing from the accepted extradata must still expose the later SPS.
+        let mut ambiguous_avcc = vec![0, 0, 1, 0, 0x41];
+        ambiguous_avcc.resize(4 + 256, 0x80);
+        let limited_sps = baseline_sps(false);
+        ambiguous_avcc.extend_from_slice(&(limited_sps.len() as u32).to_be_bytes());
+        ambiguous_avcc.extend_from_slice(&limited_sps);
+        assert_eq!(
+            validate_packet_color(&ambiguous_avcc, ColorMode::Bt709Full, true),
             Err("nvenc_vui_mismatch")
         );
     }
@@ -850,6 +964,9 @@ mod tests {
             bits.write_bits(u32::from(color_ids[0]), 8);
             bits.write_bits(u32::from(color_ids[1]), 8);
             bits.write_bits(u32::from(color_ids[2]), 8);
+            for _ in 0..6 {
+                bits.write_bit(false); // remaining optional VUI syntax absent
+            }
         }
         bits.write_bit(true); // rbsp_stop_one_bit
         while bits.bit_len % 8 != 0 {
@@ -876,7 +993,7 @@ mod tests {
 
     impl TestBitWriter {
         fn write_bit(&mut self, bit: bool) {
-            if self.bit_len % 8 == 0 {
+            if self.bit_len.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if bit {
