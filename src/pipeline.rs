@@ -1337,7 +1337,10 @@ fn encoder_supports_configuration(
     match identity.clsid.as_str() {
         SOFTWARE_HEVC_ENCODER_ID => {
             configuration.codec == VideoCodec::Hevc
-                && configuration.color_mode == ColorMode::Bt709Limited
+                && matches!(
+                    configuration.color_mode,
+                    ColorMode::Bt709Limited | ColorMode::Bt709Full
+                )
                 && configuration.max_reference_frames <= 1
         }
         LINUX_FFMPEG_NVENC_ID => {
@@ -1708,7 +1711,7 @@ mod integration_contract_tests {
     }
 
     #[test]
-    fn hevc_auto_selection_requires_the_registered_x265_identity_and_limited_bt709() {
+    fn hevc_auto_selection_requires_registered_x265_identity_and_supported_bt709_range() {
         let payload = json!({
             "ok":true,"enabled":true,"encoders":[
                 description(SOFTWARE_ENCODER_ID, "x264", false),
@@ -1725,6 +1728,14 @@ mod integration_contract_tests {
         );
 
         configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            SOFTWARE_HEVC_ENCODER_ID
+        );
+
+        configuration.color_mode = ColorMode::Bt601Full;
         assert!(matches!(
             resolve_encoder_selection(None, &configuration, &payload),
             Err("hevc_encoder_unavailable")
