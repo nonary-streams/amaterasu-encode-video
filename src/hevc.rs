@@ -1,4 +1,6 @@
 //! Bounded Annex B handling for single-layer HEVC access units.
+use amaterasu_media::ColorMode;
+
 const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NALS: usize = 1024;
 
@@ -73,9 +75,14 @@ impl Normalizer {
         Ok((output, irap))
     }
 
-    pub fn validate_main_bt709_limited(&self) -> Result<(), &'static str> {
+    pub fn validate_main_bt709(&self, color_mode: ColorMode) -> Result<(), &'static str> {
         let sps = self.sps.as_deref().ok_or("hevc_parameter_sets_missing")?;
         let signal = parse_sps_signal(sps)?;
+        let expected_full_range = match color_mode {
+            ColorMode::Bt709Limited => false,
+            ColorMode::Bt709Full => true,
+            _ => return Err("hevc_sps_configuration_unsupported"),
+        };
         if signal.profile_idc != 1
             || signal.chroma_format_idc != 1
             || signal.bit_depth_luma_minus8 != 0
@@ -83,7 +90,7 @@ impl Normalizer {
             || signal.color_primaries != 1
             || signal.transfer_characteristics != 1
             || signal.matrix_coefficients != 1
-            || signal.full_range
+            || signal.full_range != expected_full_range
         {
             return Err("hevc_sps_configuration_unsupported");
         }
@@ -712,7 +719,19 @@ mod tests {
 
         let mut normalizer = Normalizer::default();
         normalizer.header(&header_with_sps(&supported)).unwrap();
-        assert_eq!(normalizer.validate_main_bt709_limited(), Ok(()));
+        assert_eq!(
+            normalizer.validate_main_bt709(ColorMode::Bt709Limited),
+            Ok(())
+        );
+
+        let full = escaped_sps(1, 0, true, 1);
+        let mut normalizer = Normalizer::default();
+        normalizer.header(&header_with_sps(&full)).unwrap();
+        assert_eq!(normalizer.validate_main_bt709(ColorMode::Bt709Full), Ok(()));
+        assert_eq!(
+            normalizer.validate_main_bt709(ColorMode::Bt709Limited),
+            Err("hevc_sps_configuration_unsupported")
+        );
 
         for unsupported in [
             escaped_sps(2, 0, false, 1),
@@ -723,7 +742,7 @@ mod tests {
             let mut normalizer = Normalizer::default();
             normalizer.header(&header_with_sps(&unsupported)).unwrap();
             assert_eq!(
-                normalizer.validate_main_bt709_limited(),
+                normalizer.validate_main_bt709(ColorMode::Bt709Limited),
                 Err("hevc_sps_configuration_unsupported")
             );
         }

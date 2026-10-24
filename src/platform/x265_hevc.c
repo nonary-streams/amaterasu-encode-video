@@ -138,12 +138,13 @@ static int encode_one(amaterasu_x265 *state, x265_picture *input) {
 }
 
 void *amaterasu_x265_hevc_open(int width, int height, int fps, int bitrate,
-                               int max_reference_frames, int *error) {
+                               int max_reference_frames, int full_range, int *error) {
     if (error)
         *error = 1;
     if (width < 16 || width > 3840 || height < 16 || height > 2160 ||
         (width & 1) || (height & 1) || fps < 1 || fps > 120 || bitrate < 100000 ||
-        bitrate > 100000000 || max_reference_frames < 0 || max_reference_frames > 1)
+        bitrate > 100000000 || max_reference_frames < 0 || max_reference_frames > 1 ||
+        full_range < 0 || full_range > 1)
         return NULL;
 
     const x265_api *api = x265_api_get(8);
@@ -200,7 +201,7 @@ void *amaterasu_x265_hevc_open(int width, int height, int fps, int bitrate,
     state->param->logLevel = X265_LOG_NONE;
     state->param->vui.bEnableVideoSignalTypePresentFlag = 1;
     state->param->vui.videoFormat = 5;
-    state->param->vui.bEnableVideoFullRangeFlag = 0;
+    state->param->vui.bEnableVideoFullRangeFlag = full_range;
     state->param->vui.bEnableColorDescriptionPresentFlag = 1;
     state->param->vui.colorPrimaries = 1;
     state->param->vui.transferCharacteristics = 1;

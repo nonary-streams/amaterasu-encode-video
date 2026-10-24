@@ -32,6 +32,7 @@ unsafe extern "C" {
         fps: i32,
         bitrate: i32,
         max_reference_frames: i32,
+        full_range: i32,
         error_code: *mut i32,
     ) -> *mut c_void;
     fn amaterasu_x265_hevc_close(encoder: *mut c_void);
@@ -91,7 +92,10 @@ fn probe_configuration() -> Configuration {
 #[cfg(any(amaterasu_x265_hevc, test))]
 fn validate_configuration(configuration: &Configuration) -> Result<(), &'static str> {
     if configuration.codec != VideoCodec::Hevc
-        || configuration.color_mode != ColorMode::Bt709Limited
+        || !matches!(
+            configuration.color_mode,
+            ColorMode::Bt709Limited | ColorMode::Bt709Full
+        )
         || configuration.max_reference_frames > 1
         || configuration.nvenc_preset.is_some()
         || configuration.nvenc_h264_cavlc
@@ -126,6 +130,7 @@ impl Encoder {
 pub struct Encoder {
     native: NonNull<c_void>,
     normalizer: Normalizer,
+    color_mode: ColorMode,
     packets: VecDeque<Packet>,
     input_bytes: usize,
     draining: bool,
@@ -144,6 +149,7 @@ fn open(configuration: &Configuration) -> Result<NonNull<c_void>, &'static str> 
             configuration.fps as i32,
             configuration.bitrate as i32,
             configuration.max_reference_frames as i32,
+            i32::from(configuration.color_mode == ColorMode::Bt709Full),
             &mut error_code,
         )
     };
@@ -181,7 +187,11 @@ impl Encoder {
         }
         // SAFETY: the shim guarantees this bounded range lives until close.
         let header = unsafe { std::slice::from_raw_parts(data, length) };
-        if normalizer.header(header).is_err() || normalizer.validate_main_bt709_limited().is_err() {
+        if normalizer.header(header).is_err()
+            || normalizer
+                .validate_main_bt709(configuration.color_mode)
+                .is_err()
+        {
             // SAFETY: native is uniquely owned here; initialization failed.
             unsafe { amaterasu_x265_hevc_close(native.as_ptr()) };
             return Err("hevc_headers_unsupported");
@@ -189,6 +199,7 @@ impl Encoder {
         Ok(Self {
             native,
             normalizer,
+            color_mode: configuration.color_mode,
             packets: VecDeque::new(),
             input_bytes: configuration.width as usize * configuration.height as usize * 3 / 2,
             draining: false,
@@ -273,7 +284,7 @@ impl Encoder {
                 // SAFETY: borrowed range is valid until the next shim receive.
                 let borrowed = unsafe { std::slice::from_raw_parts(data, length) };
                 let (bytes, keyframe) = self.normalizer.sample(borrowed)?;
-                self.normalizer.validate_main_bt709_limited()?;
+                self.normalizer.validate_main_bt709(self.color_mode)?;
                 if keyframe != (native_keyframe != 0) {
                     return Err("hevc_keyframe_mismatch");
                 }
@@ -340,10 +351,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_hevc_and_unsupported_color_or_reference_configuration() {
+    fn supports_bt709_full_and_rejects_other_color_or_reference_modes() {
         let mut configuration = probe_configuration();
         assert!(validate_configuration(&configuration).is_ok());
         configuration.color_mode = ColorMode::Bt709Full;
+        assert!(validate_configuration(&configuration).is_ok());
+        configuration.color_mode = ColorMode::Bt601Full;
         assert_eq!(
             validate_configuration(&configuration),
             Err("hevc_configuration_unsupported")

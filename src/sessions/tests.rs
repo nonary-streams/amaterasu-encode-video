@@ -315,14 +315,25 @@ fn hevc_marks_complete_access_unit_and_eos_with_hevc_codec() {
 
 #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
 #[test]
-fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
+fn x265_real_shim_emits_bt709_limited_main_idr_and_codec_tagged_eos() {
+    run_x265_real_shim_smoke(amaterasu_media::ColorMode::Bt709Limited);
+}
+
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+#[test]
+fn x265_real_shim_emits_bt709_full_main_idr_and_codec_tagged_eos() {
+    run_x265_real_shim_smoke(amaterasu_media::ColorMode::Bt709Full);
+}
+
+#[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+fn run_x265_real_shim_smoke(color_mode: amaterasu_media::ColorMode) {
     let mut config = configuration();
     config.width = 64;
     config.height = 64;
     config.fps = 30;
     config.bitrate = 500_000;
     config.codec = VideoCodec::Hevc;
-    config.color_mode = amaterasu_media::ColorMode::Bt709Limited;
+    config.color_mode = color_mode;
 
     let identity = EncoderIdentity {
         clsid: "amaterasu.software.linux.x265.hevc".into(),
@@ -338,19 +349,24 @@ fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
     assert_eq!(reply["codec"], "hevc");
     assert_eq!(reply["packet_boundaries"], true);
 
-    let mut nv12 = vec![16; 64 * 64];
-    nv12.resize(64 * 64 * 3 / 2, 128);
+    let (frame_bytes, format, stride) = if color_mode == amaterasu_media::ColorMode::Bt709Full {
+        (vec![0, 0, 255, 255].repeat(64 * 64), PIXEL_BGRA8, 64 * 4)
+    } else {
+        let mut nv12 = vec![16; 64 * 64];
+        nv12.resize(64 * 64 * 3 / 2, 128);
+        (nv12, PIXEL_NV12, 64)
+    };
     let frame = CpuFrame {
         width: 64,
         height: 64,
-        format: PIXEL_NV12,
-        stride: 64,
-        data: nv12.as_ptr(),
-        len: nv12.len(),
+        format,
+        stride,
+        data: frame_bytes.as_ptr(),
+        len: frame_bytes.len(),
         timestamp_us: 100_000,
         sequence: 1,
     };
-    // SAFETY: `nv12` remains alive while Sessions copies the borrowed frame.
+    // SAFETY: `frame_bytes` remains alive while Sessions copies the borrowed frame.
     assert_eq!(
         unsafe { sessions.submit("x265-smoke", 1, &frame, 1) },
         STATUS_OK
@@ -384,7 +400,12 @@ fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
         assert_eq!(status, STATUS_OK, "x265 receive failed: {status}");
     }
 
-    if let Some(output_path) = std::env::var_os("AMATERASU_X265_SMOKE_OUTPUT") {
+    let output_env = if color_mode == amaterasu_media::ColorMode::Bt709Full {
+        "AMATERASU_X265_SMOKE_FULL_OUTPUT"
+    } else {
+        "AMATERASU_X265_SMOKE_OUTPUT"
+    };
+    if let Some(output_path) = std::env::var_os(output_env) {
         let output = sink.data.concat();
         std::fs::write(&output_path, &output).expect("write x265 access unit for external decode");
         eprintln!(
@@ -431,7 +452,10 @@ fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
         assert_eq!(signal.color_primaries, 1);
         assert_eq!(signal.transfer_characteristics, 1);
         assert_eq!(signal.matrix_coefficients, 1);
-        assert!(!signal.full_range);
+        assert_eq!(
+            signal.full_range,
+            color_mode == amaterasu_media::ColorMode::Bt709Full
+        );
     }
 }
 

@@ -315,10 +315,14 @@ The optional `linux-x265-hevc` feature enables direct open by the exact identity
 emits bounded Annex B VPS/SPS/PPS. It is not added to public encoder enumeration,
 so automatic selection and advertisement remain disabled pending end-to-end
 stream validation.
-The backend accepts BT.709 limited SDR NV12 input, configured as progressive 8-bit
+The backend accepts BT.709 limited or full SDR. BGRA frames are converted to
+NV12 with the selected BT.709 range before the shim converts chroma planes for
+x265; raw NV12 input is accepted only for the default BT.709 limited mode. The
+encoder sets and verifies matching SPS VUI range signaling, progressive 8-bit
 4:2:0, and returns one complete Annex B HEVC access unit per media packet. The
-packet codec is `CODEC_HEVC`; timestamps remain in 100 ns units. x265 is configured
-for a closed GOP, no B frames or lookahead, and repeated VPS/SPS/PPS before IDR.
+packet codec is `CODEC_HEVC`; timestamps remain in 100 ns units. x265 is
+configured for a closed GOP, no B frames or lookahead, and repeated VPS/SPS/PPS
+before IDR.
 The adapter retains bounded parameter sets and supplies them in VPS, SPS, PPS
 order before IDR NAL types 19 and 20. CRA and other unsupported random-access
 types fail closed.
@@ -335,3 +339,8 @@ x265 smoke access unit was identified by ffprobe as Main, 8-bit 4:2:0, BT.709
 limited, decoded by FFmpeg, and passed the GameStream fixture using the exact
 shim output. Actual Moonlight streaming remains unqualified; keep public
 registry advertisement disabled until that path is validated.
+
+The BT.709 full-range path is source-only pending central feature-on and decoder
+validation. The real-shim test can write its limited-range access unit when
+`AMATERASU_X265_SMOKE_OUTPUT` is set, or its full-range access unit when
+`AMATERASU_X265_SMOKE_FULL_OUTPUT` is set; neither file is written by default.
