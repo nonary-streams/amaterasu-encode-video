@@ -215,9 +215,6 @@ pub fn parse_sps_signal(nal: &[u8]) -> Result<SpsSignal, &'static str> {
         return Err("hevc_sps_vui_missing");
     }
     skip_vui_prefix(&mut bits)?;
-    if !bits.read_flag()? {
-        return Err("hevc_sps_color_signal_missing");
-    }
     bits.skip(3)?; // video_format
     let full_range = bits.read_flag()?;
     if !bits.read_flag()? {
@@ -555,6 +552,16 @@ mod tests {
         full_range: bool,
         matrix: u8,
     ) -> Vec<u8> {
+        escaped_sps_with_video_format(profile_idc, luma_depth_minus8, full_range, matrix, 5)
+    }
+
+    fn escaped_sps_with_video_format(
+        profile_idc: u8,
+        luma_depth_minus8: u32,
+        full_range: bool,
+        matrix: u8,
+        video_format: u8,
+    ) -> Vec<u8> {
         let mut bits = BitWriter::new();
         bits.bits(0, 4); // sps_video_parameter_set_id
         bits.bits(0, 3); // sps_max_sub_layers_minus1
@@ -592,7 +599,7 @@ mod tests {
         bits.bits(0, 1); // aspect_ratio_info_present_flag
         bits.bits(0, 1); // overscan_info_present_flag
         bits.bits(1, 1); // video_signal_type_present_flag
-        bits.bits(5, 3); // video_format: unspecified
+        bits.bits(u32::from(video_format), 3);
         bits.bits(u32::from(full_range), 1);
         bits.bits(1, 1); // colour_description_present_flag
         bits.bits(1, 8); // colour_primaries: BT.709
@@ -720,5 +727,16 @@ mod tests {
                 Err("hevc_sps_configuration_unsupported")
             );
         }
+    }
+
+    #[test]
+    fn parses_color_vui_when_video_format_top_bit_is_zero() {
+        let sps = escaped_sps_with_video_format(1, 0, false, 1, 0);
+        let signal = parse_sps_signal(&sps).unwrap();
+        assert_eq!(signal.profile_idc, 1);
+        assert_eq!(signal.color_primaries, 1);
+        assert_eq!(signal.transfer_characteristics, 1);
+        assert_eq!(signal.matrix_coefficients, 1);
+        assert!(!signal.full_range);
     }
 }
