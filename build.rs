@@ -11,7 +11,14 @@ fn x264_build_version(header: &str) -> Option<u32> {
 }
 
 fn main() {
-    build_linux_ffmpeg_nvenc();
+    let nvenc_abi = build_linux_ffmpeg_nvenc();
+    let vaapi_abi = build_linux_ffmpeg_vaapi(nvenc_abi.is_none());
+    if let (Some(nvenc), Some(vaapi)) = (nvenc_abi, vaapi_abi) {
+        assert_eq!(
+            nvenc, vaapi,
+            "FFmpeg backends resolved different target ABIs"
+        );
+    }
     println!("cargo:rustc-check-cfg=cfg(amaterasu_x264)");
     println!("cargo:rerun-if-changed=src/platform/x264/adapter.c");
     println!("cargo:rerun-if-env-changed=AMATERASU_X264_INCLUDE_DIR");
@@ -89,15 +96,15 @@ fn main() {
     println!("cargo:rustc-cfg=amaterasu_x264");
 }
 
-fn build_linux_ffmpeg_nvenc() {
+fn build_linux_ffmpeg_nvenc() -> Option<(u32, u32)> {
     println!("cargo:rustc-check-cfg=cfg(amaterasu_ffmpeg_nvenc)");
     println!("cargo:rerun-if-changed=src/platform/ffmpeg_nvenc.c");
     if env::var_os("CARGO_FEATURE_LINUX_FFMPEG_NVENC").is_none() {
-        return;
+        return None;
     }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo:warning=FFmpeg NVENC encoding is supported only on Linux");
-        return;
+        return None;
     }
 
     // This opt-in backend requires target FFmpeg development headers and
@@ -120,6 +127,63 @@ fn build_linux_ffmpeg_nvenc() {
     };
     let avcodec_major = abi_major(&avcodec.version);
     let avutil_major = abi_major(&avutil.version);
+    let mut build = cc::Build::new();
+    build
+        .includes(avcodec.include_paths)
+        .includes(avutil.include_paths)
+        .file("src/platform/ffmpeg_nvenc.c");
+    add_ffmpeg_abi_marker(&mut build, avcodec_major, avutil_major);
+    build.compile("amaterasu_ffmpeg_nvenc_adapter");
+    println!("cargo:rustc-cfg=amaterasu_ffmpeg_nvenc");
+    Some((avcodec_major, avutil_major))
+}
+
+fn build_linux_ffmpeg_vaapi(emit_abi_marker: bool) -> Option<(u32, u32)> {
+    println!("cargo:rustc-check-cfg=cfg(amaterasu_ffmpeg_vaapi)");
+    println!("cargo:rerun-if-changed=src/platform/ffmpeg_vaapi.c");
+    if env::var_os("CARGO_FEATURE_LINUX_FFMPEG_VAAPI").is_none() {
+        return None;
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo:warning=FFmpeg VAAPI encoding is supported only on Linux");
+        return None;
+    }
+
+    // As with NVENC, pkg-config must resolve the target FFmpeg libraries.
+    // The FFmpeg VAAPI hwcontext API owns the libva/driver interaction; this
+    // adapter does not directly link a system libva implementation.
+    let avcodec = pkg_config::Config::new()
+        .atleast_version("59")
+        .probe("libavcodec")
+        .expect("linux-ffmpeg-vaapi requires target libavcodec headers and library");
+    let avutil = pkg_config::Config::new()
+        .atleast_version("57")
+        .probe("libavutil")
+        .expect("linux-ffmpeg-vaapi requires target libavutil headers and library");
+    let abi_major = |version: &str| -> u32 {
+        version
+            .split('.')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .expect("FFmpeg pkg-config version must start with a positive ABI major")
+    };
+    let avcodec_major = abi_major(&avcodec.version);
+    let avutil_major = abi_major(&avutil.version);
+    let mut build = cc::Build::new();
+    build
+        .includes(avcodec.include_paths)
+        .includes(avutil.include_paths)
+        .file("src/platform/ffmpeg_vaapi.c");
+    if emit_abi_marker {
+        add_ffmpeg_abi_marker(&mut build, avcodec_major, avutil_major);
+    }
+    build.compile("amaterasu_ffmpeg_vaapi_adapter");
+    println!("cargo:rustc-cfg=amaterasu_ffmpeg_vaapi");
+    Some((avcodec_major, avutil_major))
+}
+
+fn add_ffmpeg_abi_marker(build: &mut cc::Build, avcodec_major: u32, avutil_major: u32) {
     let marker_source = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is unset"))
         .join("ffmpeg_abi_marker.c");
     std::fs::write(
@@ -129,12 +193,7 @@ fn build_linux_ffmpeg_nvenc() {
         ),
     )
     .expect("could not write the FFmpeg ABI marker source");
-    cc::Build::new()
-        .includes(avcodec.include_paths)
-        .includes(avutil.include_paths)
-        .file("src/platform/ffmpeg_nvenc.c")
-        .file(&marker_source)
-        .compile("amaterasu_ffmpeg_nvenc_adapter");
+    build.file(&marker_source);
+    // Exactly one adapter archive roots the marker when both backends are on.
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_ffmpeg_abi_marker");
-    println!("cargo:rustc-cfg=amaterasu_ffmpeg_nvenc");
 }
