@@ -384,10 +384,14 @@ fn x265_real_shim_emits_main_idr_hevc_access_unit_and_codec_tagged_eos() {
         assert_eq!(status, STATUS_OK, "x265 receive failed: {status}");
     }
 
-    let output_path = std::env::temp_dir().join("amaterasu-x265-smoke.hevc");
-    let output = sink.data.concat();
-    std::fs::write(&output_path, &output).expect("write x265 access unit for external decode");
-    eprintln!("x265 Annex-B smoke output: {}", output_path.display());
+    if let Some(output_path) = std::env::var_os("AMATERASU_X265_SMOKE_OUTPUT") {
+        let output = sink.data.concat();
+        std::fs::write(&output_path, &output).expect("write x265 access unit for external decode");
+        eprintln!(
+            "x265 Annex-B smoke output: {}",
+            std::path::Path::new(&output_path).display()
+        );
+    }
 
     assert_eq!(sink.codecs, vec![CODEC_HEVC; sink.codecs.len()]);
     assert!(sink.data.len() >= 1, "expected an encoded HEVC access unit");
