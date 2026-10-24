@@ -13,6 +13,7 @@ fn x264_build_version(header: &str) -> Option<u32> {
 fn main() {
     let nvenc_abi = build_linux_ffmpeg_nvenc();
     let vaapi_abi = build_linux_ffmpeg_vaapi(nvenc_abi.is_none());
+    build_linux_x265_hevc();
     if let (Some(nvenc), Some(vaapi)) = (nvenc_abi, vaapi_abi) {
         assert_eq!(
             nvenc, vaapi,
@@ -94,6 +95,30 @@ fn main() {
     // ABI build from the encoder artifact it is about to sign.
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_x264_build_marker");
     println!("cargo:rustc-cfg=amaterasu_x264");
+}
+
+fn build_linux_x265_hevc() {
+    println!("cargo:rustc-check-cfg=cfg(amaterasu_x265_hevc)");
+    println!("cargo:rerun-if-changed=src/platform/x265_hevc.c");
+    if env::var_os("CARGO_FEATURE_LINUX_X265_HEVC").is_none() {
+        return;
+    }
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("linux"),
+        "linux-x265-hevc is supported only on Linux"
+    );
+    // Resolve the target ABI through pkg-config rather than borrowing host
+    // headers during a cross build. A feature-on build fails if the target
+    // encoder is unavailable; no stub is advertised as an encoder.
+    let x265 = pkg_config::Config::new()
+        .probe("x265")
+        .expect("linux-x265-hevc requires target x265 headers and library");
+    cc::Build::new()
+        .includes(x265.include_paths)
+        .file("src/platform/x265_hevc.c")
+        .compile("amaterasu_x265_hevc_adapter");
+    println!("cargo:rustc-cfg=amaterasu_x265_hevc");
 }
 
 fn build_linux_ffmpeg_nvenc() -> Option<(u32, u32)> {

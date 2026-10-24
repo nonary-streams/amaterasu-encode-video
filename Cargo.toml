@@ -16,6 +16,8 @@ linux-ffmpeg-nvenc = []
 # Explicit Linux FFmpeg/VA-API hardware path; runtime discovery requires a
 # successful encoder/device probe before it can be offered to a stream.
 linux-ffmpeg-vaapi = []
+# Software HEVC is opt-in and requires matching target x265 headers/runtime.
+linux-x265-hevc = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
