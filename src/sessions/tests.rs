@@ -240,10 +240,11 @@ fn configuration() -> Configuration {
 fn hevc_open_reply_and_native_media_tag_use_the_shared_codec_number() {
     let mut configuration = configuration();
     configuration.codec = VideoCodec::Hevc;
-    let reply = super::open_reply(7, &configuration, true);
+    let reply = super::open_reply(7, &configuration, false);
     assert_eq!(reply["codec"], "hevc");
-    assert_eq!(media_codec(VideoCodec::Hevc), CODEC_HEVC);
-    assert_eq!(media_codec(VideoCodec::H264), CODEC_H264);
+    assert!(reply["packet_boundaries"].as_bool().unwrap());
+    assert_eq!(VideoCodec::Hevc.abi_id(), CODEC_HEVC);
+    assert_eq!(VideoCodec::H264.abi_id(), CODEC_H264);
 }
 
 fn encoder_identity() -> EncoderIdentity {
@@ -258,6 +259,7 @@ struct Sink {
     reject: bool,
     flags: Vec<u32>,
     sequences: Vec<u64>,
+    codecs: Vec<u32>,
 }
 
 unsafe extern "C" fn write(context: *mut c_void, packet: *const EncodedPacket) -> Status {
@@ -269,6 +271,7 @@ unsafe extern "C" fn write(context: *mut c_void, packet: *const EncodedPacket) -
     }
     sink.flags.push(packet.flags);
     sink.sequences.push(packet.sequence);
+    sink.codecs.push(packet.codec);
     STATUS_OK
 }
 
@@ -297,22 +300,29 @@ unsafe fn binding(registration: &Registration, owner: &str) -> *const EncoderApi
 
 #[test]
 fn native_bindings_enforce_owner_preserve_rejected_packets_and_emit_eos_once() {
-    exercise_packet_flags(false);
+    exercise_packet_flags(false, VideoCodec::H264);
 }
 
 #[test]
 fn boundary_opt_in_marks_data_and_never_combines_eos() {
-    exercise_packet_flags(true);
+    exercise_packet_flags(true, VideoCodec::H264);
 }
 
-fn exercise_packet_flags(packet_boundaries: bool) {
+#[test]
+fn hevc_marks_complete_access_unit_and_eos_with_hevc_codec() {
+    exercise_packet_flags(false, VideoCodec::Hevc);
+}
+
+fn exercise_packet_flags(packet_boundaries: bool, codec: VideoCodec) {
     let submissions = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let mut sessions = Sessions::new(true);
-    sessions
+    let mut config = configuration();
+    config.codec = codec;
+    let reply = sessions
         .insert(
             "alice",
-            configuration(),
+            config,
             Box::new(Fake {
                 packets: VecDeque::from([Packet {
                     bytes: vec![0, 0, 1, 0x41, 1],
@@ -325,12 +335,17 @@ fn exercise_packet_flags(packet_boundaries: bool) {
             packet_boundaries,
         )
         .unwrap();
+    assert_eq!(
+        reply["packet_boundaries"].as_bool(),
+        Some(packet_boundaries || codec == VideoCodec::Hevc)
+    );
     let shared = Arc::new(Mutex::new(sessions));
     let registration = Registration::new(shared.clone());
     let mut sink = Sink {
         reject: true,
         flags: Vec::new(),
         sequences: Vec::new(),
+        codecs: Vec::new(),
     };
     let packet_sink = PacketSink {
         context: (&mut sink as *mut Sink).cast(),
@@ -383,12 +398,13 @@ fn exercise_packet_flags(packet_boundaries: bool) {
             (alice.receive)(alice.base.context, 1, packet_sink),
             MEDIA_PENDING
         );
-        let data_flags = if packet_boundaries {
+        let data_flags = if packet_boundaries || codec == VideoCodec::Hevc {
             FLAG_END_OF_ACCESS_UNIT
         } else {
             0
         };
         assert_eq!(sink.flags, [data_flags, FLAG_END_OF_STREAM]);
+        assert_eq!(sink.codecs, [codec.abi_id(), codec.abi_id()]);
         assert!(sink.flags.iter().all(|flags| flags
             & (FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT)
             != (FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT)));
@@ -497,6 +513,7 @@ fn asynchronous_drain_waits_for_encoder_poll_before_emitting_eos() {
         reject: false,
         flags: Vec::new(),
         sequences: Vec::new(),
+        codecs: Vec::new(),
     };
     let packet_sink = PacketSink {
         context: (&mut sink as *mut Sink).cast(),
@@ -597,6 +614,7 @@ fn slow_worker_bounds_real_queue_preserves_retry_metadata_and_orders_drain_eos()
         reject: false,
         flags: Vec::new(),
         sequences: Vec::new(),
+        codecs: Vec::new(),
     };
     let packet_sink = PacketSink {
         context: (&mut sink as *mut Sink).cast(),
@@ -764,6 +782,7 @@ fn delivered_packet_releases_metadata_capacity_without_losing_input_order() {
         reject: true,
         flags: Vec::new(),
         sequences: Vec::new(),
+        codecs: Vec::new(),
     };
     let packet_sink = PacketSink {
         context: (&mut sink as *mut Sink).cast(),
@@ -858,6 +877,7 @@ fn forced_frame_without_keyframe_fails_before_delivery_and_closes_cleanly() {
         reject: false,
         flags: Vec::new(),
         sequences: Vec::new(),
+        codecs: Vec::new(),
     };
     let packet_sink = PacketSink {
         context: (&mut sink as *mut Sink).cast(),

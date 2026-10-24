@@ -326,3 +326,7 @@ The feature requires target `x265` development headers and library through
 `x265` only for Linux feature builds. Keep this feature opt-in; it adds an x265
 runtime dependency and is GPL-2.0-or-later or commercially licensed. H.264 remains the default codec,
 and Windows does not opt into this backend.
+
+The source backend is intentionally not included in encoder enumeration yet.
+Enable registry advertisement only after the HEVC packet-fragment transport and
+end-to-end stream path have passed integration validation.

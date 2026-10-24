@@ -177,6 +177,7 @@ impl Sessions {
         packet_boundaries: bool,
     ) -> Result<Value, &'static str> {
         self.next_id = self.next_id.checked_add(1).ok_or("session_limit")?;
+        let packet_boundaries = packet_boundaries || configuration.codec == VideoCodec::Hevc;
         let response = open_reply(self.next_id, &configuration, packet_boundaries);
         self.values.insert(
             self.next_id,
@@ -387,7 +388,7 @@ impl Sessions {
                 return MEDIA_PENDING;
             }
             let packet = EncodedPacket {
-                codec: media_codec(session.config.codec),
+                codec: session.config.codec.abi_id(),
                 flags: FLAG_END_OF_STREAM,
                 data: std::ptr::null(),
                 len: 0,
@@ -414,7 +415,9 @@ impl Sessions {
             return MEDIA_BACKEND_ERROR;
         }
         let encoded = EncodedPacket {
-            codec: media_codec(session.config.codec),
+            codec: session.config.codec.abi_id(),
+            // Encoder packets are whole access units. HEVC always marks this
+            // packet as the final fragment, even without H.264 boundary opt-in.
             flags: if session.packet_boundaries {
                 FLAG_END_OF_ACCESS_UNIT
             } else {
@@ -454,14 +457,8 @@ fn validate_operation(operation: &str) -> Result<(), &'static str> {
 }
 
 fn open_reply(id: u64, config: &Configuration, packet_boundaries: bool) -> Value {
+    let packet_boundaries = packet_boundaries || config.codec == VideoCodec::Hevc;
     json!({"ok":true,"session_id":id,"configuration":config,"codec":match config.codec { VideoCodec::H264 => "h264", VideoCodec::Hevc => "hevc" },"max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
-}
-
-fn media_codec(codec: VideoCodec) -> u32 {
-    match codec {
-        VideoCodec::H264 => CODEC_H264,
-        VideoCodec::Hevc => CODEC_HEVC,
-    }
 }
 
 #[cfg(test)]

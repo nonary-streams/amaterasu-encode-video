@@ -85,11 +85,8 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
         encoders.push(hardware);
     }
 
-    #[cfg(target_os = "linux")]
-    if let Some(software) = x265_hevc::description() {
-        encoders.push(software);
-    }
-
+    // x265 stays out of this public registry until HEVC fragment transport has
+    // passed integrated end-to-end validation.
     if let Some(software) = software {
         encoders.push(software);
     }

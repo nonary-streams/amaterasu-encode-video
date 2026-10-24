@@ -2,7 +2,7 @@
 //! copies every borrowed access unit before requesting another packet.
 #[cfg(amaterasu_x265_hevc)]
 use crate::hevc::Normalizer;
-use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
+use crate::model::{Configuration, EncoderIdentity, Packet};
 #[cfg(any(amaterasu_x265_hevc, test))]
 use amaterasu_media::{ColorMode, VideoCodec};
 #[cfg(amaterasu_x265_hevc)]
@@ -66,38 +66,12 @@ fn backend_identity() -> EncoderIdentity {
     }
 }
 
-#[cfg(any(amaterasu_x265_hevc, test))]
-fn description_with_probe(
-    mut probe: impl FnMut(&Configuration) -> bool,
-) -> Option<EncoderDescription> {
-    let mut configuration = probe_configuration();
-    let main_supported = probe(&configuration);
-    configuration.color_mode = ColorMode::Bt709Full;
-    let full_range_supported = probe(&configuration);
-    (main_supported && !full_range_supported).then(|| EncoderDescription {
-        identity: backend_identity(),
-        name: ENCODER_NAME.into(),
-        codec: "hevc",
-        hardware: false,
-        vendor_id: None,
-    })
-}
-
-pub fn description() -> Option<EncoderDescription> {
-    #[cfg(amaterasu_x265_hevc)]
-    {
-        description_with_probe(probe_hevc)
-    }
-    #[cfg(not(amaterasu_x265_hevc))]
-    None
-}
-
 #[cfg(target_os = "linux")]
 pub fn selected(identity: &EncoderIdentity) -> bool {
     identity == &backend_identity()
 }
 
-#[cfg(any(amaterasu_x265_hevc, test))]
+#[cfg(test)]
 fn probe_configuration() -> Configuration {
     Configuration {
         width: 640,
@@ -112,28 +86,6 @@ fn probe_configuration() -> Configuration {
         nvenc_spatial_aq: false,
         amd_av1_latency_mode: Default::default(),
     }
-}
-
-#[cfg(amaterasu_x265_hevc)]
-fn probe_hevc(configuration: &Configuration) -> bool {
-    let Ok(native) = open(configuration) else {
-        return false;
-    };
-    let mut data = std::ptr::null();
-    let mut length = 0usize;
-    // SAFETY: probe owns the context until parameter sets are copied below.
-    let status = unsafe { amaterasu_x265_hevc_header(native.as_ptr(), &mut data, &mut length) };
-    let valid = status == 0 && !data.is_null() && length > 0 && length <= 1024 * 1024;
-    let valid = if valid {
-        // SAFETY: shim's bounded header remains live until close.
-        let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-        Normalizer::default().header(bytes).is_ok()
-    } else {
-        false
-    };
-    // SAFETY: probe created this unique context and has completed inspection.
-    unsafe { amaterasu_x265_hevc_close(native.as_ptr()) };
-    valid
 }
 
 #[cfg(any(amaterasu_x265_hevc, test))]
@@ -229,7 +181,7 @@ impl Encoder {
         }
         // SAFETY: the shim guarantees this bounded range lives until close.
         let header = unsafe { std::slice::from_raw_parts(data, length) };
-        if normalizer.header(header).is_err() {
+        if normalizer.header(header).is_err() || normalizer.validate_main_bt709_limited().is_err() {
             // SAFETY: native is uniquely owned here; initialization failed.
             unsafe { amaterasu_x265_hevc_close(native.as_ptr()) };
             return Err("hevc_headers_unsupported");
@@ -321,6 +273,7 @@ impl Encoder {
                 // SAFETY: borrowed range is valid until the next shim receive.
                 let borrowed = unsafe { std::slice::from_raw_parts(data, length) };
                 let (bytes, keyframe) = self.normalizer.sample(borrowed)?;
+                self.normalizer.validate_main_bt709_limited()?;
                 if keyframe != (native_keyframe != 0) {
                     return Err("hevc_keyframe_mismatch");
                 }
@@ -387,24 +340,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn injected_registry_probe_is_fail_closed_and_codec_truthful() {
-        assert!(description_with_probe(|_| false).is_none());
-        let description = description_with_probe(|configuration| {
-            configuration.codec == VideoCodec::Hevc
-                && configuration.color_mode == ColorMode::Bt709Limited
-        })
-        .unwrap();
-        assert_eq!(description.codec, "hevc");
-        assert!(!description.hardware);
-        assert!(description.identity == backend_identity());
-        assert!(
-            description_with_probe(|configuration| {
-                configuration.color_mode == ColorMode::Bt709Full
-            })
-            .is_none()
-        );
-    }
-
     #[test]
     fn rejects_non_hevc_and_unsupported_color_or_reference_configuration() {
         let mut configuration = probe_configuration();
