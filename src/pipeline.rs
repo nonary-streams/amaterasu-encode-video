@@ -1213,13 +1213,19 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
 const MAX_ENCODER_ENTRIES: usize = 64;
 const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
 const LINUX_FFMPEG_NVENC_ID: &str = "amaterasu.hardware.nvidia.nvenc.ffmpeg";
+const LINUX_FFMPEG_VAAPI_ID: &str = "amaterasu.hardware.vaapi.h264.ffmpeg";
 
 fn x264_fallback_for_auto(
     index: Option<u32>,
     selected: &EncoderIdentity,
     payload: &Value,
 ) -> Option<EncoderIdentity> {
-    if index.is_some() || selected.clsid != LINUX_FFMPEG_NVENC_ID {
+    if index.is_some()
+        || !matches!(
+            selected.clsid.as_str(),
+            LINUX_FFMPEG_NVENC_ID | LINUX_FFMPEG_VAAPI_ID
+        )
+    {
         return None;
     }
     payload
@@ -1236,18 +1242,36 @@ fn x264_fallback_for_auto(
 }
 
 fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
-    if !matches!(
-        reason,
-        Some(
-            "nvenc_device_unavailable"
-                | "nvenc_allocation_failed"
-                | "nvenc_open_failed"
-                | "nvenc_configuration_unsupported"
-                | "nvenc_headers_unavailable"
-                | "nvenc_headers_unsupported"
-        )
-    ) || stream.encoder_attempt != 0
+    let confirmed_open_failure = match stream
+        .encoder
+        .as_ref()
+        .map(|encoder| encoder.clsid.as_str())
     {
+        Some(LINUX_FFMPEG_NVENC_ID) => matches!(
+            reason,
+            Some(
+                "nvenc_device_unavailable"
+                    | "nvenc_allocation_failed"
+                    | "nvenc_open_failed"
+                    | "nvenc_configuration_unsupported"
+                    | "nvenc_headers_unavailable"
+                    | "nvenc_headers_unsupported"
+            )
+        ),
+        Some(LINUX_FFMPEG_VAAPI_ID) => matches!(
+            reason,
+            Some(
+                "vaapi_device_unavailable"
+                    | "vaapi_allocation_failed"
+                    | "vaapi_open_failed"
+                    | "vaapi_configuration_unsupported"
+                    | "vaapi_headers_unavailable"
+                    | "vaapi_headers_unsupported"
+            )
+        ),
+        _ => false,
+    };
+    if !confirmed_open_failure || stream.encoder_attempt != 0 {
         return false;
     }
     let Some(fallback) = stream.fallback_encoder.take() else {
@@ -1263,11 +1287,19 @@ fn encoder_supports_configuration(
     identity: &EncoderIdentity,
     configuration: &Configuration,
 ) -> bool {
-    identity.clsid != LINUX_FFMPEG_NVENC_ID
-        || (matches!(
-            configuration.color_mode,
-            ColorMode::Bt709Limited | ColorMode::Bt709Full
-        ) && configuration.max_reference_frames == 0)
+    match identity.clsid.as_str() {
+        LINUX_FFMPEG_NVENC_ID => {
+            matches!(
+                configuration.color_mode,
+                ColorMode::Bt709Limited | ColorMode::Bt709Full
+            ) && configuration.max_reference_frames == 0
+        }
+        LINUX_FFMPEG_VAAPI_ID => {
+            configuration.color_mode == ColorMode::Bt709Limited
+                && configuration.max_reference_frames == 0
+        }
+        _ => true,
+    }
 }
 
 /// Resolve profile indices against the current bounded H.264 registry before
@@ -1536,6 +1568,34 @@ mod integration_contract_tests {
                 .clsid,
             SOFTWARE_ENCODER_ID
         );
+    }
+
+    #[test]
+    fn vaapi_is_auto_selected_only_for_its_supported_limited_color() {
+        let payload = json!({
+            "ok": true, "enabled": true, "encoders": [
+                description(LINUX_FFMPEG_VAAPI_ID, "VAAPI", true),
+                description(SOFTWARE_ENCODER_ID, "x264", false)
+            ]
+        });
+        let mut configuration = default_configuration();
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            LINUX_FFMPEG_VAAPI_ID
+        );
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            SOFTWARE_ENCODER_ID
+        );
+        assert!(matches!(
+            resolve_encoder_selection(Some(0), &configuration, &payload),
+            Err("encoder_configuration_unsupported")
+        ));
     }
 }
 
