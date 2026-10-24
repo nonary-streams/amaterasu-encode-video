@@ -134,6 +134,9 @@ pub fn selected(candidate: &EncoderIdentity) -> bool {
 #[cfg(any(amaterasu_ffmpeg_vaapi, test))]
 fn validate_configuration(configuration: &Configuration) -> Result<(), &'static str> {
     configuration.validate()?;
+    if configuration.codec != amaterasu_media::VideoCodec::H264 {
+        return Err("vaapi_codec_unsupported");
+    }
     if configuration.color_mode != ColorMode::Bt709Limited {
         return Err("vaapi_color_mode_unsupported");
     }

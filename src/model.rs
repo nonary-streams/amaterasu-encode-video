@@ -1,4 +1,4 @@
-use amaterasu_media::ColorMode;
+use amaterasu_media::{ColorMode, VideoCodec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -25,6 +25,9 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Bitstream family. Old callers omit this and continue to receive H.264.
+    #[serde(default, skip_serializing_if = "is_h264")]
+    pub codec: VideoCodec,
     /// SDR Y'CbCr interpretation used by the input pixels and encoded stream.
     #[serde(default, skip_serializing_if = "ColorMode::is_default")]
     pub color_mode: ColorMode,
@@ -90,8 +93,15 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_h264(codec: &VideoCodec) -> bool {
+    *codec == VideoCodec::H264
+}
+
 impl Configuration {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.codec == VideoCodec::Hevc && !cfg!(target_os = "linux") {
+            return Err("codec_unsupported");
+        }
         if cfg!(windows) && !self.color_mode.is_default() {
             return Err("color_mode_unsupported");
         }
@@ -416,13 +426,11 @@ mod tests {
             r#"{"width":16,"height":16,"fps":60,"bitrate":1000000,"amd_av1_latency_mode":"auto"}"#,
         )
         .unwrap();
+        assert_eq!(defaulted.codec, VideoCodec::H264);
         assert!(defaulted.validate().is_ok());
-        assert!(
-            serde_json::to_value(defaulted)
-                .unwrap()
-                .get("amd_av1_latency_mode")
-                .is_none()
-        );
+        let encoded = serde_json::to_value(defaulted).unwrap();
+        assert!(encoded.get("codec").is_none());
+        assert!(encoded.get("amd_av1_latency_mode").is_none());
     }
 
     #[test]
@@ -432,6 +440,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 1_000_000,
+            codec: VideoCodec::H264,
             color_mode: ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: Some(NvencPreset::P1),

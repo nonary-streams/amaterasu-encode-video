@@ -159,6 +159,9 @@ impl Encoder {
             return Err("encoder_identity_changed");
         }
         config.validate()?;
+        if config.codec != amaterasu_media::VideoCodec::H264 {
+            return Err("codec_unsupported");
+        }
         let library = CodecLibrary::load()?;
         let preset = CString::new("superfast").expect("static x264 preset has no NUL");
         let tune = CString::new("zerolatency").expect("static x264 tune has no NUL");

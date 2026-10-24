@@ -387,7 +387,7 @@ impl Sessions {
                 return MEDIA_PENDING;
             }
             let packet = EncodedPacket {
-                codec: CODEC_H264,
+                codec: media_codec(session.config.codec),
                 flags: FLAG_END_OF_STREAM,
                 data: std::ptr::null(),
                 len: 0,
@@ -414,7 +414,7 @@ impl Sessions {
             return MEDIA_BACKEND_ERROR;
         }
         let encoded = EncodedPacket {
-            codec: CODEC_H264,
+            codec: media_codec(session.config.codec),
             flags: if session.packet_boundaries {
                 FLAG_END_OF_ACCESS_UNIT
             } else {
@@ -454,7 +454,14 @@ fn validate_operation(operation: &str) -> Result<(), &'static str> {
 }
 
 fn open_reply(id: u64, config: &Configuration, packet_boundaries: bool) -> Value {
-    json!({"ok":true,"session_id":id,"configuration":config,"codec":"h264","max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
+    json!({"ok":true,"session_id":id,"configuration":config,"codec":match config.codec { VideoCodec::H264 => "h264", VideoCodec::Hevc => "hevc" },"max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
+}
+
+fn media_codec(codec: VideoCodec) -> u32 {
+    match codec {
+        VideoCodec::H264 => CODEC_H264,
+        VideoCodec::Hevc => CODEC_HEVC,
+    }
 }
 
 #[cfg(test)]

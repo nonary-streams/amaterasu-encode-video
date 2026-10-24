@@ -4,8 +4,8 @@
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.
 The default build remains hardware-only on Windows and has no Linux encoder.
-Explicit build features can add real Linux hardware NVENC or software x264
-encoding; no generated frames are used. Automatic video selection chooses x264
+Explicit build features can add real Linux hardware NVENC, software x264, or
+software x265 HEVC encoding; no generated frames are used. Automatic video selection chooses x264
 when the requested color or reference mode is unsupported by Linux NVENC. If a
 probed NVENC open later fails with a confirmed availability/configuration error,
 automatic selection retries x264 once using a distinct operation ID. Explicit
@@ -24,9 +24,9 @@ Control requests are strict JSON; frames and encoded bytes never use JSON:
 {"action":"close","session_id":1}
 ```
 
-Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264",hardware:true}]}`.
-An index identifies the current Media Foundation enumeration, not a stable GPU ID.
-Open/lookup return `{ok:true,session_id,configuration,codec:"h264",max_reference_frames}`. Status adds
+Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264"|"hevc",hardware:true}]}`.
+An index identifies the current encoder enumeration, not a stable GPU ID.
+Open/lookup return `{ok:true,session_id,configuration,codec:"h264"|"hevc",max_reference_frames}`. Status adds
 `state:"open"|"draining"|"failed"`; close returns `{ok:true,session_id,state:"closed"}`.
 Errors contain only `{ok:false,code}`; native driver messages are not exposed.
 Enumeration confirms a registered hardware NV12/H.264 transform, not that every
@@ -44,8 +44,10 @@ lookup after settling their original runtime request.
 
 At most eight active sessions and two per caller are allowed. Width is even,
 16–3840; height is even, 16–2160; frame rate is 1–120 FPS; bitrate is
-100,000–100,000,000 bits/second. Hardware may impose narrower limits. H.264
-Baseline with no B pictures and requested low latency is the only configuration.
+100,000–100,000,000 bits/second. Hardware may impose narrower limits. The H.264
+backend uses Baseline with no B pictures and requested low latency. The optional
+HEVC backend is constrained to Main profile, 8-bit 4:2:0, BT.709 limited SDR,
+and closed-GOP IDR recovery.
 `configuration.max_reference_frames` accepts only `0` or `1` and defaults to
 `0`. Zero preserves legacy behavior and leaves the encoder's H.264 reference-frame
 selection unconstrained; it is omitted when serializing the configuration so its
@@ -306,3 +308,21 @@ Open, lookup, and status report `packet_boundaries` and
 `supports_packet_boundaries: true`. Changing the mode for an existing operation
 ID is an `operation_conflict`. The mode does not relax backend output-boundary
 verification or promise a stream is ready before open succeeds.
+# Linux HEVC software encoding
+
+The optional `linux-x265-hevc` feature registers `amaterasu.software.linux.x265.hevc`
+only after an 8-bit x265 Main encoder opens and emits bounded Annex B VPS/SPS/PPS.
+The backend accepts BT.709 limited SDR NV12 input, configured as progressive 8-bit
+4:2:0, and returns one complete Annex B HEVC access unit per media packet. The
+packet codec is `CODEC_HEVC`; timestamps remain in 100 ns units. x265 is configured
+for a closed GOP, no B frames or lookahead, and repeated VPS/SPS/PPS before IDR.
+The adapter retains bounded parameter sets and supplies them in VPS, SPS, PPS
+order before IDR NAL types 19 and 20. CRA and other unsupported random-access
+types fail closed.
+
+The feature requires target `x265` development headers and library through
+`pkg-config`. Root build integration must compile
+`src/platform/x265_hevc.c`, emit checked cfg `amaterasu_x265_hevc`, and link
+`x265` only for Linux feature builds. Keep this feature opt-in; it adds an x265
+runtime dependency and is GPL-2.0-or-later or commercially licensed. H.264 remains the default codec,
+and Windows does not opt into this backend.

@@ -7,6 +7,8 @@
     amaterasu_ffmpeg_vaapi
 ))]
 mod bitstream;
+#[cfg(any(test, amaterasu_x265_hevc))]
+mod hevc;
 mod layout;
 mod model;
 mod native;

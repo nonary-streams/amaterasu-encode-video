@@ -7,6 +7,9 @@ mod ffmpeg_nvenc;
 #[cfg(target_os = "linux")]
 mod ffmpeg_vaapi;
 
+#[cfg(target_os = "linux")]
+mod x265_hevc;
+
 #[cfg(windows)]
 mod windows;
 
@@ -82,6 +85,11 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
         encoders.push(hardware);
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(software) = x265_hevc::description() {
+        encoders.push(software);
+    }
+
     if let Some(software) = software {
         encoders.push(software);
     }
@@ -95,6 +103,8 @@ pub enum Encoder {
     Nvenc(ffmpeg_nvenc::Encoder),
     #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
     Vaapi(ffmpeg_vaapi::Encoder),
+    #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+    Hevc(x265_hevc::Encoder),
     Software(x264::Encoder),
 }
 
@@ -111,6 +121,14 @@ impl Encoder {
         #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
         if ffmpeg_vaapi::selected(identity) {
             return ffmpeg_vaapi::open(identity, configuration).map(Self::Vaapi);
+        }
+
+        #[cfg(target_os = "linux")]
+        if x265_hevc::selected(identity) {
+            #[cfg(amaterasu_x265_hevc)]
+            return x265_hevc::Encoder::open(identity, configuration).map(Self::Hevc);
+            #[cfg(not(amaterasu_x265_hevc))]
+            return Err("hevc_feature_disabled");
         }
 
         if x264::selected(identity) {
@@ -148,6 +166,8 @@ impl Encoder {
             Self::Nvenc(encoder) => encoder.submit(bytes, timestamp, force),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
             Self::Vaapi(encoder) => encoder.submit(bytes, timestamp, force),
+            #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+            Self::Hevc(encoder) => encoder.submit(bytes, timestamp, force),
             Self::Software(encoder) => encoder.submit(bytes, timestamp, force),
         }
     }
@@ -162,6 +182,8 @@ impl Encoder {
             Self::Nvenc(_) => true,
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
             Self::Vaapi(_) => true,
+            #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+            Self::Hevc(_) => true,
             Self::Software(_) => true,
         }
     }
@@ -174,6 +196,8 @@ impl Encoder {
             Self::Nvenc(encoder) => encoder.receive(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
             Self::Vaapi(encoder) => encoder.receive(),
+            #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+            Self::Hevc(encoder) => encoder.receive(),
             Self::Software(encoder) => encoder.receive(),
         }
     }
@@ -186,6 +210,8 @@ impl Encoder {
             Self::Nvenc(encoder) => encoder.drain(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
             Self::Vaapi(encoder) => encoder.drain(),
+            #[cfg(all(target_os = "linux", amaterasu_x265_hevc))]
+            Self::Hevc(encoder) => encoder.drain(),
             Self::Software(encoder) => encoder.drain(),
         }
     }

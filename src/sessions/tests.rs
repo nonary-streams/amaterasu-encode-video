@@ -226,6 +226,7 @@ fn configuration() -> Configuration {
         height: 16,
         fps: 60,
         bitrate: 1_000_000,
+        codec: VideoCodec::H264,
         color_mode: amaterasu_media::ColorMode::default(),
         max_reference_frames: 0,
         nvenc_preset: None,
@@ -233,6 +234,16 @@ fn configuration() -> Configuration {
         nvenc_spatial_aq: false,
         amd_av1_latency_mode: crate::model::AmdAv1LatencyMode::Auto,
     }
+}
+
+#[test]
+fn hevc_open_reply_and_native_media_tag_use_the_shared_codec_number() {
+    let mut configuration = configuration();
+    configuration.codec = VideoCodec::Hevc;
+    let reply = super::open_reply(7, &configuration, true);
+    assert_eq!(reply["codec"], "hevc");
+    assert_eq!(media_codec(VideoCodec::Hevc), CODEC_HEVC);
+    assert_eq!(media_codec(VideoCodec::H264), CODEC_H264);
 }
 
 fn encoder_identity() -> EncoderIdentity {

@@ -141,6 +141,9 @@ pub fn selected(candidate: &EncoderIdentity) -> bool {
 #[cfg(any(amaterasu_ffmpeg_nvenc, test))]
 fn validate_configuration(configuration: &Configuration) -> Result<(), &'static str> {
     configuration.validate()?;
+    if configuration.codec != amaterasu_media::VideoCodec::H264 {
+        return Err("nvenc_codec_unsupported");
+    }
     if !matches!(
         configuration.color_mode,
         ColorMode::Bt709Limited | ColorMode::Bt709Full
