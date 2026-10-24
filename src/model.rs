@@ -1,3 +1,4 @@
+use amaterasu_media::ColorMode;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -105,6 +106,9 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// SDR Y'CbCr interpretation used by the encoder input and output bitstream.
+    #[serde(default, skip_serializing_if = "ColorMode::is_default")]
+    pub color_mode: ColorMode,
     /// Zero leaves reference-frame selection to the encoder; one requires a
     /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -172,6 +176,7 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 1
+            && (!cfg!(windows) || self.color_mode.is_default())
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
     }
 }
@@ -430,6 +435,43 @@ mod tests {
                 "bitrate": 100000
             }
         })
+    }
+
+    #[test]
+    fn color_mode_defaults_to_709_limited_and_round_trips_explicit_modes() {
+        let Operation::Open { configuration, .. } = serde_json::from_value(open_request()).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(configuration.color_mode, ColorMode::Bt709Limited);
+        assert!(
+            serde_json::to_value(&configuration)
+                .unwrap()
+                .get("color_mode")
+                .is_none()
+        );
+
+        let mut request = open_request();
+        request["configuration"]["color_mode"] = json!("bt601_full");
+        let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(configuration.color_mode, ColorMode::Bt601Full);
+        assert_eq!(
+            serde_json::to_value(configuration).unwrap()["color_mode"],
+            "bt601_full"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_nondefault_color_mode_before_open() {
+        let mut request = open_request();
+        request["configuration"]["color_mode"] = json!("bt709_full");
+        let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
+            unreachable!();
+        };
+        assert!(!configuration.validate());
     }
 
     #[test]

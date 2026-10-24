@@ -30,7 +30,7 @@ runtime library. If no H.264 backend is available, Open fails with
 {"action":"select_portal_source","source_type":"monitor","operation_id":"desktop-1"}
 {"action":"poll_portal_selection","operation_id":"desktop-1"}
 {"action":"cancel_portal_selection","operation_id":"desktop-1"}
-{"action":"open","capture_provider":"pipewire","output":"portal-selected-session-source","encoder":{"clsid":"amaterasu.software.x264","friendly_name":"x264 software H.264","hardware_url":null},"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
+{"action":"open","capture_provider":"pipewire","output":"portal-selected-session-source","encoder":{"clsid":"amaterasu.software.x264","friendly_name":"x264 software H.264","hardware_url":null},"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000,"color_mode":"bt709_limited"}}
 {"action":"open","output":"<capture enumerate output id>","encoder":0,"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"status"}
 {"action":"status","stream":1}
@@ -38,6 +38,11 @@ runtime library. If no H.264 backend is available, Open fails with
 {"action":"drain","stream":1}
 {"action":"close","stream":1}
 ```
+
+The optional configuration.color_mode selects the SDR matrix/range used for
+BGRA conversion and encoder signaling: bt601_limited, bt601_full,
+bt709_limited, or bt709_full. It defaults to bt709_limited. Windows continues to
+support only that default; non-default color modes are rejected.
 
 Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
 `"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned

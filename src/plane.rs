@@ -598,6 +598,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 100_000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
@@ -664,6 +665,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 100_000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
@@ -768,6 +770,7 @@ mod tests {
             height: 16,
             fps: 30,
             bitrate: 100_000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
@@ -865,6 +868,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 100000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };
@@ -919,6 +923,7 @@ mod tests {
             height: 16,
             fps: 60,
             bitrate: 100_000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         };

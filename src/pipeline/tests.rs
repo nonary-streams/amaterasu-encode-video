@@ -396,6 +396,7 @@ fn open() -> Operation {
             height: 1080,
             fps: 60,
             bitrate: 5_000_000,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
         },
@@ -423,6 +424,30 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
         runtime.completed[0].1["configuration"]["max_reference_frames"],
         1
     );
+}
+
+#[test]
+fn selected_color_mode_is_forwarded_to_encoder_open() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!();
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt601Limited;
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    let encoder_open = runtime
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(encoder_open["configuration"]["color_mode"], "bt601_limited");
 }
 
 #[test]
