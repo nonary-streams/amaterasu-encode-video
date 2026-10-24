@@ -430,6 +430,12 @@ impl Worker {
             if packet.is_none() && self.drain_enqueued && !self.drain_complete {
                 return Ok(ReceiveResult::Pending);
             }
+            // Keep one receive in flight across runtime ticks. Waiting for a
+            // second caller tick to request it halves packet delivery cadence.
+            let prefetch = !self.drain_enqueued || (self.drain_complete && packet.is_some());
+            if prefetch && self.enqueue(Operation::Receive, AsyncKind::Receive)? {
+                self.receive_pending = true;
+            }
             return Ok(ReceiveResult::Ready(packet));
         }
         if self.receive_pending || (self.drain_enqueued && !self.drain_complete) {
@@ -490,6 +496,76 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 mod tests {
     use super::*;
     use std::sync::{Condvar, Mutex};
+
+    struct PacketBackend(Arc<std::sync::atomic::AtomicUsize>);
+    impl WorkerBackend for PacketBackend {
+        fn uses_background_encode(&self) -> bool {
+            true
+        }
+        fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn drain(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(Packet {
+                bytes: vec![call as u8],
+                timestamp_100ns: call as i64,
+                keyframe: call == 0,
+            }))
+        }
+    }
+
+    #[test]
+    fn consuming_a_packet_prefetches_only_one_next_receive_without_an_extra_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let mut worker = Worker::start(move || Ok(Box::new(PacketBackend(backend_calls)))).unwrap();
+        assert!(matches!(worker.receive().unwrap(), ReceiveResult::Pending));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            worker.metrics().unwrap();
+            if worker.receive_result.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let ReceiveResult::Ready(Some(first)) = worker.receive().unwrap() else {
+            panic!("first packet not ready")
+        };
+        assert_eq!(first.bytes, [0]);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while calls.load(Ordering::SeqCst) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "next receive waited for another caller tick"
+            );
+            thread::yield_now();
+        }
+        worker.metrics().unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "receive prefetch grew without consumption"
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match worker.receive().unwrap() {
+                ReceiveResult::Ready(Some(second)) => {
+                    assert_eq!(second.bytes, [1]);
+                    break;
+                }
+                ReceiveResult::Pending => {}
+                _ => panic!("second packet was lost"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
 
     #[derive(Default)]
     struct DropGateState {
