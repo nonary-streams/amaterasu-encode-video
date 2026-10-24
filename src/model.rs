@@ -1,4 +1,4 @@
-use amaterasu_media::ColorMode;
+use amaterasu_media::{ColorMode, VideoCodec};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -106,6 +106,9 @@ pub struct Configuration {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Bitstream family; omitted legacy values retain the H.264 default.
+    #[serde(default, skip_serializing_if = "is_h264")]
+    pub codec: VideoCodec,
     /// SDR Y'CbCr interpretation used by the encoder input and output bitstream.
     #[serde(default, skip_serializing_if = "ColorMode::is_default")]
     pub color_mode: ColorMode,
@@ -167,6 +170,10 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+fn is_h264(codec: &VideoCodec) -> bool {
+    *codec == VideoCodec::H264
+}
+
 impl Configuration {
     pub fn validate(&self) -> bool {
         (16..=3840).contains(&self.width)
@@ -176,6 +183,7 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 1
+            && (cfg!(target_os = "linux") || self.codec == VideoCodec::H264)
             && (!cfg!(windows) || self.color_mode.is_default())
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
     }

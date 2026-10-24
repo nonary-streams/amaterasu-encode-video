@@ -14,7 +14,7 @@ use crate::{
     queue::Queues,
     rpc::{self, Send},
 };
-use amaterasu_media::{CaptureGeometry, ColorMode};
+use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
 use amaterasu_module_sdk::{Command, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1258,6 +1258,7 @@ fn payload_error_code(payload: &Value) -> Option<&str> {
 
 const MAX_ENCODER_ENTRIES: usize = 64;
 const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
+const SOFTWARE_HEVC_ENCODER_ID: &str = "amaterasu.software.linux.x265.hevc";
 const LINUX_FFMPEG_NVENC_ID: &str = "amaterasu.hardware.nvidia.nvenc.ffmpeg";
 const LINUX_FFMPEG_VAAPI_ID: &str = "amaterasu.hardware.vaapi.h264.ffmpeg";
 
@@ -1334,21 +1335,30 @@ fn encoder_supports_configuration(
     configuration: &Configuration,
 ) -> bool {
     match identity.clsid.as_str() {
-        LINUX_FFMPEG_NVENC_ID => {
-            matches!(
-                configuration.color_mode,
-                ColorMode::Bt709Limited | ColorMode::Bt709Full
-            ) && configuration.max_reference_frames == 0
+        SOFTWARE_HEVC_ENCODER_ID => {
+            configuration.codec == VideoCodec::Hevc
+                && configuration.color_mode == ColorMode::Bt709Limited
+                && configuration.max_reference_frames <= 1
         }
-        LINUX_FFMPEG_VAAPI_ID => {
-            configuration.color_mode == ColorMode::Bt709Limited
+        LINUX_FFMPEG_NVENC_ID => {
+            configuration.codec == VideoCodec::H264
+                && matches!(
+                    configuration.color_mode,
+                    ColorMode::Bt709Limited | ColorMode::Bt709Full
+                )
                 && configuration.max_reference_frames == 0
         }
-        _ => true,
+        LINUX_FFMPEG_VAAPI_ID => {
+            configuration.codec == VideoCodec::H264
+                && configuration.color_mode == ColorMode::Bt709Limited
+                && configuration.max_reference_frames == 0
+        }
+        SOFTWARE_ENCODER_ID => configuration.codec == VideoCodec::H264,
+        _ => configuration.codec == VideoCodec::H264,
     }
 }
 
-/// Resolve profile indices against the current bounded H.264 registry before
+/// Resolve profile indices against the current bounded codec registry before
 /// capture is opened. `None` means explicit `auto`: hardware first, then the
 /// registered software encoder. No missing/out-of-range selection is guessed.
 fn resolve_encoder_selection(
@@ -1370,7 +1380,7 @@ fn resolve_encoder_selection(
         return Err("invalid_encoder_enumeration");
     }
     if entries.is_empty() {
-        return Err("h264_encoder_unavailable");
+        return Err(codec_unavailable(configuration.codec));
     }
 
     let mut identities = Vec::with_capacity(entries.len());
@@ -1384,9 +1394,12 @@ fn resolve_encoder_selection(
                 .ok_or("invalid_encoder_enumeration")?,
         )
         .map_err(|_| "invalid_encoder_enumeration")?;
-        if !valid_encoder_identity(&identity)
-            || entry.get("codec").and_then(Value::as_str) != Some("h264")
-        {
+        let codec = entry
+            .get("codec")
+            .and_then(Value::as_str)
+            .filter(|codec| matches!(*codec, "h264" | "hevc"))
+            .ok_or("invalid_encoder_enumeration")?;
+        if !valid_encoder_identity(&identity) {
             return Err("invalid_encoder_enumeration");
         }
         let name = entry
@@ -1408,8 +1421,12 @@ fn resolve_encoder_selection(
             return Err("invalid_encoder_enumeration");
         }
         if is_hardware {
-            hardware.push(identity.clone());
-        } else if identity.clsid == SOFTWARE_ENCODER_ID {
+            if codec == codec_name(configuration.codec) {
+                hardware.push(identity.clone());
+            }
+        } else if identity.clsid == software_encoder_id(configuration.codec)
+            && codec == codec_name(configuration.codec)
+        {
             software.push(identity.clone());
         }
         identities.push(identity);
@@ -1419,6 +1436,13 @@ fn resolve_encoder_selection(
         let selected = identities
             .get(index as usize)
             .ok_or("encoder_unavailable")?;
+        let selected_codec = entries[index as usize]
+            .get("codec")
+            .and_then(Value::as_str)
+            .ok_or("invalid_encoder_enumeration")?;
+        if selected_codec != codec_name(configuration.codec) {
+            return Err(codec_unavailable(configuration.codec));
+        }
         if !encoder_supports_configuration(selected, configuration) {
             return Err("encoder_configuration_unsupported");
         }
@@ -1428,7 +1452,28 @@ fn resolve_encoder_selection(
         .into_iter()
         .find(|identity| encoder_supports_configuration(identity, configuration))
         .or_else(|| software.into_iter().next())
-        .ok_or("encoder_unavailable")
+        .ok_or_else(|| codec_unavailable(configuration.codec))
+}
+
+fn codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+    }
+}
+
+fn software_encoder_id(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => SOFTWARE_ENCODER_ID,
+        VideoCodec::Hevc => SOFTWARE_HEVC_ENCODER_ID,
+    }
+}
+
+fn codec_unavailable(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264_encoder_unavailable",
+        VideoCodec::Hevc => "hevc_encoder_unavailable",
+    }
 }
 
 fn valid_encoder_identity(identity: &EncoderIdentity) -> bool {
@@ -1462,6 +1507,16 @@ fn encoder_failure_code(reason: Option<&str>) -> &'static str {
             | "x264_headers_unavailable"
             | "x264_runtime_unavailable",
         ) => "h264_encoder_unavailable",
+        Some(
+            "hevc_feature_disabled"
+            | "hevc_configuration_unsupported"
+            | "hevc_x265_abi_unsupported"
+            | "hevc_allocation_failed"
+            | "hevc_profile_unsupported"
+            | "hevc_open_failed"
+            | "hevc_headers_unavailable"
+            | "hevc_headers_unsupported",
+        ) => "hevc_encoder_unavailable",
         _ => "encoder_failed",
     }
 }
@@ -1478,10 +1533,14 @@ mod integration_contract_tests {
     }
 
     fn description(clsid: &str, name: &str, hardware: bool) -> Value {
+        description_for_codec(clsid, name, hardware, "h264")
+    }
+
+    fn description_for_codec(clsid: &str, name: &str, hardware: bool, codec: &str) -> Value {
         json!({
             "identity":{"clsid":clsid,"hardware_url":null,"friendly_name":name},
             "name":name,
-            "codec":"h264",
+            "codec":codec,
             "hardware":hardware
         })
     }
@@ -1643,6 +1702,40 @@ mod integration_contract_tests {
             Err("encoder_configuration_unsupported")
         ));
     }
+
+    #[test]
+    fn hevc_auto_selection_requires_the_registered_x265_identity_and_limited_bt709() {
+        let payload = json!({
+            "ok":true,"enabled":true,"encoders":[
+                description(SOFTWARE_ENCODER_ID, "x264", false),
+                description_for_codec(SOFTWARE_HEVC_ENCODER_ID, "x265 Main", false, "hevc")
+            ]
+        });
+        let mut configuration = default_configuration();
+        configuration.codec = VideoCodec::Hevc;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            SOFTWARE_HEVC_ENCODER_ID
+        );
+
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert!(matches!(
+            resolve_encoder_selection(None, &configuration, &payload),
+            Err("hevc_encoder_unavailable")
+        ));
+
+        configuration.color_mode = ColorMode::Bt709Limited;
+        let h264_only = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
+        });
+        assert!(matches!(
+            resolve_encoder_selection(None, &configuration, &h264_only),
+            Err("hevc_encoder_unavailable")
+        ));
+    }
 }
 
 fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<String> {
@@ -1787,6 +1880,11 @@ fn capture_touch_port(
 }
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
+    if payload.get("codec").and_then(Value::as_str) != Some(codec_name(stream.configuration.codec))
+    {
+        stream.cleanup("encoder_codec_mismatch");
+        return false;
+    }
     if stream.packet_boundaries
         && payload.get("packet_boundaries").and_then(Value::as_bool) != Some(true)
     {

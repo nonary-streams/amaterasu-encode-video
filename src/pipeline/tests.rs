@@ -197,6 +197,11 @@ impl Runtime {
                         error(code)
                     } else {
                         let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                        result["codec"] = payload["configuration"]
+                            .get("codec")
+                            .and_then(Value::as_str)
+                            .unwrap_or("h264")
+                            .into();
                         if !self.omit_reference_metadata {
                             result["max_reference_frames"] =
                                 payload["configuration"]["max_reference_frames"].clone();
@@ -213,6 +218,11 @@ impl Runtime {
                     error("not_found")
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                    result["codec"] = payload["configuration"]
+                        .get("codec")
+                        .and_then(Value::as_str)
+                        .unwrap_or("h264")
+                        .into();
                     if !self.omit_reference_metadata {
                         result["max_reference_frames"] =
                             payload["configuration"]["max_reference_frames"].clone();
@@ -466,6 +476,7 @@ fn open() -> Operation {
             height: 1080,
             fps: 60,
             bitrate: 5_000_000,
+            codec: amaterasu_media::VideoCodec::H264,
             color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             amd_av1_latency_mode: AmdAv1LatencyMode::Auto,
