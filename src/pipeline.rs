@@ -1264,8 +1264,10 @@ fn encoder_supports_configuration(
     configuration: &Configuration,
 ) -> bool {
     identity.clsid != LINUX_FFMPEG_NVENC_ID
-        || (configuration.color_mode == ColorMode::Bt709Limited
-            && configuration.max_reference_frames == 0)
+        || (matches!(
+            configuration.color_mode,
+            ColorMode::Bt709Limited | ColorMode::Bt709Full
+        ) && configuration.max_reference_frames == 0)
 }
 
 /// Resolve profile indices against the current bounded H.264 registry before
@@ -1509,6 +1511,13 @@ mod integration_contract_tests {
             LINUX_FFMPEG_NVENC_ID
         );
         configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            resolve_encoder_selection(None, &configuration, &payload)
+                .unwrap()
+                .clsid,
+            LINUX_FFMPEG_NVENC_ID
+        );
+        configuration.color_mode = ColorMode::Bt601Full;
         assert_eq!(
             resolve_encoder_selection(None, &configuration, &payload)
                 .unwrap()
