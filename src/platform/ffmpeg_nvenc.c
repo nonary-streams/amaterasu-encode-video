@@ -32,13 +32,14 @@ struct amaterasu_ffmpeg_nvenc {
 
 static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     int width, int height, int fps, int bitrate, int max_reference_frames,
+    int full_range,
     int *error_code)
 {
     if (error_code != NULL)
         *error_code = 1;
     if (width < 16 || height < 16 || (width & 1) != 0 || (height & 1) != 0 ||
         fps < 1 || fps > 120 || bitrate < 100000 || bitrate > 100000000 ||
-        max_reference_frames != 0)
+        max_reference_frames != 0 || (full_range != 0 && full_range != 1))
         return NULL;
 
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
@@ -76,7 +77,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     context->profile = AV_PROFILE_H264_BASELINE;
     context->thread_count = 1;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_GLOBAL_HEADER;
-    context->color_range = AVCOL_RANGE_MPEG;
+    context->color_range = full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     context->color_primaries = AVCOL_PRI_BT709;
     context->color_trc = AVCOL_TRC_BT709;
     context->colorspace = AVCOL_SPC_BT709;
@@ -100,7 +101,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     if (context->pix_fmt != AV_PIX_FMT_NV12 || context->max_b_frames != 0 ||
         context->profile != AV_PROFILE_H264_BASELINE ||
         context->extradata == NULL || context->extradata_size <= 0 ||
-        context->color_range != AVCOL_RANGE_MPEG ||
+        context->color_range != (full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG) ||
         context->color_primaries != AVCOL_PRI_BT709 ||
         context->color_trc != AVCOL_TRC_BT709 || context->colorspace != AVCOL_SPC_BT709) {
         if (error_code != NULL)
@@ -111,7 +112,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     encoder->frame->format = AV_PIX_FMT_NV12;
     encoder->frame->width = width;
     encoder->frame->height = height;
-    encoder->frame->color_range = AVCOL_RANGE_MPEG;
+    encoder->frame->color_range = full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
     encoder->frame->color_primaries = AVCOL_PRI_BT709;
     encoder->frame->color_trc = AVCOL_TRC_BT709;
     encoder->frame->colorspace = AVCOL_SPC_BT709;
@@ -137,10 +138,11 @@ fail:
 
 void *amaterasu_ffmpeg_nvenc_open(
     int width, int height, int fps, int bitrate, int max_reference_frames,
+    int full_range,
     int *error_code)
 {
     return amaterasu_nvenc_open(width, height, fps, bitrate, max_reference_frames,
-                                error_code);
+                                full_range, error_code);
 }
 
 void amaterasu_ffmpeg_nvenc_close(void *opaque)

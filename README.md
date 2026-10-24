@@ -178,21 +178,25 @@ links the matching libraries through pkg-config. The encoder artifact embeds the
 compiled avcodec/avutil ABI majors; LinuxSession packaging and user-service
 preflight require those exact loader sonames and API symbols when this feature
 is present. Runtime packaging must provide compatible FFmpeg
-libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes a
-small throwaway H.264 encoder context; a missing encoder, driver, device, or
-supported baseline configuration keeps the backend out of discovery. This is
-a capability probe, not a guarantee that every requested resolution or bitrate
-will open.
+libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes
+throwaway H.264 contexts for both supported BT.709 range modes; if either
+fails its SPS/VUI check, NVENC stays out of discovery and software x264 remains
+available. This capability probe does not guarantee that every requested
+resolution or bitrate will open.
 
 The first backend supports 8-bit NV12 input, H.264 Baseline, no B frames,
-BT.709 limited-range SDR, and a fixed low-latency CBR configuration. Other
-color modes and explicit reference-frame/NVENC controls fail closed. Frames
-are copied into FFmpeg-owned NV12 storage; packets are copied and normalized to
-Annex B before the borrowed FFmpeg packet is released. Packet PTS remains in
-100-nanosecond units. The worker owns the FFmpeg context, submit queue is
-bounded by the existing encoder worker, and drain flushes delayed packets
-before session EOS. No CUDA-frame import, HDR, HEVC, AV1, or dynamic device
-selection is claimed.
+BT.709 limited-range and full-range SDR, and a fixed low-latency CBR
+configuration. It sets FFmpeg's full-range color metadata for full-range input
+and parses the opened encoder's actual SPS VUI to require the requested range
+flag plus BT.709 primaries, transfer, and matrix identifiers. Any mismatched or
+missing VUI rejects Open, and repeated SPS units in output packets are checked
+again before delivery. Other color modes and explicit reference-frame/NVENC
+controls fail closed. Frames are copied into FFmpeg-owned NV12 storage; packets
+are copied and normalized to Annex B before the borrowed FFmpeg packet is
+released. Packet PTS remains in 100-nanosecond units. The worker owns the
+FFmpeg context, submit queue is bounded by the existing encoder worker, and
+drain flushes delayed packets before session EOS. No CUDA-frame import, HDR,
+HEVC, AV1, or dynamic device selection is claimed.
 
 ## Linux software x264
 
