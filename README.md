@@ -167,6 +167,9 @@ Its preset and
 tune are fixed to `superfast` and `zerolatency` for this first integration.
 The encoder sets H.264 VUI range and color description to match the selected
 mode. BT.601 uses SMPTE 170M identifiers; BT.709 uses BT.709 identifiers.
+Software x264 uses the process-visible CPU parallelism for slice threads,
+bounded to 2–8 to avoid imposing a fixed two-thread ceiling or creating an
+unbounded number of slices.
 Linux desktop-stream release artifacts must enable `software-x264` for
 `amaterasu-encode` and provide a compatible x264 runtime library. The feature
 does not bundle the runtime; the artifact must provide the matching

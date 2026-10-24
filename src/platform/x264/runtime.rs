@@ -170,7 +170,11 @@ impl Encoder {
             bitrate: config.bitrate,
             reference_frames: config.max_reference_frames,
             slices_per_frame: 1,
-            min_threads: 2,
+            min_threads: super::effective_min_threads(
+                std::thread::available_parallelism()
+                    .ok()
+                    .map(|threads| threads.get()),
+            ),
             color_primaries: vui.color_primaries,
             transfer_characteristics: vui.transfer_characteristics,
             matrix_coefficients: vui.matrix_coefficients,

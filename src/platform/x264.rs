@@ -27,6 +27,14 @@ fn vui_color(mode: ColorMode) -> VuiColor {
 
 const SOFTWARE_ID: &str = "amaterasu.software.x264";
 const SOFTWARE_NAME: &str = "x264 software H.264";
+const MIN_SOFTWARE_THREADS: usize = 2;
+const MAX_SOFTWARE_THREADS: usize = 8;
+
+fn effective_min_threads(available: Option<usize>) -> i32 {
+    available
+        .unwrap_or(MIN_SOFTWARE_THREADS)
+        .clamp(MIN_SOFTWARE_THREADS, MAX_SOFTWARE_THREADS) as i32
+}
 
 pub fn identity() -> EncoderIdentity {
     EncoderIdentity {
@@ -61,6 +69,20 @@ mod color_tests {
                     full_range,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn software_thread_count_uses_available_cpu_parallelism_with_bounds() {
+        for (available, expected) in [
+            (None, 2),
+            (Some(1), 2),
+            (Some(2), 2),
+            (Some(4), 4),
+            (Some(8), 8),
+            (Some(64), 8),
+        ] {
+            assert_eq!(effective_min_threads(available), expected);
         }
     }
 }
