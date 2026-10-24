@@ -92,8 +92,56 @@ struct Stream {
     last_pixels: Option<OwnedFrame>,
     dropped: u64,
     submitted: u64,
+    timing: StageTimings,
     last_frame: Option<FrameMetadata>,
     unresolved: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TimingMetric {
+    calls: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+impl TimingMetric {
+    fn record(&mut self, elapsed_us: u64) {
+        self.calls = self.calls.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(elapsed_us);
+        self.max_us = self.max_us.max(elapsed_us);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageTimings {
+    capture_callback: TimingMetric,
+    encoder_submit: TimingMetric,
+    frame_copy: TimingMetric,
+    encoder_poll: TimingMetric,
+    transport_admission: TimingMetric,
+    captured_frames: u64,
+}
+
+impl StageTimings {
+    fn record(&mut self, progress: &Progress) {
+        if progress.capture_callback_count > 0 {
+            self.capture_callback.record(progress.capture_callback_us);
+            self.captured_frames = self
+                .captured_frames
+                .saturating_add(progress.capture_frame_count);
+        }
+        if progress.capture_frame_count > 0 || progress.repeat_attempted {
+            self.encoder_submit.record(progress.encoder_submit_us);
+        }
+        if progress.owned_frame.is_some() {
+            self.frame_copy.record(progress.frame_copy_us);
+        }
+        self.encoder_poll.record(progress.encoder_poll_us);
+        for _ in 0..progress.transport_admission_count {
+            self.transport_admission
+                .record(progress.transport_admission_us);
+        }
+    }
 }
 
 impl Stream {
@@ -154,6 +202,13 @@ impl Stream {
             "configuration": self.configuration,
             "dropped_frames": self.dropped,
             "submitted_frames": self.submitted,
+            "stage_timing_us": {
+                "capture_callback": {"calls":self.timing.capture_callback.calls,"total":self.timing.capture_callback.total_us,"max":self.timing.capture_callback.max_us,"frames":self.timing.captured_frames},
+                "encoder_submit": {"calls":self.timing.encoder_submit.calls,"total":self.timing.encoder_submit.total_us,"max":self.timing.encoder_submit.max_us},
+                "frame_copy": {"calls":self.timing.frame_copy.calls,"total":self.timing.frame_copy.total_us,"max":self.timing.frame_copy.max_us},
+                "encoder_poll": {"calls":self.timing.encoder_poll.calls,"total":self.timing.encoder_poll.total_us,"max":self.timing.encoder_poll.max_us},
+                "transport_admission": {"calls":self.timing.transport_admission.calls,"total":self.timing.transport_admission.total_us,"max":self.timing.transport_admission.max_us}
+            },
             "error": self.error,
         });
         if let Some(encoder) = &self.encoder {
@@ -486,6 +541,7 @@ impl Pipeline {
                 last_pixels: None,
                 dropped: 0,
                 submitted: 0,
+                timing: StageTimings::default(),
                 last_frame: None,
                 unresolved: false,
             }
@@ -614,6 +670,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     }) {
         Ok(progress) => {
             let completed_at = Instant::now();
+            stream.timing.record(&progress);
             if capture_due
                 && stream.provider == CaptureProvider::Wgc
                 && (!stream.constant_rate

@@ -245,8 +245,15 @@ from the encoder sink. A full queue returns `MEDIA_BUSY` without consuming the
 encoder packet. Consumer sink rejection likewise retains the exact queued packet.
 The shared queue uses nonblocking native lock acquisition; contended receive returns
 `MEDIA_BUSY`. Callbacks must be bounded and must not retain borrowed bytes. Reentry
-into receive is busy while the queue callback runs. No video-owned worker threads
-or copied raw-frame queues exist.
+into receive is busy while the queue callback runs. Video owns no frame-processing
+thread or raw-frame queue. The Linux software-x264 encoder has a separate bounded
+worker queue; accepted frames are copied before the capture callback returns.
+Stream status exposes numeric stage timing counters for capture callback/frame
+arrival, encoder API submission, retained-frame copy, encoder polling, and packet
+queue admission. They contain no pixel data and update in status snapshots rather
+than logging each frame. Encode status separately reports BGRA conversion and
+actual worker-side x264 submit duration, allowing queue delay and encoder work to
+be distinguished from video tick time.
 
 ## Authority, cancellation and lifecycle
 

@@ -53,6 +53,14 @@ pub struct Progress {
     pub capture_arrival: Option<CaptureArrival>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
+    pub capture_callback_us: u64,
+    pub capture_callback_count: u64,
+    pub capture_frame_count: u64,
+    pub encoder_submit_us: u64,
+    pub frame_copy_us: u64,
+    pub encoder_poll_us: u64,
+    pub transport_admission_us: u64,
+    pub transport_admission_count: u64,
 }
 
 /// An owned copy of a previously accepted capture frame. The native capture
@@ -131,6 +139,8 @@ struct Submission<'a> {
     sequence: u64,
     frame: Option<FrameMetadata>,
     owned_frame: Option<OwnedFrame>,
+    encoder_submit_us: u64,
+    frame_copy_us: u64,
 }
 
 unsafe extern "C" fn submit(context: *mut c_void, frame: *const CpuFrame) -> Status {
@@ -224,19 +234,23 @@ unsafe fn submit_frame(
             sequence: submission.sequence,
         });
         // SAFETY: validated borrowed capture frame remains live; encoder copies on acceptance.
-        unsafe {
+        let started = Instant::now();
+        let status = unsafe {
             (submission.api.submit)(
                 submission.api.base.context,
                 submission.encoder,
                 &forwarded,
                 u32::from(submission.force_idr),
             )
-        }
+        };
+        submission.encoder_submit_us = elapsed_micros(started);
+        status
     };
     if submission.status == STATUS_OK {
         // SAFETY: capture bytes remain borrowed until read_frame returns. A failed
         // allocation only disables repeats; the encoder already copied its input.
         if let Ok(bytes) = unsafe { frame.bytes() } {
+            let started = Instant::now();
             let mut owned = Vec::new();
             if owned.try_reserve_exact(bytes.len()).is_ok() {
                 owned.extend_from_slice(bytes);
@@ -248,6 +262,7 @@ unsafe fn submit_frame(
                     bytes: owned,
                 });
             }
+            submission.frame_copy_us = elapsed_micros(started);
         }
     }
     // Capture ownership ends here even on encoder backpressure: deliberately drop frame.
@@ -257,6 +272,8 @@ unsafe fn submit_frame(
 struct Destination<'a> {
     queues: &'a Arc<Mutex<Queues>>,
     video: u64,
+    transport_admission_us: u64,
+    transport_admission_count: u64,
 }
 
 unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) -> Status {
@@ -264,11 +281,16 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
         return STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: encoder borrows packet; destination lives through synchronous receive.
-    let destination = unsafe { &*context.cast::<Destination<'_>>() };
-    let Ok(mut queues) = destination.queues.try_lock() else {
-        return MEDIA_BUSY;
+    let destination = unsafe { &mut *context.cast::<Destination<'_>>() };
+    let started = Instant::now();
+    destination.transport_admission_count = destination.transport_admission_count.saturating_add(1);
+    let status = if let Ok(mut queues) = destination.queues.try_lock() {
+        unsafe { queues.push(destination.video, &*packet) }
+    } else {
+        MEDIA_BUSY
     };
-    unsafe { queues.push(destination.video, &*packet) }
+    destination.transport_admission_us = elapsed_micros(started);
+    status
 }
 
 impl Plane for NativePlane {
@@ -340,7 +362,12 @@ impl Plane for NativePlane {
         } else {
             progress
         };
-        receive(encoder_api, input.encoder, input.video, &self.queues)?;
+        let (encoder_poll_us, transport_admission_us, destination_count) =
+            receive(encoder_api, input.encoder, input.video, &self.queues)?;
+        let mut progress = progress;
+        progress.encoder_poll_us = encoder_poll_us;
+        progress.transport_admission_us = transport_admission_us;
+        progress.transport_admission_count = destination_count;
         Ok(progress)
     }
 
@@ -377,7 +404,10 @@ fn capture(
         sequence: input.sequence,
         frame: None,
         owned_frame: None,
+        encoder_submit_us: 0,
+        frame_copy_us: 0,
     };
+    let callback_started = Instant::now();
     let result = if let Some(capture_timestamp_api) = capture_timestamp_api {
         let sink = FreshFrameSinkV1_3 {
             context: (&mut submission as *mut Submission<'_>).cast(),
@@ -430,6 +460,12 @@ fn capture(
             .then_some(submission.frame)
             .flatten(),
         owned_frame: submission.owned_frame,
+        capture_callback_us: elapsed_micros(callback_started),
+        capture_callback_count: 1,
+        capture_frame_count: u64::from(submission.called),
+        encoder_submit_us: submission.encoder_submit_us,
+        frame_copy_us: submission.frame_copy_us,
+        ..Progress::default()
     })
 }
 
@@ -470,6 +506,7 @@ fn repeat(
     };
     // SAFETY: bytes are owned by Video for the full synchronous submit callback;
     // the encoder contract copies accepted input before returning.
+    let started = Instant::now();
     let status = unsafe {
         (api.submit)(
             api.base.context,
@@ -489,6 +526,8 @@ fn repeat(
         capture_arrival: None,
         frame: None,
         owned_frame: None,
+        encoder_submit_us: elapsed_micros(started),
+        ..Progress::default()
     })
 }
 
@@ -554,17 +593,31 @@ fn receive(
     encoder: u64,
     video: u64,
     queues: &Arc<Mutex<Queues>>,
-) -> Result<(), &'static str> {
-    let mut destination = Destination { queues, video };
+) -> Result<(u64, u64, u64), &'static str> {
+    let mut destination = Destination {
+        queues,
+        video,
+        transport_admission_us: 0,
+        transport_admission_count: 0,
+    };
     let sink = PacketSink {
         context: (&mut destination as *mut Destination<'_>).cast(),
         write: packet,
     };
     // SAFETY: stack sink copies at most one bounded borrowed packet.
+    let started = Instant::now();
     match unsafe { (api.receive)(api.base.context, encoder, sink) } {
-        STATUS_OK | MEDIA_PENDING | MEDIA_BUSY => Ok(()),
+        STATUS_OK | MEDIA_PENDING | MEDIA_BUSY => Ok((
+            elapsed_micros(started),
+            destination.transport_admission_us,
+            destination.transport_admission_count,
+        )),
         _ => Err("encoder_failed"),
     }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -616,6 +669,8 @@ mod tests {
             sequence: 3,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         let bytes = [0; 16 * 16 * 4];
         let mut frame = CpuFrame {
@@ -697,6 +752,8 @@ mod tests {
             sequence: 3,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         let context = (&mut submission as *mut Submission<'_>).cast();
 
@@ -799,6 +856,8 @@ mod tests {
             sequence: 3,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         let context = (&mut submission as *mut Submission<'_>).cast();
         assert_eq!(unsafe { submit(context, &captured) }, STATUS_OK);
@@ -897,6 +956,8 @@ mod tests {
             sequence: 3,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         assert_eq!(
             unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &frame) },
@@ -952,6 +1013,8 @@ mod tests {
             sequence: 2,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         let fresh_context = (&mut fresh_submission as *mut Submission<'_>).cast();
         assert_eq!(
@@ -975,6 +1038,8 @@ mod tests {
             sequence: 3,
             frame: None,
             owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
         };
         let cached_context = (&mut cached_submission as *mut Submission<'_>).cast();
         assert_eq!(

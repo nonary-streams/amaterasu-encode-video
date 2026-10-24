@@ -3,6 +3,45 @@ use crate::model::{AmdAv1LatencyMode, EncoderIdentity, EncoderSelection};
 use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
+
+#[test]
+fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admission() {
+    let mut timings = StageTimings::default();
+    let accepted = Progress {
+        submitted: true,
+        owned_frame: Some(OwnedFrame {
+            width: 16,
+            height: 16,
+            format: 1,
+            stride: 64,
+            bytes: vec![0; 16],
+        }),
+        capture_callback_us: 140,
+        capture_callback_count: 1,
+        capture_frame_count: 1,
+        encoder_submit_us: 12,
+        frame_copy_us: 31,
+        encoder_poll_us: 7,
+        transport_admission_us: 4,
+        transport_admission_count: 1,
+        ..Progress::default()
+    };
+    timings.record(&accepted);
+    let pending = Progress {
+        encoder_poll_us: 2,
+        ..Progress::default()
+    };
+    timings.record(&pending);
+
+    assert_eq!(timings.capture_callback.total_us, 140);
+    assert_eq!(timings.captured_frames, 1);
+    assert_eq!(timings.encoder_submit.total_us, 12);
+    assert_eq!(timings.frame_copy.total_us, 31);
+    assert_eq!(timings.encoder_poll.calls, 2);
+    assert_eq!(timings.encoder_poll.total_us, 9);
+    assert_eq!(timings.transport_admission.total_us, 4);
+}
+
 #[derive(Default)]
 struct Runtime {
     next: u64,
@@ -294,6 +333,7 @@ impl Plane for FakePlane {
                             * 4
                     ],
                 }),
+                ..Progress::default()
             })
         }
     }
