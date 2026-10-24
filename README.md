@@ -48,6 +48,12 @@ uncertain requests and failures after the single retry clean up the stream.
 {"action":"close","stream":1}
 ```
 
+PipeWire sources retain the compositor's negotiated image size. When it differs
+from the stream size, video fits the complete BGRA image with bilinear resizing
+and centered black bars when needed to preserve its aspect ratio. This does not
+change monitor positions, resolution or scaling, and does not grant absolute
+pointer mapping without authoritative capture geometry.
+
 The optional configuration.color_mode selects the SDR matrix/range used for
 BGRA conversion and encoder signaling: bt601_limited, bt601_full,
 bt709_limited, or bt709_full. It defaults to bt709_limited. Windows continues to

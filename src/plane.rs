@@ -1,4 +1,5 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
+mod resize;
 use crate::{
     model::{CaptureProvider, Configuration},
     queue::Queues,
@@ -131,6 +132,7 @@ struct Submission<'a> {
     configuration: &'a Configuration,
     status: Status,
     called: bool,
+    allow_resize: bool,
     track_wgc_arrival: bool,
     capture_reused: bool,
     capture_arrival: Option<CaptureArrival>,
@@ -217,12 +219,55 @@ unsafe fn submit_frame(
             observed_at: Instant::now(),
         });
     }
-    submission.status = if frame.validate().is_err()
-        || frame.width != submission.configuration.width
-        || frame.height != submission.configuration.height
-    {
-        STATUS_INVALID_ARGUMENT
+    if frame.validate().is_err() {
+        submission.status = STATUS_INVALID_ARGUMENT;
+        return STATUS_OK;
+    }
+    let size_matches = frame.width == submission.configuration.width
+        && frame.height == submission.configuration.height;
+    let resize_started = Instant::now();
+    let resized = if size_matches {
+        None
+    } else if submission.allow_resize {
+        // SAFETY: the capture provider retains the validated allocation until
+        // this synchronous callback returns; the resizer copies every pixel.
+        let result = unsafe { frame.bytes() }.and_then(|pixels| {
+            resize::fit_bgra(
+                frame,
+                pixels,
+                submission.configuration.width,
+                submission.configuration.height,
+            )
+        });
+        match result {
+            Ok(frame) => Some(frame),
+            Err(status) => {
+                submission.status = status;
+                return STATUS_OK;
+            }
+        }
     } else {
+        submission.status = STATUS_INVALID_ARGUMENT;
+        return STATUS_OK;
+    };
+    let normalized;
+    let frame = if let Some(resized) = &resized {
+        submission.frame_copy_us = elapsed_micros(resize_started);
+        normalized = CpuFrame {
+            width: resized.width,
+            height: resized.height,
+            format: resized.format,
+            stride: resized.stride,
+            data: resized.bytes.as_ptr(),
+            len: resized.bytes.len(),
+            timestamp_us: frame.timestamp_us,
+            sequence: frame.sequence,
+        };
+        &normalized
+    } else {
+        frame
+    };
+    submission.status = {
         let mut forwarded = *frame;
         forwarded.timestamp_us = submission.timestamp_us;
         forwarded.sequence = submission.sequence;
@@ -247,6 +292,10 @@ unsafe fn submit_frame(
         status
     };
     if submission.status == STATUS_OK {
+        if let Some(resized) = resized {
+            submission.owned_frame = Some(resized);
+            return STATUS_OK;
+        }
         // SAFETY: capture bytes remain borrowed until read_frame returns. A failed
         // allocation only disables repeats; the encoder already copied its input.
         if let Ok(bytes) = unsafe { frame.bytes() } {
@@ -395,6 +444,7 @@ fn capture(
         configuration: input.configuration,
         status: MEDIA_PENDING,
         called: false,
+        allow_resize: input.provider == CaptureProvider::Pipewire,
         track_wgc_arrival: input.provider == CaptureProvider::Wgc
             && (!input.constant_rate || capture_timestamp_api.is_some() || freshness_api.is_some()),
         capture_reused: false,
@@ -662,6 +712,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
@@ -746,6 +797,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
@@ -851,6 +903,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
@@ -900,6 +953,79 @@ mod tests {
         assert_eq!(observed.0[1].1, 21);
         assert_eq!(observed.0[1].2, vec![0x6b; source_bytes.len()]);
     }
+    #[test]
+    fn portal_resize_submits_and_retains_the_complete_fitted_frame() {
+        let mut observed = SubmittedFrames::default();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: (&mut observed as *mut SubmittedFrames).cast(),
+                release: None,
+            },
+            submit: record_frame,
+            receive,
+            drain,
+        };
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,"height":16,"fps":30,"bitrate":100000
+        }))
+        .unwrap();
+        let mut pixels = vec![0x6b; 32 * 32 * 4];
+        let captured = CpuFrame {
+            width: 32,
+            height: 32,
+            format: PIXEL_BGRA8,
+            stride: 128,
+            data: pixels.as_ptr(),
+            len: pixels.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut submission = Submission {
+            api: &api,
+            encoder: 2,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            allow_resize: true,
+            track_wgc_arrival: false,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 12,
+            sequence: 3,
+            frame: None,
+            owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
+        };
+        // SAFETY: this test retains both the borrowed source and submission
+        // context throughout the synchronous capture callback.
+        assert_eq!(
+            unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &captured) },
+            STATUS_OK
+        );
+        assert_eq!(submission.status, STATUS_OK);
+        let metadata = submission.frame.unwrap();
+        assert_eq!(
+            (metadata.width, metadata.height, metadata.stride),
+            (16, 16, 64)
+        );
+        assert_eq!((metadata.timestamp_us, metadata.sequence), (12, 3));
+        pixels.fill(0);
+        let retained = submission.owned_frame.unwrap();
+        assert_eq!(retained.bytes.len(), 16 * 16 * 4);
+        assert!(
+            retained
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0x6b, 0x6b, 0x6b, 255])
+        );
+        assert_eq!(observed.0[0].2, retained.bytes);
+    }
+
     #[test]
     fn native_submission_passes_force_idr_as_exact_c_flag() {
         unsafe extern "C" fn flag(
@@ -952,6 +1078,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
@@ -1010,6 +1137,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
@@ -1035,6 +1163,7 @@ mod tests {
             configuration: &configuration,
             status: MEDIA_PENDING,
             called: false,
+            allow_resize: false,
             track_wgc_arrival: true,
             capture_reused: false,
             capture_arrival: None,
