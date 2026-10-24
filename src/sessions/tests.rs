@@ -4,10 +4,113 @@ use amaterasu_abi::{AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQu
 use std::{
     ffi::c_void,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
+
+use crate::worker::{Worker, WorkerBackend};
+
+#[derive(Default)]
+struct SlowGateState {
+    first_submit_entered: bool,
+    release_first_submit: bool,
+    submits_started: usize,
+    submits_completed: usize,
+    packets: VecDeque<Packet>,
+    drain_entered: bool,
+    release_drain: bool,
+    drain_completed: bool,
+}
+
+#[derive(Default)]
+struct SlowGate {
+    state: Mutex<SlowGateState>,
+    changed: Condvar,
+}
+
+impl SlowGate {
+    fn wait_for(&self, timeout: Duration, predicate: impl Fn(&SlowGateState) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while !predicate(&state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if result.timed_out() && !predicate(&state) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_first_submit(&self) {
+        self.state.lock().unwrap().release_first_submit = true;
+        self.changed.notify_all();
+    }
+
+    fn release_drain(&self) {
+        self.state.lock().unwrap().release_drain = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ReleaseSlowGateOnDrop(Arc<SlowGate>);
+
+impl Drop for ReleaseSlowGateOnDrop {
+    fn drop(&mut self) {
+        self.0.release_first_submit();
+        self.0.release_drain();
+    }
+}
+
+struct SlowWorkerBackend(Arc<SlowGate>);
+
+impl WorkerBackend for SlowWorkerBackend {
+    fn uses_background_encode(&self) -> bool {
+        true
+    }
+
+    fn submit(&mut self, _: Vec<u8>, timestamp: i64, _: bool) -> Result<(), &'static str> {
+        let mut state = self.0.state.lock().unwrap();
+        state.submits_started += 1;
+        if state.submits_started == 1 {
+            state.first_submit_entered = true;
+            self.0.changed.notify_all();
+            while !state.release_first_submit {
+                state = self.0.changed.wait(state).unwrap();
+            }
+        }
+        state.packets.push_back(Packet {
+            bytes: vec![0, 0, 1, 0x41],
+            timestamp_100ns: timestamp,
+            keyframe: false,
+        });
+        state.submits_completed += 1;
+        self.0.changed.notify_all();
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        Ok(self.0.state.lock().unwrap().packets.pop_front())
+    }
+
+    fn drain(&mut self) -> Result<(), &'static str> {
+        let mut state = self.0.state.lock().unwrap();
+        state.drain_entered = true;
+        self.0.changed.notify_all();
+        while !state.release_drain {
+            state = self.0.changed.wait(state).unwrap();
+        }
+        state.drain_completed = true;
+        self.0.changed.notify_all();
+        Ok(())
+    }
+}
 struct Fake {
     packets: VecDeque<Packet>,
     submissions: Arc<AtomicUsize>,
@@ -399,6 +502,122 @@ fn asynchronous_drain_waits_for_encoder_poll_before_emitting_eos() {
         STATUS_OK
     );
     assert_eq!(sink.flags, [FLAG_END_OF_STREAM]);
+}
+
+#[test]
+fn slow_worker_bounds_real_queue_preserves_retry_metadata_and_orders_drain_eos() {
+    let gate = Arc::new(SlowGate::default());
+    let worker = Worker::with_backend(SlowWorkerBackend(gate.clone()));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert("alice", configuration(), Box::new(worker), false)
+        .unwrap();
+    let _release_gate_on_exit = ReleaseSlowGateOnDrop(gate.clone());
+    let data = vec![0; 384];
+    let mut frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+
+    // SAFETY: frame points into `data`, which remains live and immutable until
+    // all synchronous submit callbacks in this test finish.
+    // The first submit is held inside the fake encoder while the bounded queue fills.
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+    let first_submit_entered =
+        gate.wait_for(Duration::from_secs(2), |state| state.first_submit_entered);
+    if !first_submit_entered {
+        gate.release_first_submit();
+    }
+    assert!(first_submit_entered);
+    for sequence in 2..=3 {
+        frame.timestamp_us = sequence;
+        frame.sequence = sequence;
+        assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 0) }, STATUS_OK);
+    }
+    frame.timestamp_us = 4;
+    frame.sequence = 4;
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        MEDIA_BUSY
+    );
+    assert_eq!(
+        unsafe { sessions.submit("alice", 1, &frame, 0) },
+        MEDIA_BUSY
+    );
+    {
+        let session = sessions.values.get(&1).unwrap();
+        assert_eq!(session.metadata.len(), 3);
+        assert_eq!(session.last_input, Some((30, 3)));
+    }
+    assert_eq!(sessions.drain("alice", 1), MEDIA_BUSY);
+
+    gate.release_first_submit();
+    assert!(gate.wait_for(Duration::from_secs(2), |state| state.submits_completed == 3));
+    let retry_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match unsafe { sessions.submit("alice", 1, &frame, 0) } {
+            STATUS_OK => break,
+            MEDIA_BUSY if Instant::now() < retry_deadline => std::thread::yield_now(),
+            status => panic!("frame retry should be accepted, got {status}"),
+        }
+    }
+    assert!(gate.wait_for(Duration::from_secs(2), |state| state.submits_completed == 4));
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match sessions.drain("alice", 1) {
+            STATUS_OK => break,
+            MEDIA_BUSY if Instant::now() < drain_deadline => std::thread::yield_now(),
+            status => panic!("drain should be admitted, got {status}"),
+        }
+    }
+    let drain_entered = gate.wait_for(Duration::from_secs(2), |state| state.drain_entered);
+    if !drain_entered {
+        gate.release_drain();
+    }
+    assert!(drain_entered);
+
+    let mut sink = Sink {
+        reject: false,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // A pending worker drain cannot be mistaken for an empty, completed stream.
+    // SAFETY: packet sink context stays live throughout the receive loop.
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_PENDING
+    );
+    assert!(sink.flags.is_empty());
+    gate.release_drain();
+    assert!(gate.wait_for(Duration::from_secs(2), |state| state.drain_completed));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // SAFETY: `packet_sink` continues to reference the live `sink` until loop exit.
+    while sink.flags.last() != Some(&FLAG_END_OF_STREAM) && Instant::now() < deadline {
+        let status = unsafe { sessions.receive("alice", 1, packet_sink) };
+        assert!(matches!(status, STATUS_OK | MEDIA_PENDING));
+        if status == MEDIA_PENDING {
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(sink.sequences, [1, 2, 3, 4]);
+    assert_eq!(
+        sink.flags
+            .iter()
+            .filter(|flag| **flag == FLAG_END_OF_STREAM)
+            .count(),
+        1
+    );
 }
 
 #[test]

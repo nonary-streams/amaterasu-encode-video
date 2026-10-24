@@ -7,8 +7,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -17,6 +16,34 @@ use std::{
 
 const ASYNC_QUEUE_CAPACITY: usize = 2;
 const ASYNC_MAX_OUTSTANDING: usize = ASYNC_QUEUE_CAPACITY + 1;
+
+#[derive(Default)]
+struct CancellationGate {
+    cancelled: Mutex<bool>,
+}
+
+impl CancellationGate {
+    fn may_start_operation(&self) -> bool {
+        !*self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cancel(&self) {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 enum Operation {
     Submit(Vec<u8>, i64, bool),
@@ -85,10 +112,35 @@ pub enum ReceiveResult {
     Pending,
 }
 
+pub(crate) trait WorkerBackend: Send {
+    fn uses_background_encode(&self) -> bool;
+    fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
+    fn drain(&mut self) -> Result<(), &'static str>;
+}
+
+impl WorkerBackend for platform::Encoder {
+    fn uses_background_encode(&self) -> bool {
+        platform::Encoder::uses_background_encode(self)
+    }
+
+    fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+        platform::Encoder::submit(self, data, timestamp, force)
+    }
+
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        platform::Encoder::receive(self)
+    }
+
+    fn drain(&mut self) -> Result<(), &'static str> {
+        platform::Encoder::drain(self)
+    }
+}
+
 pub struct Worker {
     sender: Option<SyncSender<Request>>,
     thread: Option<JoinHandle<()>>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<CancellationGate>,
     background_encode: bool,
     pending: VecDeque<Pending>,
     receive_result: Option<Option<Packet>>,
@@ -101,14 +153,23 @@ pub struct Worker {
 
 impl Worker {
     pub fn open(identity: EncoderIdentity, config: Configuration) -> Result<Self, &'static str> {
+        Self::start(move || {
+            platform::Encoder::open(&identity, &config)
+                .map(|encoder| Box::new(encoder) as Box<dyn WorkerBackend>)
+        })
+    }
+
+    fn start(
+        open_backend: impl FnOnce() -> Result<Box<dyn WorkerBackend>, &'static str> + Send + 'static,
+    ) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel::<Request>(ASYNC_QUEUE_CAPACITY);
         let (ready, initialized) = mpsc::sync_channel(1);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CancellationGate::default());
         let worker_cancel = Arc::clone(&cancel);
         let thread = thread::Builder::new()
             .name("amaterasu-h264".into())
             .spawn(move || {
-                let mut encoder = match platform::Encoder::open(&identity, &config) {
+                let mut encoder = match open_backend() {
                     Ok(encoder) => encoder,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -126,8 +187,7 @@ impl Worker {
                         duration_micros(started_at.saturating_duration_since(request.queued_at));
                     let result = if failed {
                         Err("encoder_failed")
-                    } else if should_cancel_queued_operation(worker_cancel.load(Ordering::Acquire))
-                    {
+                    } else if !worker_cancel.may_start_operation() {
                         Err("encoder_cancelled")
                     } else {
                         match request.operation {
@@ -153,7 +213,7 @@ impl Worker {
                         .is_err()
                     {
                         // An abandoned asynchronous reply is expected during close.
-                        if worker_cancel.load(Ordering::Acquire) {
+                        if worker_cancel.is_cancelled() {
                             continue;
                         }
                     }
@@ -181,12 +241,17 @@ impl Worker {
                 metrics: Metrics::default(),
             }),
             Err(error) => {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
                 drop(sender);
                 let _ = thread.join();
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: impl WorkerBackend + 'static) -> Self {
+        Self::start(move || Ok(Box::new(backend))).expect("controlled test backend opens")
     }
 
     fn request(&mut self, operation: Operation) -> Result<Reply, &'static str> {
@@ -393,7 +458,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         // Native calls are not forcibly interruptible. Mark cancellation so the
         // worker skips queued frames immediately after its current call returns.
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
         self.sender.take();
         // Keep module-owned native code loaded until an in-flight call returns.
         if let Some(thread) = self.thread.take() {
@@ -410,10 +475,6 @@ fn can_enqueue(outstanding: usize) -> bool {
     outstanding < ASYNC_MAX_OUTSTANDING
 }
 
-fn should_cancel_queued_operation(cancelled: bool) -> bool {
-    cancelled
-}
-
 pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
     thread::spawn(platform::enumerate)
         .join()
@@ -423,6 +484,76 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Condvar, Mutex};
+
+    #[derive(Default)]
+    struct DropGateState {
+        entered: bool,
+        release: bool,
+        submit_calls: usize,
+    }
+
+    #[derive(Default)]
+    struct DropGate {
+        state: Mutex<DropGateState>,
+        changed: Condvar,
+    }
+
+    struct SlowBackend(Arc<DropGate>);
+
+    struct ReleaseGateOnDrop(Arc<DropGate>);
+
+    impl Drop for ReleaseGateOnDrop {
+        fn drop(&mut self) {
+            self.0.state.lock().unwrap().release = true;
+            self.0.changed.notify_all();
+        }
+    }
+
+    impl WorkerBackend for SlowBackend {
+        fn uses_background_encode(&self) -> bool {
+            true
+        }
+
+        fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+            let mut state = self.0.state.lock().unwrap();
+            state.submit_calls += 1;
+            if state.submit_calls == 1 {
+                state.entered = true;
+                self.0.changed.notify_all();
+                while !state.release {
+                    state = self.0.changed.wait(state).unwrap();
+                }
+            }
+            self.0.changed.notify_all();
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+            Ok(None)
+        }
+
+        fn drain(&mut self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    fn wait_for(gate: &DropGate, predicate: impl Fn(&DropGateState) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = gate.state.lock().unwrap();
+        while !predicate(&state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed) = gate.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timed.timed_out() && !predicate(&state) {
+                return false;
+            }
+        }
+        true
+    }
 
     #[test]
     fn background_queue_is_bounded_to_running_plus_two_queued_operations() {
@@ -441,7 +572,64 @@ mod tests {
 
     #[test]
     fn close_cancels_queued_work_but_never_claims_to_interrupt_running_native_calls() {
-        assert!(!should_cancel_queued_operation(false));
-        assert!(should_cancel_queued_operation(true));
+        let cancellation = CancellationGate::default();
+        assert!(cancellation.may_start_operation());
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        assert!(!cancellation.may_start_operation());
+    }
+
+    #[test]
+    fn bounded_queue_drop_skips_queued_calls_and_joins_the_in_flight_call() {
+        let gate = Arc::new(DropGate::default());
+        let mut worker = Worker::with_backend(SlowBackend(gate.clone()));
+        let _release_gate_on_exit = ReleaseGateOnDrop(gate.clone());
+        assert_eq!(
+            worker.submit(vec![1], 10, false).unwrap(),
+            SubmitResult::Accepted
+        );
+        let entered = wait_for(&gate, |state| state.entered);
+        if !entered {
+            gate.state.lock().unwrap().release = true;
+            gate.changed.notify_all();
+        }
+        assert!(entered);
+        assert_eq!(
+            worker.submit(vec![2], 20, false).unwrap(),
+            SubmitResult::Accepted
+        );
+        assert_eq!(
+            worker.submit(vec![3], 30, false).unwrap(),
+            SubmitResult::Accepted
+        );
+        assert_eq!(
+            worker.submit(vec![4], 40, false).unwrap(),
+            SubmitResult::Busy
+        );
+
+        let cancelled = Arc::clone(&worker.cancel);
+        let (finished, finished_rx) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(worker);
+            let _ = finished.send(());
+        });
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while !cancelled.is_cancelled() && Instant::now() < cancel_deadline {
+            thread::yield_now();
+        }
+        let cancellation_seen = cancelled.is_cancelled();
+        let drop_waited_for_active_call =
+            matches!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        {
+            gate.state.lock().unwrap().release = true;
+            gate.changed.notify_all();
+        }
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker joins once its active call returns");
+        closer.join().unwrap();
+        assert!(cancellation_seen);
+        assert!(drop_waited_for_active_call);
+        assert_eq!(gate.state.lock().unwrap().submit_calls, 1);
     }
 }
