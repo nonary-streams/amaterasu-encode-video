@@ -112,7 +112,10 @@ pub enum ReceiveResult {
     Pending,
 }
 
-pub(crate) trait WorkerBackend: Send {
+/// Encoder state is created, used, and dropped inside the worker thread. The
+/// backend intentionally has no `Send` bound because native handles may be
+/// thread-affine; only the factory closure crosses the thread boundary.
+pub(crate) trait WorkerBackend {
     fn uses_background_encode(&self) -> bool;
     fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
     fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
@@ -249,8 +252,10 @@ impl Worker {
         }
     }
 
+    // Test backends are captured by the Send factory closure; production
+    // backends are instead constructed by that closure on the worker thread.
     #[cfg(test)]
-    pub(crate) fn with_backend(backend: impl WorkerBackend + 'static) -> Self {
+    pub(crate) fn with_backend(backend: impl WorkerBackend + Send + 'static) -> Self {
         Self::start(move || Ok(Box::new(backend))).expect("controlled test backend opens")
     }
 
