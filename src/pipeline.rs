@@ -30,6 +30,7 @@ enum Stage {
     Capture,
     FallbackEnumerate,
     Encoder,
+    RestartCloseEncoder,
     Activating,
     Running,
     StopCapture,
@@ -65,6 +66,7 @@ struct Stream {
     capture_output: String,
     encoder: Option<EncoderIdentity>,
     fallback_encoder: Option<EncoderIdentity>,
+    restart_pending: bool,
     encoder_index: Option<u32>,
     encoder_attempt: u8,
     configuration: Configuration,
@@ -189,6 +191,7 @@ impl Stream {
             | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
+            | Stage::RestartCloseEncoder
             | Stage::Activating => "opening",
             Stage::Running => "running",
             Stage::StopCapture | Stage::Draining => "draining",
@@ -397,6 +400,7 @@ impl Pipeline {
                         | Stage::Capture
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
+                        | Stage::RestartCloseEncoder
                         | Stage::Activating
                         | Stage::Running
                         | Stage::StopCapture
@@ -523,6 +527,7 @@ impl Pipeline {
                 output,
                 encoder,
                 fallback_encoder: None,
+                restart_pending: false,
                 encoder_index,
                 encoder_attempt: 0,
                 configuration,
@@ -590,6 +595,7 @@ impl Pipeline {
         if stream.stage == Stage::Running {
             pump(plane, stream, id);
             if stream.stage != Stage::Running
+                && stream.stage != Stage::RestartCloseEncoder
                 && let Ok(mut queues) = self.queues.lock()
             {
                 queues.close(id);
@@ -604,7 +610,7 @@ impl Pipeline {
                     .expect("activation follows capture admission"),
                 stream.desktop_geometry,
             ) {
-                Ok(GeometryProgress::Ready) => activate(stream, id, &self.queues, send),
+                Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, &self.queues, send),
                 Ok(GeometryProgress::Busy) => return,
                 Err(code) => stream.cleanup(code),
             }
@@ -738,6 +744,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 stream.force_idr = false;
             }
         }
+        Err(code) if begin_runtime_encoder_recovery(stream, code) => {}
         Err(code) => stream.cleanup(code),
     }
 }
@@ -918,6 +925,10 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             ENCODE,
             json!({"action":"close","session_id":stream.session}),
         ),
+        Stage::RestartCloseEncoder => (
+            ENCODE,
+            json!({"action":"close","session_id":stream.session}),
+        ),
         Stage::FindCapture => (
             stream.provider.service(),
             json!({"action":"lookup","operation_id":stream.capture_operation}),
@@ -955,6 +966,7 @@ fn stage_name(stage: Stage) -> &'static str {
         Stage::Activating => "activating",
         Stage::FindEncoder => "find-encoder",
         Stage::CloseEncoder => "close-encoder",
+        Stage::RestartCloseEncoder => "restart-close-encoder",
         Stage::FindCapture => "find-capture",
         Stage::CloseCapture => "close-capture",
         Stage::StopCapture => "drain-close-capture",
@@ -971,6 +983,7 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
             | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
+            | Stage::RestartCloseEncoder
             | Stage::Activating
             | Stage::StopCapture
     ) {
@@ -988,6 +1001,23 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
             stream.retries = 0;
         }
     }
+}
+
+fn begin_runtime_encoder_recovery(stream: &mut Stream, code: &'static str) -> bool {
+    if !matches!(code, "encoder_failed" | "frame_rejected")
+        || stream.stage != Stage::Running
+        || stream.encoder_attempt != 0
+        || stream.fallback_encoder.is_none()
+        || stream.restart_pending
+    {
+        return false;
+    }
+    stream.restart_pending = true;
+    stream.force_idr = true;
+    stream.next_frame = Instant::now();
+    stream.retries = 0;
+    stream.stage = Stage::RestartCloseEncoder;
+    true
 }
 
 fn apply_result(
@@ -1023,11 +1053,16 @@ fn apply_result(
                 stream.stage,
                 Stage::FindEncoder
                     | Stage::CloseEncoder
+                    | Stage::RestartCloseEncoder
                     | Stage::FindCapture
                     | Stage::CloseCapture
                     | Stage::StopCapture
             ))
     {
+        if stream.stage == Stage::RestartCloseEncoder {
+            stream.cleanup("encoder_restart_failed");
+            return false;
+        }
         if stream.stage == Stage::Encoder
             && begin_encoder_fallback(stream, payload_error_code(&payload))
         {
@@ -1120,7 +1155,7 @@ fn apply_result(
                 stream.capture.expect("encoder follows capture admission"),
                 stream.desktop_geometry,
             ) {
-                Ok(GeometryProgress::Ready) => activate(stream, id, queues, send),
+                Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                 Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
                 Err(code) => stream.cleanup(code),
             }
@@ -1139,6 +1174,17 @@ fn apply_result(
             }
         }
         Stage::CloseEncoder => Stage::FindCapture,
+        Stage::RestartCloseEncoder => {
+            stream.session = None;
+            let Some(fallback) = stream.fallback_encoder.take() else {
+                stream.cleanup("encoder_restart_unavailable");
+                return false;
+            };
+            stream.encoder = Some(fallback);
+            stream.encoder_attempt = 1;
+            stream.retries = 0;
+            Stage::Encoder
+        }
         Stage::FindCapture => {
             if missing {
                 return finish_cleanup(stream);
@@ -1778,6 +1824,22 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
         if let Ok(mut queues) = queues.lock() {
             queues.close(id);
         }
+    }
+}
+
+fn activate_or_resume(
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    send: &mut Send<'_>,
+) {
+    if stream.restart_pending {
+        stream.restart_pending = false;
+        stream.stage = Stage::Running;
+        stream.force_idr = true;
+        stream.next_frame = Instant::now();
+    } else {
+        activate(stream, id, queues, send);
     }
 }
 

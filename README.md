@@ -19,10 +19,19 @@ identifier, or drain timeout outside 100–30000 ms is rejected.
 Enabled startup binds every configured native capture provider and the encoder.
 Disabled startup registers services but binds no lower interface and opens no
 devices. Unsupported hardware/platforms fail through real provider responses;
-there is no synthetic frame or implicit software fallback. Linux H.264 requires
-the opt-in `software-x264` feature, x264 development headers, and a matching
-runtime library. If no H.264 backend is available, Open fails with
-`h264_encoder_unavailable` after resource cleanup.
+there are no synthetic frames. Linux H.264 requires a registered real backend.
+The optional x264 fallback requires the `software-x264` feature, x264 development
+headers, and a matching runtime library. If no H.264 backend is available, Open
+fails with `h264_encoder_unavailable` after resource cleanup.
+
+For `encoder: "auto"`, video can select a registered NVENC or VAAPI H.264
+backend before x264. A confirmed hardware Open failure can retry x264 once with
+a distinct operation ID. If an automatically selected hardware encoder later
+returns a terminal `encoder_failed` or `frame_rejected` during streaming, video
+closes that encoder session and can restart once with x264 while retaining the
+capture stream and output queue. The replacement's first input is forced to a
+keyframe. Explicit encoder identities and registry indices do not fall back;
+uncertain requests and failures after the single retry clean up the stream.
 
 ## API
 

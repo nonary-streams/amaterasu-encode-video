@@ -264,6 +264,7 @@ struct FakePlane {
     dropped: bool,
     fail: bool,
     failure_code: Option<&'static str>,
+    failure_code_once: Option<&'static str>,
     freshness_api: bool,
     capture_timestamp_api: bool,
     capture_pacing_timestamp_us: u64,
@@ -297,7 +298,9 @@ impl Plane for FakePlane {
             input.sequence,
             input.timestamp_us,
         ));
-        if let Some(code) = self.failure_code {
+        if let Some(code) = self.failure_code_once.take() {
+            Err(code)
+        } else if let Some(code) = self.failure_code {
             Err(code)
         } else if self.fail {
             Err("frame_rejected")
@@ -3006,6 +3009,100 @@ fn auto_retries_only_confirmed_vaapi_open_failure() {
             ))
             .count(),
         1
+    );
+}
+
+#[test]
+fn auto_restarts_encoder_once_after_runtime_failure_and_forces_idr() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_VAAPI_ID,"hardware_url":"ffmpeg://h264_vaapi","friendly_name":"VAAPI"},"name":"VAAPI","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(
+        pipeline.streams[&1].stage,
+        Stage::RestartCloseEncoder
+    ));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.encoder_attempt, 1);
+    assert!(stream.force_idr);
+    assert_eq!(stream.provider, CaptureProvider::Dxgi);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(plane.inputs.last().unwrap().2);
+    assert!(!pipeline.streams[&1].force_idr);
+
+    let encoder_opens: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == ENCODE && payload["action"] == "open" => Some((
+                payload["encoder"]["clsid"].as_str().unwrap(),
+                operation_id.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_opens.len(), 2);
+    assert_eq!(
+        (encoder_opens[0].0, encoder_opens[1].0),
+        (LINUX_FFMPEG_VAAPI_ID, SOFTWARE_ENCODER_ID)
+    );
+    assert_ne!(encoder_opens[0].1, encoder_opens[1].1);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "close"
+            ))
+            .count(),
+        1
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+            if service == CAPTURE && payload["action"] == "close"
+    )));
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::FindEncoder));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_failed");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        2
     );
 }
 
