@@ -198,6 +198,37 @@ FFmpeg context, submit queue is bounded by the existing encoder worker, and
 drain flushes delayed packets before session EOS. No CUDA-frame import, HDR,
 HEVC, AV1, or dynamic device selection is claimed.
 
+## Linux hardware VA-API
+
+The opt-in `linux-ffmpeg-vaapi` feature adds FFmpeg's `h264_vaapi` encoder.
+The build script must compile `src/platform/ffmpeg_vaapi.c`, set the checked
+cfg `amaterasu_ffmpeg_vaapi`, and link target `libavcodec`/`libavutil` through
+pkg-config. FFmpeg's VAAPI hardware-frame implementation uses libva at runtime;
+the package must provide compatible FFmpeg sonames, libva, a VAAPI driver and
+an accessible render device. The source does not select a device path or change
+permissions.
+
+Discovery performs one bounded-size FFmpeg device, frame-pool, and encoder open
+at 640x480, then validates the encoder's actual generated H.264 extradata for
+Baseline plus BT.709 limited-range VUI before advertising the identity
+`amaterasu.hardware.vaapi.h264.ffmpeg` (`ffmpeg://h264_vaapi`). It does not
+submit probe frames. This checks that a device and encoder context can be
+created, but does not qualify sustained encoding or every requested resolution.
+Open repeats the checks at the requested dimensions. Confirmed device, encoder,
+or configuration open failures are reported distinctly so auto selection can
+retry software x264; explicit selections must not fall back. The video layer
+owns that fallback policy.
+
+This initial path accepts CPU NV12 or converted BGRA input as BT.709 limited
+SDR, constrained Baseline, CAVLC, no B pictures, and CBR. CPU NV12 is copied to
+an FFmpeg-owned frame, transferred into a bounded pool of VAAPI surfaces, and
+submitted to FFmpeg. The encoder worker owns device/context/surface references.
+H.264 SPS in the opened headers and any later packets are parsed and checked
+for video_full_range_flag=0 and BT.709 primaries, transfer, and matrix IDs;
+missing or mismatched VUI fails closed. Other color modes, explicit reference
+frame limits, HDR, 10-bit formats, and advanced VAAPI controls are unsupported.
+The backend is opt-in and has not been qualified on hardware.
+
 ## Linux software x264
 
 The optional `software-x264` feature compiles a small C adapter against the

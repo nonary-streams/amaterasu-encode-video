@@ -4,6 +4,9 @@ mod x264;
 #[cfg(target_os = "linux")]
 mod ffmpeg_nvenc;
 
+#[cfg(target_os = "linux")]
+mod ffmpeg_vaapi;
+
 #[cfg(windows)]
 mod windows;
 
@@ -74,6 +77,11 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
         encoders.push(hardware);
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(hardware) = ffmpeg_vaapi::description() {
+        encoders.push(hardware);
+    }
+
     if let Some(software) = software {
         encoders.push(software);
     }
@@ -85,6 +93,8 @@ pub enum Encoder {
     Hardware(windows::Encoder),
     #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
     Nvenc(ffmpeg_nvenc::Encoder),
+    #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+    Vaapi(ffmpeg_vaapi::Encoder),
     Software(x264::Encoder),
 }
 
@@ -96,6 +106,11 @@ impl Encoder {
         #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
         if ffmpeg_nvenc::selected(identity) {
             return ffmpeg_nvenc::open(identity, configuration).map(Self::Nvenc);
+        }
+
+        #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+        if ffmpeg_vaapi::selected(identity) {
+            return ffmpeg_vaapi::open(identity, configuration).map(Self::Vaapi);
         }
 
         if x264::selected(identity) {
@@ -131,6 +146,8 @@ impl Encoder {
             Self::Hardware(encoder) => encoder.submit(bytes, timestamp, force),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.submit(bytes, timestamp, force),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+            Self::Vaapi(encoder) => encoder.submit(bytes, timestamp, force),
             Self::Software(encoder) => encoder.submit(bytes, timestamp, force),
         }
     }
@@ -143,6 +160,8 @@ impl Encoder {
             Self::Hardware(_) => false,
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(_) => true,
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+            Self::Vaapi(_) => true,
             Self::Software(_) => true,
         }
     }
@@ -153,6 +172,8 @@ impl Encoder {
             Self::Hardware(encoder) => encoder.receive(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.receive(),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+            Self::Vaapi(encoder) => encoder.receive(),
             Self::Software(encoder) => encoder.receive(),
         }
     }
@@ -163,6 +184,8 @@ impl Encoder {
             Self::Hardware(encoder) => encoder.drain(),
             #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
             Self::Nvenc(encoder) => encoder.drain(),
+            #[cfg(all(target_os = "linux", amaterasu_ffmpeg_vaapi))]
+            Self::Vaapi(encoder) => encoder.drain(),
             Self::Software(encoder) => encoder.drain(),
         }
     }
@@ -190,8 +213,8 @@ mod tests {
     #[test]
     fn linux_does_not_claim_or_open_an_unregistered_hardware_encoder() {
         let identity = EncoderIdentity {
-            clsid: "amaterasu.hardware.vaapi.h264".into(),
-            hardware_url: Some("vaapi://unprobed-device".into()),
+            clsid: "amaterasu.hardware.vaapi.h264.unregistered".into(),
+            hardware_url: Some("ffmpeg://unprobed-device".into()),
             friendly_name: "VA-API H.264".into(),
         };
         let configuration: Configuration = serde_json::from_value(serde_json::json!({
@@ -203,6 +226,7 @@ mod tests {
         .unwrap();
 
         assert!(!ffmpeg_nvenc::selected(&identity));
+        assert!(!ffmpeg_vaapi::selected(&identity));
         assert!(matches!(
             Encoder::open(&identity, &configuration),
             Err("hardware_encoder_unavailable")
