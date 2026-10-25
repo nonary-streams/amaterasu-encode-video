@@ -34,7 +34,40 @@ mod gpu_tests;
 use crate::model::{EncoderDescription, EncoderIdentity};
 
 #[cfg(amaterasu_nvenc_cuda)]
-pub use runtime::{Encoder, NativeStatus, last_open_failure};
+pub use runtime::{Encoder, last_open_failure};
+
+/// Names for the adapter's `am_nvcuda_stage` values (native/internal.h), so
+/// enumeration can say which native step refused the last open.
+#[cfg_attr(not(amaterasu_nvenc_cuda), allow(dead_code))]
+pub fn stage_name(stage: u32) -> &'static str {
+    const NAMES: [&str; 21] = [
+        "none",
+        "nvenc_cuda_library",
+        "nvenc_cuda_driver",
+        "nvenc_cuda_api",
+        "nvenc_cuda_device",
+        "nvenc_cuda_session",
+        "nvenc_cuda_capabilities",
+        "nvenc_cuda_preset",
+        "nvenc_cuda_initialize",
+        "nvenc_cuda_input",
+        "nvenc_cuda_bitstream",
+        "nvenc_cuda_encode",
+        "nvenc_cuda_drain",
+        "nvenc_cuda_egl_display",
+        "nvenc_cuda_gl_context",
+        "nvenc_cuda_gl_resources",
+        "nvenc_cuda_cuda_interop",
+        "nvenc_cuda_upload",
+        "nvenc_cuda_fence",
+        "nvenc_cuda_import",
+        "nvenc_cuda_convert",
+    ];
+    NAMES
+        .get(stage as usize)
+        .copied()
+        .unwrap_or("nvenc_cuda_unknown")
+}
 
 /// True for a published NVENC/CUDA identity: a known codec clsid located by
 /// PCI bus id. Open locates that device again before touching it.
@@ -90,6 +123,15 @@ fn result_code(result: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_names_follow_the_native_stage_order() {
+        assert_eq!(stage_name(0), "none");
+        assert_eq!(stage_name(13), "nvenc_cuda_egl_display");
+        assert_eq!(stage_name(14), "nvenc_cuda_gl_context");
+        assert_eq!(stage_name(20), "nvenc_cuda_convert");
+        assert_eq!(stage_name(21), "nvenc_cuda_unknown");
+    }
 
     fn identity(clsid: &str, hardware_url: Option<&str>) -> EncoderIdentity {
         EncoderIdentity {

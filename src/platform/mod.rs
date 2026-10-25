@@ -42,7 +42,13 @@ pub fn last_failure() -> Option<Diagnostic> {
             hresult: detail.hresult,
         });
     }
-    #[cfg(not(windows))]
+    // The NVENC, CUDA, EGL or GL code is reported in the hresult field.
+    #[cfg(amaterasu_nvenc_cuda)]
+    return nvenc_cuda::last_open_failure().map(|status| Diagnostic {
+        stage: nvenc_cuda::stage_name(status.stage),
+        hresult: status.native_code as u32,
+    });
+    #[cfg(not(any(windows, amaterasu_nvenc_cuda)))]
     None
 }
 
