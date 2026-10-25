@@ -1,7 +1,7 @@
-# Amaterasu encode and video source (publication candidate)
+# Amaterasu encode and video source
 
 This workspace holds `amaterasu-encode` and `amaterasu-video`, including their
-C shims and original opt-in features. The proposed portable Cargo pin
+C shims and original opt-in features. The portable Cargo pin
 references an exact `nonary-streams/amaterasu-sdk` commit; `Cargo.lock` records
 the locally validated resolution. `cargo test --workspace --locked --offline`
 passed with the bundled synthetic bitstream fixture in
