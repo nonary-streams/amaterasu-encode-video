@@ -87,7 +87,8 @@ fn encode_cpu_frames(codec: Codec, mode: ColorMode, nv12_input: bool) -> Vec<Pac
         .into_iter()
         .find(|entry| entry.codec == codec.token())
         .unwrap_or_else(|| panic!("{} is not published", codec.token()));
-    let mut encoder = Encoder::open(&description.identity, &configuration(codec, mode)).unwrap();
+    let mut encoder = Encoder::open(&description.identity, &configuration(codec, mode))
+        .unwrap_or_else(|error| panic!("{error}: {:?}", super::last_open_failure()));
     let bgra = bgra_frame();
     let nv12 = layout::bgra(
         &bgra,
@@ -97,6 +98,9 @@ fn encode_cpu_frames(codec: Codec, mode: ColorMode, nv12_input: bool) -> Vec<Pac
         mode,
     )
     .unwrap();
+    // Collect output between submissions, as the session worker does, so the
+    // bounded packet queue never fills.
+    let mut packets = Vec::new();
     for frame in 0..FRAMES {
         let timestamp = (frame * 333_333) as i64;
         let force = frame == 0 || frame == SECOND_IDR;
@@ -107,9 +111,11 @@ fn encode_cpu_frames(codec: Codec, mode: ColorMode, nv12_input: bool) -> Vec<Pac
                 .submit_gpu(GpuInput::Bgra(bgra.clone()), timestamp, force)
                 .unwrap();
         }
+        packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
     }
     encoder.drain().unwrap();
-    std::iter::from_fn(|| encoder.receive().unwrap()).collect()
+    packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
+    packets
 }
 
 fn assert_packet_sequence(packets: &[Packet]) {
@@ -193,11 +199,31 @@ fn assert_stream_signal(codec: Codec, mode: ColorMode, stream: &Value) {
     match codec {
         Codec::H264 => {
             assert!(profile.contains("Baseline"), "{stream}");
-            assert_eq!(stream["refs"], 1, "{stream}");
+            // FFprobe 9 no longer reports `refs`; older versions still do.
+            if !stream["refs"].is_null() {
+                assert_eq!(stream["refs"], 1, "{stream}");
+            }
         }
         Codec::Hevc | Codec::Av1 => assert_eq!(profile, "Main", "{stream}"),
     }
     assert_eq!(stream["has_b_frames"].as_u64().unwrap_or(0), 0, "{stream}");
+}
+
+/// Reads `max_num_ref_frames` from every H.264 SPS with FFmpeg's
+/// trace_headers bitstream filter, independent of ffprobe's stream fields.
+fn h264_reference_frame_limits(path: &PathBuf) -> Vec<u64> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "trace", "-f", "h264", "-i"])
+        .arg(path)
+        .args(["-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+        .expect("ffmpeg must be installed");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains(" max_num_ref_frames "))
+        .filter_map(|line| line.rsplit("= ").next()?.trim().parse().ok())
+        .collect()
 }
 
 /// Decodes with a software decoder and returns raw I420 frames.
@@ -321,6 +347,10 @@ fn nvenc_cuda_gpu_encodes_synthetic_frames_that_ffmpeg_decodes() {
                 packets.into_iter().map(|packet| packet.bytes),
             );
             assert_stream_signal(codec, mode, &probe(codec, &path));
+            if codec == Codec::H264 {
+                let limits = h264_reference_frame_limits(&path);
+                assert!(!limits.is_empty() && limits.iter().all(|limit| *limit == 1));
+            }
             assert_decoded_colours(&decode(codec, &path), mode);
             std::fs::remove_file(path).unwrap();
         }

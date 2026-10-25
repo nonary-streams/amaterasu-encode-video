@@ -19,7 +19,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_void},
     os::fd::{AsRawFd, IntoRawFd},
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 const MAX_DEVICES: usize = 16;
@@ -29,10 +29,28 @@ const MAX_PENDING_PACKETS: usize = 16;
 const MAX_MODIFIERS_PER_FORMAT: usize = 64;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct NativeStatus {
-    stage: u32,
-    native_code: i32,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeStatus {
+    /// The adapter stage that failed (`AM_STAGE_*` in native/internal.h).
+    pub stage: u32,
+    /// The NVENC, CUDA, EGL or GL error that stage reported, or 0.
+    pub native_code: i32,
+}
+
+/// The most recent failed open in this process, kept so operators and tests
+/// can see which native step refused instead of only the coarse error code.
+static LAST_OPEN_FAILURE: Mutex<Option<NativeStatus>> = Mutex::new(None);
+
+pub fn last_open_failure() -> Option<NativeStatus> {
+    *LAST_OPEN_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_open_failure(status: NativeStatus) {
+    *LAST_OPEN_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
 }
 
 #[repr(C)]
@@ -349,7 +367,10 @@ impl Encoder {
                 &mut result,
             )
         };
-        let native = NonNull::new(raw).ok_or(result_code(result))?;
+        let Some(native) = NonNull::new(raw) else {
+            record_open_failure(status);
+            return Err(result_code(result));
+        };
         let mut encoder = Self {
             native,
             framer: OutputFramer::new(codec),

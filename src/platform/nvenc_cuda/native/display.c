@@ -86,6 +86,7 @@ static int describe_display(const struct am_egl_api *egl, EGLDisplay display,
     description->native_fence_sync = has_token(extensions, "EGL_ANDROID_native_fence_sync") &&
                                      egl->create_sync != NULL && egl->destroy_sync != NULL;
     description->wait_sync = has_token(extensions, "EGL_KHR_wait_sync") && egl->wait_sync != NULL;
+    description->no_config_context = has_token(extensions, "EGL_KHR_no_config_context");
     return 1;
 }
 

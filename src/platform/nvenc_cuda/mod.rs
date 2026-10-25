@@ -34,7 +34,7 @@ mod gpu_tests;
 use crate::model::{EncoderDescription, EncoderIdentity};
 
 #[cfg(amaterasu_nvenc_cuda)]
-pub use runtime::Encoder;
+pub use runtime::{Encoder, NativeStatus, last_open_failure};
 
 /// True for a published NVENC/CUDA identity: a known codec clsid located by
 /// PCI bus id. Open locates that device again before touching it.

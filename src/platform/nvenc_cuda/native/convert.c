@@ -99,13 +99,23 @@ static int create_context(struct am_converter *converter, struct am_nvcuda_statu
         am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
         return AM_NVCUDA_CONVERTER_UNAVAILABLE;
     }
-    const EGLint config_attributes[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
-    EGLConfig config = NULL;
-    EGLint config_count = 0;
-    if (!egl->choose_config(display, config_attributes, &config, 1, &config_count) ||
-        config_count < 1) {
-        am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
-        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    /* The converter only renders into textures, so it needs no surface. NVIDIA's
+     * device platform exposes no window-capable configs, and eglChooseConfig
+     * defaults EGL_SURFACE_TYPE to EGL_WINDOW_BIT, so either create the context
+     * without a config or ask for one with any surface type. */
+    EGLConfig config = EGL_NO_CONFIG_KHR;
+    if (!converter->display->no_config_context) {
+        const EGLint config_attributes[] = {
+            EGL_SURFACE_TYPE, EGL_DONT_CARE,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_NONE,
+        };
+        EGLint config_count = 0;
+        if (!egl->choose_config(display, config_attributes, &config, 1, &config_count) ||
+            config_count < 1) {
+            am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
+            return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+        }
     }
     const EGLint context_attributes[] = {
         EGL_CONTEXT_MAJOR_VERSION, 3,

@@ -120,6 +120,8 @@ struct am_egl_display {
     int dmabuf_modifiers;
     int native_fence_sync;
     int wait_sync;
+    /* EGL_KHR_no_config_context: offscreen contexts need no EGLConfig. */
+    int no_config_context;
 };
 
 int am_egl_display_for_device(const struct am_driver *driver, CUdevice device,
