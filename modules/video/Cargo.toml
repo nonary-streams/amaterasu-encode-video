@@ -1,0 +1,20 @@
+[package]
+name = "amaterasu-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[features]
+linux-ffmpeg-convert = []
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+[lints]
+workspace = true

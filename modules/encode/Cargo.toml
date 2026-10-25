@@ -1,0 +1,42 @@
+[package]
+name = "amaterasu-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# x264 is GPL-2.0-or-later or commercially licensed. Distribution is explicit.
+software-x264 = ["dep:libloading"]
+# Explicit Linux FFmpeg/NVIDIA hardware path; runtime discovery still requires
+# a successful encoder open before it is offered to a stream.
+linux-ffmpeg-nvenc = []
+# Explicit Linux FFmpeg/VA-API hardware path; runtime discovery requires a
+# successful encoder/device probe before it can be offered to a stream.
+linux-ffmpeg-vaapi = []
+# Native NVENC (H.264, HEVC, AV1) on a CUDA context with GPU RGB conversion
+# and DMA-BUF import. Needs nv-codec-headers plus EGL/GL/GBM headers at build
+# time; libcuda, libnvidia-encode and libEGL are loaded at run time.
+linux-nvenc-cuda = []
+# Software HEVC is opt-in and requires matching target x265 headers/runtime.
+linux-x265-hevc = []
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+amaterasu-abi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libloading = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Ole"] }
+
+[lints]
+workspace = true
