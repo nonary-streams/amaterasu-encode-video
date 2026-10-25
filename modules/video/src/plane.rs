@@ -443,6 +443,9 @@ unsafe fn submit_frame(
         submission.status = STATUS_INVALID_ARGUMENT;
         return STATUS_OK;
     }
+    // The repeat source is the capture provider's unmodified frame. Caching a
+    // processor result would apply non-idempotent transforms again on repeat.
+    let source_frame = *frame;
     let before_owned = match process_cpu_stage(submission.processor, PROCESS_BEFORE_FRAME, frame) {
         Ok(FrameProcessOutcome::Pass) => None,
         Ok(FrameProcessOutcome::Drop) => {
@@ -555,6 +558,26 @@ unsafe fn submit_frame(
             timestamp_us: submission.timestamp_us,
             sequence: submission.sequence,
         });
+        if submission.processor.is_some() {
+            // SAFETY: the provider keeps the validated source alive until this
+            // callback returns. Repeats rerun both stages from these raw pixels.
+            if let Ok(bytes) = unsafe { source_frame.bytes() } {
+                let started = Instant::now();
+                let mut owned = Vec::new();
+                if owned.try_reserve_exact(bytes.len()).is_ok() {
+                    owned.extend_from_slice(bytes);
+                    submission.owned_frame = Some(OwnedFrame {
+                        width: source_frame.width,
+                        height: source_frame.height,
+                        format: source_frame.format,
+                        stride: source_frame.stride,
+                        bytes: owned,
+                    });
+                }
+                submission.frame_copy_us = elapsed_micros(started);
+            }
+            return STATUS_OK;
+        }
         if let Some(frame) = after_owned {
             submission.owned_frame = Some(owned_processor_frame(frame));
             return STATUS_OK;
@@ -1040,6 +1063,35 @@ fn repeat(
     };
     let before_view = before_owned.as_ref().map(OwnedCpuFrame::borrowed);
     let frame = before_view.as_ref().unwrap_or(&copied_frame);
+    let resized =
+        if frame.width == input.configuration.width && frame.height == input.configuration.height {
+            None
+        } else if input.provider == CaptureProvider::Pipewire {
+            // SAFETY: repeat pixels are owned for this entire synchronous call.
+            let bytes = unsafe { frame.bytes() }.map_err(|_| "frame_rejected")?;
+            Some(
+                resize::fit_bgra(
+                    frame,
+                    bytes,
+                    input.configuration.width,
+                    input.configuration.height,
+                )
+                .map_err(|_| "frame_rejected")?,
+            )
+        } else {
+            return Err("frame_rejected");
+        };
+    let resized_view = resized.as_ref().map(|frame| CpuFrame {
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        stride: frame.stride,
+        data: frame.bytes.as_ptr(),
+        len: frame.bytes.len(),
+        timestamp_us: input.timestamp_us,
+        sequence: input.sequence,
+    });
+    let frame = resized_view.as_ref().unwrap_or(frame);
     let after_owned = match process_cpu_stage(processor, PROCESS_BEFORE_ENCODE, frame)? {
         FrameProcessOutcome::Pass => None,
         FrameProcessOutcome::Drop => {
@@ -1496,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_processor_transforms_before_encoder_submit_and_retains_owned_repeat_pixels() {
+    fn selected_processor_transforms_each_frame_once_from_owned_raw_repeat_pixels() {
         let mut observed = SubmittedFrames::default();
         let api = EncoderApi {
             base: NativeInterface {
@@ -1558,7 +1610,44 @@ mod tests {
         assert_eq!((observed.0[0].0, observed.0[0].1), (3, 12));
         assert_eq!(observed.0[0].2[0], 4);
         source.fill(0);
-        assert_eq!(submission.owned_frame.as_ref().unwrap().bytes[0], 4);
+        let cached = submission.owned_frame.as_ref().unwrap();
+        assert_eq!(cached.bytes[0], 1);
+        let input = Pump {
+            video: 1,
+            provider: CaptureProvider::Dxgi,
+            frame_path: FramePath::Cpu,
+            capture: 1,
+            encoder: 2,
+            configuration: &configuration,
+            capture_due: false,
+            constant_rate: false,
+            repeat_due: true,
+            repeat_frame: Some(cached),
+            timestamp_us: 21,
+            sequence: 4,
+            force_idr: false,
+        };
+        for _ in 0..2 {
+            assert!(
+                repeat(&api, cached, &input, Some(&processor))
+                    .unwrap()
+                    .submitted
+            );
+        }
+        assert_eq!(observed.0.len(), 3);
+        assert_eq!(observed.0[1].2[0], 4);
+        assert_eq!(observed.0[2].2[0], 4);
+        assert_eq!(
+            processor.stages.borrow().as_slice(),
+            &[
+                PROCESS_BEFORE_FRAME,
+                PROCESS_BEFORE_ENCODE,
+                PROCESS_BEFORE_FRAME,
+                PROCESS_BEFORE_ENCODE,
+                PROCESS_BEFORE_FRAME,
+                PROCESS_BEFORE_ENCODE,
+            ]
+        );
     }
 
     #[test]
@@ -1966,10 +2055,32 @@ mod tests {
         );
         assert_eq!(processor.widths.borrow().as_slice(), &[32, 16]);
         assert_eq!(observed.0.len(), 2);
-        assert_eq!(
-            submission.owned_frame.as_ref().unwrap().bytes,
-            observed.0[1].2
+        let cached = submission.owned_frame.as_ref().unwrap();
+        assert_eq!((cached.width, cached.height), (32, 32));
+        assert_eq!(cached.bytes, vec![0x6b; 32 * 32 * 4]);
+        let input = Pump {
+            video: 1,
+            provider: CaptureProvider::Pipewire,
+            frame_path: FramePath::Cpu,
+            capture: 1,
+            encoder: 2,
+            configuration: &configuration,
+            capture_due: false,
+            constant_rate: false,
+            repeat_due: true,
+            repeat_frame: Some(cached),
+            timestamp_us: 21,
+            sequence: 4,
+            force_idr: false,
+        };
+        pixels.fill(0);
+        assert!(
+            repeat(&api, cached, &input, Some(&processor))
+                .unwrap()
+                .submitted
         );
+        assert_eq!(processor.widths.borrow().as_slice(), &[32, 16, 32, 16]);
+        assert_eq!(observed.0[2].2, observed.0[1].2);
     }
 
     #[test]

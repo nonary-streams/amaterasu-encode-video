@@ -127,9 +127,12 @@ stage before optional built-in resize, normalizes to the stream timestamp and
 sequence, then invokes `BEFORE_ENCODE` before `EncoderApi.submit`. Either stage
 may pass, drop that input, or supply one bounded copied CPU replacement with
 identical shape and metadata. Only an accepted encoder submit updates the
-repeat cache, which owns the exact processed pixels; busy or dropped submits
-leave that cache untouched. Repeats run both stages again on a new timestamp
-without modifying the cached source. `AFTER_ENCODE` observes a non-EOS encoded
+repeat cache. With a selected processor it owns the original captured CPU
+pixels, so each repeat runs both stages once from the same unmodified source,
+including resize between stages. Without a processor it retains the accepted
+encoder input as before. Busy or dropped submits leave the cache untouched.
+Repeats use a new timestamp without modifying that cached source.
+`AFTER_ENCODE` observes a non-EOS encoded
 packet before video takes its bounded queue lock; v1 cannot replace or drop
 packet bytes. Backpressure can cause the encoder to offer the same packet
 again, so the processor may observe it more than once. Failed, malformed or
@@ -484,8 +487,8 @@ hardware keyframe behavior still requires qualification.
 `minimum_fps_target` defaults to 20 and accepts finite values from 0 through
 1000, including fractional targets. Zero resolves to the negotiated capture FPS.
 Video submits fresh frames immediately and, while capture is idle, makes at most
-one repeat attempt per module tick using an owned copy of the last frame accepted
-by the encoder. The repeat deadline is independent of capture polling, so a
+one repeat attempt per module tick using an owned source for the last accepted
+frame. The repeat deadline is independent of capture polling, so a
 target above negotiated FPS can receive repeats on intervening ticks when the
 host tick rate allows it. A fresh accepted capture suppresses a repeat in the
 same tick. Sequence and timestamp values are monotonic and are committed only
