@@ -225,7 +225,7 @@ impl NativePlane {
     }
 }
 
-/// Bind each signed settings slot to exactly one service. Only Vkms is optional;
+/// Bind each host-configured slot to exactly one service. Only Vkms is optional;
 /// an explicitly replaced X11 slot never retries the built-in provider.
 type CaptureBindings<T> = (
     BTreeMap<CaptureProvider, T>,

@@ -25,7 +25,7 @@ there are no synthetic frames. Linux H.264 requires a registered real backend.
 
 ### Signed X11 capture service replacement
 
-The signed video module settings may set `"x11_capture_service":
+Trusted host-owned video module settings may set `"x11_capture_service":
 "example.capture-test/1"` with `"x11"` in `capture_providers`. Without this
 field, X11 still binds `amaterasu.capture-x11/1`. The external service name must
 be a bounded lower-case namespace ending in `/1`; built-in `amaterasu.*`
@@ -35,8 +35,11 @@ an override for every capture provider. There is no fallback to the built-in
 X11 service if its explicitly selected replacement cannot bind.
 
 The signed package must include the provider component and its dependency
-before video, grant that provider `native_provide` for this exact service, and
-grant video both `call` and `native_use` for the same service. The external
+before video, request that provider's `native_provide` for this exact service,
+and request video's `call` and `native_use` for the same service. The host-owned
+bootstrap policy must also allow these exact grants; runtime uses their
+intersection. Changing the host-owned service selection among already granted
+services does not change the signed package bytes. The external
 module must implement the X11-slot control protocol (`enumerate`, `open`,
 `lookup`, `close`) as well as the native `CaptureApi` table: both paths route to
 the same exact service throughout teardown. The runtime rejects missing or
@@ -50,10 +53,10 @@ by the default LinuxSession profile.
 
 ## Optional video lifecycle metadata observations
 
-The signed video settings may opt in with `"capture_observation":true` for
+Trusted host-owned video settings may opt in with `"capture_observation":true` for
 capture facts and `"frame_observation":true` for accepted frame/encode facts;
-both default to false. The signed runtime policy must also grant video
-`publish` on the exact corresponding topics
+both default to false. The signed component grant request and trusted host
+policy must also allow video `publish` on the exact corresponding topics
 `amaterasu.video.capture-observation/1` and
 `amaterasu.video.frame-observation/1`. Without a grant the first rejected
 publication disables only that source for this module instance. No default

@@ -102,8 +102,8 @@ pub struct Settings {
     pub frame_observation: bool,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
-    /// Exact X11-slot replacement service from signed video package settings.
-    /// The runtime still requires an exact native-use grant and compatible ABI.
+    /// Exact X11-slot replacement from trusted host-owned module settings.
+    /// Native-use/call grants remain bounded by the signed component request.
     #[serde(default)]
     pub x11_capture_service: Option<String>,
     #[serde(default = "default_drain_timeout")]

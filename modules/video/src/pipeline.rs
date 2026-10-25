@@ -59,7 +59,7 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
-    /// Exact signed X11 service used by both control RPC and native pixels.
+    /// Exact host-configured X11 service used by control RPC and native pixels.
     x11_capture_service: Option<String>,
     frame_path: FramePath,
     owned_capture: owned_capture::OwnedOutputCapture,
