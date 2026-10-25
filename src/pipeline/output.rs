@@ -102,6 +102,7 @@ pub(super) fn tick(
     let input = Pump {
         video: id,
         provider: stream.provider,
+        frame_path: stream.frame_path,
         capture: 0,
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,

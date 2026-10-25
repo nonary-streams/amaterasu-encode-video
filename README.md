@@ -2,29 +2,186 @@
 
 `amaterasu_video` provides control and native service `amaterasu.video/1`. Product
 coordination stays in this independently built library. It opens an allowlisted capture
-stream and explicitly selected native encoder session asynchronously, then moves borrowed
+stream and H.264 encoder session asynchronously, then moves borrowed
 CPU frames directly into the encoder's copying submit API. Encoded packets reach
 consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 
-Settings default to:
+Linux settings default to:
 
 ```json
-{"enabled":false,"capture_providers":["dxgi"],"drain_timeout_ms":5000}
+{"enabled":false,"capture_providers":["pipewire","vkms"],"drain_timeout_ms":5000}
 ```
 
-Capture providers are finite identifiers: `dxgi` maps to
-`amaterasu.capture-dxgi/1`; `wgc` maps to `amaterasu.capture-wgc/1`. An empty
-allowlist, unknown identifier, or drain timeout outside 100–30000 ms is rejected.
+Linux defaults to the finite `pipewire` provider,
+`amaterasu.capture-pipewire/1`, plus the optional `vkms` provider,
+`amaterasu.capture-vkms/1` (see "Owned virtual outputs and DMA-BUF frames");
+other platforms retain the `dxgi` default.
+`wgc` maps to `amaterasu.capture-wgc/1`. An empty allowlist, unknown
+identifier, or drain timeout outside 100–30000 ms is rejected.
 Enabled startup binds every configured native capture provider and the encoder.
 Disabled startup registers services but binds no lower interface and opens no
-devices. Unsupported capture hardware/platforms fail through real provider
-responses. Auto encoder selection may use actual available x264; capture frames
-are never replaced with generated output.
+devices. Unsupported hardware/platforms fail through real provider responses;
+there are no synthetic frames. Linux H.264 requires a registered real backend.
+The optional x264 fallback requires the `software-x264` feature, x264 development
+headers, and a matching runtime library. If no H.264 backend is available, Open
+fails with `h264_encoder_unavailable` after resource cleanup.
+
+For `encoder: "auto"`, video can select a registered NVENC or VAAPI H.264
+backend before x264. A confirmed hardware Open failure can retry x264 once with
+a distinct operation ID. If an automatically selected hardware encoder later
+returns a terminal `encoder_failed` or `frame_rejected` during streaming, video
+closes that encoder session and can restart once with x264 while retaining the
+capture stream and output queue. The replacement's first input is forced to a
+keyframe. Explicit encoder identities and registry indices do not fall back;
+uncertain requests and failures after the single retry clean up the stream.
+
+## Encoder selection and configuration
+
+The `encoder` selector accepts a complete enumeration identity, an unsigned
+registry ordinal, `"auto"`, or `"software"`. Selection preserves complete
+identities, including the hardware URL. Auto ranks supported hardware first,
+preferring DMA-BUF input for an owned output whose capture interface is ready,
+then the registered software encoder for the selected codec. Each candidate is
+probed with the frozen configuration before capture allocation. Only a correlated,
+settled unusable reply permits the next probe; cancellation, an uncertain request,
+a malformed reply, and failed result release prevent capture allocation. All
+selection work shares a five-second deadline. Status reports the requested
+selection, the resolved identity, probe attempts, and the last negative reason.
+Explicit identities and ordinals never substitute another encoder; `"software"`
+restricts selection to registered software and retains x264 unavailable reasons.
+
+`configuration.video_stream_format` carries the negotiated codec, bit depth,
+and dynamic range. Legacy `configuration.codec` remains accepted; video
+synchronizes both representations before selection and rejects contradictory
+non-default codecs. Current backends accept only 8-bit SDR. HEVC and AV1 remain
+Linux-only. Software preset and tune strings pass through unchanged, with limits
+of 128 and 256 bytes and no control characters. Slice count, minimum threads,
+QP, and NVENC controls remain part of the frozen configuration; each encoder
+validates and applies the controls it supports. Current encoders reject any
+non-default nested `nvenc_settings` with `nvenc_settings_unsupported` before
+capture allocation; preset, multipass and other scoped policy fields remain
+persisted but are not implemented in these backends. Default policy retains the
+existing native P1 encoding and disabled native multipass behavior.
+
+Explicit `x11` and `kms` providers require their signed allowlist entries and
+validate the exact selected output against a fresh enumeration before opening.
+They never substitute another provider. Physical KMS capture remains a separate
+path from owned-output VKMS DMA-BUF capture.
+
+## Owned virtual outputs and DMA-BUF frames
+
+An Open with provider `pipewire` (explicit or default) for an owned KWin output
+`kwin:Virtual-N` tries providers in the order `vkms`, then `pipewire`. N is the
+DRM connector type id: any positive id without leading zeros, so connectors
+renamed `Virtual-9`..`Virtual-16` by a driver reload are accepted. Such outputs
+never need a portal selection.
+
+Video chooses `vkms` only when all of these hold, checked once before the first
+capture Open:
+
+- `vkms` is in `capture_providers` and its native binding succeeded. That binding
+  is optional: a failed startup bind leaves the provider unbound for this module
+  instance instead of failing startup;
+- the vkms table advertises capture minor 4 and is at least
+  `CAPTURE_API_V1_4_SIZE` bytes, and the encoder table advertises minor 1 and is
+  at least `ENCODER_API_V1_1_SIZE` bytes. Video binds both at v1.0 and reads a
+  tail only after both checks pass;
+- the selected encoder's enumerate description lists `"dmabuf"` in its optional
+  `inputs` array (absent or malformed means CPU input only). For `encoder: "auto"`
+  on such a stream, a supported hardware encoder that accepts DMA-BUF is ranked
+  ahead of other hardware. An explicit encoder identity skips enumeration, so its
+  inputs are unknown and the stream keeps PipeWire.
+
+On the DMA-BUF path each due capture calls `read_dmabuf_frame` and submits the
+borrowed frame through `submit_dmabuf` inside the capture callback, carrying video's
+stream timestamp, sequence and force-IDR flag. Video performs no CPU resize,
+conversion or copy for that stream, and the frame must already match the stream
+size. Encoder `MEDIA_BUSY` drops the presentation like a busy CPU frame. Repeats
+re-read the latest presentation, which the provider may satisfy with cached reuse.
+Status counts delivered presentations in `dmabuf_frames.fresh` and
+`dmabuf_frames.reused`.
+
+Pacing on the DMA-BUF path depends on the vkms table. A table that advertises
+capture minor 5 and is at least `CAPTURE_API_V1_5_SIZE` bytes is paced by
+presentations; a smaller or older table keeps the PipeWire periodic 1/fps timer.
+Presentation pacing works as follows on every module tick:
+
+- video calls the non-blocking `latest_presentation`. A sequence newer than the
+  last delivered presentation is read and submitted on that tick when the
+  frame-rate cap admits it, without waiting for a 1/fps boundary;
+- the cap keeps submits on a 1/fps grid of the negotiated client rate, so the
+  sustained rate never exceeds it. Each submit claims the next grid slot, which
+  absorbs host-tick jitter without drifting. A submit late by more than half an
+  interval admits the next one no sooner than half an interval later, and a gap
+  of a whole interval past a slot re-anchors the grid instead of catching up;
+- presentations that arrive while the cap holds coalesce: only the newest is
+  read when the cap reopens, and each superseded one counts as coalesced;
+- with nothing new, only the existing keepalive rule submits: a cached-reuse
+  repeat at the `minimum_fps_target` deadline (zero means the negotiated FPS),
+  also bounded by the cap. A pending `force_idr` rides on the next fresh push or,
+  without one, on a repeat as soon as the cap admits it;
+- until the first frame is accepted, the 1/fps timer also probes the provider,
+  so a source that has not presented yet still produces a first frame;
+- encoder backpressure drops a delivered presentation like a busy CPU frame; the
+  next presentation or keepalive repeat replaces it;
+- fresh pushes are stamped from the presentation timestamp, mapped onto the
+  stream clock, so variable (VRR) cadence survives. A provider timestamp of
+  zero, one that regresses, one more than a frame ahead of its observation, or
+  one more than 200 ms behind re-anchors the mapping. Output timestamps stay
+  strictly monotonic; repeats use the stream clock;
+- `MEDIA_UNSUPPORTED` from the query returns the stream to timer pacing, and any
+  other query failure is a capture failure.
+
+Status reports `pacing` (`presentation` or `timer`, for every stream) and
+`presentation_pacing` with `fresh_pushes`, `repeats` and `coalesced` counters.
+CPU (PipeWire, WGC, DXGI) streams never query presentations and keep their
+existing pacing.
+
+Fallbacks never fail a stream that PipeWire can still serve:
+
+- when a condition above fails, the stream opens PipeWire and reports the reason
+  (`capture_vkms_not_configured`, `capture_provider_unbound`,
+  `capture_dmabuf_interface_unavailable`, `encoder_dmabuf_interface_unavailable`,
+  `encoder_dmabuf_input_unavailable` or `encoder_inputs_unknown`);
+- a definite vkms refusal, either an admission error or an `ok:false` Open reply
+  such as `frame_helper_unavailable`, `permission_denied` or `driver_unavailable`,
+  reopens the same output through PipeWire with a fresh operation ID and records
+  the provider's code. Lost or uncertain vkms replies keep the normal settle and
+  cleanup path, because they may have opened a stream;
+- `MEDIA_UNSUPPORTED` from `read_dmabuf_frame` or `submit_dmabuf`, or a frame
+  size mismatch, switches a running stream to CPU capture once: video closes the
+  vkms capture (stage `cpu-fallback-close-capture`), opens PipeWire for the same
+  output, keeps the encoder session and packet queue, and forces a keyframe on
+  the first CPU frame.
+
+Status for these streams adds `frame_path` (`dmabuf` or `cpu`, reported for every
+stream), `vkms_fallback_reason` and `dmabuf_frames`; `capture_provider` names the
+provider that actually opened. An explicit `capture_provider: "vkms"` is pinned:
+an unmet condition or a runtime `MEDIA_UNSUPPORTED` fails the stream with that
+reason instead of falling back.
+
+Packaging must add `"vkms"` to `capture_providers` and grant video `call` and
+`native_use` for `amaterasu.capture-vkms/1`, with the vkms module started before
+video so the startup binding can succeed. Without these, owned outputs keep
+using PipeWire and report the reason. Real KWin/vkms and NVENC DMA-BUF import
+remain unqualified on hardware.
+
+Configuration `codec` may be `h264`, `hevc` or `av1` on Linux. AV1 requires a
+registered hardware encoder such as `amaterasu.hardware.nvenc-cuda.av1`; there is
+no software AV1 encoder and no x264 fallback, so a missing backend fails Open with
+`av1_encoder_unavailable`. Native NVENC identities
+`amaterasu.hardware.nvenc-cuda.<codec>` are auto-selected only for their own
+codec and supported SDR color modes. H.264 accepts at most one reference frame;
+HEVC and AV1 accept the backend-supported multiple-reference configuration.
 
 ## API
 
 ```json
-{"action":"open","output":"<capture enumerate output id>","encoder":{"clsid":"<encoder enumerate identity>","hardware_url":null,"friendly_name":"<encoder enumerate name>"},"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
+{"action":"select_portal_source","source_type":"monitor","operation_id":"desktop-1"}
+{"action":"poll_portal_selection","operation_id":"desktop-1"}
+{"action":"cancel_portal_selection","operation_id":"desktop-1"}
+{"action":"open","capture_provider":"pipewire","output":"portal-selected-session-source","encoder":{"clsid":"amaterasu.software.x264","friendly_name":"x264 software H.264","hardware_url":null},"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000,"color_mode":"bt709_limited"}}
+{"action":"open","output":"<capture enumerate output id>","encoder":0,"minimum_fps_target":20,"configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}}
 {"action":"status"}
 {"action":"status","stream":1}
 {"action":"force_idr","stream":1}
@@ -32,63 +189,36 @@ are never replaced with generated output.
 {"action":"close","stream":1}
 ```
 
-Encoder selection passes the complete enumeration identity unchanged.
-The `encoder` selector also accepts a legacy unsigned ordinal, `"auto"`, or
-`"software"`. Video resolves these selectors against one strict H.264 encoder
-enumeration (at most 64 entries) before opening capture. It freezes the selected
-full identity for encoder Open and reports both `requested_encoder` and the
-resolved `encoder`; enumeration reorder after selection cannot change the
-allocated encoder. Full identity requests retain their existing wire shape and
-skip ordinal resolution. Invalid, disabled, or unavailable selections fail before
-capture allocation. The child enumeration has a five-second deadline, follows
-parent cancellation, and releases its result before allocation.
+PipeWire sources retain the compositor's negotiated image size. When it differs
+from the stream size, video fits the complete BGRA image with bilinear resizing
+and centered black bars when needed to preserve its aspect ratio. This does not
+change monitor positions, resolution or scaling, and does not grant absolute
+pointer mapping without authoritative capture geometry.
 
-`"auto"` probes each registered H.264 hardware candidate in enumeration order,
-then the actual available x264 backend. Every probe uses the exact frozen
-configuration and complete identity, submits owned synthetic NV12 without a
-capture provider, and requires a real Annex B IDR before draining and closing.
-A definite unusable result permits the next candidate only after teardown and
-child-result release. Unknown transport outcomes, malformed/mismatched replies,
-failed cleanup, cancellation and deadline abort selection. The enumeration and
-all probes share a five-second admission budget; native vendor calls cannot be
-forcibly interrupted and retain their synchronous worker-join ownership.
-Capture opens once after a usable candidate is frozen. The final normal encoder
-Open can still fail after a device change; it does not select another encoder
-after capture allocation. Explicit identities, ordinals and `"software"` never
-substitute another backend. `"software"`
-requires the real x264 backend and preserves explicit unavailable reasons for
-disabled builds, missing headers, and missing/incompatible runtime libraries.
-Synthetic stream-source fixtures continue accepting legacy selectors and do not
-advertise real codec enumeration or software availability.
+The Linux `linux-ffmpeg-convert` feature moves default BT.709-limited portal
+resizing and color conversion to a joined worker using system libswscale.
+Only one frame may be outstanding, so slow conversion cannot build an input-loop
+stall or an unbounded queue. The worker returns fitted NV12 pixels, preserving the
+encoder's existing range contract. Other color modes retain the BGRA path.
+The video artifact embeds its required swscale/avutil ABI majors; Linux packaging
+and user-service preflight check those exact system loader dependencies.
 
-Status reports bounded `encoder_probe_attempts` and the last negative
-`encoder_probe_reason`. Local factory tests exercise a registered fault candidate
-followed by genuine x264 output; Windows hardware activation and vendor return
-latency remain separate qualification gates. This follows the pinned reference's
-synthetic viability probing, while preserving Amaterasu's stricter explicit
-selection behavior and H.264-only capabilities.
-
-`configuration.sw_preset` and `configuration.sw_tune` pass unchanged to the encoder
-service and stream status, with limits of 128 and 256 bytes and no control
-characters. The client-negotiated `configuration.slices_per_frame` and signed
-32-bit `configuration.min_threads` resolve to
-`max(slices_per_frame, min_threads)` for software x264, subject to frame-size
-and backend limits. QP defaults to 28 and
-passes through this snapshot, but x264 ABR ignores it and Amaterasu has no VAAPI
-constant-QP consumer yet. Omitted defaults preserve the prior wire shape. The
-opt-in x264 provider resolves its `superfast` and `zerolatency` defaults; hardware
-leaves these software options unapplied. Availability, build prerequisites, and
-licensing are documented in [the encoder README](../encode/README.md#software-x264-selection-and-distribution).
+The optional configuration.color_mode selects the SDR matrix/range used for
+BGRA conversion and encoder signaling: bt601_limited, bt601_full,
+bt709_limited, or bt709_full. It defaults to bt709_limited. Windows continues to
+support only that default; non-default color modes are rejected.
 
 Open optionally accepts the canonical `"capture"` mode `"ddx"`, `"wgc"`,
 `"wgcc"`, `"auto"`, or `""`. Explicit `ddx`, `wgc`, and `wgcc` modes are pinned
 to their provider. Empty and `auto` preserve the bootstrap provider selected by
-`capture_provider` as the first choice, defaulting to `dxgi`, and may retry once
+`capture_provider` as the first choice, defaulting to `pipewire` on Linux and
+`dxgi` elsewhere, and may retry once
 with the other provider only after a clean `unsupported_platform` provider reply
 or clean `unavailable` admission rejection. The alternate must be in the startup
 allowlist. Video translates provider-specific output IDs through their shared
 Windows device name and opens the alternate only when its enumeration has one
 attached exact match; missing or ambiguous matches retain the original failure.
+PipeWire has no alternate provider and never falls back to KMS.
 For paged enumeration, video follows every `next_offset` before opening the
 alternate and checks that each page reports the same full-list
 `enumeration_id`. A malformed cursor, changed revision, or duplicate match
@@ -105,6 +235,22 @@ each scheduled read when no new frame is ready. Video's configured FPS sets the
 read cadence; the WGC module does not busy-wait or create a timer. The default is
 event-driven WGC delivery. Product-level `capture = wgcc` routing through NVHTTP,
 RTSP, and stream-session is still pending.
+
+Linux PipeWire capture requires `pipewire` in the startup provider allowlist.
+An authenticated management client calls `/v1/capture/select_portal_source`
+with `source_type` `monitor` or `window`, then polls
+`/v1/capture/poll_portal_selection` using the same caller-owned operation ID until the
+selection state is `ready`. Open the profile's
+`portal-selected-session-source` sentinel; video resolves it to the current
+management-selected output. Portal control operation IDs remain scoped to the
+principal that started them, while the one current selected output can be used by
+an authorized streaming caller without passing the operation ID to that caller.
+Direct opaque output IDs are accepted only when they match the current ready
+selection. Startup and Open never launch a chooser. Cancel with
+`/v1/capture/cancel_portal_selection`. Public selection replies omit PipeWire node handles
+and replace the provider's internal operation ID with the caller's operation ID.
+Permission denial, cancellation, provider unavailability, and revocation fail
+closed; there is no KMS or synthetic fallback.
 
 Video Open accepts `"wgc_pacing_smoothing"`, defaulting to `true`, to snapshot
 the global Windows policy. On WGC streams, a fresh frame after a missed capture
@@ -263,13 +409,22 @@ from the encoder sink. A full queue returns `MEDIA_BUSY` without consuming the
 encoder packet. Consumer sink rejection likewise retains the exact queued packet.
 The shared queue uses nonblocking native lock acquisition; contended receive returns
 `MEDIA_BUSY`. Callbacks must be bounded and must not retain borrowed bytes. Reentry
-into receive is busy while the queue callback runs. No video-owned worker threads
-or copied raw-frame queues exist.
+into receive is busy while the queue callback runs. Video owns no frame-processing
+thread or raw-frame queue. The Linux software-x264 encoder has a separate bounded
+worker queue; accepted frames are copied before the capture callback returns.
+Stream status exposes numeric stage timing counters for capture callback/frame
+arrival, encoder API submission, retained-frame copy, encoder polling, and packet
+queue admission. They contain no pixel data and update in status snapshots rather
+than logging each frame. Encode status separately reports BGRA conversion and
+actual worker-side x264 submit duration, allowing queue delay and encoder work to
+be distinguished from video tick time.
 
 ## Authority, cancellation and lifecycle
 
 Video needs `provide` and `native_provide` for `amaterasu.video/1`, `call` and
-`native_use` for each configured capture service and `amaterasu.encode/1`, and
+`native_use` for each configured capture service (on Linux,
+`amaterasu.capture-pipewire/1` and `amaterasu.capture-vkms/1`) and
+`amaterasu.encode/1`, and
 signed startup dependencies on those providers. Initiating control consumers currently
 need call grants for video, the selected capture service and the encoder because parent delegation
 intersects initiating authority. Lower resources are owned by the video runtime

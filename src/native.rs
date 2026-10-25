@@ -1,5 +1,5 @@
 use crate::queue::Queues;
-use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, VideoApi};
+use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, VideoApiV1_1};
 use amaterasu_module_sdk::abi::*;
 use std::{
     ffi::c_void,
@@ -27,7 +27,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: VideoApi,
+    api: VideoApiV1_1,
     queues: Arc<Mutex<Queues>>,
     caller: String,
 }
@@ -49,8 +49,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 0
-            || query.min_size as usize > size_of::<VideoApi>()
+            || query.min_minor > 1
+            || query.min_size as usize > size_of::<VideoApiV1_1>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -64,13 +64,18 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: VideoApi {
+            api: VideoApiV1_1 {
                 base: NativeInterface {
-                    header: AbiHeader::of::<VideoApi>(),
+                    header: AbiHeader {
+                        size: size_of::<VideoApiV1_1>() as u32,
+                        major: 1,
+                        minor: 1,
+                    },
                     context: std::ptr::null_mut(),
                     release: Some(release),
                 },
                 receive,
+                geometry,
             },
             queues: factory.queues.clone(),
             caller,
@@ -111,6 +116,35 @@ unsafe extern "C" fn receive(context: *mut c_void, stream: u64, sink: PacketSink
     })
 }
 
+unsafe extern "C" fn geometry(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut amaterasu_media::CaptureGeometry,
+) -> Status {
+    guarded(|| {
+        if context.is_null()
+            || output.is_null()
+            || !(output as usize).is_multiple_of(align_of::<amaterasu_media::CaptureGeometry>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the broker retains this binding and aligned output slot until
+        // return; copied queue metadata never borrows a capture provider.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        match queues.geometry(&binding.caller, stream) {
+            Ok(Some(geometry)) => {
+                unsafe { output.write(geometry) };
+                STATUS_OK
+            }
+            Ok(None) => MEDIA_UNSUPPORTED,
+            Err(status) => status,
+        }
+    })
+}
+
 fn guarded(operation: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
 }
@@ -118,14 +152,14 @@ fn guarded(operation: impl FnOnce() -> Status) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amaterasu_media::{CODEC_H264, EncodedPacket, MEDIA_CLOSED};
+    use amaterasu_media::{CODEC_H264, EncodedPacket, MEDIA_CLOSED, VideoApi};
     unsafe extern "C" fn accept(_: *mut c_void, _: *const EncodedPacket) -> Status {
         STATUS_OK
     }
     #[test]
     fn factory_copies_principal_and_binds_packet_ownership() {
         let queues = Arc::new(Mutex::new(Queues::default()));
-        queues.lock().unwrap().open(7, "alice");
+        queues.lock().unwrap().open(7, "alice", 0);
         let bytes = [1];
         let packet = EncodedPacket {
             codec: CODEC_H264,

@@ -1,13 +1,53 @@
 use super::*;
-use crate::model::AmdAv1LatencyMode;
+use crate::model::{AmdAv1LatencyMode, EncoderSelection};
 use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_module_sdk::EncoderIdentity;
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
+
+#[test]
+fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admission() {
+    let mut timings = StageTimings::default();
+    let accepted = Progress {
+        submitted: true,
+        owned_frame: Some(OwnedFrame {
+            width: 16,
+            height: 16,
+            format: 1,
+            stride: 64,
+            bytes: vec![0; 16],
+        }),
+        capture_callback_us: 140,
+        capture_callback_count: 1,
+        capture_frame_count: 1,
+        encoder_submit_us: 12,
+        frame_copy_us: 31,
+        encoder_poll_us: 7,
+        transport_admission_us: 4,
+        transport_admission_count: 1,
+        ..Progress::default()
+    };
+    timings.record(&accepted);
+    let pending = Progress {
+        encoder_poll_us: 2,
+        ..Progress::default()
+    };
+    timings.record(&pending);
+
+    assert_eq!(timings.capture_callback.total_us, 140);
+    assert_eq!(timings.captured_frames, 1);
+    assert_eq!(timings.encoder_submit.total_us, 12);
+    assert_eq!(timings.frame_copy.total_us, 31);
+    assert_eq!(timings.encoder_poll.calls, 2);
+    assert_eq!(timings.encoder_poll.total_us, 9);
+    assert_eq!(timings.transport_admission.total_us, 4);
+}
+
 #[derive(Default)]
 struct Runtime {
     next: u64,
     operations: BTreeMap<String, u64>,
+    failed_encoder_operations: std::collections::BTreeSet<String>,
     ended: std::collections::BTreeSet<u64>,
     cancel_failures: usize,
     release_failures: usize,
@@ -30,12 +70,14 @@ struct Runtime {
     capture_page_size: Option<usize>,
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
-    encoder_enumeration: Option<Value>,
-    hold_encoder_enumeration: bool,
-    encoder_probe_replies: BTreeMap<String, Value>,
-    hold_encoder_probes: bool,
-    lose_probe_accept: bool,
     encoder_open_error: Option<&'static str>,
+    encoder_open_error_once: Option<&'static str>,
+    encoder_close_error_once: Option<&'static str>,
+    encoder_enumeration_override: Option<Value>,
+    encoder_probe_replies: BTreeMap<String, Value>,
+    lose_probe_accept: bool,
+    hold_encoder_probes: bool,
+    hold_encoder_enumeration: bool,
 }
 
 impl Runtime {
@@ -71,24 +113,31 @@ impl Runtime {
                     return Ok(Response::error(code, ""));
                 }
                 self.next += 1;
-                self.operations.insert(operation_id, self.next);
+                self.operations.insert(operation_id.clone(), self.next);
                 if action == "open" {
                     self.open_effects += 1;
                 }
-                let result = if self.fail_encoder_cleanup
+                let result = if service == ENCODE
+                    && action == "close"
+                    && let Some(code) = self.encoder_close_error_once.take()
+                {
+                    error(code)
+                } else if self.fail_encoder_cleanup
                     && service == ENCODE
                     && matches!(action, "lookup" | "close")
                 {
                     error("hardware_error")
                 } else if service == ENCODE && action == "enumerate" {
-                    self.encoder_enumeration.clone().unwrap_or_else(|| {
-                        json!({
-                            "ok":true,"enabled":true,"encoders":[{
-                                "identity":encoder_identity(),"name":"Test NVIDIA H.264",
-                                "codec":"h264","hardware":true,"vendor_id":0x10de
-                            }]
+                    self.encoder_enumeration_override
+                        .clone()
+                        .unwrap_or_else(|| {
+                            json!({
+                                "ok":true,"enabled":true,"encoders":[{
+                                    "identity":encoder_identity(),"name":"Test NVIDIA H.264",
+                                    "codec":"h264","hardware":true,"vendor_id":0x10de
+                                }]
+                            })
                         })
-                    })
                 } else if service == ENCODE && action == "probe" {
                     self.encoder_probe_replies
                         .get(payload["encoder"]["clsid"].as_str().unwrap())
@@ -146,11 +195,51 @@ impl Runtime {
                             }
                             result
                         }
+                    } else if action == "select_source" {
+                        json!({
+                            "ok":true,"selection_state":"ready",
+                            "output":{"id":"portal-test-output","source_type":"monitor","width":1920,"height":1080,
+                                "format":"bgra8","pipewire_node":77,"geometry_supported":false}
+                        })
                     } else {
                         json!({"ok":true,"stream":41})
                     }
+                } else if service == ENCODE && action == "open" {
+                    if let Some(code) = self
+                        .encoder_open_error_once
+                        .take()
+                        .or(self.encoder_open_error)
+                    {
+                        self.failed_encoder_operations.insert(operation_id);
+                        error(code)
+                    } else {
+                        let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                        result["codec"] = payload["configuration"]
+                            .get("codec")
+                            .and_then(Value::as_str)
+                            .unwrap_or("h264")
+                            .into();
+                        if !self.omit_reference_metadata {
+                            result["max_reference_frames"] =
+                                payload["configuration"]["max_reference_frames"].clone();
+                        }
+                        result
+                    }
+                } else if service == ENCODE
+                    && action == "lookup"
+                    && payload
+                        .get("operation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|operation| self.failed_encoder_operations.contains(operation))
+                {
+                    error("not_found")
                 } else {
                     let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                    result["codec"] = payload["configuration"]
+                        .get("codec")
+                        .and_then(Value::as_str)
+                        .unwrap_or("h264")
+                        .into();
                     if !self.omit_reference_metadata {
                         result["max_reference_frames"] =
                             payload["configuration"]["max_reference_frames"].clone();
@@ -224,7 +313,8 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
     [
         CaptureProvider::Dxgi,
         CaptureProvider::Wgc,
-        CaptureProvider::PipeWire,
+        CaptureProvider::Pipewire,
+        CaptureProvider::Vkms,
         CaptureProvider::X11,
         CaptureProvider::Kms,
     ]
@@ -240,6 +330,7 @@ struct FakePlane {
     dropped: bool,
     fail: bool,
     failure_code: Option<&'static str>,
+    failure_code_once: Option<&'static str>,
     freshness_api: bool,
     capture_timestamp_api: bool,
     capture_pacing_timestamp_us: u64,
@@ -247,6 +338,18 @@ struct FakePlane {
     capture_reused: bool,
     geometry_checks: Vec<Option<CaptureGeometry>>,
     geometry_results: VecDeque<Result<GeometryProgress, &'static str>>,
+    /// Native geometry reported for owned KWin outputs.
+    owned_geometry: Option<CaptureGeometry>,
+    /// Both native tables carry the DMA-BUF tails for the vkms provider.
+    dmabuf_ready: bool,
+    /// The next DMA-BUF capture reports that this stream cannot use GPU frames.
+    dmabuf_fallback_once: Option<&'static str>,
+    frame_paths: Vec<crate::plane::FramePath>,
+    /// The vkms table carries the capture v1.5 presentation query.
+    presentation_api: bool,
+    /// Newest completed presentation; sequence zero means none yet.
+    presentation: amaterasu_media::PresentationStatus,
+    presentation_queries: usize,
 }
 
 impl Plane for FakePlane {
@@ -262,6 +365,34 @@ impl Plane for FakePlane {
             .unwrap_or(Ok(GeometryProgress::Ready))
     }
 
+    fn geometry(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<CaptureGeometry>, &'static str> {
+        Ok(self.owned_geometry)
+    }
+
+    fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
+        (!self.dmabuf_ready).then_some("capture_dmabuf_interface_unavailable")
+    }
+
+    fn latest_presentation(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<crate::plane::PresentationQuery, &'static str> {
+        use crate::plane::PresentationQuery;
+        self.presentation_queries += 1;
+        Ok(if !self.presentation_api {
+            PresentationQuery::Unavailable
+        } else if self.presentation.sequence == 0 {
+            PresentationQuery::Pending
+        } else {
+            PresentationQuery::Latest(self.presentation)
+        })
+    }
+
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         self.calls += 1;
         self.inputs.push((
@@ -273,7 +404,20 @@ impl Plane for FakePlane {
             input.sequence,
             input.timestamp_us,
         ));
-        if let Some(code) = self.failure_code {
+        self.frame_paths.push(input.frame_path);
+        let gpu = input.frame_path == crate::plane::FramePath::DmaBuf;
+        if gpu
+            && input.capture_due
+            && let Some(reason) = self.dmabuf_fallback_once.take()
+        {
+            return Ok(Progress {
+                dmabuf_fallback: Some(reason),
+                ..Progress::default()
+            });
+        }
+        if let Some(code) = self.failure_code_once.take() {
+            Err(code)
+        } else if let Some(code) = self.failure_code {
             Err(code)
         } else if self.fail {
             Err("frame_rejected")
@@ -284,7 +428,7 @@ impl Plane for FakePlane {
             let repeat_attempted = !capture_submitted
                 && !self.dropped
                 && input.repeat_due
-                && input.repeat_frame.is_some();
+                && (input.repeat_frame.is_some() || gpu);
             Ok(Progress {
                 dropped: self.dropped,
                 submitted: capture_submitted || repeat_attempted,
@@ -308,7 +452,13 @@ impl Plane for FakePlane {
                     timestamp_us: input.timestamp_us,
                     sequence: input.sequence,
                 }),
-                owned_frame: capture_submitted.then_some(OwnedFrame {
+                dmabuf_fresh: (gpu && (input.capture_due || repeat_attempted))
+                    .then_some(input.capture_due),
+                dmabuf_presentation: (gpu
+                    && (input.capture_due || repeat_attempted)
+                    && self.presentation.sequence != 0)
+                    .then_some(self.presentation.sequence),
+                owned_frame: (capture_submitted && !gpu).then_some(OwnedFrame {
                     width: input.configuration.width,
                     height: input.configuration.height,
                     format: amaterasu_media::PIXEL_BGRA8,
@@ -320,6 +470,7 @@ impl Plane for FakePlane {
                             * 4
                     ],
                 }),
+                ..Progress::default()
             })
         }
     }
@@ -350,7 +501,7 @@ fn encoder_identity() -> EncoderIdentity {
 }
 
 fn probe_reply(identity: &Value, configuration: &Value, usable: bool) -> Value {
-    json!({"ok":true,"codec":"h264","encoder":identity,"configuration":configuration,
+    json!({"ok":true,"codec":configuration.get("codec").and_then(Value::as_str).unwrap_or("h264"),"encoder":identity,"configuration":configuration,
         "usable":usable,"settled":true,
         "code":if usable { None } else { Some("encoder_unusable") },
         "reason":if usable { None } else { Some("encoder_open_failed") }})
@@ -427,33 +578,6 @@ fn capture_output(id: &str, device_name: &str) -> Value {
     })
 }
 
-fn pipewire_output(
-    id: &str,
-    width: u32,
-    height: u32,
-    source_type: &str,
-    geometry_supported: bool,
-) -> Value {
-    json!({
-        "id": id,
-        "source_type": source_type,
-        "width": width,
-        "height": height,
-        "format": "bgra8",
-        "pipewire_node": 42,
-        "geometry_supported": geometry_supported
-    })
-}
-
-fn pipewire_enumeration(output: Value) -> Value {
-    json!({
-        "ok": true,
-        "outputs": [output.clone()],
-        "enumeration_id": output["id"],
-        "geometry_supported": false
-    })
-}
-
 fn x11_output(id: &str, device_name: &str, width: u32, height: u32) -> Value {
     json!({
         "id": id,
@@ -500,16 +624,18 @@ fn open() -> Operation {
         wgc_pacing_smoothing: true,
         minimum_fps_target: 20.0,
         output: "display-1".into(),
-        encoder: amaterasu_module_sdk::EncoderSelection::Identity(encoder_identity()),
+        encoder: EncoderSelection::Identity(encoder_identity()),
         configuration: Box::new(Configuration {
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
+            slices_per_frame: 1,
+            qp: 28,
+            min_threads: 2,
             width: 1920,
             height: 1080,
             fps: 60,
             bitrate: 5_000_000,
-            slices_per_frame: 1,
-            qp: 28,
-            min_threads: 2,
+            codec: amaterasu_media::VideoCodec::H264,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             nvenc_settings: amaterasu_module_sdk::NvencSettings::default(),
             nvenc_spatial_aq: false,
@@ -586,6 +712,30 @@ fn required_reference_frame_limit_is_forwarded_and_confirmed() {
         runtime.completed[0].1["configuration"]["max_reference_frames"],
         3
     );
+}
+
+#[test]
+fn selected_color_mode_is_forwarded_to_encoder_open() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!();
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt601Limited;
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+
+    let encoder_open = runtime
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(encoder_open["configuration"]["color_mode"], "bt601_limited");
 }
 
 #[test]
@@ -1596,17 +1746,31 @@ fn encoder_cleanup_failure_still_closes_capture_and_retains_failure() {
 
 #[test]
 fn disabled_open_has_no_provider_calls() {
-    let (mut pipeline, mut runtime, mut plane) = setup();
-    pipeline.enabled = false;
-    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
-    tick(&mut pipeline, &mut runtime, &mut plane, 3);
-    assert_eq!(runtime.completed[0].1["code"], "disabled");
-    assert!(
-        !runtime
-            .commands
-            .iter()
-            .any(|command| matches!(command, Command::Request { .. }))
-    );
+    for operation in [
+        open(),
+        serde_json::from_value(json!({
+            "action":"open",
+            "output":"disabled-test-output",
+            "encoder":encoder_identity(),
+            "configuration":open_configuration()
+        }))
+        .unwrap(),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        pipeline.enabled = false;
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 3);
+        assert_eq!(runtime.completed[0].1["code"], "disabled");
+        assert!(pipeline.streams.is_empty());
+        assert!(pipeline.operations.is_empty());
+        assert!(
+            !runtime
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Request { .. }))
+        );
+        assert_eq!(plane.calls, 0);
+    }
 }
 
 #[test]
@@ -1793,145 +1957,6 @@ fn expired_dedup_cannot_replay_open_after_parent_termination() {
     assert!(runtime.ended.contains(&99));
     assert_eq!(runtime.open_effects, 1);
     assert!(pipeline.streams.is_empty());
-}
-
-#[test]
-fn pipewire_open_reenumerates_one_current_source_and_keeps_its_id_private() {
-    let output_id = "portal-private-output-id";
-    let (mut pipeline, mut runtime, mut plane) =
-        setup_with_providers([CaptureProvider::PipeWire].into());
-    runtime.capture_enumeration_override = Some(pipewire_enumeration(pipewire_output(
-        output_id, 1920, 1080, "monitor", false,
-    )));
-    pipeline.handle(
-        "alice",
-        99,
-        canonical_open(
-            "auto",
-            CaptureProvider::PipeWire,
-            "client-output-placeholder",
-        ),
-        &mut |command| runtime.send(command),
-    );
-    tick(&mut pipeline, &mut runtime, &mut plane, 12);
-
-    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
-    let provider_requests: Vec<_> = runtime
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == CaptureProvider::PipeWire.service() => Some(payload.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(provider_requests[0]["action"], "enumerate");
-    assert_eq!(provider_requests[1]["action"], "open");
-    assert_eq!(provider_requests[1]["output"], output_id);
-    assert_eq!(
-        runtime.completed[0].1["output"],
-        "client-output-placeholder"
-    );
-    assert!(!runtime.completed[0].1.to_string().contains(output_id));
-}
-
-#[test]
-fn pipewire_requires_one_current_matching_geometry_before_open_without_fallback() {
-    let (mut pipeline, mut runtime, mut plane) = setup_with_providers(
-        [
-            CaptureProvider::PipeWire,
-            CaptureProvider::Dxgi,
-            CaptureProvider::Wgc,
-        ]
-        .into(),
-    );
-    runtime.capture_enumeration_override = Some(json!({
-        "ok": true,
-        "outputs": [],
-        "geometry_supported": false
-    }));
-    pipeline.handle(
-        "alice",
-        99,
-        canonical_open(
-            "auto",
-            CaptureProvider::PipeWire,
-            "client-output-placeholder",
-        ),
-        &mut |command| runtime.send(command),
-    );
-    tick(&mut pipeline, &mut runtime, &mut plane, 12);
-    assert_eq!(runtime.completed[0].1["code"], "source_selection_required");
-    assert_eq!(plane.calls, 0);
-    let capture_opens: Vec<_> = runtime
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if capture_provider_for_service(service).is_some() && payload["action"] == "open" => {
-                Some(service.as_str())
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(capture_opens.is_empty());
-    assert_eq!(runtime.open_effects, 0);
-    assert_eq!(alternate_provider(CaptureProvider::PipeWire), None);
-    assert_eq!(
-        output_device_name(CaptureProvider::PipeWire, "portal-source"),
-        None
-    );
-}
-
-#[test]
-fn pipewire_enumeration_rejects_multiple_mismatched_and_unsupported_sources() {
-    let configuration = open_configuration();
-    let valid_output = pipewire_output("portal-1", 1920, 1080, "window", false);
-    let valid_payload = pipewire_enumeration(valid_output.clone());
-    assert_eq!(
-        pipewire_selection_output(&valid_payload, &configuration).unwrap(),
-        "portal-1"
-    );
-
-    assert_eq!(
-        pipewire_selection_output(
-            &json!({"ok":true,"outputs":[],"geometry_supported":false}),
-            &configuration
-        ),
-        Err("source_selection_required")
-    );
-    assert_eq!(
-        pipewire_selection_output(
-            &json!({"ok":true,"outputs":[valid_output.clone(),valid_output.clone()],
-                "enumeration_id":"portal-1","geometry_supported":false}),
-            &configuration
-        ),
-        Err("invalid_capture_selection")
-    );
-    assert_eq!(
-        pipewire_selection_output(
-            &pipewire_enumeration(pipewire_output("portal-1", 1280, 720, "monitor", false)),
-            &configuration
-        ),
-        Err("capture_dimensions_mismatch")
-    );
-    assert_eq!(
-        pipewire_selection_output(
-            &pipewire_enumeration(pipewire_output("portal-1", 1920, 1080, "monitor", true)),
-            &configuration
-        ),
-        Err("invalid_capture_selection")
-    );
-    assert_eq!(
-        pipewire_selection_output(
-            &json!({"ok":true,"outputs":[valid_output],"enumeration_id":"stale-output",
-                "geometry_supported":false}),
-            &configuration
-        ),
-        Err("invalid_capture_selection")
-    );
 }
 
 #[test]
@@ -3103,74 +3128,858 @@ fn native_drain_error_is_visible_after_resource_cleanup() {
     assert_eq!(plane.drains, 1);
 }
 
-mod operations;
-
 #[test]
-fn legacy_index_resolves_once_and_freezes_identity_before_allocation() {
-    let (mut pipeline, mut runtime, mut plane) = setup();
-    let mut operation = open();
-    let Operation::Open { encoder, .. } = &mut operation else {
-        unreachable!()
-    };
-    *encoder = EncoderSelection::Index(0);
-    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
-    tick(&mut pipeline, &mut runtime, &mut plane, 2);
-    assert_eq!(runtime.open_effects, 0);
-    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,"encoders":[]}));
+fn pipewire_sentinel_delegates_restoration_to_the_authorized_provider() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "alice",
+        91,
+        canonical_open(
+            "",
+            CaptureProvider::Pipewire,
+            "portal-selected-session-source",
+        ),
+        &mut |command| runtime.send(command),
+    );
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
-    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
-        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "enumerate")).count(), 1);
-    let open_position = runtime
-        .commands
-        .iter()
-        .position(|command| {
-            matches!(command,
-        Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "open")
-        })
-        .unwrap();
-    let release_position = runtime
-        .commands
-        .iter()
-        .position(|command| matches!(command, Command::ReleaseResult { request: 1 }))
-        .unwrap();
-    assert!(release_position < open_position);
-    assert!(runtime.commands.iter().any(|command| matches!(command,
-        Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "open" && payload["encoder"] == json!(encoder_identity()))));
-    let status = pipeline.streams.values().next().unwrap().response(1);
-    assert_eq!(status["requested_encoder"], 0);
-    assert_eq!(status["encoder"], json!(encoder_identity()));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. } if service == CaptureProvider::Pipewire.service() && payload["action"] == "open" && payload["output"] == "portal-selected-session-source"
+    )));
 }
 
 #[test]
-fn unavailable_selection_releases_enumeration_without_allocating_resources() {
-    for (selection, reason) in [
-        (EncoderSelection::Index(1), "encoder_unavailable"),
-        (
-            EncoderSelection::Backend(amaterasu_module_sdk::EncoderBackend::Software),
-            "x264_feature_disabled",
+fn pipewire_selection_flows_into_the_capture_and_encoder_stages() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "amaterasu.management",
+        90,
+        Operation::SelectPortalSource {
+            source_type: crate::model::PortalSourceType::Monitor,
+            operation_id: "desktop-pick".into(),
+        },
+        &mut |command| runtime.send(command),
+    );
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    assert_eq!(
+        runtime.completed.last().unwrap().1["selection_state"],
+        "ready"
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["output"].get("pipewire_node"),
+        None
+    );
+
+    pipeline.handle(
+        "amaterasu.stream-session",
+        91,
+        canonical_open(
+            "",
+            CaptureProvider::Pipewire,
+            "portal-selected-session-source",
         ),
-    ] {
-        let (mut pipeline, mut runtime, mut plane) = setup();
-        runtime.encoder_enumeration = Some(
-            json!({"ok":true,"enabled":true,"encoders":[],"software_encoder":{"available":false,"reason":"x264_feature_disabled"}}),
-        );
-        let mut operation = open();
-        let Operation::Open { encoder, .. } = &mut operation else {
-            unreachable!()
-        };
-        *encoder = selection;
-        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
-        tick(&mut pipeline, &mut runtime, &mut plane, 5);
-        assert!(pipeline.streams.is_empty());
-        assert_eq!(runtime.open_effects, 0);
-        assert!(
-            runtime
-                .commands
-                .iter()
-                .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
-        );
-        assert_eq!(runtime.completed.last().unwrap().1["code"], reason);
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Pipewire.service()
+                && payload["action"] == "open"
+                && payload["output"] == "portal-selected-session-source"
+    )));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+    )));
+    assert_eq!(plane.inputs.last().unwrap().0, CaptureProvider::Pipewire);
+}
+
+#[test]
+fn unavailable_software_h264_fails_video_open_with_a_specific_error() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_open_error = Some("x264_feature_disabled");
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "h264_encoder_unavailable");
+}
+
+#[test]
+fn numeric_encoder_selection_resolves_registry_before_opening_capture() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(
+        runtime
+            .commands
+            .iter()
+            .find(|command| matches!(command, Command::Request { .. })),
+        Some(Command::Request { service, payload, .. })
+            if service == ENCODE && payload["action"] == "enumerate"
+    ));
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 6);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+                && payload["encoder"]["clsid"] == encoder_identity().clsid
+    )));
+}
+
+#[test]
+fn auto_encoder_selection_prefers_hardware_and_invalid_index_fails_before_capture() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok":true,"enabled":true,"encoders":[
+            {"identity":{"clsid":"software","hardware_url":null,"friendly_name":"Software"},"name":"Software","codec":"h264","hardware":false,"vendor_id":null},
+            {"identity":{"clsid":"hardware","hardware_url":"test://hardware","friendly_name":"Hardware"},"name":"Hardware","codec":"h264","hardware":true,"vendor_id":null}
+        ]
+    }));
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "open"
+                && payload["encoder"]["clsid"] == "hardware"
+    )));
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(1);
+    pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(
+        pipeline.recent.back().unwrap().1["error"],
+        "encoder_unavailable"
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, payload, .. }
+            if service == CaptureProvider::Dxgi.service() && payload["action"] == "open"
+    )));
+}
+
+#[test]
+fn auto_retries_confirmed_nvenc_open_failure_with_distinct_x264_operation() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let attempts: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == ENCODE && payload["action"] == "open" => Some((
+                payload["encoder"]["clsid"].as_str().unwrap(),
+                operation_id.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, LINUX_FFMPEG_NVENC_ID);
+    assert_eq!(attempts[1].0, SOFTWARE_ENCODER_ID);
+    assert_ne!(attempts[0].1, attempts[1].1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Index(0);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 30);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE && payload["action"] == "open"
+    )).count(), 1);
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_NVENC_ID,"hardware_url":"ffmpeg://h264_nvenc","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("permission_denied");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 30);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE && payload["action"] == "open"
+    )).count(), 1);
+}
+
+#[test]
+fn auto_retries_only_confirmed_vaapi_open_failure() {
+    let enumeration = json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_VAAPI_ID,"hardware_url":"ffmpeg://h264_vaapi","friendly_name":"VAAPI"},"name":"VAAPI","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    });
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(enumeration.clone());
+    runtime.encoder_open_error_once = Some("vaapi_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    let attempts: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == ENCODE && payload["action"] == "open" => Some((
+                payload["encoder"]["clsid"].as_str().unwrap(),
+                operation_id.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        (attempts[0].0, attempts[1].0),
+        (LINUX_FFMPEG_VAAPI_ID, SOFTWARE_ENCODER_ID)
+    );
+    assert_ne!(attempts[0].1, attempts[1].1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(enumeration);
+    runtime.encoder_open_error_once = Some("nvenc_device_unavailable");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 30);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn auto_restarts_encoder_once_after_runtime_failure_and_forces_idr() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_VAAPI_ID,"hardware_url":"ffmpeg://h264_vaapi","friendly_name":"VAAPI"},"name":"VAAPI","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(
+        pipeline.streams[&1].stage,
+        Stage::RestartCloseEncoder
+    ));
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.encoder_attempt, 1);
+    assert!(stream.force_idr);
+    assert_eq!(stream.provider, CaptureProvider::Dxgi);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(plane.inputs.last().unwrap().2);
+    assert!(!pipeline.streams[&1].force_idr);
+
+    let encoder_opens: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } if service == ENCODE && payload["action"] == "open" => Some((
+                payload["encoder"]["clsid"].as_str().unwrap(),
+                operation_id.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_opens.len(), 2);
+    assert_eq!(
+        (encoder_opens[0].0, encoder_opens[1].0),
+        (LINUX_FFMPEG_VAAPI_ID, SOFTWARE_ENCODER_ID)
+    );
+    assert_ne!(encoder_opens[0].1, encoder_opens[1].1);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "close"
+            ))
+            .count(),
+        1
+    );
+    assert!(!runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+            if service == CAPTURE && payload["action"] == "close"
+    )));
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::FindEncoder));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_failed");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        2
+    );
+}
+
+fn vaapi_and_x264_registry() -> Value {
+    json!({
+        "ok": true,
+        "enabled": true,
+        "encoders": [
+            {"identity":{"clsid":LINUX_FFMPEG_VAAPI_ID,"hardware_url":"ffmpeg://h264_vaapi","friendly_name":"VAAPI"},"name":"VAAPI","codec":"h264","hardware":true},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    })
+}
+
+fn auto_open_request() -> Operation {
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    request
+}
+
+#[test]
+fn runtime_failure_after_preopen_hardware_fallback_does_not_retry_x264() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    runtime.encoder_open_error_once = Some("vaapi_device_unavailable");
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 14);
+
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.encoder_attempt, 1);
+    assert_eq!(stream.encoder.as_ref().unwrap().clsid, SOFTWARE_ENCODER_ID);
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::FindEncoder));
+    tick(&mut pipeline, &mut runtime, &mut plane, 14);
+
+    let encoder_opens: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => {
+                Some(payload["encoder"]["clsid"].as_str().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_opens, [LINUX_FFMPEG_VAAPI_ID, SOFTWARE_ENCODER_ID]);
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_failed");
+    assert_eq!(
+        runtime.commands.iter().filter(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == ENCODE && payload["action"] == "close" && payload["session_id"] == 51
+        )).count(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_old_encoder_close_aborts_fallback_and_cleans_exact_resources() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    runtime.encoder_close_error_once = Some("hardware_error");
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 16);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "encoder_restart_failed");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        1,
+        "fallback must not open after the old encoder close failed"
+    );
+    let encoder_closes: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "close" => {
+                Some(payload["session_id"].as_u64().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_closes, [51, 51]);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn x264_open_failure_after_runtime_restart_closes_only_reported_resources() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    runtime.encoder_open_error_once = Some("x264_runtime_unavailable");
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+
+    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.recent[0].1["error"], "h264_encoder_unavailable");
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == ENCODE && payload["action"] == "open"
+            ))
+            .count(),
+        2
+    );
+    let encoder_closes: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "close" => {
+                Some(payload["session_id"].as_u64().unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(encoder_closes, [51]);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == CAPTURE && payload["action"] == "close" && payload["stream"] == 41
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
+    use amaterasu_media::{
+        CODEC_H264, EncodedPacket, FLAG_END_OF_ACCESS_UNIT, FLAG_KEYFRAME, PacketSink,
+    };
+    use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+    use std::ffi::c_void;
+
+    #[derive(Default)]
+    struct Received(Vec<(u64, u64, u32, Vec<u8>)>);
+
+    unsafe extern "C" fn accept_packet(
+        context: *mut c_void,
+        packet: *const EncodedPacket,
+    ) -> Status {
+        // SAFETY: the callback context and packet remain valid for this synchronous call.
+        let received = unsafe { &mut *context.cast::<Received>() };
+        // SAFETY: the queue owns the packet bytes during the callback.
+        let packet = unsafe { &*packet };
+        // SAFETY: EncodedPacket::bytes validates the borrowed queue allocation.
+        let bytes = unsafe { packet.bytes() }.unwrap().to_vec();
+        received
+            .0
+            .push((packet.sequence, packet.timestamp_us, packet.flags, bytes));
+        STATUS_OK
     }
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(vaapi_and_x264_registry());
+    pipeline.handle("alice", 99, auto_open_request(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let old_packets = [([0x11], 1, 10), ([0x22], 2, 20)];
+    {
+        let mut queues = pipeline.queues.lock().unwrap();
+        for (bytes, sequence, timestamp_us) in old_packets {
+            let packet = EncodedPacket {
+                codec: CODEC_H264,
+                flags: FLAG_END_OF_ACCESS_UNIT,
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+                timestamp_us,
+                sequence,
+            };
+            // SAFETY: packet data stays alive through the synchronous queue copy.
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        }
+    }
+    pipeline.streams.get_mut(&1).unwrap().last_output_sequence = 2;
+
+    plane.failure_code_once = Some("encoder_failed");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert!(pipeline.streams[&1].force_idr);
+
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(plane.inputs.last().unwrap().5, 3);
+    assert!(
+        plane.inputs.last().unwrap().2,
+        "fallback frame must request IDR"
+    );
+
+    // Reuse the exact tiny Annex B SPS/PPS/IDR fixture used by the pure H.264
+    // normalizer fixture; this test never invokes x264 or a hardware encoder.
+    let fallback_idr = [
+        0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
+    ];
+    {
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_END_OF_ACCESS_UNIT | FLAG_KEYFRAME,
+            data: fallback_idr.as_ptr(),
+            len: fallback_idr.len(),
+            timestamp_us: 30,
+            sequence: 3,
+        };
+        let mut queues = pipeline.queues.lock().unwrap();
+        // SAFETY: packet data stays alive through the synchronous queue copy.
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+    }
+
+    let mut received = Received::default();
+    let sink = PacketSink {
+        context: (&mut received as *mut Received).cast(),
+        write: accept_packet,
+    };
+    let origin = pipeline.streams[&1].clock_origin_us;
+    let mut queues = pipeline.queues.lock().unwrap();
+    for _ in 0..3 {
+        // SAFETY: sink and context remain valid through each synchronous receive.
+        assert_eq!(unsafe { queues.receive("alice", 1, sink) }, STATUS_OK);
+    }
+    assert_eq!(
+        received.0.iter().map(|packet| packet.0).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    // Packets leave on the host clock: the stream origin plus their offsets.
+    assert!(origin > 0);
+    assert_eq!(
+        received
+            .0
+            .iter()
+            .map(|packet| packet.1 - origin)
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+    assert_eq!(received.0[0].3, [0x11]);
+    assert_eq!(received.0[1].3, [0x22]);
+    assert_eq!(received.0[2].2, FLAG_END_OF_ACCESS_UNIT | FLAG_KEYFRAME);
+    assert_eq!(received.0[2].3, fallback_idr);
+}
+
+mod operations;
+mod owned_capture;
+mod presentation;
+
+#[test]
+fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
+    let start = Instant::now();
+    let mut deadline = start;
+    let mut frames = 0;
+    for tick in 0..1000 {
+        let now = start + Duration::from_millis(tick * 10);
+        if now >= deadline {
+            frames += 1;
+            deadline = periodic_capture_deadline(deadline, now, 60);
+        }
+    }
+    assert!(
+        (599..=601).contains(&frames),
+        "captured {frames} frames in ten seconds"
+    );
+    let stalled = start + Duration::from_secs(20);
+    let next = periodic_capture_deadline(deadline, stalled, 60);
+    assert!(next > stalled && next - stalled <= Duration::from_secs_f64(1.0 / 60.0));
+}
+
+#[test]
+fn named_virtual_output_reaches_the_authorized_provider_without_a_portal_selection() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    pipeline.handle(
+        "amaterasu.stream-session",
+        91,
+        canonical_open("", CaptureProvider::Pipewire, "kwin:Virtual-2"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(runtime.commands.iter().any(|command|matches!(command,Command::Request { service,payload,.. } if service==CaptureProvider::Pipewire.service() && payload["action"]=="open" && payload["output"]=="kwin:Virtual-2")));
+    for output in [
+        "kwin:HDMI-A-1",
+        "kwin:Virtual-0",
+        "kwin:Virtual-01",
+        "kwin:Virtual-2147483648",
+    ] {
+        let (mut pipeline, mut runtime, _) =
+            setup_with_providers([CaptureProvider::Pipewire].into());
+        pipeline.handle(
+            "amaterasu.stream-session",
+            91,
+            canonical_open("", CaptureProvider::Pipewire, output),
+            &mut |command| runtime.send(command),
+        );
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            "portal_source_selection_required"
+        );
+    }
+}
+
+#[test]
+fn pipewire_idle_repeats_keep_sixty_fps_phase_on_two_ms_host_ticks() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle(
+        "alice",
+        91,
+        canonical_open("", CaptureProvider::Dxgi, "LUID/display-1"),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.provider = CaptureProvider::Pipewire;
+    stream.minimum_fps_target = 60.0;
+    stream.last_pixels = Some(OwnedFrame {
+        width: 16,
+        height: 16,
+        stride: 64,
+        format: 1,
+        bytes: vec![0; 1024],
+    });
+    let start = Instant::now();
+    stream.record_repeat_deadline(start, false, true);
+    let mut frames = 1;
+    for millis in (2..10000).step_by(2) {
+        let now = start + Duration::from_millis(millis);
+        if stream.repeat_due(now) {
+            frames += 1;
+            stream.record_repeat_deadline(now, true, true);
+        }
+    }
+    assert_eq!(frames, 600, "idle output lost rate to host-tick rounding");
+    let stalled = start + Duration::from_secs(20);
+    assert!(stream.repeat_due(stalled));
+    stream.record_repeat_deadline(stalled, true, true);
+    assert!(
+        !stream.repeat_due(stalled),
+        "missed output slots were replayed as a burst"
+    );
+}
+
+#[test]
+fn auto_retries_confirmed_nvenc_cuda_open_failure_with_x264() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":"amaterasu.hardware.nvenc-cuda.h264","hardware_url":"pci:0000:01:00.0","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true,"inputs":["cpu","dmabuf"]},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_cuda_driver_too_old");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let attempts: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => {
+                payload["encoder"]["clsid"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        ["amaterasu.hardware.nvenc-cuda.h264", SOFTWARE_ENCODER_ID]
+    );
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+}
+
+#[test]
+fn owned_output_geometry_accepts_any_uniform_kwin_scale() {
+    // 3840x2160 at 250%, 2560x1440 at 175% (KWin rounds 1462.86 x 822.86),
+    // 1920x1080 at 125%, and unscaled.
+    assert!(consistent_output_scale(1536, 864, 3840, 2160));
+    assert!(consistent_output_scale(1463, 823, 2560, 1440));
+    assert!(consistent_output_scale(1536, 864, 1920, 1080));
+    assert!(consistent_output_scale(1920, 1080, 1920, 1080));
+    // A resized or reshaped output no longer matches the stream's pixels.
+    assert!(!consistent_output_scale(1920, 1200, 3840, 2160));
+    assert!(!consistent_output_scale(3840, 2160, 1920, 1080));
+    assert!(!consistent_output_scale(0, 864, 3840, 2160));
 }
 
 #[test]
@@ -3186,7 +3995,7 @@ fn auto_probes_all_hardware_before_software_and_freezes_the_usable_identity() {
     let software = candidate_description(amaterasu_module_sdk::SOFTWARE_ENCODER_ID, false);
     let first = candidate_description("first-hardware", true);
     let second = candidate_description("second-hardware", true);
-    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,
+    runtime.encoder_enumeration_override = Some(json!({"ok":true,"enabled":true,
         "encoders":[software,first,second]}));
     for candidate in [&first, &second] {
         runtime.encoder_probe_replies.insert(
@@ -3239,7 +4048,7 @@ fn auto_probes_all_hardware_before_software_and_freezes_the_usable_identity() {
     let release_position = runtime.commands.iter().position(|command|
         matches!(command, Command::ReleaseResult {request} if request == last_probe_id)).unwrap();
     assert!(release_position < capture_position);
-    runtime.encoder_enumeration = Some(json!({"ok":true,"enabled":true,"encoders":[]}));
+    runtime.encoder_enumeration_override = Some(json!({"ok":true,"enabled":true,"encoders":[]}));
     tick(&mut pipeline, &mut runtime, &mut plane, 2);
     assert_eq!(json!(pipeline.streams[&1].encoder), software["identity"]);
     assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
@@ -3413,23 +4222,71 @@ fn selection_release_failure_blocks_allocation_until_settled() {
 }
 
 #[test]
-fn uncertain_selection_admission_is_reconciled_and_never_allocates() {
-    let (mut pipeline, mut runtime, mut plane) = setup();
-    runtime.lose_accept = true;
-    let mut operation = open();
-    let Operation::Open { encoder, .. } = &mut operation else {
-        unreachable!()
-    };
-    *encoder = EncoderSelection::Index(0);
-    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
-    tick(&mut pipeline, &mut runtime, &mut plane, 5);
-    assert!(pipeline.streams.is_empty());
-    assert_eq!(runtime.open_effects, 0);
-    assert_eq!(runtime.operations.len(), 1);
-    assert!(
-        runtime
-            .commands
-            .iter()
-            .any(|command| matches!(command, Command::ReleaseResult { request: 1 }))
-    );
+fn explicit_software_ignores_hardware_and_preserves_unavailable_reason() {
+    for available in [false, true] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        let mut encoders = vec![candidate_description("hardware", true)];
+        if available {
+            encoders.push(candidate_description(SOFTWARE_ENCODER_ID, false));
+        }
+        runtime.encoder_enumeration_override = Some(
+            json!({"ok":true,"enabled":true,"encoders":encoders,"software_encoder":{"reason":"x264_headers_unavailable"}}),
+        );
+        let mut operation = open();
+        let Operation::Open { encoder, .. } = &mut operation else {
+            unreachable!()
+        };
+        *encoder = EncoderSelection::Backend(EncoderBackend::Software);
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 16);
+        if available {
+            assert_eq!(
+                pipeline.streams[&1].encoder.as_ref().unwrap().clsid,
+                SOFTWARE_ENCODER_ID
+            );
+            assert!(pipeline.streams[&1].fallback_encoder.is_none());
+        } else {
+            assert!(pipeline.streams.is_empty());
+            assert_eq!(runtime.open_effects, 0);
+            assert_eq!(
+                runtime.completed.last().unwrap().1["code"],
+                "x264_headers_unavailable"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_nvenc_policies_fail_before_capture_or_encoder_allocation() {
+    for settings in [
+        json!({"nvenc_preset":7}),
+        json!({"nvenc_twopass":"full_res"}),
+        json!({"nvenc_preset":0}),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        let mut operation = open();
+        let Operation::Open { configuration, .. } = &mut operation else {
+            unreachable!()
+        };
+        configuration.nvenc_settings = serde_json::from_value(settings).unwrap();
+        let invalid = configuration.nvenc_settings.validate().is_err();
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 4);
+        assert!(pipeline.streams.is_empty());
+        assert_eq!(runtime.open_effects, 0);
+        assert!(
+            !runtime
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Request { .. }))
+        );
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            if invalid {
+                "invalid_nvenc_settings"
+            } else {
+                "nvenc_settings_unsupported"
+            }
+        );
+    }
 }

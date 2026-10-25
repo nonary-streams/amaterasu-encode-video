@@ -1,17 +1,23 @@
+use amaterasu_media::{ColorMode, VideoCodec};
+#[cfg(test)]
+use amaterasu_module_sdk::EncoderBackend;
 pub use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+/// The default is the platform's ordinary desktop capture provider.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
-    #[default]
+    #[cfg_attr(not(target_os = "linux"), default)]
     Dxgi,
     Wgc,
-    /// An explicitly selected current-user portal source.
-    #[serde(rename = "pipewire")]
-    PipeWire,
+    #[cfg_attr(target_os = "linux", default)]
+    Pipewire,
+    /// DMA-BUF capture of owned KWin virtual outputs. Optional: when it is not
+    /// bound or cannot open, owned outputs use PipeWire instead.
+    Vkms,
     /// An explicitly selected XRandR output captured from the X11 root.
     X11,
     /// An explicitly selected physical KMS primary-plane framebuffer.
@@ -23,11 +29,46 @@ impl CaptureProvider {
         match self {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
-            Self::PipeWire => "amaterasu.capture-pipewire/1",
+            Self::Pipewire => "amaterasu.capture-pipewire/1",
+            Self::Vkms => "amaterasu.capture-vkms/1",
             Self::X11 => "amaterasu.capture-x11/1",
             Self::Kms => "amaterasu.capture-kms/1",
         }
     }
+
+    /// A provider whose native binding may be absent at startup. Streams that
+    /// would use it fall back to PipeWire and record why.
+    pub fn binding_is_optional(self) -> bool {
+        self == Self::Vkms
+    }
+
+    /// Linux providers that read an owned or portal output at a fixed period
+    /// and retain repeat deadlines independent of capture polling.
+    pub fn uses_periodic_capture(self) -> bool {
+        matches!(self, Self::Pipewire | Self::Vkms)
+    }
+}
+
+/// Whether `output` names a KWin virtual output owned by the virtual-display
+/// module: `kwin:Virtual-N`, where N is the DRM connector type id (positive,
+/// without leading zeros). The id is not bounded to the first eight connectors
+/// because reloading the DRM driver does not reset type ids.
+pub fn is_owned_kwin_output(output: &str) -> bool {
+    let Some(index) = output.strip_prefix("kwin:Virtual-") else {
+        return false;
+    };
+    !index.is_empty()
+        && index.len() <= 10
+        && !index.starts_with('0')
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && index.parse::<i32>().is_ok_and(|value| value > 0)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalSourceType {
+    Monitor,
+    Window,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -58,7 +99,14 @@ pub struct Settings {
     pub drain_timeout_ms: u64,
 }
 fn default_providers() -> BTreeSet<CaptureProvider> {
-    [CaptureProvider::Dxgi].into()
+    #[cfg(target_os = "linux")]
+    {
+        [CaptureProvider::Pipewire, CaptureProvider::Vkms].into()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        [CaptureProvider::Dxgi].into()
+    }
 }
 fn default_drain_timeout() -> u64 {
     5000
@@ -113,8 +161,14 @@ pub struct Configuration {
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
-    /// Zero leaves H.264 reference-frame selection to the encoder; a positive
-    /// value requests the exact maximum in the stream's H.264 SPS.
+    /// Bitstream family; omitted legacy values retain the H.264 default.
+    #[serde(default, skip_serializing_if = "is_h264")]
+    pub codec: VideoCodec,
+    /// SDR Y'CbCr interpretation used by the encoder input and output bitstream.
+    #[serde(default, skip_serializing_if = "ColorMode::is_default")]
+    pub color_mode: ColorMode,
+    /// Zero leaves reference-frame selection to the encoder; one requires a
+    /// single H.264 reference frame.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_reference_frames: u32,
     /// Frozen host hardware-encoder controls resolved before stream activation.
@@ -184,20 +238,51 @@ fn is_default_qp(value: &i32) -> bool {
     *value == default_qp()
 }
 
+fn is_h264(codec: &VideoCodec) -> bool {
+    *codec == VideoCodec::H264
+}
+
 impl Configuration {
+    /// Accept either public codec representation, while refusing contradictory
+    /// explicit non-default selections before allocating capture resources.
+    pub fn normalize_codec(&mut self) -> Result<(), &'static str> {
+        let negotiated = match self.video_stream_format.codec {
+            amaterasu_module_sdk::VideoCodec::H264 => VideoCodec::H264,
+            amaterasu_module_sdk::VideoCodec::Hevc => VideoCodec::Hevc,
+            amaterasu_module_sdk::VideoCodec::Av1 => VideoCodec::Av1,
+        };
+        if self.video_stream_format != default_video_stream_format() {
+            if self.codec != VideoCodec::H264 && self.codec != negotiated {
+                return Err("conflicting_video_codec");
+            }
+            self.codec = negotiated;
+        } else {
+            self.video_stream_format.codec = match self.codec {
+                VideoCodec::H264 => amaterasu_module_sdk::VideoCodec::H264,
+                VideoCodec::Hevc => amaterasu_module_sdk::VideoCodec::Hevc,
+                VideoCodec::Av1 => amaterasu_module_sdk::VideoCodec::Av1,
+            };
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> bool {
         self.video_stream_format.validate().is_ok()
-            && self.video_stream_format == amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+            && self.video_stream_format.bit_depth == 8
+            && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Sdr
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
-            && self.slices_per_frame >= 1
             && self.max_reference_frames <= 16
+            && (cfg!(target_os = "linux") || self.codec == VideoCodec::H264)
+            && (!cfg!(windows) || self.color_mode.is_default())
+            && self.slices_per_frame >= 1
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
             && self.nvenc_settings.validate().is_ok()
+            && self.nvenc_settings == amaterasu_module_sdk::NvencSettings::default()
             && valid_software_option(&self.sw_preset, 128)
             && valid_software_option(&self.sw_tune, 256)
     }
@@ -224,6 +309,16 @@ pub struct OpenSpec {
 }
 
 pub enum Operation {
+    SelectPortalSource {
+        source_type: PortalSourceType,
+        operation_id: String,
+    },
+    PollPortalSelection {
+        operation_id: String,
+    },
+    CancelPortalSelection {
+        operation_id: String,
+    },
     Open {
         packet_boundaries: bool,
         operation_id: Option<String>,
@@ -256,6 +351,16 @@ pub enum Operation {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum OperationInput {
+    SelectPortalSource {
+        source_type: PortalSourceType,
+        operation_id: String,
+    },
+    PollPortalSelection {
+        operation_id: String,
+    },
+    CancelPortalSelection {
+        operation_id: String,
+    },
     Open {
         #[serde(default)]
         packet_boundaries: bool,
@@ -349,6 +454,19 @@ impl<'de> Deserialize<'de> for Operation {
         D: Deserializer<'de>,
     {
         Ok(match OperationInput::deserialize(deserializer)? {
+            OperationInput::SelectPortalSource {
+                source_type,
+                operation_id,
+            } => Self::SelectPortalSource {
+                source_type,
+                operation_id,
+            },
+            OperationInput::PollPortalSelection { operation_id } => {
+                Self::PollPortalSelection { operation_id }
+            }
+            OperationInput::CancelPortalSelection { operation_id } => {
+                Self::CancelPortalSelection { operation_id }
+            }
             OperationInput::Open {
                 packet_boundaries,
                 operation_id,
@@ -437,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_video_format_defaults_to_h264_sdr_and_fails_closed_for_hevc() {
+    fn negotiated_video_format_defaults_to_h264_sdr_and_accepts_hevc_sdr() {
         let mut request = open_request();
         let Operation::Open { configuration, .. } =
             serde_json::from_value::<Operation>(request.clone()).unwrap()
@@ -461,7 +579,38 @@ mod tests {
         let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
             panic!("open expected")
         };
-        assert!(!configuration.validate());
+        assert!(configuration.validate());
+    }
+
+    #[test]
+    fn codec_normalization_accepts_either_representation_and_rejects_conflicts() {
+        for (media, negotiated) in [
+            (VideoCodec::Hevc, amaterasu_module_sdk::VideoCodec::Hevc),
+            (VideoCodec::Av1, amaterasu_module_sdk::VideoCodec::Av1),
+        ] {
+            let mut legacy: Configuration =
+                serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+            legacy.codec = media;
+            legacy.normalize_codec().unwrap();
+            assert_eq!(legacy.video_stream_format.codec, negotiated);
+            assert!(legacy.validate());
+            let mut current: Configuration =
+                serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+            current.video_stream_format.codec = negotiated;
+            current.normalize_codec().unwrap();
+            assert_eq!(current.codec, media);
+            assert!(current.validate());
+            current.video_stream_format.bit_depth = 10;
+            assert!(!current.validate());
+        }
+        let mut conflicting: Configuration =
+            serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+        conflicting.codec = VideoCodec::Hevc;
+        conflicting.video_stream_format.codec = amaterasu_module_sdk::VideoCodec::Av1;
+        assert_eq!(
+            conflicting.normalize_codec(),
+            Err("conflicting_video_codec")
+        );
     }
 
     fn open_request() -> Value {
@@ -482,8 +631,51 @@ mod tests {
     }
 
     #[test]
+    fn color_mode_defaults_to_709_limited_and_round_trips_explicit_modes() {
+        let Operation::Open { configuration, .. } = serde_json::from_value(open_request()).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(configuration.color_mode, ColorMode::Bt709Limited);
+        assert!(
+            serde_json::to_value(&configuration)
+                .unwrap()
+                .get("color_mode")
+                .is_none()
+        );
+
+        let mut request = open_request();
+        request["configuration"]["color_mode"] = json!("bt601_full");
+        let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
+            unreachable!();
+        };
+        assert_eq!(configuration.color_mode, ColorMode::Bt601Full);
+        assert_eq!(
+            serde_json::to_value(configuration).unwrap()["color_mode"],
+            "bt601_full"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_nondefault_color_mode_before_open() {
+        let mut request = open_request();
+        request["configuration"]["color_mode"] = json!("bt709_full");
+        let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
+            unreachable!();
+        };
+        assert!(!configuration.validate());
+    }
+
+    #[test]
     fn provider_identifiers_are_finite_and_settings_have_bounded_deadline() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            settings.capture_providers,
+            [CaptureProvider::Pipewire, CaptureProvider::Vkms].into()
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(settings.capture_providers, [CaptureProvider::Dxgi].into());
         for input in [
             r#"{"capture_providers":["arbitrary/service"]}"#,
@@ -498,6 +690,57 @@ mod tests {
             );
         }
         assert!(serde_json::from_value::<Operation>(json!({"action":"open","capture_provider":"other","output":"x","encoder":0,"configuration":{"width":16,"height":16,"fps":1,"bitrate":100000}})).is_err());
+        for source_type in ["monitor", "window"] {
+            assert!(
+                serde_json::from_value::<Operation>(json!({
+                    "action": "select_portal_source",
+                    "source_type": source_type,
+                    "operation_id": "choose-1"
+                }))
+                .is_ok()
+            );
+        }
+        assert!(
+            serde_json::from_value::<Operation>(json!({
+                "action": "select_portal_source",
+                "source_type": "virtual_display",
+                "operation_id": "choose-1"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn open_accepts_numeric_encoder_indices_and_explicit_identities() {
+        let mut request = open_request();
+        request["encoder"] = json!(0);
+        let Operation::Open { encoder, .. } = serde_json::from_value::<Operation>(request).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(encoder, EncoderSelection::Index(0)));
+
+        let mut request = open_request();
+        request["encoder"] = json!("auto");
+        let Operation::Open { encoder, .. } = serde_json::from_value::<Operation>(request).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(
+            encoder,
+            EncoderSelection::Backend(EncoderBackend::Auto)
+        ));
+
+        let Operation::Open { encoder, .. } =
+            serde_json::from_value::<Operation>(open_request()).unwrap()
+        else {
+            panic!("open request expected");
+        };
+        assert!(matches!(encoder, EncoderSelection::Identity(_)));
+
+        let mut invalid = open_request();
+        invalid["encoder"] = json!(-1);
+        assert!(serde_json::from_value::<Operation>(invalid).is_err());
     }
 
     #[test]
@@ -584,7 +827,7 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(capture_provider, CaptureProvider::Dxgi);
+        assert_eq!(capture_provider, CaptureProvider::default());
         assert!(!auto_capture);
         assert!(!constant_rate);
         assert!(wgc_pacing_smoothing);
@@ -633,8 +876,8 @@ mod tests {
             ("", CaptureProvider::Wgc, CaptureProvider::Wgc, false, true),
             (
                 "auto",
-                CaptureProvider::PipeWire,
-                CaptureProvider::PipeWire,
+                CaptureProvider::Pipewire,
+                CaptureProvider::Pipewire,
                 false,
                 true,
             ),
@@ -719,19 +962,55 @@ mod tests {
     }
 
     #[test]
-    fn canonical_auto_defaults_to_dxgi_when_no_bootstrap_provider_is_supplied() {
+    fn canonical_auto_defaults_to_platform_provider_when_none_is_supplied() {
         let mut request = open_request();
         request["capture"] = json!("auto");
 
         assert!(matches!(
             serde_json::from_value::<Operation>(request).unwrap(),
             Operation::Open {
-                capture_provider: CaptureProvider::Dxgi,
+                capture_provider,
                 auto_capture: true,
                 constant_rate: false,
                 ..
-            }
+            } if capture_provider == CaptureProvider::default()
         ));
+    }
+
+    #[test]
+    fn owned_kwin_outputs_accept_connector_ids_past_the_first_pool() {
+        for output in [
+            "kwin:Virtual-1",
+            "kwin:Virtual-8",
+            "kwin:Virtual-9",
+            "kwin:Virtual-16",
+        ] {
+            assert!(is_owned_kwin_output(output), "{output}");
+        }
+        for output in [
+            "kwin:Virtual-0",
+            "kwin:Virtual-01",
+            "kwin:Virtual-",
+            "kwin:Virtual-2147483648",
+            "kwin:Virtual-1a",
+            "kwin:HDMI-A-1",
+            "Virtual-1",
+            "portal-selected-session-source",
+        ] {
+            assert!(!is_owned_kwin_output(output), "{output}");
+        }
+    }
+
+    #[test]
+    fn vkms_provider_is_an_optional_periodic_linux_provider() {
+        assert_eq!(CaptureProvider::Vkms.service(), "amaterasu.capture-vkms/1");
+        assert!(CaptureProvider::Vkms.binding_is_optional());
+        assert!(!CaptureProvider::Pipewire.binding_is_optional());
+        assert!(CaptureProvider::Vkms.uses_periodic_capture());
+        assert!(!CaptureProvider::Wgc.uses_periodic_capture());
+        let settings: Settings =
+            serde_json::from_str(r#"{"capture_providers":["pipewire","vkms"]}"#).unwrap();
+        assert!(settings.capture_providers.contains(&CaptureProvider::Vkms));
     }
 
     #[test]
