@@ -22,6 +22,34 @@ Enabled startup binds every configured native capture provider and the encoder.
 Disabled startup registers services but binds no lower interface and opens no
 devices. Unsupported hardware/platforms fail through real provider responses;
 there are no synthetic frames. Linux H.264 requires a registered real backend.
+
+## Optional capture metadata observations
+
+The signed video settings may opt in with `"capture_observation":true`; the
+default is false. The signed runtime policy must also grant video `publish` on
+`amaterasu.video.capture-observation/1`. Without that grant the first rejected
+publication disables the observer for this module instance. No default policy
+grants the topic. An authorized subscriber may request the broker's bounded,
+coalescing event queue and detect gaps via publisher sequence numbers.
+
+Video records versioned `before_capture` and `after_capture` **observations** of
+one due native read. It publishes their small metadata envelopes on the module
+tick only after native frame callbacks return. The before marker records the
+point before `Plane::pump` starts; its delivery is deferred, so it cannot veto
+or transform that capture. If a plane fails or never reaches a native read,
+both markers are omitted because callback progress is uncertain. At most eight
+capture attempts queue locally and one attempt
+(at most two broker sends) is drained per tick. Full queues drop new metadata;
+broker failure never fails the stream. Stop/unload discards pending metadata.
+Disabled operation does not allocate events, serialize payloads, or call the
+broker. These events include only geometry and a CPU-borrowed/GPU-opaque label:
+no frame pixels, DMA-BUF descriptors, process paths or client identifiers.
+
+The SDK describes additional frame/encode/packet hook points, but this video
+module does not wire those points yet. In particular, its encoder submit occurs
+inside a borrowed native capture callback, and invoking third-party code there
+would violate the current buffer-lifetime and cadence contract. This metadata
+source does not provide a transformation or a GPU zero-copy extension API.
 The optional x264 fallback requires the `software-x264` feature, x264 development
 headers, and a matching runtime library. If no H.264 backend is available, Open
 fails with `h264_encoder_unavailable` after resource cleanup.

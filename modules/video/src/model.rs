@@ -93,6 +93,10 @@ impl AmdAv1LatencyMode {
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
+    /// Metadata-only capture event source. The signed runtime grant must also
+    /// allow publishing the exact video observation topic; default is off.
+    #[serde(default)]
+    pub capture_observation: bool,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default = "default_drain_timeout")]
@@ -115,6 +119,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            capture_observation: false,
             capture_providers: default_providers(),
             drain_timeout_ms: default_drain_timeout(),
         }
@@ -916,6 +921,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            capture_observation: false,
             capture_providers: [CaptureProvider::X11].into(),
             drain_timeout_ms: 5000,
         };
@@ -934,6 +940,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            capture_observation: false,
             capture_providers: [CaptureProvider::Kms].into(),
             drain_timeout_ms: 5000,
         };

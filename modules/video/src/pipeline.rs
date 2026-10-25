@@ -12,6 +12,7 @@ use crate::{
         AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderSelection, OpenSpec, Operation,
         Settings, TouchSurface, error, is_owned_kwin_output, valid_minimum_fps_target,
     },
+    observation::Observations,
     plane::{
         ENCODE, FrameMetadata, FramePath, GeometryProgress, OwnedFrame, Plane, Progress, Pump,
     },
@@ -19,7 +20,9 @@ use crate::{
     rpc::{self, Send},
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
-use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
+use amaterasu_module_sdk::{
+    Command, EncoderBackend, EncoderIdentity, FrameMemory, ModuleResult, Response,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -384,6 +387,7 @@ pub struct Pipeline {
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), operations::Record>,
     portal: portal::Control,
+    observations: Observations,
     pub queues: Arc<Mutex<Queues>>,
 }
 
@@ -403,6 +407,7 @@ impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
         Self {
             enabled: settings.enabled,
+            observations: Observations::new(settings.enabled && settings.capture_observation),
             providers: settings.capture_providers,
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
@@ -782,7 +787,7 @@ impl Pipeline {
             }
         }
         if stream.stage == Stage::Running {
-            pump(plane, stream, id);
+            pump(plane, stream, id, &mut self.observations);
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
             }
@@ -814,6 +819,16 @@ impl Pipeline {
                 queues.close(id);
             }
         }
+    }
+
+    /// Deliver only after native callbacks have returned. Missing grants and
+    /// observer failures cannot change video stream behavior.
+    pub fn flush_observations(&mut self, send: &mut dyn FnMut(Command) -> ModuleResult<Response>) {
+        self.observations.flush(send);
+    }
+
+    pub fn stop_observations(&mut self) {
+        self.observations.clear();
     }
 }
 
@@ -885,7 +900,7 @@ enum CaptureTrigger {
     Presentation,
 }
 
-fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
+fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64, observations: &mut Observations) {
     let now = Instant::now();
     let presentation_paced = match stream.observe_presentation(plane) {
         Ok(paced) => paced,
@@ -951,6 +966,18 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         stream.cleanup("frame_clock_exhausted");
         return;
     };
+    let capture_marker = capture_due
+        .then(|| {
+            observations.before_capture(
+                stream.configuration.width,
+                stream.configuration.height,
+                match stream.frame_path {
+                    FramePath::Cpu => FrameMemory::CpuBorrowed,
+                    FramePath::DmaBuf => FrameMemory::GpuOpaque,
+                },
+            )
+        })
+        .flatten();
     match plane.pump(Pump {
         video: id,
         provider: stream.provider,
@@ -967,6 +994,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         force_idr: stream.force_idr,
     }) {
         Ok(progress) => {
+            observations.after_capture(capture_marker, progress.capture_callback_count > 0);
             let completed_at = Instant::now();
             stream.timing.record(&progress);
             stream.owned_capture.record_freshness(&progress);
@@ -1055,8 +1083,12 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 stream.force_idr = false;
             }
         }
-        Err(code) if begin_runtime_encoder_recovery(stream, code) => {}
-        Err(code) => stream.cleanup(code),
+        Err(code) => {
+            observations.discard_capture(capture_marker);
+            if !begin_runtime_encoder_recovery(stream, code) {
+                stream.cleanup(code);
+            }
+        }
     }
 }
 

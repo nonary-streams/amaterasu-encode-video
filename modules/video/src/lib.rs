@@ -1,6 +1,7 @@
 //! Managed capture-to-encode coordination with bounded native packet delivery.
 mod model;
 mod native;
+mod observation;
 mod pipeline;
 mod plane;
 mod queue;
@@ -86,6 +87,8 @@ impl ManagedModule for Video {
         self.pipeline.tick(&mut *self.plane, &mut |command| {
             runtime.send_ephemeral(command)
         });
+        self.pipeline
+            .flush_observations(&mut |command| runtime.send(command));
         match runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -119,6 +122,7 @@ impl Drop for Video {
         let runtime = &self.runtime;
         self.pipeline
             .shutdown(&mut |command| runtime.send_ephemeral(command));
+        self.pipeline.stop_observations();
     }
 }
 

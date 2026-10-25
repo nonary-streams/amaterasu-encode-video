@@ -326,6 +326,7 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 struct FakePlane {
     calls: usize,
     drains: usize,
+    report_capture_callback: bool,
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
     fail: bool,
@@ -470,6 +471,10 @@ impl Plane for FakePlane {
                             * 4
                     ],
                 }),
+                capture_callback_count: u64::from(
+                    self.report_capture_callback && input.capture_due,
+                ),
+                capture_frame_count: u64::from(self.report_capture_callback && fresh_capture),
                 ..Progress::default()
             })
         }
@@ -1617,6 +1622,71 @@ fn tick(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane, c
     for _ in 0..count {
         pipeline.tick(plane, &mut |command| runtime.send(command));
     }
+}
+
+#[test]
+fn optional_capture_observations_follow_native_read_and_stop_with_module() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    plane.report_capture_callback = true;
+    pipeline.observations = Observations::new(true);
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    assert!(plane.inputs.last().is_some_and(|input| input.1));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    let points: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Publish { topic, payload } => {
+                assert_eq!(topic, crate::observation::TOPIC);
+                Some(payload["point"].as_str().unwrap().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(points, ["before_capture", "after_capture"]);
+
+    pipeline.stop_observations();
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Publish { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn failed_plane_preflight_does_not_publish_a_false_capture_marker() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+    pipeline.observations = Observations::new(true);
+    plane.failure_code_once = Some("capture_interface");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    assert!(plane.inputs.last().is_some_and(|input| input.1));
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
 }
 
 #[test]
