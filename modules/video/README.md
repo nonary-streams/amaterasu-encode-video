@@ -23,7 +23,7 @@ Disabled startup registers services but binds no lower interface and opens no
 devices. Unsupported hardware/platforms fail through real provider responses;
 there are no synthetic frames. Linux H.264 requires a registered real backend.
 
-### Signed X11 capture service replacement
+### Host-configured X11 capture service replacement
 
 Trusted host-owned video module settings may set `"x11_capture_service":
 "example.capture-test/1"` with `"x11"` in `capture_providers`. Without this
@@ -92,8 +92,40 @@ its input, and a frame may produce multiple packet fragments. It is **not** a
 whole-frame completion event. Only codec, packet byte count, keyframe flag and
 timestamp are published; packet bytes remain in the native media queue. All
 these markers are delivered after native callbacks return and cannot modify
-the frame or packet. A synchronous transform/replacement API still requires a
-separate owner-safe memory and scheduling contract.
+the frame or packet.
+
+### Explicit trusted CPU processor
+
+Trusted host-owned settings may name one exact external native service with
+`"cpu_processor_service":"example.video-effects/1"` and set an optional
+`"cpu_processor_budget_us"` from 100 through 5000 (default 2000). The setting
+is absent by default, and a signed `native_use` grant plus a provider registered
+under the same service are required. Binding failure rejects enabled startup;
+it never falls back to a different processor. This is one selected service,
+not ordered multi-extension chaining or a general UI option grant.
+
+For borrowed CPU capture, Video invokes the processor's v1 `BEFORE_FRAME`
+stage before optional built-in resize, normalizes to the stream timestamp and
+sequence, then invokes `BEFORE_ENCODE` before `EncoderApi.submit`. Either stage
+may pass, drop that input, or supply one bounded copied CPU replacement with
+identical shape and metadata. Only an accepted encoder submit updates the
+repeat cache, which owns the exact processed pixels; busy or dropped submits
+leave that cache untouched. Repeats run both stages again on a new timestamp
+without modifying the cached source. `AFTER_ENCODE` observes a non-EOS encoded
+packet before video takes its bounded queue lock; v1 cannot replace or drop
+packet bytes. Backpressure can cause the encoder to offer the same packet
+again, so the processor may observe it more than once. Failed, malformed or
+over-budget calls fail the stream closed and release owned resources through
+normal cleanup. A call is timed **after it returns**: native code cannot be
+preempted, and unload waits for it to return.
+
+The selected processor requires CPU memory. Owned-output selection uses the
+existing PipeWire CPU fallback; an explicitly pinned GPU-only vkms stream is
+rejected before opening capture resources. The opt-in processor bypasses
+video's optional asynchronous PipeWire color-conversion worker to keep one
+serialized native binding on the video tick thread. That can increase callback
+latency and CPU work. No processor or callback is invoked on the default path,
+and this service does not expose GPU buffers or DMA-BUF descriptors.
 
 SDK packet/network and input hook points are not wired by this video module.
 In particular, its encoder submit occurs inside a borrowed native capture

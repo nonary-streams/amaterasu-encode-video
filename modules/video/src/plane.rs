@@ -7,9 +7,16 @@ use crate::{
     model::{CaptureProvider, Configuration, Settings},
     queue::Queues,
 };
+use amaterasu_media::processing::{
+    MEDIA_PROCESSOR_API_V1_SIZE, MEDIA_PROCESSOR_INTERFACE_MAJOR, MEDIA_PROCESSOR_INTERFACE_MINOR,
+    PROCESS_BEFORE_ENCODE, PROCESS_BEFORE_FRAME,
+};
 use amaterasu_media::*;
 use amaterasu_module_sdk::FrameMemory;
-use amaterasu_module_sdk::{ModuleResult, NativeBinding, RuntimeClient, abi::*};
+use amaterasu_module_sdk::{
+    FrameProcessOutcome, ModuleResult, NativeBinding, OwnedCpuFrame, ProcessorError, RuntimeClient,
+    abi::*,
+};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -128,6 +135,59 @@ pub struct OwnedFrame {
     pub bytes: Vec<u8>,
 }
 
+fn owned_processor_frame(frame: OwnedCpuFrame) -> OwnedFrame {
+    OwnedFrame {
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        stride: frame.stride,
+        bytes: frame.bytes,
+    }
+}
+
+fn processor_failure(error: ProcessorError) -> &'static str {
+    match error {
+        ProcessorError::OverBudget => "cpu_processor_over_budget",
+        _ => "cpu_processor_failed",
+    }
+}
+
+trait CpuProcessor {
+    fn frame(&self, stage: u32, frame: &CpuFrame) -> Result<FrameProcessOutcome, ProcessorError>;
+    fn packet(&self, packet: &EncodedPacket) -> Result<(), ProcessorError>;
+}
+
+struct BoundProcessor {
+    binding: NativeBinding,
+    budget_us: u32,
+}
+
+impl CpuProcessor for BoundProcessor {
+    fn frame(&self, stage: u32, frame: &CpuFrame) -> Result<FrameProcessOutcome, ProcessorError> {
+        // SAFETY: this wrapper owns the exact binding and Video serializes calls.
+        unsafe { self.binding.process_cpu_frame(stage, frame, self.budget_us) }
+    }
+
+    fn packet(&self, packet: &EncodedPacket) -> Result<(), ProcessorError> {
+        // SAFETY: the encoder lends the packet through the synchronous sink.
+        unsafe { self.binding.observe_encoded_packet(packet, self.budget_us) }
+    }
+}
+
+/// The selected binding is called only on video's serialized tick thread.
+/// This may run inside a synchronous borrowed capture callback, so every
+/// replacement is copied by the SDK before its provider callback returns.
+fn process_cpu_stage(
+    processor: Option<&dyn CpuProcessor>,
+    stage: u32,
+    frame: &CpuFrame,
+) -> Result<FrameProcessOutcome, &'static str> {
+    let Some(processor) = processor else {
+        return Ok(FrameProcessOutcome::Pass);
+    };
+    processor.frame(stage, frame).map_err(processor_failure)
+}
+
 /// Non-secret metadata from a frame accepted by the encoder. The frame bytes
 /// remain borrowed only during the native callback and are never retained.
 #[derive(Clone, Copy)]
@@ -190,6 +250,9 @@ pub trait Plane {
 }
 
 pub struct NativePlane {
+    /// Exact signed native binding. Drop before capture and encoder bindings;
+    /// no processor callback or borrowed buffer may outlive this consumer.
+    processor: Option<BoundProcessor>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     /// Optional providers whose startup binding failed, with the reason.
     unbound: BTreeMap<CaptureProvider, &'static str>,
@@ -213,7 +276,24 @@ impl NativePlane {
                 bind_capture_providers(settings, |service, major, minor, size| {
                     runtime.bind_native(service, major, minor, size)
                 })?;
+            let processor = settings
+                .cpu_processor_service
+                .as_deref()
+                .map(|service| {
+                    runtime.bind_native(
+                        service,
+                        MEDIA_PROCESSOR_INTERFACE_MAJOR,
+                        MEDIA_PROCESSOR_INTERFACE_MINOR,
+                        MEDIA_PROCESSOR_API_V1_SIZE,
+                    )
+                })
+                .transpose()?
+                .map(|binding| BoundProcessor {
+                    binding,
+                    budget_us: settings.cpu_processor_budget_us,
+                });
             Ok(Self {
+                processor,
                 captures,
                 unbound,
                 encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
@@ -260,6 +340,8 @@ fn bind_capture_providers<T>(
 
 struct Submission<'a> {
     api: &'a EncoderApi,
+    processor: Option<&'a dyn CpuProcessor>,
+    processor_error: Option<&'static str>,
     encoder: u64,
     configuration: &'a Configuration,
     status: Status,
@@ -356,6 +438,21 @@ unsafe fn submit_frame(
         submission.status = STATUS_INVALID_ARGUMENT;
         return STATUS_OK;
     }
+    let before_owned = match process_cpu_stage(submission.processor, PROCESS_BEFORE_FRAME, frame) {
+        Ok(FrameProcessOutcome::Pass) => None,
+        Ok(FrameProcessOutcome::Drop) => {
+            submission.status = MEDIA_BUSY;
+            return STATUS_OK;
+        }
+        Ok(FrameProcessOutcome::Replace(frame)) => Some(frame),
+        Err(code) => {
+            submission.processor_error = Some(code);
+            submission.status = MEDIA_BACKEND_ERROR;
+            return STATUS_OK;
+        }
+    };
+    let before_view = before_owned.as_ref().map(OwnedCpuFrame::borrowed);
+    let frame = before_view.as_ref().unwrap_or(frame);
     let size_matches = frame.width == submission.configuration.width
         && frame.height == submission.configuration.height;
     let resize_started = Instant::now();
@@ -400,14 +497,30 @@ unsafe fn submit_frame(
     } else {
         frame
     };
+    let mut forwarded = *frame;
+    forwarded.timestamp_us = submission.timestamp_us;
+    forwarded.sequence = submission.sequence;
+    let after_owned =
+        match process_cpu_stage(submission.processor, PROCESS_BEFORE_ENCODE, &forwarded) {
+            Ok(FrameProcessOutcome::Pass) => None,
+            Ok(FrameProcessOutcome::Drop) => {
+                submission.status = MEDIA_BUSY;
+                return STATUS_OK;
+            }
+            Ok(FrameProcessOutcome::Replace(frame)) => Some(frame),
+            Err(code) => {
+                submission.processor_error = Some(code);
+                submission.status = MEDIA_BACKEND_ERROR;
+                return STATUS_OK;
+            }
+        };
+    let after_view = after_owned.as_ref().map(OwnedCpuFrame::borrowed);
+    let forwarded = after_view.as_ref().unwrap_or(&forwarded);
     submission.status = {
-        let mut forwarded = *frame;
-        forwarded.timestamp_us = submission.timestamp_us;
-        forwarded.sequence = submission.sequence;
         submission.frame = Some(FrameMetadata {
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
+            width: forwarded.width,
+            height: forwarded.height,
+            stride: forwarded.stride,
             timestamp_us: submission.timestamp_us,
             sequence: submission.sequence,
         });
@@ -417,7 +530,7 @@ unsafe fn submit_frame(
             (submission.api.submit)(
                 submission.api.base.context,
                 submission.encoder,
-                &forwarded,
+                forwarded,
                 u32::from(submission.force_idr),
             )
         };
@@ -426,10 +539,10 @@ unsafe fn submit_frame(
     };
     if submission.status == STATUS_OK {
         submission.accepted_frame = Some(AcceptedFrame {
-            width: frame.width,
-            height: frame.height,
-            format: frame.format,
-            memory: if resized.is_some() {
+            width: forwarded.width,
+            height: forwarded.height,
+            format: forwarded.format,
+            memory: if resized.is_some() || before_owned.is_some() || after_owned.is_some() {
                 FrameMemory::CpuOwned
             } else {
                 FrameMemory::CpuBorrowed
@@ -437,22 +550,30 @@ unsafe fn submit_frame(
             timestamp_us: submission.timestamp_us,
             sequence: submission.sequence,
         });
+        if let Some(frame) = after_owned {
+            submission.owned_frame = Some(owned_processor_frame(frame));
+            return STATUS_OK;
+        }
         if let Some(resized) = resized {
             submission.owned_frame = Some(resized);
             return STATUS_OK;
         }
+        if let Some(frame) = before_owned {
+            submission.owned_frame = Some(owned_processor_frame(frame));
+            return STATUS_OK;
+        }
         // SAFETY: capture bytes remain borrowed until read_frame returns. A failed
         // allocation only disables repeats; the encoder already copied its input.
-        if let Ok(bytes) = unsafe { frame.bytes() } {
+        if let Ok(bytes) = unsafe { forwarded.bytes() } {
             let started = Instant::now();
             let mut owned = Vec::new();
             if owned.try_reserve_exact(bytes.len()).is_ok() {
                 owned.extend_from_slice(bytes);
                 submission.owned_frame = Some(OwnedFrame {
-                    width: frame.width,
-                    height: frame.height,
-                    format: frame.format,
-                    stride: frame.stride,
+                    width: forwarded.width,
+                    height: forwarded.height,
+                    format: forwarded.format,
+                    stride: forwarded.stride,
                     bytes: owned,
                 });
             }
@@ -465,6 +586,8 @@ unsafe fn submit_frame(
 
 struct Destination<'a> {
     queues: &'a Arc<Mutex<Queues>>,
+    processor: Option<&'a dyn CpuProcessor>,
+    processor_error: Option<&'static str>,
     video: u64,
     transport_admission_us: u64,
     transport_admission_count: u64,
@@ -477,6 +600,17 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
     }
     // SAFETY: encoder borrows packet; destination lives through synchronous receive.
     let destination = unsafe { &mut *context.cast::<Destination<'_>>() };
+    // EOS has no encoded payload. This observation runs before taking the
+    // output queue lock and may repeat if that queue rejects this packet.
+    if unsafe { (*packet).flags } & FLAG_END_OF_STREAM == 0
+        && let Some(processor) = destination.processor
+    {
+        // SAFETY: encoder lends this packet through the synchronous sink.
+        if let Err(error) = processor.packet(unsafe { &*packet }) {
+            destination.processor_error = Some(processor_failure(error));
+            return MEDIA_BACKEND_ERROR;
+        }
+    }
     let started = Instant::now();
     destination.transport_admission_count = destination.transport_admission_count.saturating_add(1);
     let status = if let Ok(mut queues) = destination.queues.try_lock() {
@@ -543,6 +677,9 @@ impl Plane for NativePlane {
     }
 
     fn dmabuf_unavailable(&self, provider: CaptureProvider) -> Option<&'static str> {
+        if self.processor.is_some() {
+            return Some("cpu_processor_requires_cpu");
+        }
         let Some(binding) = self.captures.get(&provider) else {
             return Some(
                 self.unbound
@@ -588,11 +725,15 @@ impl Plane for NativePlane {
         let encoder_api =
             unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
         if input.frame_path == FramePath::DmaBuf {
+            if self.processor.is_some() {
+                return Err("cpu_processor_requires_cpu");
+            }
             let progress = self.deliver_dmabuf(&input)?;
             return self.receive_packets(encoder_api, &input, progress);
         }
         #[cfg(amaterasu_swscale)]
-        let processed = if input.provider == CaptureProvider::Pipewire
+        let processed = if self.processor.is_none()
+            && input.provider == CaptureProvider::Pipewire
             && input.configuration.color_mode.is_default()
             && input.capture != 0
         {
@@ -649,13 +790,23 @@ impl Plane for NativePlane {
                 freshness_api,
                 encoder_api,
                 &input,
+                self.processor
+                    .as_ref()
+                    .map(|processor| processor as &dyn CpuProcessor),
             )?
         } else {
             Progress::default()
         };
         let progress = if !progress.submitted && !progress.dropped && input.repeat_due {
             if let Some(frame) = input.repeat_frame {
-                repeat(encoder_api, frame, &input)?
+                repeat(
+                    encoder_api,
+                    frame,
+                    &input,
+                    self.processor
+                        .as_ref()
+                        .map(|processor| processor as &dyn CpuProcessor),
+                )?
             } else {
                 progress
             }
@@ -722,8 +873,15 @@ impl NativePlane {
         input: &Pump<'_>,
         mut progress: Progress,
     ) -> Result<Progress, &'static str> {
-        let (encoder_poll_us, transport_admission_us, destination_count, encoded_packet) =
-            receive(encoder_api, input.encoder, input.video, &self.queues)?;
+        let (encoder_poll_us, transport_admission_us, destination_count, encoded_packet) = receive(
+            encoder_api,
+            input.encoder,
+            input.video,
+            &self.queues,
+            self.processor
+                .as_ref()
+                .map(|processor| processor as &dyn CpuProcessor),
+        )?;
         progress.encoder_poll_us = encoder_poll_us;
         progress.transport_admission_us = transport_admission_us;
         progress.transport_admission_count = destination_count;
@@ -738,9 +896,12 @@ fn capture(
     freshness_api: Option<&CaptureApiV1_2>,
     encoder: &EncoderApi,
     input: &Pump<'_>,
+    processor: Option<&dyn CpuProcessor>,
 ) -> Result<Progress, &'static str> {
     let mut submission = Submission {
         api: encoder,
+        processor,
+        processor_error: None,
         encoder: input.encoder,
         configuration: input.configuration,
         status: MEDIA_PENDING,
@@ -799,6 +960,9 @@ fn capture(
     if !matches!(result, STATUS_OK | MEDIA_PENDING | MEDIA_BUSY) {
         return Err("capture_failed");
     }
+    if let Some(code) = submission.processor_error {
+        return Err(code);
+    }
     if submission.called && !matches!(submission.status, STATUS_OK | MEDIA_BUSY) {
         return Err("frame_rejected");
     }
@@ -846,6 +1010,7 @@ fn repeat(
     api: &EncoderApi,
     frame: &OwnedFrame,
     input: &Pump<'_>,
+    processor: Option<&dyn CpuProcessor>,
 ) -> Result<Progress, &'static str> {
     let copied_frame = CpuFrame {
         width: frame.width,
@@ -857,6 +1022,32 @@ fn repeat(
         timestamp_us: input.timestamp_us,
         sequence: input.sequence,
     };
+    let before_owned = match process_cpu_stage(processor, PROCESS_BEFORE_FRAME, &copied_frame)? {
+        FrameProcessOutcome::Pass => None,
+        FrameProcessOutcome::Drop => {
+            return Ok(Progress {
+                dropped: true,
+                repeat_attempted: true,
+                ..Progress::default()
+            });
+        }
+        FrameProcessOutcome::Replace(frame) => Some(frame),
+    };
+    let before_view = before_owned.as_ref().map(OwnedCpuFrame::borrowed);
+    let frame = before_view.as_ref().unwrap_or(&copied_frame);
+    let after_owned = match process_cpu_stage(processor, PROCESS_BEFORE_ENCODE, frame)? {
+        FrameProcessOutcome::Pass => None,
+        FrameProcessOutcome::Drop => {
+            return Ok(Progress {
+                dropped: true,
+                repeat_attempted: true,
+                ..Progress::default()
+            });
+        }
+        FrameProcessOutcome::Replace(frame) => Some(frame),
+    };
+    let after_view = after_owned.as_ref().map(OwnedCpuFrame::borrowed);
+    let frame = after_view.as_ref().unwrap_or(frame);
     // SAFETY: bytes are owned by Video for the full synchronous submit callback;
     // the encoder contract copies accepted input before returning.
     let started = Instant::now();
@@ -864,7 +1055,7 @@ fn repeat(
         (api.submit)(
             api.base.context,
             input.encoder,
-            &copied_frame,
+            frame,
             u32::from(input.force_idr),
         )
     };
@@ -954,9 +1145,12 @@ fn receive(
     encoder: u64,
     video: u64,
     queues: &Arc<Mutex<Queues>>,
+    processor: Option<&dyn CpuProcessor>,
 ) -> Result<(u64, u64, u64, Option<AcceptedPacket>), &'static str> {
     let mut destination = Destination {
         queues,
+        processor,
+        processor_error: None,
         video,
         transport_admission_us: 0,
         transport_admission_count: 0,
@@ -968,7 +1162,11 @@ fn receive(
     };
     // SAFETY: stack sink copies at most one bounded borrowed packet.
     let started = Instant::now();
-    match unsafe { (api.receive)(api.base.context, encoder, sink) } {
+    let status = unsafe { (api.receive)(api.base.context, encoder, sink) };
+    if let Some(code) = destination.processor_error {
+        return Err(code);
+    }
+    match status {
         STATUS_OK | MEDIA_PENDING | MEDIA_BUSY => Ok((
             elapsed_micros(started),
             destination.transport_admission_us,
@@ -988,9 +1186,61 @@ mod tests {
     use super::*;
     use crate::model::AmdAv1LatencyMode;
     use amaterasu_module_sdk::abi::AbiHeader;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct FakeProcessor {
+        stages: RefCell<Vec<u32>>,
+        widths: RefCell<Vec<u32>>,
+        drop_stage: Option<u32>,
+        fail_stage: Option<u32>,
+        fail_packet: bool,
+    }
+
+    impl CpuProcessor for FakeProcessor {
+        fn frame(
+            &self,
+            stage: u32,
+            frame: &CpuFrame,
+        ) -> Result<FrameProcessOutcome, ProcessorError> {
+            self.stages.borrow_mut().push(stage);
+            self.widths.borrow_mut().push(frame.width);
+            if self.fail_stage == Some(stage) {
+                return Err(ProcessorError::OverBudget);
+            }
+            if self.drop_stage == Some(stage) {
+                return Ok(FrameProcessOutcome::Drop);
+            }
+            // SAFETY: each fixture retains the source allocation through the call.
+            let mut bytes = unsafe { frame.bytes() }
+                .map_err(|_| ProcessorError::InvalidInput)?
+                .to_vec();
+            bytes[0] += if stage == PROCESS_BEFORE_FRAME { 1 } else { 2 };
+            Ok(FrameProcessOutcome::Replace(OwnedCpuFrame {
+                width: frame.width,
+                height: frame.height,
+                format: frame.format,
+                stride: frame.stride,
+                timestamp_us: frame.timestamp_us,
+                sequence: frame.sequence,
+                bytes,
+            }))
+        }
+
+        fn packet(&self, _: &EncodedPacket) -> Result<(), ProcessorError> {
+            self.stages
+                .borrow_mut()
+                .push(amaterasu_media::processing::PROCESS_AFTER_ENCODE);
+            if self.fail_packet {
+                Err(ProcessorError::InvalidResult)
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     #[test]
-    fn signed_x11_replacement_binds_only_the_exact_service() {
+    fn host_configured_x11_replacement_binds_only_the_exact_service() {
         if !cfg!(target_os = "linux") {
             return;
         }
@@ -1071,6 +1321,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1165,6 +1417,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1237,6 +1491,273 @@ mod tests {
     }
 
     #[test]
+    fn selected_processor_transforms_before_encoder_submit_and_retains_owned_repeat_pixels() {
+        let mut observed = SubmittedFrames::default();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: (&mut observed as *mut SubmittedFrames).cast(),
+                release: None,
+            },
+            submit: record_frame,
+            receive,
+            drain,
+        };
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,"height":16,"fps":30,"bitrate":100000
+        }))
+        .unwrap();
+        let processor = FakeProcessor::default();
+        let mut source = [1u8; 16 * 16 * 4];
+        let captured = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_BGRA8,
+            stride: 64,
+            data: source.as_ptr(),
+            len: source.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut submission = Submission {
+            api: &api,
+            processor: Some(&processor),
+            processor_error: None,
+            encoder: 2,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            allow_resize: true,
+            track_wgc_arrival: false,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 12,
+            sequence: 3,
+            frame: None,
+            accepted_frame: None,
+            owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
+        };
+        assert_eq!(
+            unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &captured) },
+            STATUS_OK
+        );
+        assert_eq!(
+            processor.stages.borrow().clone(),
+            [PROCESS_BEFORE_FRAME, PROCESS_BEFORE_ENCODE]
+        );
+        assert_eq!(submission.status, STATUS_OK);
+        assert_eq!(observed.0.len(), 1);
+        assert_eq!((observed.0[0].0, observed.0[0].1), (3, 12));
+        assert_eq!(observed.0[0].2[0], 4);
+        source.fill(0);
+        assert_eq!(submission.owned_frame.as_ref().unwrap().bytes[0], 4);
+    }
+
+    #[test]
+    fn processor_drop_never_submits_or_replaces_the_repeat_cache() {
+        let mut observed = SubmittedFrames::default();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context: (&mut observed as *mut SubmittedFrames).cast(),
+                release: None,
+            },
+            submit: record_frame,
+            receive,
+            drain,
+        };
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,"height":16,"fps":30,"bitrate":100000
+        }))
+        .unwrap();
+        let processor = FakeProcessor {
+            drop_stage: Some(PROCESS_BEFORE_ENCODE),
+            ..FakeProcessor::default()
+        };
+        let failed = FakeProcessor {
+            fail_stage: Some(PROCESS_BEFORE_FRAME),
+            ..FakeProcessor::default()
+        };
+        let source = [1u8; 16 * 16 * 4];
+        let captured = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_BGRA8,
+            stride: 64,
+            data: source.as_ptr(),
+            len: source.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut submission = Submission {
+            api: &api,
+            processor: Some(&processor),
+            processor_error: None,
+            encoder: 2,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            allow_resize: false,
+            track_wgc_arrival: false,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 12,
+            sequence: 3,
+            frame: None,
+            accepted_frame: None,
+            owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
+        };
+        assert_eq!(
+            unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &captured) },
+            STATUS_OK
+        );
+        assert_eq!(submission.status, MEDIA_BUSY);
+        assert!(submission.owned_frame.is_none());
+        assert!(observed.0.is_empty());
+        assert_eq!(
+            processor.stages.borrow().clone(),
+            [PROCESS_BEFORE_FRAME, PROCESS_BEFORE_ENCODE]
+        );
+        submission.processor = Some(&failed);
+        submission.status = MEDIA_PENDING;
+        assert_eq!(
+            unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &captured) },
+            STATUS_OK
+        );
+        assert_eq!(
+            submission.processor_error,
+            Some("cpu_processor_over_budget")
+        );
+        assert!(observed.0.is_empty());
+        assert!(submission.owned_frame.is_none());
+    }
+
+    unsafe extern "C" fn record_packet_len(
+        context: *mut c_void,
+        packet: *const EncodedPacket,
+    ) -> Status {
+        if context.is_null() || packet.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: queue borrows one packet through this synchronous callback.
+        unsafe { *context.cast::<usize>() = (*packet).len };
+        STATUS_OK
+    }
+
+    #[test]
+    fn after_encode_observes_before_queue_admission_and_failure_leaves_queue_empty() {
+        let queues = Arc::new(Mutex::new(Queues::default()));
+        queues.lock().unwrap().open(1, "alice", 0);
+        let bytes = [7u8; 4];
+        let encoded = EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_KEYFRAME,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 3,
+            sequence: 2,
+        };
+        let failed = FakeProcessor {
+            fail_packet: true,
+            ..FakeProcessor::default()
+        };
+        let accepted = FakeProcessor::default();
+        let retried = FakeProcessor::default();
+        let mut destination = Destination {
+            queues: &queues,
+            processor: Some(&failed),
+            processor_error: None,
+            video: 1,
+            transport_admission_us: 0,
+            transport_admission_count: 0,
+            encoded_packet: None,
+        };
+        assert_eq!(
+            unsafe { packet((&mut destination as *mut Destination<'_>).cast(), &encoded) },
+            MEDIA_BACKEND_ERROR
+        );
+        assert_eq!(destination.processor_error, Some("cpu_processor_failed"));
+        let mut seen = 0usize;
+        assert_eq!(
+            unsafe {
+                queues.lock().unwrap().receive(
+                    "alice",
+                    1,
+                    PacketSink {
+                        context: (&mut seen as *mut usize).cast(),
+                        write: record_packet_len,
+                    },
+                )
+            },
+            MEDIA_PENDING
+        );
+
+        destination.processor = Some(&accepted);
+        destination.processor_error = None;
+        assert_eq!(
+            unsafe { packet((&mut destination as *mut Destination<'_>).cast(), &encoded) },
+            STATUS_OK
+        );
+        assert_eq!(
+            accepted.stages.borrow().as_slice(),
+            &[amaterasu_media::processing::PROCESS_AFTER_ENCODE]
+        );
+        assert_eq!(
+            unsafe {
+                queues.lock().unwrap().receive(
+                    "alice",
+                    1,
+                    PacketSink {
+                        context: (&mut seen as *mut usize).cast(),
+                        write: record_packet_len,
+                    },
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(seen, bytes.len());
+
+        // Queue refusal leaves the encoder packet for redelivery. AFTER_ENCODE
+        // is an at-least-once attempt observation, not an exactly-once receipt.
+        for _ in 0..4 {
+            assert_eq!(
+                unsafe { queues.lock().unwrap().push(1, &encoded) },
+                STATUS_OK
+            );
+        }
+        destination.processor = Some(&retried);
+        assert_eq!(
+            unsafe { packet((&mut destination as *mut Destination<'_>).cast(), &encoded) },
+            MEDIA_BUSY
+        );
+        assert_eq!(retried.stages.borrow().len(), 1);
+        assert_eq!(
+            unsafe {
+                queues.lock().unwrap().receive(
+                    "alice",
+                    1,
+                    PacketSink {
+                        context: (&mut seen as *mut usize).cast(),
+                        write: record_packet_len,
+                    },
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { packet((&mut destination as *mut Destination<'_>).cast(), &encoded) },
+            STATUS_OK
+        );
+        assert_eq!(retried.stages.borrow().len(), 2);
+    }
+
+    #[test]
     fn repeats_use_owned_accepted_pixels_and_advance_video_metadata() {
         let mut observed = SubmittedFrames::default();
         let api = EncoderApi {
@@ -1280,6 +1801,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1325,7 +1848,7 @@ mod tests {
             sequence: 4,
             force_idr: false,
         };
-        let repeated = repeat(&api, owned_frame, &input).unwrap();
+        let repeated = repeat(&api, owned_frame, &input, None).unwrap();
         assert!(repeated.submitted);
         assert!(repeated.repeat_attempted);
         assert_eq!(observed.0.len(), 2);
@@ -1335,10 +1858,22 @@ mod tests {
         assert_eq!(observed.0[1].0, 4);
         assert_eq!(observed.0[1].1, 21);
         assert_eq!(observed.0[1].2, vec![0x6b; source_bytes.len()]);
+        let processor = FakeProcessor::default();
+        let transformed = repeat(&api, owned_frame, &input, Some(&processor)).unwrap();
+        assert!(transformed.submitted);
+        assert_eq!(observed.0[2].2[0], 0x6e);
+        assert_eq!(observed.0[2].0, 4);
+        assert_eq!(observed.0[2].1, 21);
+        assert_eq!(owned_frame.bytes[0], 0x6b);
+        assert_eq!(
+            processor.stages.borrow().as_slice(),
+            &[PROCESS_BEFORE_FRAME, PROCESS_BEFORE_ENCODE]
+        );
     }
     #[test]
     fn portal_resize_submits_and_retains_the_complete_fitted_frame() {
         let mut observed = SubmittedFrames::default();
+        let processor = FakeProcessor::default();
         let api = EncoderApi {
             base: NativeInterface {
                 header: AbiHeader::of::<EncoderApi>(),
@@ -1366,6 +1901,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1397,7 +1934,7 @@ mod tests {
         );
         assert_eq!((metadata.timestamp_us, metadata.sequence), (12, 3));
         pixels.fill(0);
-        let retained = submission.owned_frame.unwrap();
+        let retained = submission.owned_frame.as_ref().unwrap();
         assert_eq!(retained.bytes.len(), 16 * 16 * 4);
         assert!(
             retained
@@ -1407,7 +1944,27 @@ mod tests {
                 .iter()
                 .all(|pixel| *pixel == [0x6b, 0x6b, 0x6b, 255])
         );
-        assert_eq!(observed.0[0].2, retained.bytes);
+        assert_eq!(observed.0[0].2.as_slice(), retained.bytes.as_slice());
+
+        // With the explicit service selected, BEFORE_FRAME sees the captured
+        // geometry and BEFORE_ENCODE sees the resized encoder geometry.
+        pixels.fill(0x6b);
+        submission.processor = Some(&processor);
+        assert_eq!(
+            unsafe { submit((&mut submission as *mut Submission<'_>).cast(), &captured) },
+            STATUS_OK
+        );
+        assert_eq!(submission.status, STATUS_OK);
+        assert_eq!(
+            processor.stages.borrow().as_slice(),
+            &[PROCESS_BEFORE_FRAME, PROCESS_BEFORE_ENCODE]
+        );
+        assert_eq!(processor.widths.borrow().as_slice(), &[32, 16]);
+        assert_eq!(observed.0.len(), 2);
+        assert_eq!(
+            submission.owned_frame.as_ref().unwrap().bytes,
+            observed.0[1].2
+        );
     }
 
     #[test]
@@ -1466,6 +2023,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1534,6 +2093,8 @@ mod tests {
         };
         let mut fresh_submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1561,6 +2122,8 @@ mod tests {
 
         let mut cached_submission = Submission {
             api: &api,
+            processor: None,
+            processor_error: None,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,

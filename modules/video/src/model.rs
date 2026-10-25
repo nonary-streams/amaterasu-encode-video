@@ -100,6 +100,14 @@ pub struct Settings {
     /// Separate opt-in metadata stream for accepted frames and encoded output.
     #[serde(default)]
     pub frame_observation: bool,
+    /// Exact trusted native CPU processing service. None leaves the hot path
+    /// unchanged; binding also requires an exact signed native-use grant.
+    #[serde(default)]
+    pub cpu_processor_service: Option<String>,
+    /// Elapsed budget checked after each synchronous native call. It cannot
+    /// preempt a provider that does not return.
+    #[serde(default = "default_cpu_processor_budget_us")]
+    pub cpu_processor_budget_us: u32,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
     /// Exact X11-slot replacement from trusted host-owned module settings.
@@ -122,12 +130,17 @@ fn default_providers() -> BTreeSet<CaptureProvider> {
 fn default_drain_timeout() -> u64 {
     5000
 }
+fn default_cpu_processor_budget_us() -> u32 {
+    2_000
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
             capture_observation: false,
             frame_observation: false,
+            cpu_processor_service: None,
+            cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: default_providers(),
             x11_capture_service: None,
             drain_timeout_ms: default_drain_timeout(),
@@ -139,10 +152,18 @@ impl Settings {
         if self.capture_providers.is_empty() || !(100..=30000).contains(&self.drain_timeout_ms) {
             return Err("invalid_video_settings");
         }
+        if !(100..=5_000).contains(&self.cpu_processor_budget_us)
+            || self
+                .cpu_processor_service
+                .as_deref()
+                .is_some_and(|service| !valid_external_service(service))
+        {
+            return Err("invalid_cpu_processor_service");
+        }
         if let Some(service) = &self.x11_capture_service
             && (!cfg!(target_os = "linux")
                 || !self.capture_providers.contains(&CaptureProvider::X11)
-                || !valid_external_x11_service(service))
+                || !valid_external_service(service))
         {
             return Err("invalid_x11_capture_service");
         }
@@ -160,7 +181,7 @@ impl Settings {
     }
 }
 
-fn valid_external_x11_service(service: &str) -> bool {
+fn valid_external_service(service: &str) -> bool {
     let Some(namespace) = service.strip_suffix("/1") else {
         return false;
     };
@@ -966,6 +987,8 @@ mod tests {
             enabled: true,
             capture_observation: false,
             frame_observation: false,
+            cpu_processor_service: None,
+            cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::X11].into(),
             x11_capture_service: None,
             drain_timeout_ms: 5000,
@@ -1031,6 +1054,29 @@ mod tests {
     }
 
     #[test]
+    fn cpu_processing_requires_an_explicit_external_service_and_bounded_budget() {
+        let mut settings = Settings::default();
+        assert!(settings.cpu_processor_service.is_none());
+        assert!(settings.validate().is_ok());
+        settings.cpu_processor_service = Some("example.video-effects/1".into());
+        assert!(settings.validate().is_ok());
+        for invalid in [
+            "amaterasu.video/1",
+            "example.video-effects/2",
+            "Example.effects/1",
+            "example..effects/1",
+        ] {
+            settings.cpu_processor_service = Some(invalid.into());
+            assert_eq!(settings.validate(), Err("invalid_cpu_processor_service"));
+        }
+        settings.cpu_processor_service = Some("example.video-effects/1".into());
+        settings.cpu_processor_budget_us = 5_001;
+        assert_eq!(settings.validate(), Err("invalid_cpu_processor_service"));
+        settings.cpu_processor_budget_us = 100;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
     fn kms_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
         assert_eq!(CaptureProvider::Kms.service(), "amaterasu.capture-kms/1");
         assert_eq!(serde_json::to_value(CaptureProvider::Kms).unwrap(), "kms");
@@ -1039,6 +1085,8 @@ mod tests {
             enabled: true,
             capture_observation: false,
             frame_observation: false,
+            cpu_processor_service: None,
+            cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::Kms].into(),
             x11_capture_service: None,
             drain_timeout_ms: 5000,

@@ -2239,7 +2239,7 @@ fn x11_open_reenumerates_exact_current_output_and_never_falls_back() {
 }
 
 #[test]
-fn signed_x11_service_routes_enumerate_open_and_cleanup_to_one_provider() {
+fn host_configured_x11_service_routes_enumerate_open_and_cleanup_to_one_provider() {
     let service = "example.capture-test/1";
     let output_id = "x11:DP-1/000000a4";
     let (mut pipeline, mut runtime, mut plane) = setup_with_settings(Settings {
