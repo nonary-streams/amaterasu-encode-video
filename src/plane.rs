@@ -49,6 +49,17 @@ pub struct Pump<'a> {
     pub sequence: u64,
     pub force_idr: bool,
 }
+/// What a capture provider reports about its newest completed presentation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationQuery {
+    /// The provider table predates capture v1.5, or it declined the query;
+    /// the stream keeps timer pacing.
+    Unavailable,
+    /// Nothing has been presented yet, or the provider has no news this tick.
+    Pending,
+    /// The newest completed presentation; its sequence is never zero.
+    Latest(PresentationStatus),
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeometryProgress {
     Ready,
@@ -84,6 +95,9 @@ pub struct Progress {
     pub dmabuf_fresh: Option<bool>,
     /// This stream cannot exchange DMA-BUF frames; the reason selects CPU capture.
     pub dmabuf_fallback: Option<&'static str>,
+    /// Provider sequence of the DMA-BUF presentation the capture callback
+    /// delivered, whether or not the encoder accepted it.
+    pub dmabuf_presentation: Option<u64>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
     pub capture_callback_us: u64,
@@ -138,6 +152,15 @@ pub trait Plane {
     /// binding, or `None` when both native tables carry the DMA-BUF tails.
     fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
         Some("dmabuf_unsupported")
+    }
+    /// The newest completed presentation of a DMA-BUF capture stream. This
+    /// never blocks and never delivers a frame.
+    fn latest_presentation(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<PresentationQuery, &'static str> {
+        Ok(PresentationQuery::Unavailable)
     }
 }
 
@@ -466,6 +489,26 @@ impl Plane for NativePlane {
             (Err(_), _) => Some("capture_interface"),
             (_, Err(_)) => Some("encoder_interface"),
         }
+    }
+
+    fn latest_presentation(
+        &mut self,
+        provider: CaptureProvider,
+        capture: u64,
+    ) -> Result<PresentationQuery, &'static str> {
+        let binding = self
+            .captures
+            .get(&provider)
+            .ok_or("capture_provider_unavailable")?;
+        // SAFETY: the binding retains its validated v1.0 prefix. The v1.5 table
+        // is read only after its advertised minor and size cover the query.
+        let prefix =
+            unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+        if !dmabuf::presentation_tail_available(prefix.base.header) {
+            return Ok(PresentationQuery::Unavailable);
+        }
+        let api = unsafe { binding.table::<CaptureApiV1_5>() }.map_err(|_| "capture_interface")?;
+        dmabuf::latest_presentation(api, capture)
     }
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {

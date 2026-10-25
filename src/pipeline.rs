@@ -4,6 +4,7 @@ mod output;
 mod owned_capture;
 mod pacing;
 mod portal;
+mod presentation;
 
 use crate::{
     model::{
@@ -68,6 +69,7 @@ struct Stream {
     minimum_fps_target: f64,
     wgc_pacing_smoothing: bool,
     wgc_pacing: pacing::WgcPacing,
+    presentation: presentation::PresentationPacing,
     force_idr: bool,
     grace: Option<output::Grace>,
     output: String,
@@ -214,18 +216,63 @@ impl Stream {
                 .is_none_or(|last| elapsed_at_rate(now, last, target))
     }
 
-    fn next_frame_clock(&self, now: Instant) -> Option<(u64, u64)> {
-        let sequence = self.last_output_sequence.checked_add(1)?;
-        let elapsed = now
-            .saturating_duration_since(self.opened_at)
+    /// Microseconds of the stream clock at `now`.
+    fn stream_clock_us(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.opened_at)
             .as_micros()
-            .min(u64::MAX as u128) as u64;
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn next_frame_clock(&self, now: Instant) -> Option<(u64, u64)> {
+        self.frame_clock_at(self.stream_clock_us(now))
+    }
+
+    /// The next output timestamp and sequence for a frame stamped
+    /// `candidate_us`, kept strictly monotonic.
+    fn frame_clock_at(&self, candidate_us: u64) -> Option<(u64, u64)> {
+        let sequence = self.last_output_sequence.checked_add(1)?;
         let timestamp_us = self
             .last_output_timestamp_us
             .map(|timestamp| timestamp.checked_add(1))
             .unwrap_or(Some(1))?
-            .max(elapsed);
+            .max(candidate_us);
         Some((timestamp_us, sequence))
+    }
+
+    /// Asks the capture provider for its newest presentation on the DMA-BUF
+    /// path and reports whether this tick is presentation-paced.
+    fn observe_presentation(&mut self, plane: &mut dyn Plane) -> Result<bool, &'static str> {
+        if self.frame_path != FramePath::DmaBuf {
+            self.presentation.deactivate();
+            return Ok(false);
+        }
+        let capture = self.capture.expect("running streams retain their capture");
+        let query = plane.latest_presentation(self.provider, capture)?;
+        Ok(self.presentation.observe(query))
+    }
+
+    /// A presentation-paced read is due for new content: a newer presentation
+    /// the frame-rate cap admits, or, until the first frame is accepted, the
+    /// timer probe that also covers a source that has not presented yet.
+    fn presentation_capture_due(&self, now: Instant) -> CaptureTrigger {
+        if self.presentation.fresh_due(now) {
+            CaptureTrigger::Presentation
+        } else if self.last_output_at.is_none()
+            && now >= self.next_frame
+            && self.presentation.submit_allowed(now)
+        {
+            CaptureTrigger::Timer
+        } else {
+            CaptureTrigger::None
+        }
+    }
+
+    /// The keepalive rule decides repeats on a presentation-paced stream; a
+    /// pending keyframe request also repeats the latest presentation. Both
+    /// respect the frame-rate cap.
+    fn presentation_repeat_due(&self, now: Instant) -> bool {
+        (self.repeat_due(now) || (self.force_idr && self.has_repeat_source()))
+            && self.presentation.submit_allowed(now)
     }
 
     fn response(&self, id: u64) -> Value {
@@ -270,6 +317,7 @@ impl Stream {
             "error": self.error,
         });
         self.owned_capture.write_status(&mut response);
+        self.presentation.write_status(&mut response);
         if let Some(encoder) = &self.encoder {
             response["encoder"] = json!(encoder);
         }
@@ -585,6 +633,7 @@ impl Pipeline {
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 wgc_pacing,
+                presentation: presentation::PresentationPacing::default(),
                 force_idr: false,
                 grace: None,
                 capture_output: output.clone(),
@@ -728,11 +777,34 @@ fn elapsed_at_rate(now: Instant, anchor: Instant, frames_per_second: f64) -> boo
     now.saturating_duration_since(anchor).as_secs_f64() * frames_per_second >= 1.0
 }
 
+/// Why a pump tick reads the capture provider for new content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureTrigger {
+    None,
+    /// The 1/fps capture timer elapsed.
+    Timer,
+    /// A newer completed presentation is ready and the frame-rate cap admits it.
+    Presentation,
+}
+
 fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let now = Instant::now();
-    let mut capture_due = now >= stream.next_frame;
-    let mut capture_slot = capture_due.then_some(stream.next_frame);
-    if capture_due {
+    let presentation_paced = match stream.observe_presentation(plane) {
+        Ok(paced) => paced,
+        Err(code) => {
+            stream.cleanup(code);
+            return;
+        }
+    };
+    let mut trigger = if presentation_paced {
+        stream.presentation_capture_due(now)
+    } else if now >= stream.next_frame {
+        CaptureTrigger::Timer
+    } else {
+        CaptureTrigger::None
+    };
+    let mut capture_slot = (trigger == CaptureTrigger::Timer).then_some(stream.next_frame);
+    if trigger != CaptureTrigger::None {
         match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => {
@@ -744,7 +816,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                     );
                 }
                 stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
-                capture_due = false;
+                trigger = CaptureTrigger::None;
                 capture_slot = None;
             }
             Err(code) => {
@@ -752,7 +824,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 return;
             }
         }
-        if capture_due && (stream.provider != CaptureProvider::Wgc || stream.constant_rate) {
+        if trigger == CaptureTrigger::Timer
+            && (stream.provider != CaptureProvider::Wgc || stream.constant_rate)
+        {
             stream.next_frame = if stream.provider.uses_periodic_capture() {
                 periodic_capture_deadline(stream.next_frame, now, stream.configuration.fps)
             } else {
@@ -760,8 +834,22 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
             };
         }
     }
-    let repeat_due = stream.repeat_due(now);
-    let Some((timestamp_us, sequence)) = stream.next_frame_clock(now) else {
+    let capture_due = trigger != CaptureTrigger::None;
+    let frame_interval = presentation::frame_interval(stream.configuration.fps);
+    let repeat_due = if presentation_paced {
+        stream.presentation_repeat_due(now)
+    } else {
+        stream.repeat_due(now)
+    };
+    let frame_clock = if trigger == CaptureTrigger::Presentation {
+        let presented_us = stream
+            .presentation
+            .fresh_timestamp(stream.stream_clock_us(now), frame_interval);
+        stream.frame_clock_at(presented_us)
+    } else {
+        stream.next_frame_clock(now)
+    };
+    let Some((timestamp_us, sequence)) = frame_clock else {
         stream.cleanup("frame_clock_exhausted");
         return;
     };
@@ -790,8 +878,23 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 }
                 return;
             }
-            if stream.provider.uses_periodic_capture() && progress.capture_deferred {
-                stream.next_frame = capture_slot.expect("deferred capture retained its due slot");
+            if presentation_paced {
+                stream.presentation.record(
+                    completed_at,
+                    frame_interval,
+                    presentation::PresentationDelivery {
+                        pushed: trigger == CaptureTrigger::Presentation,
+                        repeat: progress.repeat_attempted,
+                        delivered: progress.dmabuf_presentation,
+                        submitted: progress.submitted,
+                    },
+                );
+            }
+            if stream.provider.uses_periodic_capture()
+                && progress.capture_deferred
+                && let Some(slot) = capture_slot
+            {
+                stream.next_frame = slot;
             }
             if capture_due
                 && stream.provider == CaptureProvider::Wgc

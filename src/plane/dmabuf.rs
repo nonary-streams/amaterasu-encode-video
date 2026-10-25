@@ -1,8 +1,9 @@
 //! Borrowed DMA-BUF delivery from a v1.4 capture provider straight into a v1.1
 //! encoder. No pixels enter video-owned memory: the producer lends its
 //! descriptors for one synchronous callback, and the encoder duplicates any
-//! descriptor it keeps before `submit_dmabuf` returns.
-use super::{FrameMetadata, Progress, Pump, elapsed_micros};
+//! descriptor it keeps before `submit_dmabuf` returns. A v1.5 provider also
+//! reports its newest completed presentation, which drives push pacing.
+use super::{FrameMetadata, PresentationQuery, Progress, Pump, elapsed_micros};
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::*;
 use std::{ffi::c_void, time::Instant};
@@ -11,6 +12,33 @@ use std::{ffi::c_void, time::Instant};
 /// `read_dmabuf_frame`. Smaller tables are never read past their size.
 pub fn capture_tail_available(header: AbiHeader) -> bool {
     header.minor >= CAPTURE_DMABUF_INTERFACE_MINOR && header.size >= CAPTURE_API_V1_4_SIZE
+}
+
+/// The capture table advertises v1.5 and is large enough to hold
+/// `latest_presentation`. Smaller tables are never read past their size.
+pub fn presentation_tail_available(header: AbiHeader) -> bool {
+    header.minor >= CAPTURE_PRESENTATION_INTERFACE_MINOR && header.size >= CAPTURE_API_V1_5_SIZE
+}
+
+/// Asks a v1.5 provider for its newest completed presentation. The query is
+/// non-blocking and delivers no frame. `MEDIA_UNSUPPORTED` keeps the stream on
+/// timer pacing; any other failure is a capture failure.
+pub fn latest_presentation(
+    capture: &CaptureApiV1_5,
+    stream: u64,
+) -> Result<PresentationQuery, &'static str> {
+    let mut presentation = PresentationStatus::default();
+    // SAFETY: `presentation` is a live, writable stack value of the exact ABI
+    // type for this synchronous call, and the provider retains nothing.
+    let status =
+        unsafe { (capture.latest_presentation)(capture.base.context, stream, &mut presentation) };
+    match status {
+        STATUS_OK if presentation.sequence == 0 => Ok(PresentationQuery::Pending),
+        STATUS_OK => Ok(PresentationQuery::Latest(presentation)),
+        MEDIA_PENDING | MEDIA_BUSY => Ok(PresentationQuery::Pending),
+        MEDIA_UNSUPPORTED => Ok(PresentationQuery::Unavailable),
+        _ => Err("capture_failed"),
+    }
 }
 
 /// The encoder table advertises v1.1 and is large enough to hold `submit_dmabuf`.
@@ -51,6 +79,8 @@ struct Submission<'a> {
     sequence: u64,
     outcome: Outcome,
     fresh: Option<bool>,
+    /// Provider sequence of the delivered presentation.
+    presentation: Option<u64>,
     frame: Option<FrameMetadata>,
     encoder_submit_us: u64,
 }
@@ -61,6 +91,7 @@ impl Submission<'_> {
     /// # Safety
     /// Every descriptor in `frame` must remain open until this call returns.
     unsafe fn forward(&mut self, frame: &DmaBufFrame) -> Outcome {
+        self.presentation = Some(frame.sequence);
         if frame.validate().is_err() {
             return Outcome::Rejected;
         }
@@ -145,6 +176,7 @@ pub fn deliver(
         sequence: input.sequence,
         outcome: Outcome::NotDelivered,
         fresh: None,
+        presentation: None,
         frame: None,
         encoder_submit_us: 0,
     };
@@ -175,6 +207,7 @@ pub fn deliver(
         capture_reused: submission.fresh == Some(false),
         dmabuf_fresh: submission.fresh,
         dmabuf_fallback,
+        dmabuf_presentation: submission.presentation,
         frame: submission.frame,
         capture_callback_us,
         capture_callback_count: 1,

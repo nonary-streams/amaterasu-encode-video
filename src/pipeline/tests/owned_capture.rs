@@ -37,7 +37,7 @@ fn dmabuf_registry() -> Value {
 
 /// Pipeline, runtime and plane for an owned output whose vkms and encoder
 /// tables both carry DMA-BUF tails.
-fn owned_setup(providers: BTreeSet<CaptureProvider>) -> (Pipeline, Runtime, FakePlane) {
+pub(super) fn owned_setup(providers: BTreeSet<CaptureProvider>) -> (Pipeline, Runtime, FakePlane) {
     let (pipeline, mut runtime, mut plane) = setup_with_providers(providers);
     runtime.encoder_enumeration_override = Some(dmabuf_registry());
     plane.owned_geometry = Some(owned_geometry());
@@ -45,7 +45,7 @@ fn owned_setup(providers: BTreeSet<CaptureProvider>) -> (Pipeline, Runtime, Fake
     (pipeline, runtime, plane)
 }
 
-fn linux_providers() -> BTreeSet<CaptureProvider> {
+pub(super) fn linux_providers() -> BTreeSet<CaptureProvider> {
     [CaptureProvider::Pipewire, CaptureProvider::Vkms].into()
 }
 
@@ -60,7 +60,7 @@ fn owned_open(provider: CaptureProvider) -> Operation {
     .unwrap()
 }
 
-fn start(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane) {
+pub(super) fn start(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane) {
     pipeline.handle(
         "alice",
         77,
@@ -99,7 +99,7 @@ fn requests(runtime: &Runtime, service: &str, action: &str) -> usize {
         .count()
 }
 
-fn status(pipeline: &Pipeline) -> Value {
+pub(super) fn status(pipeline: &Pipeline) -> Value {
     pipeline.streams[&1].response(1)
 }
 

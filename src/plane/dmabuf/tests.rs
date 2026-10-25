@@ -16,6 +16,8 @@ struct Harness {
     encoder_status: Cell<Status>,
     in_capture_callback: Cell<bool>,
     submitted: RefCell<Vec<SubmittedFrame>>,
+    presentation: Cell<PresentationStatus>,
+    presentation_status: Cell<Status>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +39,8 @@ impl Default for Harness {
             encoder_status: Cell::new(STATUS_OK),
             in_capture_callback: Cell::new(false),
             submitted: RefCell::new(Vec::new()),
+            presentation: Cell::new(PresentationStatus::default()),
+            presentation_status: Cell::new(STATUS_OK),
         }
     }
 }
@@ -148,6 +152,34 @@ fn capture_api(harness: &Harness) -> CaptureApiV1_4 {
         read_frame_with_freshness: no_fresh_frame,
         read_frame_with_capture_timestamp: no_timed_frame,
         read_dmabuf_frame: read_dmabuf,
+    }
+}
+
+unsafe extern "C" fn latest(
+    context: *mut c_void,
+    _: u64,
+    output: *mut PresentationStatus,
+) -> Status {
+    // SAFETY: the capture context is the live harness and `output` is the
+    // caller's writable stack value for this synchronous call.
+    let harness = unsafe { &*context.cast::<Harness>() };
+    unsafe { output.write(harness.presentation.get()) };
+    harness.presentation_status.get()
+}
+
+fn presentation_capture_api(harness: &Harness) -> CaptureApiV1_5 {
+    CaptureApiV1_5 {
+        base: interface(
+            CAPTURE_API_V1_5_SIZE,
+            CAPTURE_PRESENTATION_INTERFACE_MINOR,
+            harness,
+        ),
+        read_frame: no_cpu_frame,
+        geometry: no_geometry,
+        read_frame_with_freshness: no_fresh_frame,
+        read_frame_with_capture_timestamp: no_timed_frame,
+        read_dmabuf_frame: read_dmabuf,
+        latest_presentation: latest,
     }
 }
 
@@ -347,4 +379,86 @@ fn invalid_frames_and_capture_errors_are_terminal() {
     harness.deliver_freshness.set(None);
     harness.capture_status.set(MEDIA_BACKEND_ERROR);
     assert_eq!(deliver_once(&harness, true).err(), Some("capture_failed"));
+}
+
+#[test]
+fn presentation_tail_requires_v1_5_minor_and_complete_table_size() {
+    let header = |size, minor| AbiHeader {
+        size,
+        major: 1,
+        minor,
+    };
+    assert!(presentation_tail_available(header(
+        CAPTURE_API_V1_5_SIZE,
+        CAPTURE_PRESENTATION_INTERFACE_MINOR
+    )));
+    assert!(presentation_tail_available(header(
+        CAPTURE_API_V1_5_SIZE + 8,
+        CAPTURE_PRESENTATION_INTERFACE_MINOR + 1
+    )));
+    // A v1.5 minor on a v1.4-sized table must not expose the query.
+    assert!(!presentation_tail_available(header(
+        CAPTURE_API_V1_4_SIZE,
+        CAPTURE_PRESENTATION_INTERFACE_MINOR
+    )));
+    assert!(!presentation_tail_available(header(
+        CAPTURE_API_V1_5_SIZE,
+        CAPTURE_DMABUF_INTERFACE_MINOR
+    )));
+    // A v1.4 provider still qualifies for the DMA-BUF path itself.
+    assert!(capture_tail_available(header(
+        CAPTURE_API_V1_4_SIZE,
+        CAPTURE_DMABUF_INTERFACE_MINOR
+    )));
+}
+
+#[test]
+fn presentation_query_maps_provider_status() {
+    let harness = Harness::default();
+    let api = presentation_capture_api(&harness);
+    assert_eq!(latest_presentation(&api, 3), Ok(PresentationQuery::Pending));
+
+    let presented = PresentationStatus {
+        sequence: 12,
+        timestamp_us: 4_500,
+    };
+    harness.presentation.set(presented);
+    assert_eq!(
+        latest_presentation(&api, 3),
+        Ok(PresentationQuery::Latest(presented))
+    );
+    for (status, expected) in [
+        (MEDIA_PENDING, Ok(PresentationQuery::Pending)),
+        (MEDIA_BUSY, Ok(PresentationQuery::Pending)),
+        (MEDIA_UNSUPPORTED, Ok(PresentationQuery::Unavailable)),
+        (MEDIA_CLOSED, Err("capture_failed")),
+        (MEDIA_BACKEND_ERROR, Err("capture_failed")),
+    ] {
+        harness.presentation_status.set(status);
+        assert_eq!(latest_presentation(&api, 3), expected, "{status}");
+    }
+    // Querying never delivers a frame.
+    assert!(harness.submitted.borrow().is_empty());
+}
+
+#[test]
+fn delivery_reports_the_provider_sequence_it_delivered() {
+    let harness = Harness::default();
+    let progress = deliver_once(&harness, true).unwrap();
+    assert_eq!(progress.dmabuf_presentation, Some(44));
+    // The encoder still receives video's own sequence.
+    assert_eq!(harness.submitted.borrow()[0].sequence, 9);
+
+    harness.encoder_status.set(MEDIA_BUSY);
+    let dropped = deliver_once(&harness, true).unwrap();
+    assert!(dropped.dropped);
+    assert_eq!(dropped.dmabuf_presentation, Some(44));
+
+    let harness = Harness::default();
+    harness.deliver_freshness.set(None);
+    harness.capture_status.set(MEDIA_PENDING);
+    assert_eq!(
+        deliver_once(&harness, true).unwrap().dmabuf_presentation,
+        None
+    );
 }

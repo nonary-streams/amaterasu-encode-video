@@ -64,9 +64,45 @@ borrowed frame through `submit_dmabuf` inside the capture callback, carrying vid
 stream timestamp, sequence and force-IDR flag. Video performs no CPU resize,
 conversion or copy for that stream, and the frame must already match the stream
 size. Encoder `MEDIA_BUSY` drops the presentation like a busy CPU frame. Repeats
-re-read the latest presentation, which the provider may satisfy with cached reuse;
-pacing follows the PipeWire periodic schedule. Status counts delivered
-presentations in `dmabuf_frames.fresh` and `dmabuf_frames.reused`.
+re-read the latest presentation, which the provider may satisfy with cached reuse.
+Status counts delivered presentations in `dmabuf_frames.fresh` and
+`dmabuf_frames.reused`.
+
+Pacing on the DMA-BUF path depends on the vkms table. A table that advertises
+capture minor 5 and is at least `CAPTURE_API_V1_5_SIZE` bytes is paced by
+presentations; a smaller or older table keeps the PipeWire periodic 1/fps timer.
+Presentation pacing works as follows on every module tick:
+
+- video calls the non-blocking `latest_presentation`. A sequence newer than the
+  last delivered presentation is read and submitted on that tick when the
+  frame-rate cap admits it, without waiting for a 1/fps boundary;
+- the cap keeps submits on a 1/fps grid of the negotiated client rate, so the
+  sustained rate never exceeds it. Each submit claims the next grid slot, which
+  absorbs host-tick jitter without drifting. A submit late by more than half an
+  interval admits the next one no sooner than half an interval later, and a gap
+  of a whole interval past a slot re-anchors the grid instead of catching up;
+- presentations that arrive while the cap holds coalesce: only the newest is
+  read when the cap reopens, and each superseded one counts as coalesced;
+- with nothing new, only the existing keepalive rule submits: a cached-reuse
+  repeat at the `minimum_fps_target` deadline (zero means the negotiated FPS),
+  also bounded by the cap. A pending `force_idr` rides on the next fresh push or,
+  without one, on a repeat as soon as the cap admits it;
+- until the first frame is accepted, the 1/fps timer also probes the provider,
+  so a source that has not presented yet still produces a first frame;
+- encoder backpressure drops a delivered presentation like a busy CPU frame; the
+  next presentation or keepalive repeat replaces it;
+- fresh pushes are stamped from the presentation timestamp, mapped onto the
+  stream clock, so variable (VRR) cadence survives. A provider timestamp of
+  zero, one that regresses, one more than a frame ahead of its observation, or
+  one more than 200 ms behind re-anchors the mapping. Output timestamps stay
+  strictly monotonic; repeats use the stream clock;
+- `MEDIA_UNSUPPORTED` from the query returns the stream to timer pacing, and any
+  other query failure is a capture failure.
+
+Status reports `pacing` (`presentation` or `timer`, for every stream) and
+`presentation_pacing` with `fresh_pushes`, `repeats` and `coalesced` counters.
+CPU (PipeWire, WGC, DXGI) streams never query presentations and keep their
+existing pacing.
 
 Fallbacks never fail a stream that PipeWire can still serve:
 

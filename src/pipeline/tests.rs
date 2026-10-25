@@ -306,6 +306,11 @@ struct FakePlane {
     /// The next DMA-BUF capture reports that this stream cannot use GPU frames.
     dmabuf_fallback_once: Option<&'static str>,
     frame_paths: Vec<crate::plane::FramePath>,
+    /// The vkms table carries the capture v1.5 presentation query.
+    presentation_api: bool,
+    /// Newest completed presentation; sequence zero means none yet.
+    presentation: amaterasu_media::PresentationStatus,
+    presentation_queries: usize,
 }
 
 impl Plane for FakePlane {
@@ -331,6 +336,22 @@ impl Plane for FakePlane {
 
     fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
         (!self.dmabuf_ready).then_some("capture_dmabuf_interface_unavailable")
+    }
+
+    fn latest_presentation(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<crate::plane::PresentationQuery, &'static str> {
+        use crate::plane::PresentationQuery;
+        self.presentation_queries += 1;
+        Ok(if !self.presentation_api {
+            PresentationQuery::Unavailable
+        } else if self.presentation.sequence == 0 {
+            PresentationQuery::Pending
+        } else {
+            PresentationQuery::Latest(self.presentation)
+        })
     }
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
@@ -394,6 +415,10 @@ impl Plane for FakePlane {
                 }),
                 dmabuf_fresh: (gpu && (input.capture_due || repeat_attempted))
                     .then_some(input.capture_due),
+                dmabuf_presentation: (gpu
+                    && (input.capture_due || repeat_attempted)
+                    && self.presentation.sequence != 0)
+                    .then_some(self.presentation.sequence),
                 owned_frame: (capture_submitted && !gpu).then_some(OwnedFrame {
                     width: input.configuration.width,
                     height: input.configuration.height,
@@ -3459,6 +3484,7 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
 
 mod operations;
 mod owned_capture;
+mod presentation;
 
 #[test]
 fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
