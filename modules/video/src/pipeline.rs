@@ -429,8 +429,14 @@ impl Pipeline {
                 settings.enabled && settings.frame_observation,
             ),
             providers: settings.capture_providers,
-            x11_capture_service: settings.x11_capture_service,
-            encoder_service: settings.encoder_service,
+            x11_capture_service: settings
+                .x11_capture_plan
+                .map(|plan| plan.service)
+                .or(settings.x11_capture_service),
+            encoder_service: settings
+                .encoder_plan
+                .map(|plan| plan.service)
+                .or(settings.encoder_service),
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
             epoch,

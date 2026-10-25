@@ -1,7 +1,8 @@
-use amaterasu_media::{ColorMode, VideoCodec};
+use amaterasu_media::{CAPTURE_API_V1_0_SIZE, ColorMode, VideoCodec};
 #[cfg(test)]
 use amaterasu_module_sdk::EncoderBackend;
 pub use amaterasu_module_sdk::EncoderSelection;
+use amaterasu_module_sdk::{CaptureBindPlan, CaptureSlot, EncoderBindPlan};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -108,6 +109,10 @@ pub struct Settings {
     /// control calls and native interface; no fallback to the built-in encoder.
     #[serde(default)]
     pub encoder_service: Option<String>,
+    /// Package-verifier-derived approved encoder replacement. The native
+    /// broker still checks the selected table and effective grant at bind.
+    #[serde(default)]
+    pub encoder_plan: Option<EncoderBindPlan>,
     /// Elapsed budget checked after each synchronous native call. It cannot
     /// preempt a provider that does not return.
     #[serde(default = "default_cpu_processor_budget_us")]
@@ -118,6 +123,10 @@ pub struct Settings {
     /// Native-use/call grants remain bounded by the signed component request.
     #[serde(default)]
     pub x11_capture_service: Option<String>,
+    /// Package-verifier-derived approved replacement. NativeBind checks the
+    /// live provider table and effective native grants before use.
+    #[serde(default)]
+    pub x11_capture_plan: Option<CaptureBindPlan>,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_ms: u64,
 }
@@ -145,9 +154,11 @@ impl Default for Settings {
             frame_observation: false,
             cpu_processor_service: None,
             encoder_service: None,
+            encoder_plan: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: default_providers(),
             x11_capture_service: None,
+            x11_capture_plan: None,
             drain_timeout_ms: default_drain_timeout(),
         }
     }
@@ -169,6 +180,13 @@ impl Settings {
             .encoder_service
             .as_deref()
             .is_some_and(|service| !valid_external_service(service))
+            || self.encoder_plan.as_ref().is_some_and(|plan| {
+                self.encoder_service.is_some()
+                    || !valid_external_service(&plan.service)
+                    || plan.interface_major != 1
+                    || plan.minimum_table_size == 0
+                    || plan.minimum_table_size > 1_048_576
+            })
         {
             return Err("invalid_encoder_service");
         }
@@ -179,23 +197,70 @@ impl Settings {
         {
             return Err("invalid_x11_capture_service");
         }
+        if let Some(plan) = &self.x11_capture_plan
+            && (!cfg!(target_os = "linux")
+                || !self.capture_providers.contains(&CaptureProvider::X11)
+                || self.x11_capture_service.is_some()
+                || plan.slot != CaptureSlot::X11
+                || !valid_external_service(&plan.service)
+                || plan.interface_major != 1
+                || plan.minimum_table_size < CAPTURE_API_V1_0_SIZE
+                || plan.minimum_table_size > 1_048_576)
+        {
+            return Err("invalid_x11_capture_plan");
+        }
         Ok(())
     }
 
     pub fn capture_service(&self, provider: CaptureProvider) -> &str {
         if provider == CaptureProvider::X11 {
-            self.x11_capture_service
-                .as_deref()
+            self.x11_capture_plan
+                .as_ref()
+                .map(|plan| plan.service.as_str())
+                .or(self.x11_capture_service.as_deref())
                 .unwrap_or_else(|| provider.service())
         } else {
             provider.service()
         }
     }
 
+    pub fn capture_binding(&self, provider: CaptureProvider) -> (&str, u32, u32, u32) {
+        if provider == CaptureProvider::X11
+            && let Some(plan) = &self.x11_capture_plan
+        {
+            return (
+                &plan.service,
+                plan.interface_major,
+                plan.minimum_interface_minor,
+                plan.minimum_table_size,
+            );
+        }
+        (self.capture_service(provider), 1, 0, CAPTURE_API_V1_0_SIZE)
+    }
+
     pub fn encoder_service(&self) -> &str {
-        self.encoder_service
-            .as_deref()
+        self.encoder_plan
+            .as_ref()
+            .map(|plan| plan.service.as_str())
+            .or(self.encoder_service.as_deref())
             .unwrap_or("amaterasu.encode/1")
+    }
+
+    pub fn encoder_binding(&self) -> (&str, u32, u32, u32) {
+        if let Some(plan) = &self.encoder_plan {
+            return (
+                &plan.service,
+                plan.interface_major,
+                plan.minimum_interface_minor,
+                plan.minimum_table_size,
+            );
+        }
+        (
+            self.encoder_service(),
+            1,
+            0,
+            std::mem::size_of::<amaterasu_media::EncoderApi>() as u32,
+        )
     }
 }
 
@@ -1007,9 +1072,11 @@ mod tests {
             frame_observation: false,
             cpu_processor_service: None,
             encoder_service: None,
+            encoder_plan: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::X11].into(),
             x11_capture_service: None,
+            x11_capture_plan: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());
@@ -1111,6 +1178,19 @@ mod tests {
             settings.encoder_service = Some(invalid.into());
             assert_eq!(settings.validate(), Err("invalid_encoder_service"));
         }
+        settings.encoder_service = None;
+        settings.encoder_plan = Some(EncoderBindPlan {
+            provider_id: "example.encoder".into(),
+            component_id: "example.encoder".into(),
+            service: "example.encoder/1".into(),
+            interface_major: 1,
+            minimum_interface_minor: 2,
+            minimum_table_size: 128,
+        });
+        assert!(settings.validate().is_ok());
+        assert_eq!(settings.encoder_binding(), ("example.encoder/1", 1, 2, 128));
+        settings.encoder_service = Some("example.other/1".into());
+        assert_eq!(settings.validate(), Err("invalid_encoder_service"));
     }
 
     #[test]
@@ -1124,9 +1204,11 @@ mod tests {
             frame_observation: false,
             cpu_processor_service: None,
             encoder_service: None,
+            encoder_plan: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::Kms].into(),
             x11_capture_service: None,
+            x11_capture_plan: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());

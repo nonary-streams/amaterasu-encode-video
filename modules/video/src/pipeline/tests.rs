@@ -2346,6 +2346,57 @@ fn host_configured_encoder_routes_selection_open_and_cleanup_to_one_service() {
 }
 
 #[test]
+fn verified_encoder_plan_routes_control_to_the_same_native_service() {
+    let service = "example.encode-test/1";
+    let settings = Settings {
+        enabled: true,
+        encoder_plan: Some(amaterasu_module_sdk::EncoderBindPlan {
+            provider_id: "example.encode-test".into(),
+            component_id: "example.encode-test".into(),
+            service: service.into(),
+            interface_major: 1,
+            minimum_interface_minor: 0,
+            minimum_table_size: amaterasu_media::ENCODER_API_V1_0_SIZE,
+        }),
+        capture_providers: [CaptureProvider::Dxgi].into(),
+        ..Settings::default()
+    };
+    assert_eq!(settings.encoder_binding().0, service);
+    let (mut pipeline, mut runtime, mut plane) = setup_with_settings(settings);
+    runtime.external_encoder_service = Some(service.into());
+    pipeline.handle("alice", 99, auto_open(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    let actions: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service: target,
+                payload,
+                ..
+            } if target == service => payload["action"].as_str(),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.contains(&"enumerate"));
+    assert!(actions.contains(&"open"));
+    assert!(actions.contains(&"close"));
+    assert!(!runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service: target, .. } if target == ENCODE
+    )));
+}
+
+#[test]
 fn x11_selection_rejects_stale_geometry_and_does_not_select_an_alternate_output() {
     let (mut pipeline, mut runtime, mut plane) =
         setup_with_providers([CaptureProvider::X11, CaptureProvider::Wgc].into());

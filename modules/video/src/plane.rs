@@ -296,12 +296,10 @@ impl NativePlane {
                 processor,
                 captures,
                 unbound,
-                encoder: runtime.bind_native(
-                    settings.encoder_service(),
-                    1,
-                    0,
-                    size_of::<EncoderApi>() as u32,
-                )?,
+                encoder: {
+                    let (service, major, minor, size) = settings.encoder_binding();
+                    runtime.bind_native(service, major, minor, size)?
+                },
                 queues,
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),
@@ -325,12 +323,8 @@ fn bind_capture_providers<T>(
     let mut captures = BTreeMap::new();
     let mut unbound = BTreeMap::new();
     for provider in &settings.capture_providers {
-        match bind(
-            settings.capture_service(*provider),
-            1,
-            0,
-            CAPTURE_API_V1_0_SIZE,
-        ) {
+        let (service, major, minor, size) = settings.capture_binding(*provider);
+        match bind(service, major, minor, size) {
             Ok(binding) => {
                 captures.insert(*provider, binding);
             }
@@ -1335,6 +1329,47 @@ mod tests {
             assert_eq!(error, failure);
             assert_eq!(attempts, ["example.capture-test/1".to_owned()]);
         }
+    }
+
+    #[test]
+    fn verified_x11_plan_uses_its_versioned_table_requirements() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let settings = Settings {
+            enabled: true,
+            capture_providers: [CaptureProvider::X11].into(),
+            x11_capture_plan: Some(amaterasu_module_sdk::CaptureBindPlan {
+                provider_id: "example.capture-test".into(),
+                component_id: "example.capture-test".into(),
+                service: "example.capture-test/1".into(),
+                slot: amaterasu_module_sdk::CaptureSlot::X11,
+                interface_major: 1,
+                minimum_interface_minor: 2,
+                minimum_table_size: CAPTURE_API_V1_0_SIZE + 8,
+            }),
+            ..Settings::default()
+        };
+        let mut calls = Vec::new();
+        let (captures, _) = bind_capture_providers(&settings, |service, major, minor, size| {
+            calls.push((service.to_owned(), major, minor, size));
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(captures.get(&CaptureProvider::X11), Some(&7));
+        assert_eq!(
+            calls,
+            [(
+                "example.capture-test/1".into(),
+                1,
+                2,
+                CAPTURE_API_V1_0_SIZE + 8
+            )]
+        );
+        assert_eq!(
+            settings.capture_service(CaptureProvider::X11),
+            "example.capture-test/1"
+        );
     }
 
     unsafe extern "C" fn busy(_: *mut c_void, _: u64, _: *const CpuFrame, _: u32) -> Status {
