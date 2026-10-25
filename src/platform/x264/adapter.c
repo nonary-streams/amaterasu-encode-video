@@ -47,6 +47,7 @@ struct amaterasu_x264_functions {
 struct amaterasu_x264_configuration {
     uint32_t width, height, fps, bitrate, reference_frames;
     int32_t slices_per_frame, min_threads;
+    uint32_t color_primaries, transfer_characteristics, matrix_coefficients, full_range;
 };
 
 struct amaterasu_x264_output {
@@ -117,10 +118,10 @@ struct amaterasu_x264_encoder *amaterasu_x264_open(
     parameters.rc.i_vbv_buffer_size = parameters.rc.i_bitrate / (int)configuration->fps;
     if (parameters.rc.i_vbv_buffer_size < 1)
         parameters.rc.i_vbv_buffer_size = 1;
-    parameters.vui.b_fullrange = 0;
-    parameters.vui.i_colorprim = 1;
-    parameters.vui.i_transfer = 1;
-    parameters.vui.i_colmatrix = 1;
+    parameters.vui.b_fullrange = (int)configuration->full_range;
+    parameters.vui.i_colorprim = (int)configuration->color_primaries;
+    parameters.vui.i_transfer = (int)configuration->transfer_characteristics;
+    parameters.vui.i_colmatrix = (int)configuration->matrix_coefficients;
     if (configuration->reference_frames != 0)
         parameters.i_frame_reference = (int)configuration->reference_frames;
     if (functions->apply_profile(&parameters, "baseline") < 0) {

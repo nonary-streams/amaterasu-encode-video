@@ -191,8 +191,20 @@ fn exercise_native_winner(module: &EncodeModule, config: &crate::model::Configur
             context: (&mut packets as *mut Vec<(Vec<u8>, u32)>).cast(),
             write: collect,
         };
-        assert_eq!((api.receive)(api.base.context, 1, sink), STATUS_OK);
-        assert_eq!((api.receive)(api.base.context, 1, sink), STATUS_OK);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let receive_ready = || loop {
+            let status = (api.receive)(api.base.context, 1, sink);
+            if status != MEDIA_PENDING {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native encode receive timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(receive_ready(), STATUS_OK);
+        assert_eq!(receive_ready(), STATUS_OK);
         assert_eq!((api.receive)(api.base.context, 1, sink), MEDIA_PENDING);
         api.base.release.unwrap()(api.base.context);
         assert_eq!(packets.len(), 2);

@@ -1,6 +1,13 @@
-//! Native hardware and opt-in software H.264 encoding with owned CPU input.
+//! Video encoding control and the native CPU-frame and DMA-BUF interface.
 mod bitstream;
 mod factory;
+#[cfg_attr(
+    not(any(test, amaterasu_x265_hevc, amaterasu_nvenc_cuda)),
+    allow(dead_code)
+)]
+mod hevc;
+#[cfg_attr(not(amaterasu_nvenc_cuda), allow(dead_code))]
+mod input;
 mod layout;
 mod model;
 mod native;

@@ -36,24 +36,29 @@ impl Factory for TestFactory {
 }
 
 impl Backend for TestBackend {
-    fn submit(&mut self, bytes: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
         assert_eq!(bytes.len(), 16 * 16 * 3 / 2);
         assert!(bytes[..256].iter().all(|value| *value == 16));
         assert!(bytes[256..].iter().all(|value| *value == 128));
         assert_eq!(timestamp, PROBE_TIMESTAMP);
         assert!(force);
         self.observations.lock().unwrap().submitted += 1;
-        Ok(())
+        Ok(SubmitResult::Accepted)
     }
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
-        Ok(self.packets.pop_front())
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(self.packets.pop_front()))
     }
-    fn drain(&mut self) -> Result<(), &'static str> {
+    fn drain(&mut self) -> Result<bool, &'static str> {
         self.observations.lock().unwrap().drained += 1;
         if self.failure == Some("drain") {
             Err("encoder_drain_failed")
         } else {
-            Ok(())
+            Ok(true)
         }
     }
     fn close(self: Box<Self>) -> Result<(), &'static str> {
@@ -149,4 +154,39 @@ fn failed_cleanup_never_reports_a_safely_unusable_candidate() {
         Err("encoder_probe_cleanup_failed")
     );
     assert_eq!(factory.observations.lock().unwrap().closed, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn negotiated_hevc_and_av1_probes_validate_their_own_bitstreams() {
+    let mut hevc = Vec::new();
+    for unit in [
+        &[0x40, 0x01, 0x0c][..],
+        &[0x42, 0x01, 0x01],
+        &[0x44, 0x01, 0xc1],
+        &[0x26, 0x01, 0xaf],
+    ] {
+        hevc.extend_from_slice(&[0, 0, 0, 1]);
+        hevc.extend_from_slice(unit);
+    }
+    let av1 = vec![0x12, 0x00, 0x0a, 0x01, 0x00, 0x32, 0x01, 0x00];
+    for (codec, bytes) in [("hevc", hevc), ("av1", av1)] {
+        let config = serde_json::from_value(json!({
+            "width":16,"height":16,"fps":30,"bitrate":1000000,
+            "video_stream_format":{"codec":codec,"bit_depth":8,"dynamic_range":"sdr"}
+        }))
+        .unwrap();
+        let factory = factory(
+            Some(Packet {
+                bytes,
+                timestamp_100ns: PROBE_TIMESTAMP,
+                keyframe: true,
+            }),
+            None,
+        );
+        let reply = run(&factory, identity(), config).unwrap();
+        assert_eq!(reply["usable"], true, "{codec}: {reply}");
+        assert_eq!(reply["codec"], codec);
+        assert_eq!(factory.observations.lock().unwrap().closed, 1);
+    }
 }

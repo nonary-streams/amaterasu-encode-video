@@ -226,6 +226,7 @@ fn description(activation: &IMFActivate) -> NativeResult<EncoderDescription> {
                 .GetUINT32(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute)
                 .ok()
         },
+        capabilities: Default::default(),
     })
 }
 
@@ -783,6 +784,7 @@ mod diagnostic_tests {
             codec: "h264",
             hardware: true,
             vendor_id: None,
+            capabilities: Default::default(),
         }
     }
 
@@ -815,6 +817,11 @@ mod tests {
             fps: 60,
             bitrate: 1_000_000,
             min_threads: 2,
+            slices_per_frame: 1,
+            qp: 28,
+            nvenc_settings: Default::default(),
+            codec: amaterasu_media::VideoCodec::H264,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: true,
@@ -844,6 +851,11 @@ mod tests {
             fps: 60,
             bitrate: 1_000_000,
             min_threads: 2,
+            slices_per_frame: 1,
+            qp: 28,
+            nvenc_settings: Default::default(),
+            codec: amaterasu_media::VideoCodec::H264,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: false,
@@ -873,6 +885,11 @@ mod tests {
             fps: 60,
             bitrate: 1_000_000,
             min_threads: 2,
+            slices_per_frame: 1,
+            qp: 28,
+            nvenc_settings: Default::default(),
+            codec: amaterasu_media::VideoCodec::H264,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: false,
@@ -905,6 +922,11 @@ mod tests {
             fps: 30,
             bitrate: 2_000_000,
             min_threads: 2,
+            slices_per_frame: 1,
+            qp: 28,
+            nvenc_settings: Default::default(),
+            codec: amaterasu_media::VideoCodec::H264,
+            color_mode: amaterasu_media::ColorMode::default(),
             max_reference_frames: 0,
             nvenc_preset: None,
             nvenc_h264_cavlc: false,

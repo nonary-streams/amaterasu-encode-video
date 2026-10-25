@@ -43,6 +43,10 @@ struct NativeConfiguration {
     reference_frames: u32,
     slices_per_frame: i32,
     min_threads: i32,
+    color_primaries: u32,
+    transfer_characteristics: u32,
+    matrix_coefficients: u32,
+    full_range: u32,
 }
 
 #[repr(C)]
@@ -153,7 +157,6 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    #[cfg(test)]
     pub fn open(identity: &EncoderIdentity, config: &Configuration) -> Result<Self, &'static str> {
         Self::open_with_log_emitter(identity, config, None)
     }
@@ -167,11 +170,15 @@ impl Encoder {
             return Err("encoder_identity_changed");
         }
         config.validate()?;
+        if config.codec() != amaterasu_media::VideoCodec::H264 {
+            return Err("codec_unsupported");
+        }
         let library = CodecLibrary::load()?;
         let preset =
             CString::new(config.software_preset()).map_err(|_| "invalid_software_configuration")?;
         let tune =
             CString::new(config.software_tune()).map_err(|_| "invalid_software_configuration")?;
+        let vui = super::vui_color(config.color_mode);
         let native_config = NativeConfiguration {
             width: config.width,
             height: config.height,
@@ -180,6 +187,10 @@ impl Encoder {
             reference_frames: config.max_reference_frames,
             slices_per_frame: config.slices_per_frame,
             min_threads: config.min_threads,
+            color_primaries: vui.color_primaries,
+            transfer_characteristics: vui.transfer_characteristics,
+            matrix_coefficients: vui.matrix_coefficients,
+            full_range: vui.full_range,
         };
         let log_emitter = emitter.map(Box::new);
         let (log_callback, log_context) = match &log_emitter {

@@ -1,12 +1,18 @@
-# Native H.264 encoder
+# Video encoder
 
 `amaterasu-encode` provides `amaterasu.encode/1` control and the matching native
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.
-The default build enumerates Windows hardware MFTs; non-Windows hardware opens
-return `unsupported_platform`. The opt-in `software-x264` feature adds genuine
-CPU encoding when system x264 prerequisites are present. Selection is explicit;
-hardware failure never silently substitutes software or generated frames.
+The default build remains hardware-only on Windows and has no Linux encoder.
+Explicit build features can add real Linux hardware NVENC, software x264, or
+software x265 HEVC encoding; no generated frames are used. Automatic video selection chooses x264
+when the requested color or reference mode is unsupported by Linux NVENC. If a
+probed NVENC open later fails with a confirmed availability/configuration error,
+automatic selection retries x264 once using a distinct operation ID. Explicit
+encoder selections and uncertain opens do not fall back. Linux NVENC is advertised
+only after FFmpeg opens a real `h264_nvenc`
+session with the supported SDR H.264 settings. Opening an unregistered Linux
+hardware identity returns `hardware_encoder_unavailable`.
 
 Control requests are strict JSON; frames and encoded bytes never use JSON:
 
@@ -19,16 +25,11 @@ Control requests are strict JSON; frames and encoded bytes never use JSON:
 {"action":"close","session_id":1}
 ```
 
-Enumeration returns descriptions with `identity`, `name`, `codec`, `hardware`,
-and optional `vendor_id`. Hardware selection retains the registered MFT
-identity. Available x264 is appended with `hardware:false`, `vendor_id:null`,
-and the exact identity above. The response additionally reports
-`software_encoder:{available,reason}`. Missing feature, target headers, or
-version-compatible runtime produce `x264_feature_disabled`,
-`x264_headers_unavailable`, or `x264_runtime_unavailable`; the software identity
-fails Open with that code. Registered codec availability does not guarantee
-configuration Open; opening validates actual codec parameters and resources.
-Open/lookup return `{ok:true,session_id,configuration,codec:"h264",max_reference_frames}`. Status adds
+Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264"|"hevc"|"av1",hardware:true}]}`.
+Backends that report more capability add optional `inputs` (`"cpu"`, `"dmabuf"`),
+`max_width` and `max_height` fields; descriptions without them are unchanged.
+An index identifies the current encoder enumeration, not a stable GPU ID.
+Open/lookup return `{ok:true,session_id,configuration,codec:"h264"|"hevc",max_reference_frames}`. Status adds
 `state:"open"|"draining"|"failed"`; close returns `{ok:true,session_id,state:"closed"}`.
 Errors contain only `{ok:false,code}`; native driver messages are not exposed.
 Enumeration confirms a registered hardware NV12/H.264 transform, not that every
@@ -36,14 +37,14 @@ configuration can open. Open negotiates the actual requested configuration.
 
 `probe` validates codec viability with the exact identity and configuration. It
 opens a transient backend, submits one owned limited-range NV12 image at the
-requested geometry, requires actual Annex B IDR bytes with parameter sets and
+requested geometry, requires codec-validated H.264/HEVC IDR bytes with parameter sets or an AV1 key temporal unit and
 the submitted timestamp, drains, then closes and joins before responding.
 It never opens capture, allocates a session ID, retains an operation record, or
 returns coded bytes through JSON. Activation and probe calls run outside the
 shared session mutex so existing native bindings remain available.
 
 A completed probe returns
-`{ok:true,codec:"h264",encoder,configuration,usable,settled:true,code,reason}`.
+`{ok:true,codec:"h264"|"hevc"|"av1",encoder,configuration,usable,settled:true,code,reason}`.
 Success has null `code` and `reason`; a safely unusable backend has
 `code:"encoder_unusable"` and a bounded static `reason`. Validation and ambiguous
 cleanup failures return ordinary `{ok:false,code}` errors, which do not authorize
@@ -65,13 +66,17 @@ lookup after settling their original runtime request.
 
 At most eight active sessions and two per caller are allowed. Width is even,
 16–3840; height is even, 16–2160; frame rate is 1–120 FPS; bitrate is
-100,000–100,000,000 bits/second. Hardware may impose narrower limits. H.264
-Baseline with no B pictures and requested low latency is the only configuration.
-`configuration.max_reference_frames` accepts only `0` or `1` and defaults to
+100,000–100,000,000 bits/second. Hardware may impose narrower limits. The H.264
+backend uses Baseline with no B pictures and requested low latency. The optional
+HEVC backend is constrained to Main profile, 8-bit 4:2:0, BT.709 limited SDR,
+and closed-GOP IDR recovery.
+`configuration.max_reference_frames` accepts `0` through `16` and defaults to
 `0`. Zero preserves legacy behavior and leaves the encoder's H.264 reference-frame
 selection unconstrained; it is omitted when serializing the configuration so its
 wire shape remains compatible with older strict consumers. One requires the selected encoder to accept and report
 an exact single-reference-frame limit; failure to set or verify it rejects open.
+The CUDA H.264 and FFmpeg NVENC backends reject values above one; CUDA HEVC/AV1
+and software x264 can honor larger requested reference limits.
 The Windows backend verifies the value before media-type commitment, after the
 initial input/output types are committed, and after output stream-change
 renegotiation. Open and lookup metadata report the selected constraint. This is
@@ -86,14 +91,27 @@ runtime consumers release their bindings. Binding calls are serialized through
 session state; concurrent or reentrant calls return `MEDIA_BUSY`.
 
 Submit copies a validated CPU frame before returning. BGRA8 is converted to
-8-bit limited-range BT.709 NV12, ignoring alpha; NV12 input is assumed to use that
-same color interpretation. NV12 uses contiguous Y/UV planes with the same stride.
+8-bit NV12 using the session's SDR color_mode (bt601_limited, bt601_full,
+bt709_limited, or bt709_full); alpha is ignored. The default is bt709_limited
+and is omitted from serialized configuration. NV12 input is assumed to use the
+session color mode; because its color cannot be verified, non-default modes
+reject raw NV12 input. NV12 uses contiguous Y/UV planes with the same stride.
 Padding is removed, strides are limited to 16,384 bytes, and dimensions must
 match the session. Timestamps and sequence numbers must strictly increase and
 fit signed Media Foundation 100ns time after conversion from microseconds.
-Sixteen retained input metadata entries bound queued input; `MEDIA_BUSY` accepts
-nothing. `MEDIA_BACKEND_ERROR` makes the session terminal until close, since a
-hardware call may already have accepted its sample before failing or timing out.
+Sixteen retained input metadata entries bound queued input. Windows MFT submissions
+remain synchronous. Software x264 runs on the encoder worker and accepts at most
+three outstanding operations (one running and two queued); `MEDIA_BUSY` accepts
+nothing, and dropped input retains neither sequence nor timestamp. Close cancels
+queued operations after the current native call returns, then joins the worker so
+module-owned code cannot be unloaded while native code is running.
+`MEDIA_BACKEND_ERROR` makes the session terminal until close, since a hardware
+call may already have accepted its sample before failing or timing out.
+
+Owner-scoped `status` reports numeric `timing` counters for BGRA-to-NV12 conversion
+and `encoder_timing` counters for worker queue wait, submit/receive/drain duration,
+busy submissions, and pending operations. Counters update when the caller polls
+status or the media API; no per-frame timing logs or frame content are emitted.
 
 Receive delivers at most one borrowed packet. A rejected sink retains the exact
 packet for retry. Samples are normalized to Annex B; IDR is determined from NAL
@@ -220,10 +238,9 @@ Strict single-reference-frame sessions use the static
 Vibeshine documents `nvenc_preset` with numeric default `1` and choices `1` through
 `7` (P1 through P7). The request field is optional and omitted when absent to keep
 older wire payloads compatible. This NVENC-only setting applies only when NVENC is
-selected. This module has hardware MFT and optional x264 backends, without native NVENC,
-so supplying the field fails validation with
-`nvenc_preset_unsupported`; no preset is applied here. NVENC preset support remains
-pending.
+selected. The initial FFmpeg NVENC backend uses a fixed P1 low-latency preset;
+supplying this field fails validation with `nvenc_preset_unsupported`, and no
+caller-selected preset is applied.
 
 Vibeshine documents `nvenc_h264_cavlc` with a `disabled` default. When H.264 and
 NVENC are selected, `enabled` requests CAVLC instead of CABAC; the reference notes
@@ -274,7 +291,215 @@ inside an unloadable module would be unsafe, so shutdown waits for its worker.
 The host's external supervision is the recovery boundary for a hung driver.
 No crash recovery or durable encoder sessions are claimed.
 
-This implementation is not yet qualified on a Windows GPU. Host tests exercise
+## Linux hardware NVENC
+
+The opt-in `linux-ffmpeg-nvenc` feature uses the system FFmpeg `libavcodec`
+`h264_nvenc` encoder and `libavutil`. The build script compiles
+`src/platform/ffmpeg_nvenc.c` against target FFmpeg development headers and
+links the matching libraries through pkg-config. The encoder artifact embeds the
+compiled avcodec/avutil ABI majors; LinuxSession packaging and user-service
+preflight require those exact loader sonames and API symbols when this feature
+is present. Runtime packaging must provide compatible FFmpeg
+libraries and NVIDIA's NVENC runtime/driver. Enumeration opens and closes
+throwaway H.264 contexts for both supported BT.709 range modes; if either
+fails its SPS/VUI check, NVENC stays out of discovery and software x264 remains
+available. This capability probe does not guarantee that every requested
+resolution or bitrate will open.
+
+The first backend supports 8-bit NV12 input, H.264 Baseline, no B frames,
+BT.709 limited-range and full-range SDR, and a fixed low-latency CBR
+configuration. Baseline is explicitly selected through the encoder's private
+profile option as well as the codec context; the active reference lists and
+decoded-picture buffer are limited to one frame. Both default and one-reference
+Moonlight requests are supported, and SPS validation rejects larger reference
+requirements. It sets FFmpeg's full-range color metadata for full-range input
+and parses the opened encoder's actual SPS VUI to require the requested range
+flag plus BT.709 primaries, transfer, and matrix identifiers. Any mismatched or
+missing VUI rejects Open, and repeated SPS units in output packets are checked
+again before delivery. Other color modes and explicit NVENC
+controls fail closed. Frames are copied into FFmpeg-owned NV12 storage; packets
+are copied and normalized to Annex B before the borrowed FFmpeg packet is
+released. Packet PTS remains in 100-nanosecond units. The worker owns the
+FFmpeg context, submit queue is bounded by the existing encoder worker, and
+drain flushes delayed packets before session EOS. No CUDA-frame import, HDR,
+HEVC, AV1, or dynamic device selection is claimed.
+
+## Linux native NVENC on CUDA
+
+The opt-in `linux-nvenc-cuda` feature adds a native NVENC SDK backend on a CUDA
+context for H.264, HEVC and AV1, 8-bit SDR 4:2:0. It is preferred over the
+FFmpeg path: enumeration lists it first. FFmpeg is not involved.
+
+Build: `build.rs` compiles `src/platform/nvenc_cuda/native/*.c` against
+nv-codec-headers (`nvEncodeAPI.h` plus `dynlink_cuda.h`, which declares the CUDA
+driver API, so no CUDA toolkit is needed) and EGL, desktop GL core
+(`GL/glcorearb.h`) and GBM headers. Native builds search `/usr/include/ffnvcodec`
+and `/usr/include`; `AMATERASU_NVENC_INCLUDE_DIR` and `AMATERASU_EGL_INCLUDE_DIR`
+override them and are required for cross builds. An override never falls back to
+host headers. Without the headers the feature builds an unavailable stub: nothing
+is published and opening one of its identities returns
+`nvenc_cuda_headers_unavailable` (`nvenc_cuda_feature_disabled` without the feature).
+The adapter links only libc and libdl. At run time it loads `libcuda.so.1`,
+`libnvidia-encode.so.1`, `libEGL.so.1` and optionally `libgbm.so.1` with dlopen,
+once per process, and never unloads them; a machine without NVIDIA still loads the
+module and publishes nothing. Displays are likewise initialized once per GPU and
+never terminated, because `eglTerminate` would destroy other sessions' contexts.
+
+Identities: clsid `amaterasu.hardware.nvenc-cuda.h264`, `.hevc` or `.av1`, with
+`hardware_url` `pci:<CUDA PCI bus id>`. Enumeration opens a throwaway session on
+each CUDA device and publishes one description per codec whose GUID is listed,
+accepts NV12 and offers CBR (AV1 normally needs Ada or newer). A GPU is published
+only when an EGL display on it can host the converter. Descriptions carry
+`vendor_id` 0x10de, `inputs` (`["cpu"]`, plus `"dmabuf"` when that display imports
+DMA-BUFs) and `max_width`/`max_height` (the device limit clamped to 3840x2160).
+Open locates the bus id again and fails with distinct `nvenc_cuda_*` codes.
+
+NVENC API negotiation offers the compiled header's version, then earlier minor
+versions of the same major that the driver supports, with the header's struct
+revisions re-stamped; a driver that disagrees answers `NV_ENC_ERR_INVALID_VERSION`
+and the next candidate is tried. Drivers below the header's major report
+`nvenc_cuda_driver_too_old`. Configuration: P1 preset, ultra-low-latency tuning,
+CBR with a one-frame VBV, no B pictures, no lookahead, infinite GOP with IDR only
+on request (`FORCEIDR` plus repeated headers), synchronous encode with picture
+type decision enabled. H.264 uses Baseline (CAVLC) with a one-frame DPB for
+Moonlight's constrained decoders, matching the FFmpeg backend; HEVC and AV1 use
+Main and honour `max_reference_frames` (zero leaves the driver default). H.264
+and HEVC use one slice and repeat SPS/PPS (and VPS) on IDR; AV1 repeats the
+sequence header on key frames with the default tiling, since the configuration
+has no slice field. All four `color_mode` values are supported: VUI (or the AV1
+colour config) signals BT.709 or SMPTE 170M primaries, transfer and matrix with
+the matching range, and centre chroma siting (AV1: unknown, which it cannot express).
+
+Inputs, all converted on the GPU, never by `layout`:
+
+- CPU NV12: packed by the session, copied with `cuMemcpy2D` into one pitched
+  CUDA NV12 allocation registered with NVENC as a CUDA device pointer. Non-default
+  colour modes still reject raw NV12 as for every backend.
+- CPU BGRA8: stride padding is removed and the frame is uploaded to a GL texture.
+- DMA-BUF (`EncoderApiV1_1.submit_dmabuf`, advertised at minor 1; v1.0 consumers
+  bind the unchanged prefix): accepted for XRGB/ARGB/XBGR/ABGR 8888 and 2101010
+  with a modifier the display can bind to `GL_TEXTURE_2D` (or an implicit modifier
+  for a listed format), 8-bit sRGB colour, and the session's exact dimensions.
+  Other formats, external-only modifiers, `BT2020_PQ` frames and sessions without
+  DMA-BUF support return `MEDIA_UNSUPPORTED`, so the producer falls back to CPU
+  frames. Submit validates first, returns `MEDIA_BUSY` before duplicating anything
+  when the worker queue is full, then duplicates every plane and acquire fence with
+  `F_DUPFD_CLOEXEC` and returns `STATUS_OK`; the producer may close its own
+  descriptors at once. The worker waits for each acquire fence on the GPU with
+  `EGL_ANDROID_native_fence_sync` + `EGL_KHR_wait_sync` (EGL then owns that fence
+  descriptor), or else polls it for at most 500 ms (`nvenc_cuda_fence_timeout`).
+  It imports the planes with `EGL_EXT_image_dma_buf_import(_modifiers)` into a
+  fresh texture per frame (descriptor numbers are not stable identities, so nothing
+  is cached), converts, copies, and closes the duplicates before encoding.
+
+The EGL display belongs to the CUDA device: `EGL_EXT_platform_device` on the EGL
+device whose `EGL_CUDA_DEVICE_NV` is the encoder's CUdevice, or, when that display
+cannot import DMA-BUFs, GBM on the same EGL device's DRM render node. A desktop
+OpenGL 3.3 core, surfaceless context is current on the encoder worker. Two
+fragment passes draw the source into an R8 luma and an RG8 half-size chroma
+texture; both are registered with CUDA once (`cuGraphicsGLRegisterImage`). Each
+frame maps them (which orders the GL draws first), copies their arrays into the
+NVENC input buffer and synchronizes the context. Luma is the per-pixel matrix
+product and chroma the box average of each 2x2 block, like the CPU converter. The
+matrix rows are computed in `color.rs`; unit tests replay the shader's f32
+arithmetic and match exact arithmetic within one code value, and the CPU
+converter within one (two for its legacy truncated BT.709-limited matrix).
+
+Output: one packet per encoded picture, Annex B for H.264/HEVC through the shared
+normalizers (IDR from NAL types, parameter sets present), and for AV1 one
+low-overhead temporal unit led by a temporal delimiter (inserted if absent), with
+size fields required and the cached sequence header inserted on a key frame that
+lacks one. NVENC's IDR picture type must agree with the bitstream and forced IDR
+must produce a key frame, or the session fails. HEVC and AV1 packets always carry
+`FLAG_END_OF_ACCESS_UNIT`. The worker owns the CUDA context, NVENC session, buffers,
+EGL context and GL objects; close releases them in reverse order on that thread.
+
+Unqualified: nothing in this backend has run on hardware yet. Bitstream colour
+signalling is set directly and checked only by the ignored ffprobe test, not
+re-parsed at run time as the FFmpeg backend does. DMA-BUF frames queued behind a
+busy worker (at most two) are read when the worker reaches them, so a producer
+that re-renders into a queued buffer could be encoded late or torn. Older NVENC
+majors, P010/HDR, 4:4:4, slices/tiles and reference-frame invalidation, intra
+refresh, external-only modifiers (`GL_TEXTURE_EXTERNAL_OES`), multi-planar YUV
+DMA-BUFs and GPU-side fence waits through CUDA are not implemented. The GPU tests
+need an NVIDIA GPU with NVENC, `ffmpeg`/`ffprobe` with software decoders, and for
+the DMA-BUF case the GPU's render node (`AMATERASU_TEST_RENDER_NODE`, default
+`/dev/dri/renderD128`):
+
+```text
+cargo test -p amaterasu-encode --features linux-nvenc-cuda nvenc_cuda_gpu -- --ignored --test-threads=1
+```
+
+They publish and print the identities, encode BGRA (four colour modes) and NV12
+frames per supported codec with two forced IDRs, check packet key frames and
+timestamps, ffprobe the stream's profile, references and colour signalling, and
+decode it to compare colours with the CPU reference, then repeat the decode check
+for a GBM-allocated linear XRGB8888 DMA-BUF submitted through a native session.
+
+## Linux hardware VA-API
+
+The opt-in `linux-ffmpeg-vaapi` feature adds FFmpeg's `h264_vaapi` encoder.
+The build script must compile `src/platform/ffmpeg_vaapi.c`, set the checked
+cfg `amaterasu_ffmpeg_vaapi`, and link target `libavcodec`/`libavutil` through
+pkg-config. FFmpeg's VAAPI hardware-frame implementation uses libva at runtime;
+the package must provide compatible FFmpeg sonames, libva, a VAAPI driver and
+an accessible render device. The source does not select a device path or change
+permissions.
+
+Discovery performs one bounded-size FFmpeg device, frame-pool, and encoder open
+at 640x480, then validates the encoder's actual generated H.264 extradata for
+Baseline plus BT.709 limited-range VUI before advertising the identity
+`amaterasu.hardware.vaapi.h264.ffmpeg` (`ffmpeg://h264_vaapi`). It does not
+submit probe frames. This checks that a device and encoder context can be
+created, but does not qualify sustained encoding or every requested resolution.
+Open repeats the checks at the requested dimensions. Confirmed device, encoder,
+or configuration open failures are reported distinctly so auto selection can
+retry software x264; explicit selections must not fall back. The video layer
+owns that fallback policy.
+
+This initial path accepts CPU NV12 or converted BGRA input as BT.709 limited
+SDR, constrained Baseline, CAVLC, no B pictures, and CBR. CPU NV12 is copied to
+an FFmpeg-owned frame, transferred into a bounded pool of VAAPI surfaces, and
+submitted to FFmpeg. The encoder worker owns device/context/surface references.
+H.264 SPS in the opened headers and any later packets are parsed and checked
+for video_full_range_flag=0 and BT.709 primaries, transfer, and matrix IDs;
+missing or mismatched VUI fails closed. Other color modes, explicit reference
+frame limits, HDR, 10-bit formats, and advanced VAAPI controls are unsupported.
+The backend is opt-in and has not been qualified on hardware.
+
+## Linux software x264
+
+The optional `software-x264` feature compiles a small C adapter against the
+system `x264.h` and dynamically loads a matching x264 runtime. The default build
+does not enable the feature. Native builds discover headers through
+`pkg-config`; cross builds require `AMATERASU_X264_INCLUDE_DIR`. Missing headers
+or runtime libraries leave x264 unavailable, with no subprocess or generated
+frame fallback. The Linux path accepts the same owned BGRA/NV12 CPU frames and
+returns normalized Annex B H.264 packets through the encoder ABI. Non-default
+color modes require BGRA input because raw NV12 has no verified color metadata.
+Its preset and
+tune are fixed to `superfast` and `zerolatency` for this first integration.
+The encoder sets H.264 VUI range and color description to match the selected
+mode. BT.601 uses SMPTE 170M identifiers; BT.709 uses BT.709 identifiers.
+Software x264 uses the process-visible CPU parallelism for slice threads,
+bounded to 2–8 to avoid imposing a fixed two-thread ceiling or creating an
+unbounded number of slices.
+Linux desktop-stream release artifacts must enable `software-x264` for
+`amaterasu-encode` and provide a compatible x264 runtime library. The feature
+does not bundle the runtime; the artifact must provide the matching
+`libx264.so.<ABI version>` or `libx264.so` to the platform loader.
+
+x264 is GPL-2.0-or-later or commercially licensed. Enabling it for distribution
+requires a compatible licensing and source distribution policy or a suitable
+commercial license. Dynamic loading does not change those obligations.
+
+The Windows backend remains unchanged. The video pipeline binds PipeWire only
+when it is allowlisted, and selection must be completed through the explicit
+portal control operations before Open. Missing Linux H.264 support is surfaced
+as `h264_encoder_unavailable`.
+
+This implementation is not yet qualified on a Windows GPU, a Linux x264
+installation, or Linux NVENC hardware. Host tests exercise
 layout, parameter framing, native ownership, backpressure, sink refusal, EOS,
 close/drop, strict controls and factory lifetime using a fake encoder backend.
 Current host validation covers Linux feature-enabled and default builds. Windows
@@ -293,10 +518,9 @@ by these tests.
 
 Behavioral reference review used Vibeshine `src/nvenc/nvenc_config.h` and
 `src/nvenc/nvenc_encoded_frame.h` for real encoded frame/IDR expectations and its
-larger encoder policy surface. No source was copied or translated. Native NVENC,
-AMD AMF, Intel-specific controls, Linux hardware backends, GPU texture import,
-HEVC, AV1, HDR/10-bit, reference-frame invalidation, extended rate-control tuning,
-hardware quality presets,
+larger encoder policy surface. No source was copied or translated. AMD AMF,
+Intel-specific controls, GPU texture import, HEVC, AV1,
+HDR/10-bit, reference-frame invalidation, rate-control tuning, quality presets,
 dynamic resolution, and full streaming parity remain unimplemented.
 
 Primary API references:
@@ -321,3 +545,51 @@ Open, lookup, and status report `packet_boundaries` and
 `supports_packet_boundaries: true`. Changing the mode for an existing operation
 ID is an `operation_conflict`. The mode does not relax backend output-boundary
 verification or promise a stream is ready before open succeeds.
+# Linux HEVC software encoding
+
+The optional `linux-x265-hevc` feature enables direct open by the exact identity
+`amaterasu.software.linux.x265.hevc` after an 8-bit x265 Main encoder opens and
+emits bounded Annex B VPS/SPS/PPS. It is not added to public encoder enumeration,
+so automatic selection and advertisement remain disabled pending end-to-end
+stream validation.
+The backend accepts BT.709 limited or full SDR. BGRA frames are converted to
+NV12 with the selected BT.709 range before the shim converts chroma planes for
+x265; raw NV12 input is accepted only for the default BT.709 limited mode. The
+encoder sets and verifies matching SPS VUI range signaling, progressive 8-bit
+4:2:0, and returns one complete Annex B HEVC access unit per media packet. The
+packet codec is `CODEC_HEVC`; timestamps remain in 100 ns units. x265 is
+configured for a closed GOP, no B frames or lookahead, and repeated VPS/SPS/PPS
+before IDR.
+The adapter retains bounded parameter sets and supplies them in VPS, SPS, PPS
+order before IDR NAL types 19 and 20. CRA and other unsupported random-access
+types fail closed.
+
+The feature requires target `x265` development headers and library through
+`pkg-config`. Root build integration must compile
+`src/platform/x265_hevc.c`, emit checked cfg `amaterasu_x265_hevc`, and link
+`x265` only for Linux feature builds. Keep this feature opt-in; it adds an x265
+runtime dependency and is GPL-2.0-or-later or commercially licensed. H.264 remains the default codec,
+and Windows does not opt into this backend.
+
+Central feature-on validation passed 70 encode and 124 video tests. The real
+x265 smoke access unit was identified by ffprobe as Main, 8-bit 4:2:0, BT.709
+limited, decoded by FFmpeg, and passed the GameStream fixture using the exact
+shim output. Actual Moonlight streaming remains unqualified; keep public
+registry advertisement disabled until that path is validated.
+
+The BT.709 full-range path is source-only pending central feature-on and decoder
+validation. The real-shim test can write its limited-range access unit when
+`AMATERASU_X265_SMOKE_OUTPUT` is set, or its full-range access unit when
+`AMATERASU_X265_SMOKE_FULL_OUTPUT` is set; neither file is written by default.
+
+## Scoped hardware policy during integration
+
+`nvenc_settings` retains the resolved host/app/client policy on the control boundary.
+Current encoder backends cannot apply those scoped controls, so a nondefault
+record returns `nvenc_settings_unsupported` before a worker opens. Auto selection
+must not discard the request while falling back to another backend. The default
+record preserves the backend's existing behavior: native CUDA NVENC uses P1,
+disabled multipass and a one-frame VBV. Implementing the full scoped controls is
+still pending. Legacy top-level NVENC preset/CAVLC/AQ requests continue to reject
+unsupported selections. Negotiated formats accept 8-bit SDR H.264, HEVC and AV1;
+HDR and 10-bit encoding remain unimplemented and fail explicitly.

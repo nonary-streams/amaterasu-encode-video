@@ -9,7 +9,7 @@ pub struct Normalizer {
 }
 
 impl Normalizer {
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, amaterasu_ffmpeg_nvenc, amaterasu_ffmpeg_vaapi))]
     pub fn header(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
         if bytes.is_empty() {
             return Ok(());
@@ -130,7 +130,7 @@ fn validate_units(units: &[&[u8]]) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, amaterasu_ffmpeg_nvenc, amaterasu_ffmpeg_vaapi))]
 fn configuration_units(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
     // AVCDecoderConfigurationRecord with four-byte NAL lengths. Other length
     // widths are deliberately rejected rather than guessed from sample bytes.

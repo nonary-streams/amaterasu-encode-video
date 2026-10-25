@@ -1,4 +1,5 @@
 use super::*;
+use crate::worker::{ReceiveResult, SubmitResult};
 use crate::{
     factory::Factory,
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
@@ -206,6 +207,7 @@ impl AcceptanceFactory {
                 codec: "h264",
                 hardware: false,
                 vendor_id: None,
+                capabilities: Default::default(),
             },
             #[cfg(amaterasu_x264)]
             SoftwareMode::Native => crate::factory::NativeFactory
@@ -241,6 +243,7 @@ impl Factory for AcceptanceFactory {
                 codec: "h264",
                 hardware: true,
                 vendor_id: Some(0x10de),
+                capabilities: Default::default(),
             },
             self.software.clone(),
         ])
@@ -281,7 +284,12 @@ struct ControlledBackend {
 }
 
 impl Backend for ControlledBackend {
-    fn submit(&mut self, _: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        _: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
         assert!(force);
         self.packet = Some(Packet {
             bytes: vec![
@@ -290,15 +298,15 @@ impl Backend for ControlledBackend {
             timestamp_100ns: timestamp,
             keyframe: true,
         });
-        Ok(())
+        Ok(SubmitResult::Accepted)
     }
 
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
-        Ok(self.packet.take())
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(self.packet.take()))
     }
 
-    fn drain(&mut self) -> Result<(), &'static str> {
-        Ok(())
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
     }
 }
 
@@ -308,22 +316,28 @@ struct RecordingBackend {
 }
 
 impl Backend for RecordingBackend {
-    fn submit(&mut self, bytes: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
         let pixels = bytes.len() * 2 / 3;
         assert!(bytes[..pixels].iter().all(|value| *value == 16));
         assert!(bytes[pixels..].iter().all(|value| *value == 128));
         assert!(force);
-        self.backend
+        let result = self
+            .backend
             .as_mut()
             .unwrap()
             .submit(bytes, timestamp, force)?;
         self.observations.lock().unwrap().submitted += 1;
-        Ok(())
+        Ok(result)
     }
 
-    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
         let packet = self.backend.as_mut().unwrap().receive()?;
-        if let Some(packet) = &packet {
+        if let ReceiveResult::Ready(Some(packet)) = &packet {
             self.observations
                 .lock()
                 .unwrap()
@@ -337,10 +351,10 @@ impl Backend for RecordingBackend {
         Ok(packet)
     }
 
-    fn drain(&mut self) -> Result<(), &'static str> {
-        self.backend.as_mut().unwrap().drain()?;
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        let complete = self.backend.as_mut().unwrap().drain()?;
         self.observations.lock().unwrap().drained += 1;
-        Ok(())
+        Ok(complete)
     }
 
     fn close(mut self: Box<Self>) -> Result<(), &'static str> {
