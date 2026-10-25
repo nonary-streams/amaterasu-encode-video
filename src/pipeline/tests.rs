@@ -3553,3 +3553,40 @@ fn pipewire_idle_repeats_keep_sixty_fps_phase_on_two_ms_host_ticks() {
         "missed output slots were replayed as a burst"
     );
 }
+
+#[test]
+fn auto_retries_confirmed_nvenc_cuda_open_failure_with_x264() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    runtime.encoder_enumeration_override = Some(json!({
+        "ok": true, "enabled": true, "encoders": [
+            {"identity":{"clsid":"amaterasu.hardware.nvenc-cuda.h264","hardware_url":"pci:0000:01:00.0","friendly_name":"NVENC"},"name":"NVENC","codec":"h264","hardware":true,"inputs":["cpu","dmabuf"]},
+            {"identity":{"clsid":SOFTWARE_ENCODER_ID,"hardware_url":null,"friendly_name":"x264"},"name":"x264","codec":"h264","hardware":false}
+        ]
+    }));
+    runtime.encoder_open_error_once = Some("nvenc_cuda_driver_too_old");
+    let mut request = open();
+    let Operation::Open { encoder, .. } = &mut request else {
+        unreachable!();
+    };
+    *encoder = EncoderSelection::Backend(EncoderBackend::Auto);
+    pipeline.handle("alice", 99, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+
+    let attempts: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE && payload["action"] == "open" => {
+                payload["encoder"]["clsid"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        ["amaterasu.hardware.nvenc-cuda.h264", SOFTWARE_ENCODER_ID]
+    );
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+}

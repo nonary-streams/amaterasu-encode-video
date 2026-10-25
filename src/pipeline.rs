@@ -1454,10 +1454,10 @@ fn x264_fallback_for_auto(
     // x264 encodes only H.264; HEVC and AV1 never gain a software fallback here.
     if index.is_some()
         || configuration.codec != VideoCodec::H264
-        || !matches!(
+        || !(matches!(
             selected.clsid.as_str(),
             LINUX_FFMPEG_NVENC_ID | LINUX_FFMPEG_VAAPI_ID
-        )
+        ) || selected.clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX))
     {
         return None;
     }
@@ -1489,6 +1489,21 @@ fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
                     | "nvenc_configuration_unsupported"
                     | "nvenc_headers_unavailable"
                     | "nvenc_headers_unsupported"
+            )
+        ),
+        Some(clsid) if clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX) => matches!(
+            reason,
+            Some(
+                "nvenc_cuda_library_unavailable"
+                    | "nvenc_cuda_driver_unavailable"
+                    | "nvenc_cuda_api_unsupported"
+                    | "nvenc_cuda_driver_too_old"
+                    | "nvenc_cuda_device_unavailable"
+                    | "nvenc_cuda_configuration_unsupported"
+                    | "nvenc_cuda_converter_unavailable"
+                    | "nvenc_cuda_allocation_failed"
+                    | "nvenc_cuda_headers_unavailable"
+                    | "nvenc_cuda_feature_disabled"
             )
         ),
         Some(LINUX_FFMPEG_VAAPI_ID) => matches!(
@@ -1543,12 +1558,10 @@ fn encoder_supports_configuration(
                 && configuration.max_reference_frames == 0
         }
         SOFTWARE_ENCODER_ID => configuration.codec == VideoCodec::H264,
+        // The CUDA backend converts every SDR color mode on the GPU and
+        // signals it in the bitstream; each clsid encodes exactly one codec.
         clsid if clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX) => {
             clsid.strip_prefix(NVENC_CUDA_ENCODER_PREFIX) == Some(codec_name(configuration.codec))
-                && matches!(
-                    configuration.color_mode,
-                    ColorMode::Bt709Limited | ColorMode::Bt709Full
-                )
                 && configuration.max_reference_frames <= 1
         }
         _ => configuration.codec == VideoCodec::H264,
