@@ -24,7 +24,9 @@ Control requests are strict JSON; frames and encoded bytes never use JSON:
 {"action":"close","session_id":1}
 ```
 
-Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264"|"hevc",hardware:true}]}`.
+Enumeration returns `{ok:true,enabled,encoders:[{index,name,codec:"h264"|"hevc"|"av1",hardware:true}]}`.
+Backends that report more capability add optional `inputs` (`"cpu"`, `"dmabuf"`),
+`max_width` and `max_height` fields; descriptions without them are unchanged.
 An index identifies the current encoder enumeration, not a stable GPU ID.
 Open/lookup return `{ok:true,session_id,configuration,codec:"h264"|"hevc",max_reference_frames}`. Status adds
 `state:"open"|"draining"|"failed"`; close returns `{ok:true,session_id,state:"closed"}`.
@@ -203,6 +205,118 @@ released. Packet PTS remains in 100-nanosecond units. The worker owns the
 FFmpeg context, submit queue is bounded by the existing encoder worker, and
 drain flushes delayed packets before session EOS. No CUDA-frame import, HDR,
 HEVC, AV1, or dynamic device selection is claimed.
+
+## Linux native NVENC on CUDA
+
+The opt-in `linux-nvenc-cuda` feature adds a native NVENC SDK backend on a CUDA
+context for H.264, HEVC and AV1, 8-bit SDR 4:2:0. It is preferred over the
+FFmpeg path: enumeration lists it first. FFmpeg is not involved.
+
+Build: `build.rs` compiles `src/platform/nvenc_cuda/native/*.c` against
+nv-codec-headers (`nvEncodeAPI.h` plus `dynlink_cuda.h`, which declares the CUDA
+driver API, so no CUDA toolkit is needed) and EGL, desktop GL core
+(`GL/glcorearb.h`) and GBM headers. Native builds search `/usr/include/ffnvcodec`
+and `/usr/include`; `AMATERASU_NVENC_INCLUDE_DIR` and `AMATERASU_EGL_INCLUDE_DIR`
+override them and are required for cross builds. An override never falls back to
+host headers. Without the headers the feature builds an unavailable stub: nothing
+is published and opening one of its identities returns
+`nvenc_cuda_headers_unavailable` (`nvenc_cuda_feature_disabled` without the feature).
+The adapter links only libc and libdl. At run time it loads `libcuda.so.1`,
+`libnvidia-encode.so.1`, `libEGL.so.1` and optionally `libgbm.so.1` with dlopen,
+once per process, and never unloads them; a machine without NVIDIA still loads the
+module and publishes nothing. Displays are likewise initialized once per GPU and
+never terminated, because `eglTerminate` would destroy other sessions' contexts.
+
+Identities: clsid `amaterasu.hardware.nvenc-cuda.h264`, `.hevc` or `.av1`, with
+`hardware_url` `pci:<CUDA PCI bus id>`. Enumeration opens a throwaway session on
+each CUDA device and publishes one description per codec whose GUID is listed,
+accepts NV12 and offers CBR (AV1 normally needs Ada or newer). A GPU is published
+only when an EGL display on it can host the converter. Descriptions carry
+`vendor_id` 0x10de, `inputs` (`["cpu"]`, plus `"dmabuf"` when that display imports
+DMA-BUFs) and `max_width`/`max_height` (the device limit clamped to 3840x2160).
+Open locates the bus id again and fails with distinct `nvenc_cuda_*` codes.
+
+NVENC API negotiation offers the compiled header's version, then earlier minor
+versions of the same major that the driver supports, with the header's struct
+revisions re-stamped; a driver that disagrees answers `NV_ENC_ERR_INVALID_VERSION`
+and the next candidate is tried. Drivers below the header's major report
+`nvenc_cuda_driver_too_old`. Configuration: P1 preset, ultra-low-latency tuning,
+CBR with a one-frame VBV, no B pictures, no lookahead, infinite GOP with IDR only
+on request (`FORCEIDR` plus repeated headers), synchronous encode with picture
+type decision enabled. H.264 uses Baseline (CAVLC) with a one-frame DPB for
+Moonlight's constrained decoders, matching the FFmpeg backend; HEVC and AV1 use
+Main and honour `max_reference_frames` (zero leaves the driver default). H.264
+and HEVC use one slice and repeat SPS/PPS (and VPS) on IDR; AV1 repeats the
+sequence header on key frames with the default tiling, since the configuration
+has no slice field. All four `color_mode` values are supported: VUI (or the AV1
+colour config) signals BT.709 or SMPTE 170M primaries, transfer and matrix with
+the matching range, and centre chroma siting (AV1: unknown, which it cannot express).
+
+Inputs, all converted on the GPU, never by `layout`:
+
+- CPU NV12: packed by the session, copied with `cuMemcpy2D` into one pitched
+  CUDA NV12 allocation registered with NVENC as a CUDA device pointer. Non-default
+  colour modes still reject raw NV12 as for every backend.
+- CPU BGRA8: stride padding is removed and the frame is uploaded to a GL texture.
+- DMA-BUF (`EncoderApiV1_1.submit_dmabuf`, advertised at minor 1; v1.0 consumers
+  bind the unchanged prefix): accepted for XRGB/ARGB/XBGR/ABGR 8888 and 2101010
+  with a modifier the display can bind to `GL_TEXTURE_2D` (or an implicit modifier
+  for a listed format), 8-bit sRGB colour, and the session's exact dimensions.
+  Other formats, external-only modifiers, `BT2020_PQ` frames and sessions without
+  DMA-BUF support return `MEDIA_UNSUPPORTED`, so the producer falls back to CPU
+  frames. Submit validates first, returns `MEDIA_BUSY` before duplicating anything
+  when the worker queue is full, then duplicates every plane and acquire fence with
+  `F_DUPFD_CLOEXEC` and returns `STATUS_OK`; the producer may close its own
+  descriptors at once. The worker waits for each acquire fence on the GPU with
+  `EGL_ANDROID_native_fence_sync` + `EGL_KHR_wait_sync` (EGL then owns that fence
+  descriptor), or else polls it for at most 500 ms (`nvenc_cuda_fence_timeout`).
+  It imports the planes with `EGL_EXT_image_dma_buf_import(_modifiers)` into a
+  fresh texture per frame (descriptor numbers are not stable identities, so nothing
+  is cached), converts, copies, and closes the duplicates before encoding.
+
+The EGL display belongs to the CUDA device: `EGL_EXT_platform_device` on the EGL
+device whose `EGL_CUDA_DEVICE_NV` is the encoder's CUdevice, or, when that display
+cannot import DMA-BUFs, GBM on the same EGL device's DRM render node. A desktop
+OpenGL 3.3 core, surfaceless context is current on the encoder worker. Two
+fragment passes draw the source into an R8 luma and an RG8 half-size chroma
+texture; both are registered with CUDA once (`cuGraphicsGLRegisterImage`). Each
+frame maps them (which orders the GL draws first), copies their arrays into the
+NVENC input buffer and synchronizes the context. Luma is the per-pixel matrix
+product and chroma the box average of each 2x2 block, like the CPU converter. The
+matrix rows are computed in `color.rs`; unit tests replay the shader's f32
+arithmetic and match exact arithmetic within one code value, and the CPU
+converter within one (two for its legacy truncated BT.709-limited matrix).
+
+Output: one packet per encoded picture, Annex B for H.264/HEVC through the shared
+normalizers (IDR from NAL types, parameter sets present), and for AV1 one
+low-overhead temporal unit led by a temporal delimiter (inserted if absent), with
+size fields required and the cached sequence header inserted on a key frame that
+lacks one. NVENC's IDR picture type must agree with the bitstream and forced IDR
+must produce a key frame, or the session fails. HEVC and AV1 packets always carry
+`FLAG_END_OF_ACCESS_UNIT`. The worker owns the CUDA context, NVENC session, buffers,
+EGL context and GL objects; close releases them in reverse order on that thread.
+
+Unqualified: nothing in this backend has run on hardware yet. Bitstream colour
+signalling is set directly and checked only by the ignored ffprobe test, not
+re-parsed at run time as the FFmpeg backend does. DMA-BUF frames queued behind a
+busy worker (at most two) are read when the worker reaches them, so a producer
+that re-renders into a queued buffer could be encoded late or torn. Older NVENC
+majors, P010/HDR, 4:4:4, slices/tiles and reference-frame invalidation, intra
+refresh, external-only modifiers (`GL_TEXTURE_EXTERNAL_OES`), multi-planar YUV
+DMA-BUFs and GPU-side fence waits through CUDA are not implemented. The GPU tests
+need an NVIDIA GPU with NVENC, `ffmpeg`/`ffprobe` with software decoders, and for
+the DMA-BUF case the GPU's render node (`AMATERASU_TEST_RENDER_NODE`, default
+`/dev/dri/renderD128`):
+
+```text
+cargo test -p amaterasu-encode --features linux-nvenc-cuda nvenc_cuda_gpu -- --ignored --test-threads=1
+```
+
+They publish and print the identities, encode BGRA (four colour modes) and NV12
+frames per supported codec with two forced IDRs, check packet key frames and
+timestamps, ffprobe the stream's profile, references and colour signalling, and
+decode it to compare colours with the CPU reference, then repeat the decode check
+for a GBM-allocated linear XRGB8888 DMA-BUF submitted through a native session.
 
 ## Linux hardware VA-API
 

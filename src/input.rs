@@ -80,6 +80,8 @@ pub enum GpuInput {
 
 #[cfg(unix)]
 pub use dmabuf::DmaBufInput;
+#[cfg(all(unix, test, amaterasu_nvenc_cuda))]
+pub use dmabuf::DmaBufPlaneInput;
 
 #[cfg(unix)]
 mod dmabuf {

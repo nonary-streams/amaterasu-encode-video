@@ -16,6 +16,10 @@ linux-ffmpeg-nvenc = []
 # Explicit Linux FFmpeg/VA-API hardware path; runtime discovery requires a
 # successful encoder/device probe before it can be offered to a stream.
 linux-ffmpeg-vaapi = []
+# Native NVENC (H.264, HEVC, AV1) on a CUDA context with GPU RGB conversion
+# and DMA-BUF import. Needs nv-codec-headers plus EGL/GL/GBM headers at build
+# time; libcuda, libnvidia-encode and libEGL are loaded at run time.
+linux-nvenc-cuda = []
 # Software HEVC is opt-in and requires matching target x265 headers/runtime.
 linux-x265-hevc = []
 

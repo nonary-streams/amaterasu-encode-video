@@ -14,6 +14,7 @@ fn main() {
     let nvenc_abi = build_linux_ffmpeg_nvenc();
     let vaapi_abi = build_linux_ffmpeg_vaapi(nvenc_abi.is_none());
     build_linux_x265_hevc();
+    build_linux_nvenc_cuda();
     if let (Some(nvenc), Some(vaapi)) = (nvenc_abi, vaapi_abi) {
         assert_eq!(
             nvenc, vaapi,
@@ -217,4 +218,108 @@ fn add_ffmpeg_abi_marker(build: &mut cc::Build, avcodec_major: u32, avutil_major
     build.file(&marker_source);
     // Exactly one adapter archive roots the marker when both backends are on.
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_ffmpeg_abi_marker");
+}
+
+const NVENC_CUDA_SOURCES: [&str; 5] = [
+    "src/platform/nvenc_cuda/native/loader.c",
+    "src/platform/nvenc_cuda/native/display.c",
+    "src/platform/nvenc_cuda/native/convert.c",
+    "src/platform/nvenc_cuda/native/nvenc.c",
+    "src/platform/nvenc_cuda/native/test_support.c",
+];
+
+/// Native NVENC on CUDA with GL conversion. The adapter needs only headers at
+/// build time; every GPU library is loaded with dlopen at run time. Missing
+/// headers compile the backend as an unavailable stub instead of failing.
+fn build_linux_nvenc_cuda() {
+    println!("cargo:rustc-check-cfg=cfg(amaterasu_nvenc_cuda)");
+    for source in NVENC_CUDA_SOURCES {
+        println!("cargo:rerun-if-changed={source}");
+    }
+    println!("cargo:rerun-if-changed=src/platform/nvenc_cuda/native/adapter.h");
+    println!("cargo:rerun-if-changed=src/platform/nvenc_cuda/native/internal.h");
+    println!("cargo:rerun-if-env-changed=AMATERASU_NVENC_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=AMATERASU_EGL_INCLUDE_DIR");
+    if env::var_os("CARGO_FEATURE_LINUX_NVENC_CUDA").is_none() {
+        return;
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo:warning=NVENC/CUDA encoding is supported only on Linux");
+        return;
+    }
+    if env::var("HOST").ok() != env::var("TARGET").ok()
+        && (env::var_os("AMATERASU_NVENC_INCLUDE_DIR").is_none()
+            || env::var_os("AMATERASU_EGL_INCLUDE_DIR").is_none())
+    {
+        println!(
+            "cargo:warning=NVENC/CUDA unavailable: cross builds require AMATERASU_NVENC_INCLUDE_DIR and AMATERASU_EGL_INCLUDE_DIR"
+        );
+        return;
+    }
+    // nv-codec-headers supplies nvEncodeAPI.h and dynlink_cuda.h, the CUDA
+    // driver API declarations, so no CUDA toolkit is required.
+    let nvenc = header_directory(
+        "AMATERASU_NVENC_INCLUDE_DIR",
+        &["/usr/include/ffnvcodec", "/usr/local/include/ffnvcodec"],
+        &["nvEncodeAPI.h", "dynlink_cuda.h"],
+    );
+    let egl = header_directory(
+        "AMATERASU_EGL_INCLUDE_DIR",
+        &["/usr/include", "/usr/local/include"],
+        &[
+            "EGL/egl.h",
+            "EGL/eglext.h",
+            "GL/glcorearb.h",
+            "KHR/khrplatform.h",
+            "gbm.h",
+        ],
+    );
+    let (Some(nvenc), Some(egl)) = (nvenc, egl) else {
+        println!(
+            "cargo:warning=NVENC/CUDA unavailable: nvEncodeAPI.h, dynlink_cuda.h, EGL, GL core and GBM headers are required"
+        );
+        return;
+    };
+    for header in ["nvEncodeAPI.h", "dynlink_cuda.h"] {
+        println!("cargo:rerun-if-changed={}", nvenc.join(header).display());
+    }
+    let mut build = cc::Build::new();
+    build
+        .include(&nvenc)
+        .include(&egl)
+        .define("_POSIX_C_SOURCE", "200809L")
+        .std("c11")
+        .warnings(true)
+        .extra_warnings(true);
+    for source in NVENC_CUDA_SOURCES {
+        build.file(source);
+    }
+    build.compile("amaterasu_nvenc_cuda_adapter");
+    println!("cargo:rustc-link-lib=dl");
+    println!("cargo:rustc-cfg=amaterasu_nvenc_cuda");
+}
+
+/// An explicit override never falls back to system headers, so a cross
+/// build cannot silently compile against host declarations.
+fn header_directory(variable: &str, candidates: &[&str], headers: &[&str]) -> Option<PathBuf> {
+    let complete = |directory: &PathBuf| {
+        headers
+            .iter()
+            .all(|header| directory.join(header).is_file())
+    };
+    if let Some(directory) = env::var_os(variable) {
+        let directory = PathBuf::from(directory);
+        if complete(&directory) {
+            return Some(directory);
+        }
+        println!(
+            "cargo:warning={variable}={} lacks one of {headers:?}",
+            directory.display()
+        );
+        return None;
+    }
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|directory| complete(directory))
 }

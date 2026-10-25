@@ -17,6 +17,9 @@ pub struct SpsSignal {
     pub full_range: bool,
 }
 
+/// Cached VPS, SPS and PPS, in that order.
+type ParameterSets = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
 #[derive(Default)]
 pub struct Normalizer {
     vps: Option<Vec<u8>>,
@@ -98,7 +101,7 @@ impl Normalizer {
         Ok(())
     }
 
-    fn clone_sets(&self) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    fn clone_sets(&self) -> ParameterSets {
         (self.vps.clone(), self.sps.clone(), self.pps.clone())
     }
 }
@@ -345,7 +348,7 @@ impl<'a> BitReader<'a> {
 
     fn read_se(&mut self) -> Result<i32, &'static str> {
         let code = self.read_ue()?;
-        let magnitude = (u64::from(code) + 1) / 2;
+        let magnitude = u64::from(code).div_ceil(2);
         if magnitude > i32::MAX as u64 {
             return Err("invalid_hevc_sps");
         }
@@ -550,7 +553,7 @@ fn nal_type(unit: &[u8]) -> u8 {
     (unit[0] >> 1) & 0x3f
 }
 
-fn remember(sets: &mut (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>), units: &[&[u8]]) {
+fn remember(sets: &mut ParameterSets, units: &[&[u8]]) {
     for unit in units {
         match nal_type(unit) {
             32 => sets.0 = Some(unit.to_vec()),
@@ -648,7 +651,7 @@ mod tests {
 
         fn bits(&mut self, value: u32, count: usize) {
             for shift in (0..count).rev() {
-                if self.bit_count % 8 == 0 {
+                if self.bit_count.is_multiple_of(8) {
                     self.bytes.push(0);
                 }
                 let bit = if shift < u32::BITS as usize {
@@ -671,7 +674,7 @@ mod tests {
 
         fn finish(mut self) -> Vec<u8> {
             self.bits(1, 1); // rbsp_stop_one_bit
-            while self.bit_count % 8 != 0 {
+            while !self.bit_count.is_multiple_of(8) {
                 self.bits(0, 1);
             }
             self.bytes
@@ -794,7 +797,7 @@ mod tests {
         assert!(irap);
         assert_eq!(&packet[..headers.len()], headers.as_slice());
         assert_eq!(&packet[headers.len()..], nal(19, 9).as_slice());
-        assert_eq!(normalizer.sample(&nal(1, 8)).unwrap().1, false);
+        assert!(!normalizer.sample(&nal(1, 8)).unwrap().1);
         assert_eq!(
             normalizer.sample(&nal(39, 7)),
             Err("invalid_hevc_access_unit")
