@@ -458,7 +458,7 @@ fn validate_operation(operation: &str) -> Result<(), &'static str> {
 
 fn open_reply(id: u64, config: &Configuration, packet_boundaries: bool) -> Value {
     let packet_boundaries = packet_boundaries || config.codec == VideoCodec::Hevc;
-    json!({"ok":true,"session_id":id,"configuration":config,"codec":match config.codec { VideoCodec::H264 => "h264", VideoCodec::Hevc => "hevc" },"max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
+    json!({"ok":true,"session_id":id,"configuration":config,"codec":match config.codec { VideoCodec::H264 => "h264", VideoCodec::Hevc => "hevc", VideoCodec::Av1 => "av1" },"max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
 }
 
 #[cfg(test)]
