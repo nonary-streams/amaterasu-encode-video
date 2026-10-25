@@ -220,7 +220,8 @@ also require `ffmpeg`. Windows/macOS x264 packaging and runtime builds, live
 desktop capture/client playback and sustained performance remain separate
 qualification gates. Product v19 now persists and snapshots these tuning fields
 through signed host/application/certificate-bound client policy; see the
-[NVHTTP policy](../nvhttp/README.md#software-encoder-policy). Neither
+NVHTTP policy in the `amaterasu-network` repository
+(`modules/nvhttp/README.md`, software encoder policy section). Neither
 `global:sw_preset` nor `global:sw_tune` is fully verified by this backend alone.
 
 The Windows backend uses official `windows` crate COM bindings. A dedicated
