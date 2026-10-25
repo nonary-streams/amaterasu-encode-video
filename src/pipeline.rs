@@ -1542,6 +1542,7 @@ fn codec_name(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => "h264",
         VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
     }
 }
 
@@ -1549,6 +1550,8 @@ fn software_encoder_id(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => SOFTWARE_ENCODER_ID,
         VideoCodec::Hevc => SOFTWARE_HEVC_ENCODER_ID,
+        // There is no software AV1 backend; this id matches no encoder.
+        VideoCodec::Av1 => "amaterasu.software.av1-unavailable",
     }
 }
 
@@ -1556,6 +1559,7 @@ fn codec_unavailable(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => "h264_encoder_unavailable",
         VideoCodec::Hevc => "hevc_encoder_unavailable",
+        VideoCodec::Av1 => "av1_encoder_unavailable",
     }
 }
 
