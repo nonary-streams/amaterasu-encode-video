@@ -172,6 +172,7 @@ fn paused_conversion_keeps_capture_pump_responsive_and_discards_previous_stream(
     let mut input = Pump {
         video: 1,
         provider: crate::model::CaptureProvider::Pipewire,
+        frame_path: crate::plane::FramePath::Cpu,
         capture: 1,
         encoder: 1,
         configuration: &config,
@@ -271,6 +272,7 @@ fn concurrent_streams_keep_independent_workers_and_release_only_their_own_pixels
     let mut input = Pump {
         video: 1,
         provider: crate::model::CaptureProvider::Pipewire,
+        frame_path: crate::plane::FramePath::Cpu,
         capture: 1,
         encoder: 1,
         configuration: &config,

@@ -277,6 +277,7 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
         CaptureProvider::Dxgi,
         CaptureProvider::Wgc,
         CaptureProvider::Pipewire,
+        CaptureProvider::Vkms,
     ]
     .into_iter()
     .find(|provider| provider.service() == service)
@@ -298,6 +299,13 @@ struct FakePlane {
     capture_reused: bool,
     geometry_checks: Vec<Option<CaptureGeometry>>,
     geometry_results: VecDeque<Result<GeometryProgress, &'static str>>,
+    /// Native geometry reported for owned KWin outputs.
+    owned_geometry: Option<CaptureGeometry>,
+    /// Both native tables carry the DMA-BUF tails for the vkms provider.
+    dmabuf_ready: bool,
+    /// The next DMA-BUF capture reports that this stream cannot use GPU frames.
+    dmabuf_fallback_once: Option<&'static str>,
+    frame_paths: Vec<crate::plane::FramePath>,
 }
 
 impl Plane for FakePlane {
@@ -313,6 +321,18 @@ impl Plane for FakePlane {
             .unwrap_or(Ok(GeometryProgress::Ready))
     }
 
+    fn geometry(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<CaptureGeometry>, &'static str> {
+        Ok(self.owned_geometry)
+    }
+
+    fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
+        (!self.dmabuf_ready).then_some("capture_dmabuf_interface_unavailable")
+    }
+
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         self.calls += 1;
         self.inputs.push((
@@ -324,6 +344,17 @@ impl Plane for FakePlane {
             input.sequence,
             input.timestamp_us,
         ));
+        self.frame_paths.push(input.frame_path);
+        let gpu = input.frame_path == crate::plane::FramePath::DmaBuf;
+        if gpu
+            && input.capture_due
+            && let Some(reason) = self.dmabuf_fallback_once.take()
+        {
+            return Ok(Progress {
+                dmabuf_fallback: Some(reason),
+                ..Progress::default()
+            });
+        }
         if let Some(code) = self.failure_code_once.take() {
             Err(code)
         } else if let Some(code) = self.failure_code {
@@ -337,7 +368,7 @@ impl Plane for FakePlane {
             let repeat_attempted = !capture_submitted
                 && !self.dropped
                 && input.repeat_due
-                && input.repeat_frame.is_some();
+                && (input.repeat_frame.is_some() || gpu);
             Ok(Progress {
                 dropped: self.dropped,
                 submitted: capture_submitted || repeat_attempted,
@@ -361,7 +392,9 @@ impl Plane for FakePlane {
                     timestamp_us: input.timestamp_us,
                     sequence: input.sequence,
                 }),
-                owned_frame: capture_submitted.then_some(OwnedFrame {
+                dmabuf_fresh: (gpu && (input.capture_due || repeat_attempted))
+                    .then_some(input.capture_due),
+                owned_frame: (capture_submitted && !gpu).then_some(OwnedFrame {
                     width: input.configuration.width,
                     height: input.configuration.height,
                     format: amaterasu_media::PIXEL_BGRA8,
@@ -3425,6 +3458,7 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
 }
 
 mod operations;
+mod owned_capture;
 
 #[test]
 fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
@@ -3463,7 +3497,7 @@ fn named_virtual_output_reaches_the_authorized_provider_without_a_portal_selecti
         "kwin:HDMI-A-1",
         "kwin:Virtual-0",
         "kwin:Virtual-01",
-        "kwin:Virtual-9",
+        "kwin:Virtual-2147483648",
     ] {
         let (mut pipeline, mut runtime, _) =
             setup_with_providers([CaptureProvider::Pipewire].into());

@@ -9,11 +9,13 @@ consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 Linux settings default to:
 
 ```json
-{"enabled":false,"capture_providers":["pipewire"],"drain_timeout_ms":5000}
+{"enabled":false,"capture_providers":["pipewire","vkms"],"drain_timeout_ms":5000}
 ```
 
 Linux defaults to the finite `pipewire` provider,
-`amaterasu.capture-pipewire/1`; other platforms retain the `dxgi` default.
+`amaterasu.capture-pipewire/1`, plus the optional `vkms` provider,
+`amaterasu.capture-vkms/1` (see "Owned virtual outputs and DMA-BUF frames");
+other platforms retain the `dxgi` default.
 `wgc` maps to `amaterasu.capture-wgc/1`. An empty allowlist, unknown
 identifier, or drain timeout outside 100–30000 ms is rejected.
 Enabled startup binds every configured native capture provider and the encoder.
@@ -32,6 +34,75 @@ closes that encoder session and can restart once with x264 while retaining the
 capture stream and output queue. The replacement's first input is forced to a
 keyframe. Explicit encoder identities and registry indices do not fall back;
 uncertain requests and failures after the single retry clean up the stream.
+
+## Owned virtual outputs and DMA-BUF frames
+
+An Open with provider `pipewire` (explicit or default) for an owned KWin output
+`kwin:Virtual-N` tries providers in the order `vkms`, then `pipewire`. N is the
+DRM connector type id: any positive id without leading zeros, so connectors
+renamed `Virtual-9`..`Virtual-16` by a driver reload are accepted. Such outputs
+never need a portal selection.
+
+Video chooses `vkms` only when all of these hold, checked once before the first
+capture Open:
+
+- `vkms` is in `capture_providers` and its native binding succeeded. That binding
+  is optional: a failed startup bind leaves the provider unbound for this module
+  instance instead of failing startup;
+- the vkms table advertises capture minor 4 and is at least
+  `CAPTURE_API_V1_4_SIZE` bytes, and the encoder table advertises minor 1 and is
+  at least `ENCODER_API_V1_1_SIZE` bytes. Video binds both at v1.0 and reads a
+  tail only after both checks pass;
+- the selected encoder's enumerate description lists `"dmabuf"` in its optional
+  `inputs` array (absent or malformed means CPU input only). For `encoder: "auto"`
+  on such a stream, a supported hardware encoder that accepts DMA-BUF is ranked
+  ahead of other hardware. An explicit encoder identity skips enumeration, so its
+  inputs are unknown and the stream keeps PipeWire.
+
+On the DMA-BUF path each due capture calls `read_dmabuf_frame` and submits the
+borrowed frame through `submit_dmabuf` inside the capture callback, carrying video's
+stream timestamp, sequence and force-IDR flag. Video performs no CPU resize,
+conversion or copy for that stream, and the frame must already match the stream
+size. Encoder `MEDIA_BUSY` drops the presentation like a busy CPU frame. Repeats
+re-read the latest presentation, which the provider may satisfy with cached reuse;
+pacing follows the PipeWire periodic schedule. Status counts delivered
+presentations in `dmabuf_frames.fresh` and `dmabuf_frames.reused`.
+
+Fallbacks never fail a stream that PipeWire can still serve:
+
+- when a condition above fails, the stream opens PipeWire and reports the reason
+  (`capture_vkms_not_configured`, `capture_provider_unbound`,
+  `capture_dmabuf_interface_unavailable`, `encoder_dmabuf_interface_unavailable`,
+  `encoder_dmabuf_input_unavailable` or `encoder_inputs_unknown`);
+- a definite vkms refusal, either an admission error or an `ok:false` Open reply
+  such as `frame_helper_unavailable`, `permission_denied` or `driver_unavailable`,
+  reopens the same output through PipeWire with a fresh operation ID and records
+  the provider's code. Lost or uncertain vkms replies keep the normal settle and
+  cleanup path, because they may have opened a stream;
+- `MEDIA_UNSUPPORTED` from `read_dmabuf_frame` or `submit_dmabuf`, or a frame
+  size mismatch, switches a running stream to CPU capture once: video closes the
+  vkms capture (stage `cpu-fallback-close-capture`), opens PipeWire for the same
+  output, keeps the encoder session and packet queue, and forces a keyframe on
+  the first CPU frame.
+
+Status for these streams adds `frame_path` (`dmabuf` or `cpu`, reported for every
+stream), `vkms_fallback_reason` and `dmabuf_frames`; `capture_provider` names the
+provider that actually opened. An explicit `capture_provider: "vkms"` is pinned:
+an unmet condition or a runtime `MEDIA_UNSUPPORTED` fails the stream with that
+reason instead of falling back.
+
+Packaging must add `"vkms"` to `capture_providers` and grant video `call` and
+`native_use` for `amaterasu.capture-vkms/1`, with the vkms module started before
+video so the startup binding can succeed. Without these, owned outputs keep
+using PipeWire and report the reason. Real KWin/vkms and NVENC DMA-BUF import
+remain unqualified on hardware.
+
+Configuration `codec` may be `h264`, `hevc` or `av1` on Linux. AV1 requires a
+registered hardware encoder such as `amaterasu.hardware.nvenc-cuda.av1`; there is
+no software AV1 encoder and no x264 fallback, so a missing backend fails Open with
+`av1_encoder_unavailable`. Native NVENC identities
+`amaterasu.hardware.nvenc-cuda.<codec>` are auto-selected only for their own
+codec, BT.709 limited or full range, and at most one reference frame.
 
 ## API
 
@@ -281,7 +352,9 @@ be distinguished from video tick time.
 ## Authority, cancellation and lifecycle
 
 Video needs `provide` and `native_provide` for `amaterasu.video/1`, `call` and
-`native_use` for each configured capture service and `amaterasu.encode/1`, and
+`native_use` for each configured capture service (on Linux,
+`amaterasu.capture-pipewire/1` and `amaterasu.capture-vkms/1`) and
+`amaterasu.encode/1`, and
 signed startup dependencies on those providers. Initiating control consumers currently
 need call grants for video, the selected capture service and the encoder because parent delegation
 intersects initiating authority. Lower resources are owned by the video runtime

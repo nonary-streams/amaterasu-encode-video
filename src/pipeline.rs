@@ -1,16 +1,19 @@
 mod lifecycle;
 mod operations;
 mod output;
+mod owned_capture;
 mod pacing;
 mod portal;
 
 use crate::{
     model::{
         AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderBackend, EncoderIdentity,
-        EncoderSelection, OpenSpec, Operation, Settings, TouchSurface, error,
+        EncoderSelection, OpenSpec, Operation, Settings, TouchSurface, error, is_owned_kwin_output,
         valid_minimum_fps_target,
     },
-    plane::{ENCODE, FrameMetadata, GeometryProgress, OwnedFrame, Plane, Progress, Pump},
+    plane::{
+        ENCODE, FrameMetadata, FramePath, GeometryProgress, OwnedFrame, Plane, Progress, Pump,
+    },
     queue::Queues,
     rpc::{self, Send},
 };
@@ -31,6 +34,9 @@ enum Stage {
     FallbackEnumerate,
     Encoder,
     RestartCloseEncoder,
+    /// Closing the vkms capture of a running stream before reopening its
+    /// output through the CPU provider; the encoder session stays open.
+    CpuFallbackCloseCapture,
     Activating,
     Running,
     StopCapture,
@@ -46,6 +52,8 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
+    frame_path: FramePath,
+    owned_capture: owned_capture::OwnedOutputCapture,
     auto_capture: bool,
     fallback_provider: Option<CaptureProvider>,
     fallback_device_name: Option<String>,
@@ -168,8 +176,15 @@ impl Stream {
             self.minimum_fps_target
         }
     }
+    /// A repeat resubmits owned CPU pixels, or re-reads the latest DMA-BUF
+    /// presentation once the GPU path has delivered one.
+    fn has_repeat_source(&self) -> bool {
+        self.last_pixels.is_some()
+            || (self.frame_path == FramePath::DmaBuf && self.last_output_at.is_some())
+    }
+
     fn record_repeat_deadline(&mut self, now: Instant, repeated: bool, submitted: bool) {
-        if self.provider != CaptureProvider::Pipewire {
+        if !self.provider.uses_periodic_capture() {
             return;
         }
         let period = Duration::from_secs_f64(1.0 / self.repeat_rate());
@@ -181,8 +196,8 @@ impl Stream {
         }
     }
     fn repeat_due(&self, now: Instant) -> bool {
-        if self.provider == CaptureProvider::Pipewire {
-            return self.last_pixels.is_some()
+        if self.provider.uses_periodic_capture() {
+            return self.has_repeat_source()
                 && self.next_repeat_at.is_some_and(|deadline| now >= deadline);
         }
         let target = if self.minimum_fps_target == 0.0 {
@@ -220,6 +235,7 @@ impl Stream {
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::RestartCloseEncoder
+            | Stage::CpuFallbackCloseCapture
             | Stage::Activating => "opening",
             Stage::Running => "running",
             Stage::StopCapture | Stage::Draining => "draining",
@@ -235,6 +251,7 @@ impl Stream {
             "supports_packet_boundaries": true,
             "output": self.output,
             "capture_provider":self.provider,
+            "frame_path": self.frame_path.name(),
             "constant_rate": self.constant_rate,
             "wgc_pacing_smoothing": self.wgc_pacing_smoothing,
             "minimum_fps_target": self.minimum_fps_target,
@@ -252,6 +269,7 @@ impl Stream {
             },
             "error": self.error,
         });
+        self.owned_capture.write_status(&mut response);
         if let Some(encoder) = &self.encoder {
             response["encoder"] = json!(encoder);
         }
@@ -430,6 +448,7 @@ impl Pipeline {
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
                         | Stage::RestartCloseEncoder
+                        | Stage::CpuFallbackCloseCapture
                         | Stage::Activating
                         | Stage::Running
                         | Stage::StopCapture
@@ -456,8 +475,7 @@ impl Pipeline {
         if specification.provider == CaptureProvider::Pipewire {
             // A sentinel is resolved by the trusted provider, which may restore
             // an earlier portal approval without a management selection RPC.
-            let named_owned_output =
-                (1..=8).any(|index| specification.output == format!("kwin:Virtual-{index}"));
+            let named_owned_output = is_owned_kwin_output(&specification.output);
             let output =
                 if specification.output == "portal-selected-session-source" || named_owned_output {
                     Some(specification.output.clone())
@@ -537,6 +555,11 @@ impl Pipeline {
                     (None, None, Stage::SelectEncoder)
                 }
             };
+            let owned_capture = owned_capture::OwnedOutputCapture::new(
+                provider,
+                &output,
+                self.providers.contains(&CaptureProvider::Vkms),
+            );
             let fallback_provider = if auto_capture && !constant_rate {
                 alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
             } else {
@@ -546,6 +569,8 @@ impl Pipeline {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
+                frame_path: FramePath::Cpu,
+                owned_capture,
                 auto_capture,
                 fallback_provider,
                 fallback_device_name: None,
@@ -640,9 +665,10 @@ impl Pipeline {
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
             }
-            if stream.stage != Stage::Running
-                && stream.stage != Stage::RestartCloseEncoder
-                && let Ok(mut queues) = self.queues.lock()
+            if !matches!(
+                stream.stage,
+                Stage::Running | Stage::RestartCloseEncoder | Stage::CpuFallbackCloseCapture
+            ) && let Ok(mut queues) = self.queues.lock()
             {
                 queues.close(id);
             }
@@ -675,7 +701,11 @@ fn verify_stream_geometry(
     stream: &mut Stream,
 ) -> Result<GeometryProgress, &'static str> {
     let capture = stream.capture.expect("geometry follows capture admission");
-    if stream.provider == CaptureProvider::Pipewire && stream.capture_output.starts_with("kwin:") {
+    if matches!(
+        stream.provider,
+        CaptureProvider::Pipewire | CaptureProvider::Vkms
+    ) && stream.capture_output.starts_with("kwin:")
+    {
         let Some(actual) = plane.geometry(stream.provider, capture)? else {
             return Ok(GeometryProgress::Busy);
         };
@@ -723,7 +753,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
             }
         }
         if capture_due && (stream.provider != CaptureProvider::Wgc || stream.constant_rate) {
-            stream.next_frame = if stream.provider == CaptureProvider::Pipewire {
+            stream.next_frame = if stream.provider.uses_periodic_capture() {
                 periodic_capture_deadline(stream.next_frame, now, stream.configuration.fps)
             } else {
                 next_capture_deadline(now, stream.configuration.fps)
@@ -738,6 +768,7 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     match plane.pump(Pump {
         video: id,
         provider: stream.provider,
+        frame_path: stream.frame_path,
         capture: stream.capture.unwrap(),
         encoder: stream.session.unwrap(),
         configuration: &stream.configuration,
@@ -752,7 +783,14 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         Ok(progress) => {
             let completed_at = Instant::now();
             stream.timing.record(&progress);
-            if stream.provider == CaptureProvider::Pipewire && progress.capture_deferred {
+            stream.owned_capture.record_freshness(&progress);
+            if let Some(reason) = progress.dmabuf_fallback {
+                if !owned_capture::begin_cpu_capture_fallback(stream, reason) {
+                    stream.cleanup(reason);
+                }
+                return;
+            }
+            if stream.provider.uses_periodic_capture() && progress.capture_deferred {
                 stream.next_frame = capture_slot.expect("deferred capture retained its due slot");
             }
             if capture_due
@@ -889,6 +927,12 @@ fn advance(
         stream.pending = None;
         return apply_result(stream, id, queues, plane, result, send);
     }
+    if stream.stage == Stage::Capture {
+        owned_capture::select_capture_provider(stream, plane);
+        if stream.stage != Stage::Capture {
+            return false;
+        }
+    }
     if stream.stage == Stage::Encoder {
         match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
@@ -943,8 +987,14 @@ fn advance(
             stream.pending = Some(request);
         }
         rpc::Admission::Rejected(code) => {
+            if stream.stage == Stage::Capture
+                && owned_capture::begin_vkms_open_fallback(stream, &code)
+            {
+                return false;
+            }
             if stream.stage == Stage::Capture {
-                stream.no_resources = true;
+                // A running stream reopening capture still owns its encoder.
+                stream.no_resources = stream.session.is_none();
                 if code == "unavailable" {
                     if !begin_fallback(stream, "unavailable") {
                         failed_step(stream, "unavailable");
@@ -1013,7 +1063,7 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             stream.provider.service(),
             json!({"action":"lookup","operation_id":stream.capture_operation}),
         ),
-        Stage::CloseCapture | Stage::StopCapture => (
+        Stage::CloseCapture | Stage::StopCapture | Stage::CpuFallbackCloseCapture => (
             stream.provider.service(),
             json!({"action":"close","stream":stream.capture}),
         ),
@@ -1047,6 +1097,7 @@ fn stage_name(stage: Stage) -> &'static str {
         Stage::FindEncoder => "find-encoder",
         Stage::CloseEncoder => "close-encoder",
         Stage::RestartCloseEncoder => "restart-close-encoder",
+        Stage::CpuFallbackCloseCapture => "cpu-fallback-close-capture",
         Stage::FindCapture => "find-capture",
         Stage::CloseCapture => "close-capture",
         Stage::StopCapture => "drain-close-capture",
@@ -1064,6 +1115,7 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::RestartCloseEncoder
+            | Stage::CpuFallbackCloseCapture
             | Stage::Activating
             | Stage::StopCapture
     ) {
@@ -1119,9 +1171,18 @@ fn apply_result(
     let missing = rpc::missing(&payload);
     if stream.stage == Stage::Capture
         && payload.get("ok").and_then(Value::as_bool) == Some(false)
+        && owned_capture::begin_vkms_open_fallback(
+            stream,
+            payload_error_code(&payload).unwrap_or("provider_failed"),
+        )
+    {
+        return false;
+    }
+    if stream.stage == Stage::Capture
+        && payload.get("ok").and_then(Value::as_bool) == Some(false)
         && payload_error_code(&payload) == Some("unsupported_platform")
     {
-        stream.no_resources = true;
+        stream.no_resources = stream.session.is_none();
         if !begin_fallback(stream, "unsupported_platform") {
             failed_step(stream, "unsupported_platform");
         }
@@ -1134,6 +1195,7 @@ fn apply_result(
                 Stage::FindEncoder
                     | Stage::CloseEncoder
                     | Stage::RestartCloseEncoder
+                    | Stage::CpuFallbackCloseCapture
                     | Stage::FindCapture
                     | Stage::CloseCapture
                     | Stage::StopCapture
@@ -1162,11 +1224,24 @@ fn apply_result(
     }
     let next = match stream.stage {
         Stage::SelectEncoder => {
-            match resolve_encoder_selection(stream.encoder_index, &stream.configuration, &payload) {
-                Ok(identity) => {
-                    stream.fallback_encoder =
-                        x264_fallback_for_auto(stream.encoder_index, &identity, &payload);
-                    stream.encoder = Some(identity);
+            let prefer_dmabuf = stream.owned_capture.prefers_dmabuf(plane);
+            match resolve_encoder_selection(
+                stream.encoder_index,
+                &stream.configuration,
+                &payload,
+                prefer_dmabuf,
+            ) {
+                Ok(choice) => {
+                    stream.fallback_encoder = x264_fallback_for_auto(
+                        stream.encoder_index,
+                        &stream.configuration,
+                        &choice.identity,
+                        &payload,
+                    );
+                    stream
+                        .owned_capture
+                        .record_encoder_inputs(choice.accepts_dmabuf);
+                    stream.encoder = Some(choice.identity);
                     Stage::Capture
                 }
                 Err(code) => {
@@ -1200,6 +1275,15 @@ fn apply_result(
                     return false;
                 }
             };
+            if stream.session.is_some() {
+                // A CPU capture fallback reopened capture under a running encoder.
+                match verify_stream_geometry(plane, stream) {
+                    Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
+                    Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
+                    Err(code) => stream.cleanup(code),
+                }
+                return false;
+            }
             Stage::Encoder
         }
         Stage::FallbackEnumerate => {
@@ -1273,6 +1357,10 @@ fn apply_result(
                 Stage::CloseCapture
             }
         }
+        Stage::CpuFallbackCloseCapture => {
+            owned_capture::reopen_cpu_capture(stream);
+            return false;
+        }
         Stage::CloseCapture => return finish_cleanup(stream),
         Stage::StopCapture => {
             stream.capture = None;
@@ -1296,7 +1384,8 @@ fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
     match provider {
         CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
         CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
-        CaptureProvider::Pipewire => None,
+        // Owned-output vkms fallback is handled separately, before activation.
+        CaptureProvider::Pipewire | CaptureProvider::Vkms => None,
     }
 }
 
@@ -1337,13 +1426,34 @@ const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
 const SOFTWARE_HEVC_ENCODER_ID: &str = "amaterasu.software.linux.x265.hevc";
 const LINUX_FFMPEG_NVENC_ID: &str = "amaterasu.hardware.nvidia.nvenc.ffmpeg";
 const LINUX_FFMPEG_VAAPI_ID: &str = "amaterasu.hardware.vaapi.h264.ffmpeg";
+/// Native NVENC sessions, one identity per codec: `<prefix>h264|hevc|av1`.
+const NVENC_CUDA_ENCODER_PREFIX: &str = "amaterasu.hardware.nvenc-cuda.";
+
+/// The encoder chosen from an enumeration, with whether its description lists
+/// DMA-BUF among the frame inputs it accepts.
+struct EncoderChoice {
+    identity: EncoderIdentity,
+    accepts_dmabuf: bool,
+}
+
+/// `inputs` is optional and parsed tolerantly: an absent or malformed list
+/// means the legacy CPU-only input, and unknown input kinds are ignored.
+fn encoder_accepts_dmabuf(entry: &Value) -> bool {
+    entry
+        .get("inputs")
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("dmabuf")))
+}
 
 fn x264_fallback_for_auto(
     index: Option<u32>,
+    configuration: &Configuration,
     selected: &EncoderIdentity,
     payload: &Value,
 ) -> Option<EncoderIdentity> {
+    // x264 encodes only H.264; HEVC and AV1 never gain a software fallback here.
     if index.is_some()
+        || configuration.codec != VideoCodec::H264
         || !matches!(
             selected.clsid.as_str(),
             LINUX_FFMPEG_NVENC_ID | LINUX_FFMPEG_VAAPI_ID
@@ -1433,18 +1543,30 @@ fn encoder_supports_configuration(
                 && configuration.max_reference_frames == 0
         }
         SOFTWARE_ENCODER_ID => configuration.codec == VideoCodec::H264,
+        clsid if clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX) => {
+            clsid.strip_prefix(NVENC_CUDA_ENCODER_PREFIX) == Some(codec_name(configuration.codec))
+                && matches!(
+                    configuration.color_mode,
+                    ColorMode::Bt709Limited | ColorMode::Bt709Full
+                )
+                && configuration.max_reference_frames <= 1
+        }
         _ => configuration.codec == VideoCodec::H264,
     }
 }
 
 /// Resolve profile indices against the current bounded codec registry before
 /// capture is opened. `None` means explicit `auto`: hardware first, then the
-/// registered software encoder. No missing/out-of-range selection is guessed.
+/// registered software encoder. With `prefer_dmabuf`, auto ranks hardware that
+/// accepts DMA-BUF input ahead of other hardware. AV1 has no software encoder,
+/// so it never falls back past hardware. No missing/out-of-range selection is
+/// guessed.
 fn resolve_encoder_selection(
     index: Option<u32>,
     configuration: &Configuration,
     payload: &Value,
-) -> Result<EncoderIdentity, &'static str> {
+    prefer_dmabuf: bool,
+) -> Result<EncoderChoice, &'static str> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(encoder_selection_error(payload_error_code(payload)));
     }
@@ -1476,7 +1598,7 @@ fn resolve_encoder_selection(
         let codec = entry
             .get("codec")
             .and_then(Value::as_str)
-            .filter(|codec| matches!(*codec, "h264" | "hevc"))
+            .filter(|codec| matches!(*codec, "h264" | "hevc" | "av1"))
             .ok_or("invalid_encoder_enumeration")?;
         if !valid_encoder_identity(&identity) {
             return Err("invalid_encoder_enumeration");
@@ -1499,14 +1621,15 @@ fn resolve_encoder_selection(
         if identity.clsid == SOFTWARE_ENCODER_ID && is_hardware {
             return Err("invalid_encoder_enumeration");
         }
+        let accepts_dmabuf = encoder_accepts_dmabuf(entry);
         if is_hardware {
             if codec == codec_name(configuration.codec) {
-                hardware.push(identity.clone());
+                hardware.push((identity.clone(), accepts_dmabuf));
             }
         } else if identity.clsid == software_encoder_id(configuration.codec)
             && codec == codec_name(configuration.codec)
         {
-            software.push(identity.clone());
+            software.push((identity.clone(), accepts_dmabuf));
         }
         identities.push(identity);
     }
@@ -1525,15 +1648,24 @@ fn resolve_encoder_selection(
         if !encoder_supports_configuration(selected, configuration) {
             return Err("encoder_configuration_unsupported");
         }
-        return Ok(selected.clone());
+        return Ok(EncoderChoice {
+            identity: selected.clone(),
+            accepts_dmabuf: encoder_accepts_dmabuf(&entries[index as usize]),
+        });
     }
-    hardware
-        .into_iter()
-        .find(|identity| encoder_supports_configuration(identity, configuration))
-        .or_else(|| {
-            software
-                .into_iter()
-                .find(|identity| encoder_supports_configuration(identity, configuration))
+    let supported = |(identity, _): &(EncoderIdentity, bool)| {
+        encoder_supports_configuration(identity, configuration)
+    };
+    let dmabuf_hardware = hardware
+        .iter()
+        .filter(|candidate| prefer_dmabuf && candidate.1)
+        .find(|candidate| supported(candidate));
+    dmabuf_hardware
+        .or_else(|| hardware.iter().find(|candidate| supported(candidate)))
+        .or_else(|| software.iter().find(|candidate| supported(candidate)))
+        .map(|(identity, accepts_dmabuf)| EncoderChoice {
+            identity: identity.clone(),
+            accepts_dmabuf: *accepts_dmabuf,
         })
         .ok_or_else(|| codec_unavailable(configuration.codec))
 }
@@ -1612,6 +1744,15 @@ fn encoder_failure_code(reason: Option<&str>) -> &'static str {
 mod integration_contract_tests {
     use super::*;
 
+    fn select(
+        index: Option<u32>,
+        configuration: &Configuration,
+        payload: &Value,
+    ) -> Result<EncoderIdentity, &'static str> {
+        resolve_encoder_selection(index, configuration, payload, false)
+            .map(|choice| choice.identity)
+    }
+
     fn default_configuration() -> Configuration {
         serde_json::from_value(json!({
             "width": 1920, "height": 1080, "fps": 60, "bitrate": 15_000_000
@@ -1660,13 +1801,13 @@ mod integration_contract_tests {
             ]
         });
         assert_eq!(
-            resolve_encoder_selection(Some(0), &default_configuration(), &payload)
+            select(Some(0), &default_configuration(), &payload)
                 .unwrap()
                 .clsid,
             "first-software"
         );
         assert!(matches!(
-            resolve_encoder_selection(Some(2), &default_configuration(), &payload),
+            select(Some(2), &default_configuration(), &payload),
             Err("encoder_unavailable")
         ));
     }
@@ -1680,7 +1821,7 @@ mod integration_contract_tests {
                 "encoders":[description("hardware", malformed_name, true)]
             });
             assert!(matches!(
-                resolve_encoder_selection(Some(0), &default_configuration(), &payload),
+                select(Some(0), &default_configuration(), &payload),
                 Err("invalid_encoder_enumeration")
             ));
         }
@@ -1691,7 +1832,7 @@ mod integration_contract_tests {
             "encoders":[duplicate.clone(), duplicate]
         });
         assert!(matches!(
-            resolve_encoder_selection(None, &default_configuration(), &payload),
+            select(None, &default_configuration(), &payload),
             Err("invalid_encoder_enumeration")
         ));
     }
@@ -1703,7 +1844,7 @@ mod integration_contract_tests {
             "encoders":[description("other.software", "Other software", false)]
         });
         assert!(matches!(
-            resolve_encoder_selection(None, &default_configuration(), &arbitrary_software),
+            select(None, &default_configuration(), &arbitrary_software),
             Err("h264_encoder_unavailable")
         ));
 
@@ -1712,9 +1853,7 @@ mod integration_contract_tests {
             "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
         });
         assert_eq!(
-            resolve_encoder_selection(None, &default_configuration(), &x264)
-                .unwrap()
-                .clsid,
+            select(None, &default_configuration(), &x264).unwrap().clsid,
             SOFTWARE_ENCODER_ID
         );
     }
@@ -1729,35 +1868,27 @@ mod integration_contract_tests {
         });
         let mut configuration = default_configuration();
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             LINUX_FFMPEG_NVENC_ID
         );
         configuration.color_mode = ColorMode::Bt709Full;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             LINUX_FFMPEG_NVENC_ID
         );
         configuration.color_mode = ColorMode::Bt601Full;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             SOFTWARE_ENCODER_ID
         );
         assert!(matches!(
-            resolve_encoder_selection(Some(0), &configuration, &payload),
+            select(Some(0), &configuration, &payload),
             Err("encoder_configuration_unsupported")
         ));
         configuration.color_mode = ColorMode::Bt709Limited;
         configuration.max_reference_frames = 1;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             LINUX_FFMPEG_NVENC_ID
         );
     }
@@ -1772,20 +1903,16 @@ mod integration_contract_tests {
         });
         let mut configuration = default_configuration();
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             LINUX_FFMPEG_VAAPI_ID
         );
         configuration.color_mode = ColorMode::Bt709Full;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             SOFTWARE_ENCODER_ID
         );
         assert!(matches!(
-            resolve_encoder_selection(Some(0), &configuration, &payload),
+            select(Some(0), &configuration, &payload),
             Err("encoder_configuration_unsupported")
         ));
     }
@@ -1801,23 +1928,19 @@ mod integration_contract_tests {
         let mut configuration = default_configuration();
         configuration.codec = VideoCodec::Hevc;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             SOFTWARE_HEVC_ENCODER_ID
         );
 
         configuration.color_mode = ColorMode::Bt709Full;
         assert_eq!(
-            resolve_encoder_selection(None, &configuration, &payload)
-                .unwrap()
-                .clsid,
+            select(None, &configuration, &payload).unwrap().clsid,
             SOFTWARE_HEVC_ENCODER_ID
         );
 
         configuration.color_mode = ColorMode::Bt601Full;
         assert!(matches!(
-            resolve_encoder_selection(None, &configuration, &payload),
+            select(None, &configuration, &payload),
             Err("hevc_encoder_unavailable")
         ));
 
@@ -1827,7 +1950,7 @@ mod integration_contract_tests {
             "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
         });
         assert!(matches!(
-            resolve_encoder_selection(None, &configuration, &h264_only),
+            select(None, &configuration, &h264_only),
             Err("hevc_encoder_unavailable")
         ));
     }
@@ -1848,7 +1971,7 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
         CaptureProvider::Wgc => {
             (!output_id.is_empty() && !output_id.contains('/')).then(|| output_id.to_owned())
         }
-        CaptureProvider::Pipewire => None,
+        CaptureProvider::Pipewire | CaptureProvider::Vkms => None,
     }
 }
 
@@ -1918,7 +2041,7 @@ fn accumulate_fallback_page(
                         == Some(device_name)
                 }
                 CaptureProvider::Wgc => output.id == device_name,
-                CaptureProvider::Pipewire => false,
+                CaptureProvider::Pipewire | CaptureProvider::Vkms => false,
             };
         if matches && stream.fallback_match.replace(output.id).is_some() {
             return Err(());

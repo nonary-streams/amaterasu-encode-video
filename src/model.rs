@@ -3,25 +3,18 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+/// The default is the platform's ordinary desktop capture provider.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
+    #[cfg_attr(not(target_os = "linux"), default)]
     Dxgi,
     Wgc,
+    #[cfg_attr(target_os = "linux", default)]
     Pipewire,
-}
-
-impl Default for CaptureProvider {
-    fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            Self::Pipewire
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Self::Dxgi
-        }
-    }
+    /// DMA-BUF capture of owned KWin virtual outputs. Optional: when it is not
+    /// bound or cannot open, owned outputs use PipeWire instead.
+    Vkms,
 }
 
 impl CaptureProvider {
@@ -30,8 +23,36 @@ impl CaptureProvider {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
             Self::Pipewire => "amaterasu.capture-pipewire/1",
+            Self::Vkms => "amaterasu.capture-vkms/1",
         }
     }
+
+    /// A provider whose native binding may be absent at startup. Streams that
+    /// would use it fall back to PipeWire and record why.
+    pub fn binding_is_optional(self) -> bool {
+        self == Self::Vkms
+    }
+
+    /// Linux providers that read an owned or portal output at a fixed period
+    /// and retain repeat deadlines independent of capture polling.
+    pub fn uses_periodic_capture(self) -> bool {
+        matches!(self, Self::Pipewire | Self::Vkms)
+    }
+}
+
+/// Whether `output` names a KWin virtual output owned by the virtual-display
+/// module: `kwin:Virtual-N`, where N is the DRM connector type id (positive,
+/// without leading zeros). The id is not bounded to the first eight connectors
+/// because reloading the DRM driver does not reset type ids.
+pub fn is_owned_kwin_output(output: &str) -> bool {
+    let Some(index) = output.strip_prefix("kwin:Virtual-") else {
+        return false;
+    };
+    !index.is_empty()
+        && index.len() <= 10
+        && !index.starts_with('0')
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && index.parse::<i32>().is_ok_and(|value| value > 0)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -71,7 +92,7 @@ pub struct Settings {
 fn default_providers() -> BTreeSet<CaptureProvider> {
     #[cfg(target_os = "linux")]
     {
-        [CaptureProvider::Pipewire].into()
+        [CaptureProvider::Pipewire, CaptureProvider::Vkms].into()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -488,7 +509,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(
             settings.capture_providers,
-            [CaptureProvider::Pipewire].into()
+            [CaptureProvider::Pipewire, CaptureProvider::Vkms].into()
         );
         #[cfg(not(target_os = "linux"))]
         assert_eq!(settings.capture_providers, [CaptureProvider::Dxgi].into());
@@ -743,6 +764,42 @@ mod tests {
                 ..
             } if capture_provider == CaptureProvider::default()
         ));
+    }
+
+    #[test]
+    fn owned_kwin_outputs_accept_connector_ids_past_the_first_pool() {
+        for output in [
+            "kwin:Virtual-1",
+            "kwin:Virtual-8",
+            "kwin:Virtual-9",
+            "kwin:Virtual-16",
+        ] {
+            assert!(is_owned_kwin_output(output), "{output}");
+        }
+        for output in [
+            "kwin:Virtual-0",
+            "kwin:Virtual-01",
+            "kwin:Virtual-",
+            "kwin:Virtual-2147483648",
+            "kwin:Virtual-1a",
+            "kwin:HDMI-A-1",
+            "Virtual-1",
+            "portal-selected-session-source",
+        ] {
+            assert!(!is_owned_kwin_output(output), "{output}");
+        }
+    }
+
+    #[test]
+    fn vkms_provider_is_an_optional_periodic_linux_provider() {
+        assert_eq!(CaptureProvider::Vkms.service(), "amaterasu.capture-vkms/1");
+        assert!(CaptureProvider::Vkms.binding_is_optional());
+        assert!(!CaptureProvider::Pipewire.binding_is_optional());
+        assert!(CaptureProvider::Vkms.uses_periodic_capture());
+        assert!(!CaptureProvider::Wgc.uses_periodic_capture());
+        let settings: Settings =
+            serde_json::from_str(r#"{"capture_providers":["pipewire","vkms"]}"#).unwrap();
+        assert!(settings.capture_providers.contains(&CaptureProvider::Vkms));
     }
 
     #[test]

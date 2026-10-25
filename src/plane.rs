@@ -1,4 +1,5 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
+mod dmabuf;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
 mod resize;
@@ -13,9 +14,30 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 pub const ENCODE: &str = "amaterasu.encode/1";
+
+/// How captured pixels reach the encoder for one stream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FramePath {
+    /// Borrowed CPU frames, optionally resized or converted by video.
+    #[default]
+    Cpu,
+    /// Borrowed DMA-BUF descriptors forwarded unchanged inside the capture callback.
+    DmaBuf,
+}
+
+impl FramePath {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::DmaBuf => "dmabuf",
+        }
+    }
+}
+
 pub struct Pump<'a> {
     pub video: u64,
     pub provider: CaptureProvider,
+    pub frame_path: FramePath,
     pub capture: u64,
     pub encoder: u64,
     pub configuration: &'a Configuration,
@@ -57,6 +79,11 @@ pub struct Progress {
     /// means freshness is unavailable or no new source frame arrived; encoder
     /// backpressure does not clear observed arrival.
     pub capture_arrival: Option<CaptureArrival>,
+    /// Freshness of a delivered DMA-BUF presentation: `Some(true)` for a new
+    /// source frame, `Some(false)` for cached reuse.
+    pub dmabuf_fresh: Option<bool>,
+    /// This stream cannot exchange DMA-BUF frames; the reason selects CPU capture.
+    pub dmabuf_fallback: Option<&'static str>,
     pub frame: Option<FrameMetadata>,
     pub owned_frame: Option<OwnedFrame>,
     pub capture_callback_us: u64,
@@ -107,10 +134,17 @@ pub trait Plane {
     ) -> Result<Option<CaptureGeometry>, &'static str> {
         Ok(None)
     }
+    /// Why `provider` cannot deliver DMA-BUF frames directly to the encoder
+    /// binding, or `None` when both native tables carry the DMA-BUF tails.
+    fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
+        Some("dmabuf_unsupported")
+    }
 }
 
 pub struct NativePlane {
     captures: BTreeMap<CaptureProvider, NativeBinding>,
+    /// Optional providers whose startup binding failed, with the reason.
+    unbound: BTreeMap<CaptureProvider, &'static str>,
     encoder: NativeBinding,
     queues: Arc<Mutex<Queues>>,
     #[cfg(amaterasu_swscale)]
@@ -124,17 +158,25 @@ impl NativePlane {
         providers: &BTreeSet<CaptureProvider>,
     ) -> ModuleResult<Self> {
         let mut captures = BTreeMap::new();
+        let mut unbound = BTreeMap::new();
         // SAFETY: signed dependencies retain configured providers through binding
-        // destruction. Calls stay on the module tick thread.
+        // destruction. Calls stay on the module tick thread. Only the v1.0
+        // prefixes are required; optional tails are checked before each use.
         unsafe {
             for provider in providers {
-                captures.insert(
-                    *provider,
-                    runtime.bind_native(provider.service(), 1, 0, CAPTURE_API_V1_0_SIZE)?,
-                );
+                match runtime.bind_native(provider.service(), 1, 0, CAPTURE_API_V1_0_SIZE) {
+                    Ok(binding) => {
+                        captures.insert(*provider, binding);
+                    }
+                    Err(_) if provider.binding_is_optional() => {
+                        unbound.insert(*provider, "capture_provider_unbound");
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Ok(Self {
                 captures,
+                unbound,
                 encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
                 queues,
                 #[cfg(amaterasu_swscale)]
@@ -405,10 +447,35 @@ impl Plane for NativePlane {
         }
     }
 
+    fn dmabuf_unavailable(&self, provider: CaptureProvider) -> Option<&'static str> {
+        let Some(binding) = self.captures.get(&provider) else {
+            return Some(
+                self.unbound
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or("capture_provider_unavailable"),
+            );
+        };
+        // SAFETY: both bindings were validated with their complete v1.0 prefixes.
+        let capture = unsafe { binding.table::<CaptureApiPrefix>() };
+        let encoder = unsafe { self.encoder.table::<EncoderApi>() };
+        match (capture, encoder) {
+            (Ok(capture), Ok(encoder)) => {
+                dmabuf::path_unavailable(capture.base.header, encoder.base.header)
+            }
+            (Err(_), _) => Some("capture_interface"),
+            (_, Err(_)) => Some("encoder_interface"),
+        }
+    }
+
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         // SAFETY: configured services promise these layouts; bindings remain live.
         let encoder_api =
             unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        if input.frame_path == FramePath::DmaBuf {
+            let progress = self.deliver_dmabuf(&input)?;
+            return self.receive_packets(encoder_api, &input, progress);
+        }
         #[cfg(amaterasu_swscale)]
         let processed = if input.provider == CaptureProvider::Pipewire
             && input.configuration.color_mode.is_default()
@@ -480,13 +547,7 @@ impl Plane for NativePlane {
         } else {
             progress
         };
-        let (encoder_poll_us, transport_admission_us, destination_count) =
-            receive(encoder_api, input.encoder, input.video, &self.queues)?;
-        let mut progress = progress;
-        progress.encoder_poll_us = encoder_poll_us;
-        progress.transport_admission_us = transport_admission_us;
-        progress.transport_admission_count = destination_count;
-        Ok(progress)
+        self.receive_packets(encoder_api, &input, progress)
     }
 
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str> {
@@ -504,6 +565,54 @@ impl Plane for NativePlane {
         self.processors.remove(video);
         #[cfg(not(amaterasu_swscale))]
         let _ = video;
+    }
+}
+
+impl NativePlane {
+    /// Reads one DMA-BUF presentation for a due capture, or re-reads the latest
+    /// one as a keepalive repeat when only a repeat is due.
+    fn deliver_dmabuf(&self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+        if !input.capture_due && !input.repeat_due {
+            return Ok(Progress::default());
+        }
+        let binding = self
+            .captures
+            .get(&input.provider)
+            .ok_or("capture_provider_unavailable")?;
+        // SAFETY: both bindings retain validated v1.0 prefixes; the tails are
+        // read only after their advertised minor and size cover them.
+        let capture_prefix =
+            unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+        let encoder_prefix =
+            unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        if let Some(reason) =
+            dmabuf::path_unavailable(capture_prefix.base.header, encoder_prefix.base.header)
+        {
+            return Ok(Progress {
+                dmabuf_fallback: Some(reason),
+                ..Progress::default()
+            });
+        }
+        let capture_api =
+            unsafe { binding.table::<CaptureApiV1_4>() }.map_err(|_| "capture_interface")?;
+        let encoder_api =
+            unsafe { self.encoder.table::<EncoderApiV1_1>() }.map_err(|_| "encoder_interface")?;
+        dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due)
+    }
+
+    /// Polls at most one encoded packet into the stream's bounded queue.
+    fn receive_packets(
+        &self,
+        encoder_api: &EncoderApi,
+        input: &Pump<'_>,
+        mut progress: Progress,
+    ) -> Result<Progress, &'static str> {
+        let (encoder_poll_us, transport_admission_us, destination_count) =
+            receive(encoder_api, input.encoder, input.video, &self.queues)?;
+        progress.encoder_poll_us = encoder_poll_us;
+        progress.transport_admission_us = transport_admission_us;
+        progress.transport_admission_count = destination_count;
+        Ok(progress)
     }
 }
 
@@ -1007,6 +1116,7 @@ mod tests {
         let input = Pump {
             video: 1,
             provider: CaptureProvider::Dxgi,
+            frame_path: FramePath::Cpu,
             capture: 1,
             encoder: 2,
             configuration: &configuration,
