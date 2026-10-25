@@ -745,6 +745,27 @@ impl Pipeline {
     }
 }
 
+/// True when `pixels` maps onto the `logical` output rectangle with one scale
+/// in KWin's supported range on both axes, allowing for the compositor's
+/// rounding of logical sizes to whole units.
+fn consistent_output_scale(
+    logical_width: u32,
+    logical_height: u32,
+    pixel_width: u32,
+    pixel_height: u32,
+) -> bool {
+    if logical_width == 0 || logical_height == 0 {
+        return false;
+    }
+    let horizontal = f64::from(pixel_width) / f64::from(logical_width);
+    let vertical = f64::from(pixel_height) / f64::from(logical_height);
+    let in_range = |scale: f64| (0.99..=5.01).contains(&scale);
+    let rounding = 1.0 / f64::from(logical_width.min(logical_height)) + 0.001;
+    in_range(horizontal)
+        && in_range(vertical)
+        && (horizontal - vertical).abs() <= rounding * horizontal.max(vertical)
+}
+
 fn verify_stream_geometry(
     plane: &mut dyn Plane,
     stream: &mut Stream,
@@ -759,11 +780,16 @@ fn verify_stream_geometry(
             return Ok(GeometryProgress::Busy);
         };
         actual.validate().map_err(|_| "invalid_capture_geometry")?;
-        // Owned KWin outputs use scale one. A new peer can expand the desktop
-        // or move an output without invalidating its captured pixel dimensions.
-        if actual.output.width != stream.configuration.width
-            || actual.output.height != stream.configuration.height
-        {
+        // Geometry is in logical desktop units, so a scaled owned output is
+        // smaller than its pixels. A new peer can expand the desktop or move an
+        // output without invalidating its pixels; a resize that breaks the
+        // stream's aspect (one consistent scale on both axes) cannot.
+        if !consistent_output_scale(
+            actual.output.width,
+            actual.output.height,
+            stream.configuration.width,
+            stream.configuration.height,
+        ) {
             return Err("capture_geometry_changed");
         }
         stream.desktop_geometry = Some(actual);

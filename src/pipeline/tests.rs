@@ -3616,3 +3616,17 @@ fn auto_retries_confirmed_nvenc_cuda_open_failure_with_x264() {
     );
     assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
 }
+
+#[test]
+fn owned_output_geometry_accepts_any_uniform_kwin_scale() {
+    // 3840x2160 at 250%, 2560x1440 at 175% (KWin rounds 1462.86 x 822.86),
+    // 1920x1080 at 125%, and unscaled.
+    assert!(consistent_output_scale(1536, 864, 3840, 2160));
+    assert!(consistent_output_scale(1463, 823, 2560, 1440));
+    assert!(consistent_output_scale(1536, 864, 1920, 1080));
+    assert!(consistent_output_scale(1920, 1080, 1920, 1080));
+    // A resized or reshaped output no longer matches the stream's pixels.
+    assert!(!consistent_output_scale(1920, 1200, 3840, 2160));
+    assert!(!consistent_output_scale(3840, 2160, 1920, 1080));
+    assert!(!consistent_output_scale(0, 864, 3840, 2160));
+}
