@@ -3,14 +3,15 @@ resolver = "2"
 members = ["modules/encode", "modules/video"]
 
 [workspace.package]
+license = "MIT"
 edition = "2024"
 rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
-amaterasu-abi = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "24819cf7bbf0fc538b91177dd95cac7e599a9229" }
-amaterasu-module-sdk = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "24819cf7bbf0fc538b91177dd95cac7e599a9229" }
-amaterasu-media = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "24819cf7bbf0fc538b91177dd95cac7e599a9229" }
+amaterasu-abi = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "37e007d102be65041e9817c63495e308bfc0b369" }
+amaterasu-module-sdk = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "37e007d102be65041e9817c63495e308bfc0b369" }
+amaterasu-media = { git = "https://github.com/nonary-streams/amaterasu-sdk.git", rev = "37e007d102be65041e9817c63495e308bfc0b369" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.3"

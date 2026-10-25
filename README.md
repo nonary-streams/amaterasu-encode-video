@@ -11,4 +11,5 @@ x264-enabled binary distribution also needs a licensing review.
 
 The source remains governed by the host's verified package, ABI and grants.
 These source files do not install or select an encoder on a running host.
-Amaterasu's public source license remains pending.
+Project-authored source is MIT licensed. Optional x264-enabled binary
+distribution still needs its separate licensing review.
