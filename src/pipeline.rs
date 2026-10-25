@@ -99,6 +99,8 @@ struct Stream {
     error: Option<&'static str>,
     next_frame: Instant,
     opened_at: Instant,
+    /// The host clock at `opened_at`; packet timestamps are offsets from it.
+    clock_origin_us: u64,
     last_output_at: Option<Instant>,
     last_repeat_attempt_at: Option<Instant>,
     next_repeat_at: Option<Instant>,
@@ -594,6 +596,7 @@ impl Pipeline {
         }
         self.streams.insert(id, {
             let opened_at = Instant::now();
+            let clock_origin_us = amaterasu_media::host_monotonic_micros();
             let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
             let operation = format!("video-{}-{id}", self.epoch);
             let (encoder, encoder_index, stage) = match encoder {
@@ -663,6 +666,7 @@ impl Pipeline {
                 error: None,
                 next_frame: Instant::now(),
                 opened_at,
+                clock_origin_us,
                 last_output_at: None,
                 last_repeat_attempt_at: None,
                 next_repeat_at: None,
@@ -2279,7 +2283,7 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
         stream.cleanup("queue_failed");
         return;
     };
-    guard.open(id, &stream.owner);
+    guard.open(id, &stream.owner, stream.clock_origin_us);
     guard.set_geometry(id, stream.desktop_geometry);
     drop(guard);
     stream.stage = Stage::Running;

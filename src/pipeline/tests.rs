@@ -3463,6 +3463,7 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
         context: (&mut received as *mut Received).cast(),
         write: accept_packet,
     };
+    let origin = pipeline.streams[&1].clock_origin_us;
     let mut queues = pipeline.queues.lock().unwrap();
     for _ in 0..3 {
         // SAFETY: sink and context remain valid through each synchronous receive.
@@ -3472,8 +3473,14 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
         received.0.iter().map(|packet| packet.0).collect::<Vec<_>>(),
         [1, 2, 3]
     );
+    // Packets leave on the host clock: the stream origin plus their offsets.
+    assert!(origin > 0);
     assert_eq!(
-        received.0.iter().map(|packet| packet.1).collect::<Vec<_>>(),
+        received
+            .0
+            .iter()
+            .map(|packet| packet.1 - origin)
+            .collect::<Vec<_>>(),
         [10, 20, 30]
     );
     assert_eq!(received.0[0].3, [0x11]);

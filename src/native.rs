@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn factory_copies_principal_and_binds_packet_ownership() {
         let queues = Arc::new(Mutex::new(Queues::default()));
-        queues.lock().unwrap().open(7, "alice");
+        queues.lock().unwrap().open(7, "alice", 0);
         let bytes = [1];
         let packet = EncodedPacket {
             codec: CODEC_H264,
