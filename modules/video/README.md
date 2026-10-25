@@ -128,10 +128,12 @@ latency and CPU work. No processor or callback is invoked on the default path,
 and this service does not expose GPU buffers or DMA-BUF descriptors.
 
 SDK packet/network and input hook points are not wired by this video module.
-In particular, its encoder submit occurs inside a borrowed native capture
-callback, and invoking third-party code there would violate the current
-buffer-lifetime and cadence contract. These observations are not a GPU
-zero-copy extension API.
+Encoder submit occurs inside a borrowed native capture callback. The explicitly
+selected, trusted CPU processor runs synchronously within that lifetime, and
+its replacement bytes are copied into Video-owned memory before the callback
+returns. Arbitrary asynchronous or untrusted callbacks cannot retain the
+borrowed buffer or satisfy this cadence contract. This is not a GPU zero-copy
+extension API.
 
 The optional x264 fallback requires the `software-x264` feature, x264 development
 headers, and a matching runtime library. If no H.264 backend is available, Open
