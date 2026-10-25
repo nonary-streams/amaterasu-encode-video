@@ -1,5 +1,6 @@
 //! Dedicated threads own native encoder state; no native pointer crosses threads.
 use crate::{
+    input::{GpuInput, InputSupport},
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
     platform,
 };
@@ -47,6 +48,7 @@ impl CancellationGate {
 
 enum Operation {
     Submit(Vec<u8>, i64, bool),
+    SubmitGpu(GpuInput, i64, bool),
     Receive,
     Drain,
 }
@@ -120,6 +122,18 @@ pub(crate) trait WorkerBackend {
     fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
     fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
     fn drain(&mut self) -> Result<(), &'static str>;
+    /// Reported once, on the worker thread, right after the backend opens.
+    fn input_support(&self) -> InputSupport {
+        InputSupport::default()
+    }
+    fn submit_gpu(
+        &mut self,
+        _input: GpuInput,
+        _timestamp: i64,
+        _force: bool,
+    ) -> Result<(), &'static str> {
+        Err("gpu_input_unsupported")
+    }
 }
 
 impl WorkerBackend for platform::Encoder {
@@ -138,6 +152,19 @@ impl WorkerBackend for platform::Encoder {
     fn drain(&mut self) -> Result<(), &'static str> {
         platform::Encoder::drain(self)
     }
+
+    fn input_support(&self) -> InputSupport {
+        platform::Encoder::input_support(self)
+    }
+
+    fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<(), &'static str> {
+        platform::Encoder::submit_gpu(self, input, timestamp, force)
+    }
 }
 
 pub struct Worker {
@@ -145,6 +172,7 @@ pub struct Worker {
     thread: Option<JoinHandle<()>>,
     cancel: Arc<CancellationGate>,
     background_encode: bool,
+    input_support: InputSupport,
     pending: VecDeque<Pending>,
     receive_result: Option<Option<Packet>>,
     receive_pending: bool,
@@ -180,7 +208,10 @@ impl Worker {
                     }
                 };
                 let background_encode = encoder.uses_background_encode();
-                if ready.send(Ok(background_encode)).is_err() {
+                if ready
+                    .send(Ok((background_encode, encoder.input_support())))
+                    .is_err()
+                {
                     return;
                 }
                 let mut failed = false;
@@ -197,6 +228,9 @@ impl Worker {
                             Operation::Submit(data, timestamp, force) => {
                                 encoder.submit(data, timestamp, force).map(|()| Reply::Done)
                             }
+                            Operation::SubmitGpu(input, timestamp, force) => encoder
+                                .submit_gpu(input, timestamp, force)
+                                .map(|()| Reply::Done),
                             Operation::Receive => encoder.receive().map(Reply::Packet),
                             Operation::Drain => encoder.drain().map(|()| Reply::Done),
                         }
@@ -230,11 +264,12 @@ impl Worker {
             .map_err(|_| "encoder_worker_failed")
             .and_then(|value| value)
         {
-            Ok(background_encode) => Ok(Self {
+            Ok((background_encode, input_support)) => Ok(Self {
                 sender: Some(sender),
                 thread: Some(thread),
                 cancel,
                 background_encode,
+                input_support,
                 pending: VecDeque::new(),
                 receive_result: None,
                 receive_pending: false,
@@ -265,7 +300,7 @@ impl Worker {
         }
         let (reply, response) = mpsc::sync_channel(1);
         let kind = match &operation {
-            Operation::Submit(..) => AsyncKind::Submit,
+            Operation::Submit(..) | Operation::SubmitGpu(..) => AsyncKind::Submit,
             Operation::Receive => AsyncKind::Receive,
             Operation::Drain => AsyncKind::Drain,
         };
@@ -411,6 +446,45 @@ impl Worker {
         }
         self.poll_background()?;
         if self.enqueue(Operation::Submit(data, timestamp, force), AsyncKind::Submit)? {
+            Ok(SubmitResult::Accepted)
+        } else {
+            self.metrics.busy_submissions = self.metrics.busy_submissions.saturating_add(1);
+            Ok(SubmitResult::Busy)
+        }
+    }
+
+    pub fn input_support(&self) -> InputSupport {
+        self.input_support.clone()
+    }
+
+    /// True when `submit_gpu` is guaranteed to be accepted rather than busy.
+    /// DMA-BUF submission checks this before duplicating any descriptor.
+    pub fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
+        if !self.background_encode {
+            // Synchronous submission waits for the worker instead of queuing.
+            return Ok(true);
+        }
+        self.poll_background()?;
+        // Each pending entry occupies at most one channel slot, so fewer
+        // pending entries than slots guarantees the next try_send succeeds.
+        Ok(self.pending.len() < ASYNC_QUEUE_CAPACITY)
+    }
+
+    pub fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        if !self.background_encode {
+            self.request(Operation::SubmitGpu(input, timestamp, force))?;
+            return Ok(SubmitResult::Accepted);
+        }
+        self.poll_background()?;
+        if self.enqueue(
+            Operation::SubmitGpu(input, timestamp, force),
+            AsyncKind::Submit,
+        )? {
             Ok(SubmitResult::Accepted)
         } else {
             self.metrics.busy_submissions = self.metrics.busy_submissions.saturating_add(1);

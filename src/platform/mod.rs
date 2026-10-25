@@ -13,6 +13,7 @@ mod x265_hevc;
 #[cfg(windows)]
 mod windows;
 
+use crate::input::{GpuInput, InputSupport};
 use crate::model::{Configuration, EncoderDescription, EncoderIdentity, Packet};
 
 #[derive(Clone, Copy)]
@@ -211,6 +212,21 @@ impl Encoder {
             Self::Hevc(encoder) => encoder.drain(),
             Self::Software(encoder) => encoder.drain(),
         }
+    }
+
+    /// No platform backend converts on the GPU or imports DMA-BUFs yet.
+    pub fn input_support(&self) -> InputSupport {
+        InputSupport::default()
+    }
+
+    pub fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<(), &'static str> {
+        let _ = (input, timestamp, force);
+        Err("gpu_input_unsupported")
     }
 }
 

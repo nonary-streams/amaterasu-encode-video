@@ -16,6 +16,23 @@ pub fn nv12(
     Ok(packed)
 }
 
+/// Removes BGRA stride padding without converting, for a backend that
+/// converts to NV12 on the GPU.
+pub fn packed_bgra(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let row_bytes = width.checked_mul(4).ok_or("invalid_frame")?;
+    validate(data, width, height, stride, row_bytes, height)?;
+    let mut packed = Vec::with_capacity(row_bytes * height);
+    for row in data.chunks_exact(stride) {
+        packed.extend_from_slice(&row[..row_bytes]);
+    }
+    Ok(packed)
+}
+
 pub fn bgra(
     data: &[u8],
     width: usize,
@@ -285,6 +302,20 @@ fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_bgra_removes_padding_without_touching_pixels() {
+        let stride = 12;
+        let mut data = vec![0xee; stride * 2];
+        data[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        data[stride..stride + 8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            packed_bgra(&data, 2, 2, stride).unwrap(),
+            (1..=16).collect::<Vec<u8>>()
+        );
+        assert!(packed_bgra(&data[1..], 2, 2, stride).is_err());
+        assert!(packed_bgra(&data, 2, 2, 4).is_err());
+    }
 
     fn scalar_bgra_reference(
         data: &[u8],

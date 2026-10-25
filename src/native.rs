@@ -28,8 +28,10 @@ impl Registration {
     }
 }
 
+/// The v1.1 table is a strict extension of v1.0, so one binding serves both:
+/// v1.0 consumers read only the unchanged prefix.
 struct Binding {
-    api: EncoderApi,
+    api: EncoderApiV1_1,
     owner: String,
     shared: Shared,
 }
@@ -50,8 +52,8 @@ unsafe extern "C" fn bind(
             let query = &*query;
             if !query.header.supports::<NativeInterfaceQuery>()
                 || query.interface_major != INTERFACE_MAJOR
-                || query.min_minor > INTERFACE_MINOR
-                || query.min_size as usize > size_of::<EncoderApi>()
+                || query.min_minor > ENCODER_DMABUF_INTERFACE_MINOR
+                || query.min_size > ENCODER_API_V1_1_SIZE
             {
                 return MEDIA_UNSUPPORTED;
             }
@@ -65,12 +67,12 @@ unsafe extern "C" fn bind(
             };
             let shared = (&*context.cast::<Shared>()).clone();
             let mut binding = Box::new(Binding {
-                api: EncoderApi {
+                api: EncoderApiV1_1 {
                     base: NativeInterface {
                         header: AbiHeader {
-                            size: size_of::<EncoderApi>() as u32,
+                            size: ENCODER_API_V1_1_SIZE,
                             major: INTERFACE_MAJOR,
-                            minor: INTERFACE_MINOR,
+                            minor: ENCODER_DMABUF_INTERFACE_MINOR,
                         },
                         context: std::ptr::null_mut(),
                         release: Some(release),
@@ -78,6 +80,7 @@ unsafe extern "C" fn bind(
                     submit,
                     receive,
                     drain,
+                    submit_dmabuf,
                 },
                 owner,
                 shared,
@@ -116,6 +119,28 @@ unsafe extern "C" fn submit(
             return MEDIA_BUSY;
         };
         unsafe { sessions.submit(&binding.owner, id, &*frame, force) }
+    })
+}
+
+/// STATUS_OK means every descriptor the encoder needs was duplicated before
+/// returning; the producer may close or reuse its own descriptors at once.
+unsafe extern "C" fn submit_dmabuf(
+    context: *mut c_void,
+    id: u64,
+    frame: *const DmaBufFrame,
+    force: u32,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || frame.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: live binding context and frame are guaranteed by native ABI.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: the producer keeps the frame's descriptors open for this call.
+        unsafe { sessions.submit_dmabuf(&binding.owner, id, &*frame, force) }
     })
 }
 

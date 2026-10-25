@@ -99,7 +99,9 @@ fn is_h264(codec: &VideoCodec) -> bool {
 
 impl Configuration {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.codec == VideoCodec::Hevc && !cfg!(target_os = "linux") {
+        // Only Linux backends encode HEVC or AV1. Each Linux backend still
+        // rejects any codec it does not implement when it opens.
+        if self.codec != VideoCodec::H264 && !cfg!(target_os = "linux") {
             return Err("codec_unsupported");
         }
         if cfg!(windows) && !self.color_mode.is_default() {
@@ -192,10 +194,26 @@ pub struct EncoderDescription {
     /// PCI vendor identifier published by the registered hardware MFT, when
     /// the MFT provides it. This is capability metadata, not a selected index.
     pub vendor_id: Option<u32>,
+    /// Optional capability fields; omitted entirely when a backend has none,
+    /// so earlier descriptions serialize unchanged.
+    #[serde(flatten)]
+    pub capabilities: DescriptionCapabilities,
 }
 
-/// One complete H.264 coded picture. Backends must establish their output
-/// boundary before handing this owned packet to the native session queue.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DescriptionCapabilities {
+    /// Accepted frame sources: `cpu` (CpuFrame) and `dmabuf` (DmaBufFrame).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u32>,
+}
+
+/// One complete coded picture: an H.264/HEVC Annex B access unit or an AV1
+/// temporal unit. Backends must establish their output boundary before
+/// handing this owned packet to the native session queue.
 pub struct Packet {
     pub bytes: Vec<u8>,
     pub timestamp_100ns: i64,
@@ -205,6 +223,51 @@ pub struct Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_capabilities_are_omitted_when_empty() {
+        let mut description = EncoderDescription {
+            identity: EncoderIdentity {
+                clsid: "test".into(),
+                hardware_url: None,
+                friendly_name: "Test".into(),
+            },
+            name: "Test".into(),
+            codec: "h264",
+            hardware: false,
+            vendor_id: None,
+            capabilities: DescriptionCapabilities::default(),
+        };
+        let plain = serde_json::to_value(&description).unwrap();
+        assert_eq!(
+            plain.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["codec", "hardware", "identity", "name", "vendor_id"]
+        );
+        description.capabilities = DescriptionCapabilities {
+            inputs: vec!["cpu", "dmabuf"],
+            max_width: Some(4096),
+            max_height: Some(2304),
+        };
+        let extended = serde_json::to_value(&description).unwrap();
+        assert_eq!(extended["inputs"], serde_json::json!(["cpu", "dmabuf"]));
+        assert_eq!(extended["max_width"], 4096);
+        assert_eq!(extended["max_height"], 2304);
+    }
+
+    #[test]
+    fn av1_and_hevc_are_validated_only_on_linux() {
+        for codec in [VideoCodec::Hevc, VideoCodec::Av1] {
+            let configuration: Configuration = serde_json::from_value(serde_json::json!({
+                "width": 16, "height": 16, "fps": 60, "bitrate": 1_000_000, "codec": codec
+            }))
+            .unwrap();
+            if cfg!(target_os = "linux") {
+                assert!(configuration.validate().is_ok());
+            } else {
+                assert_eq!(configuration.validate(), Err("codec_unsupported"));
+            }
+        }
+    }
 
     #[test]
     fn encoder_identity_is_bounded_and_nonempty() {

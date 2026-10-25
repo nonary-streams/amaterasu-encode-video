@@ -226,6 +226,7 @@ fn description(activation: &IMFActivate) -> NativeResult<EncoderDescription> {
                 .GetUINT32(&MFT_ENUM_HARDWARE_VENDOR_ID_Attribute)
                 .ok()
         },
+        capabilities: Default::default(),
     })
 }
 
@@ -783,6 +784,7 @@ mod diagnostic_tests {
             codec: "h264",
             hardware: true,
             vendor_id: None,
+            capabilities: Default::default(),
         }
     }
 

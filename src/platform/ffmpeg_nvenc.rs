@@ -85,6 +85,7 @@ fn description_with_probe(mut probe: impl FnMut(ColorMode) -> bool) -> Option<En
         codec: "h264",
         hardware: true,
         vendor_id: Some(0x10de),
+        capabilities: Default::default(),
     })
 }
 

@@ -81,6 +81,7 @@ fn description_with_probe(mut probe: impl FnMut() -> bool) -> Option<EncoderDesc
         codec: "h264",
         hardware: true,
         vendor_id: None,
+        capabilities: Default::default(),
     })
 }
 

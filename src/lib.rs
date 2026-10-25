@@ -1,4 +1,4 @@
-//! H.264 encoding control and native CPU-frame interface.
+//! Video encoding control and the native CPU-frame and DMA-BUF interface.
 #[cfg(any(
     windows,
     test,
@@ -9,6 +9,9 @@
 mod bitstream;
 #[cfg(any(test, amaterasu_x265_hevc))]
 mod hevc;
+// GPU-converting backends are the only producers of these inputs.
+#[allow(dead_code)]
+mod input;
 mod layout;
 mod model;
 mod native;

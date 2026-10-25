@@ -1,4 +1,5 @@
 use crate::{
+    input::{GpuInput, InputSupport},
     layout,
     model::{AmdAv1LatencyMode, Configuration, EncoderIdentity, Packet},
     worker::Worker,
@@ -23,6 +24,22 @@ pub trait Backend: Send {
     fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
         Ok(None)
     }
+    /// Inputs accepted besides packed NV12; read once when the session opens.
+    fn input_support(&self) -> InputSupport {
+        InputSupport::default()
+    }
+    /// True when the next `submit_gpu` cannot report busy.
+    fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+    fn submit_gpu(
+        &mut self,
+        _input: GpuInput,
+        _timestamp: i64,
+        _force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        Err("gpu_input_unsupported")
+    }
 }
 
 impl Backend for Worker {
@@ -43,6 +60,20 @@ impl Backend for Worker {
     fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
         self.metrics().map(Some)
     }
+    fn input_support(&self) -> InputSupport {
+        Worker::input_support(self)
+    }
+    fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
+        Worker::has_gpu_submit_capacity(self)
+    }
+    fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        Worker::submit_gpu(self, input, timestamp, force)
+    }
 }
 
 struct Metadata {
@@ -56,6 +87,7 @@ pub struct Session {
     owner: String,
     config: Configuration,
     backend: Box<dyn Backend>,
+    input_support: InputSupport,
     metadata: VecDeque<Metadata>,
     last_input: Option<(i64, u64)>,
     pending: Option<Packet>,
@@ -177,8 +209,9 @@ impl Sessions {
         packet_boundaries: bool,
     ) -> Result<Value, &'static str> {
         self.next_id = self.next_id.checked_add(1).ok_or("session_limit")?;
-        let packet_boundaries = packet_boundaries || configuration.codec == VideoCodec::Hevc;
+        let packet_boundaries = packet_boundaries || configuration.codec != VideoCodec::H264;
         let response = open_reply(self.next_id, &configuration, packet_boundaries);
+        let input_support = backend.input_support();
         self.values.insert(
             self.next_id,
             Session {
@@ -186,6 +219,7 @@ impl Sessions {
                 owner: owner.into(),
                 config: configuration,
                 backend,
+                input_support,
                 metadata: VecDeque::new(),
                 last_input: None,
                 pending: None,
@@ -257,34 +291,16 @@ impl Sessions {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
         };
-        if session.failed {
-            return MEDIA_BACKEND_ERROR;
-        }
-        if session.draining {
-            return MEDIA_CLOSED;
-        }
-        if session.metadata.len() >= 16 {
-            return MEDIA_BUSY;
-        }
-        if frame.width != session.config.width || frame.height != session.config.height || force > 1
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        let Some(timestamp) = frame
-            .timestamp_us
-            .checked_mul(10)
-            .and_then(|time| i64::try_from(time).ok())
-        else {
-            return STATUS_INVALID_ARGUMENT;
+        let timestamp = match session.admit(
+            frame.width,
+            frame.height,
+            frame.timestamp_us,
+            frame.sequence,
+            force,
+        ) {
+            Ok(timestamp) => timestamp,
+            Err(status) => return status,
         };
-        if session
-            .last_input
-            .is_some_and(|(last_timestamp, last_sequence)| {
-                timestamp <= last_timestamp || frame.sequence <= last_sequence
-            })
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
         // SAFETY: native caller guarantees the allocation; validation precedes read.
         let bytes = match unsafe { frame.bytes() } {
             Ok(bytes) => bytes,
@@ -293,53 +309,52 @@ impl Sessions {
         if !layout::input_color_supported(frame.format, session.config.color_mode) {
             return STATUS_INVALID_ARGUMENT;
         }
-        let conversion_started = Instant::now();
-        let bytes = match frame.format {
-            PIXEL_BGRA8 => layout::bgra(
+        let result = if frame.format == PIXEL_BGRA8 && session.input_support.gpu_bgra_conversion {
+            let Ok(packed) = layout::packed_bgra(
                 bytes,
                 frame.width as usize,
                 frame.height as usize,
                 frame.stride as usize,
-                session.config.color_mode,
-            ),
-            PIXEL_NV12 => layout::nv12(
-                bytes,
-                frame.width as usize,
-                frame.height as usize,
-                frame.stride as usize,
-            ),
-            _ => return MEDIA_UNSUPPORTED,
+            ) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            session
+                .backend
+                .submit_gpu(GpuInput::Bgra(packed), timestamp, force != 0)
+        } else {
+            let nv12 = match session.cpu_nv12(frame, bytes) {
+                Ok(nv12) => nv12,
+                Err(status) => return status,
+            };
+            session.backend.submit(nv12, timestamp, force != 0)
         };
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
-            Err(_) => return STATUS_INVALID_ARGUMENT,
+        session.record_submission(result, timestamp, frame.sequence, force != 0)
+    }
+    /// # Safety
+    /// Every descriptor in `frame` is open for the duration of this call.
+    pub unsafe fn submit_dmabuf(
+        &mut self,
+        owner: &str,
+        id: u64,
+        frame: &DmaBufFrame,
+        force: u32,
+    ) -> Status {
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
         };
-        if frame.format == PIXEL_BGRA8 {
-            let conversion_us = conversion_started
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
-            session.color_conversion_frames = session.color_conversion_frames.saturating_add(1);
-            session.color_conversion_total_us = session
-                .color_conversion_total_us
-                .saturating_add(conversion_us);
-            session.color_conversion_max_us = session.color_conversion_max_us.max(conversion_us);
+        if let Err(status) = session.check_accepting() {
+            return status;
         }
-        match session.backend.submit(bytes, timestamp, force != 0) {
-            Ok(SubmitResult::Accepted) => {}
-            Ok(SubmitResult::Busy) => return MEDIA_BUSY,
-            Err(_) => {
-                session.failed = true;
-                return MEDIA_BACKEND_ERROR;
-            }
+        #[cfg(unix)]
+        {
+            // SAFETY: forwarded caller guarantee for the borrowed descriptors.
+            unsafe { session.submit_dmabuf(frame, force) }
         }
-        session.metadata.push_back(Metadata {
-            timestamp,
-            sequence: frame.sequence,
-            force_keyframe: force != 0,
-        });
-        session.last_input = Some((timestamp, frame.sequence));
-        STATUS_OK
+        #[cfg(not(unix))]
+        {
+            let _ = (frame, force);
+            MEDIA_UNSUPPORTED
+        }
     }
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
         let Ok(session) = self.owned(owner, id) else {
@@ -416,8 +431,9 @@ impl Sessions {
         }
         let encoded = EncodedPacket {
             codec: session.config.codec.abi_id(),
-            // Encoder packets are whole access units. HEVC always marks this
-            // packet as the final fragment, even without H.264 boundary opt-in.
+            // Encoder packets are whole access units (AV1: temporal units).
+            // HEVC and AV1 always mark the final fragment, even without the
+            // H.264 boundary opt-in.
             flags: if session.packet_boundaries {
                 FLAG_END_OF_ACCESS_UNIT
             } else {
@@ -446,6 +462,153 @@ impl Sessions {
     }
 }
 
+impl Session {
+    fn check_accepting(&self) -> Result<(), Status> {
+        if self.failed {
+            return Err(MEDIA_BACKEND_ERROR);
+        }
+        if self.draining {
+            return Err(MEDIA_CLOSED);
+        }
+        Ok(())
+    }
+
+    /// Admission shared by every input kind; returns the 100 ns timestamp.
+    /// A rejected frame retains neither its timestamp nor its sequence.
+    fn admit(
+        &self,
+        width: u32,
+        height: u32,
+        timestamp_us: u64,
+        sequence: u64,
+        force: u32,
+    ) -> Result<i64, Status> {
+        self.check_accepting()?;
+        if self.metadata.len() >= 16 {
+            return Err(MEDIA_BUSY);
+        }
+        if width != self.config.width || height != self.config.height || force > 1 {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let timestamp = timestamp_us
+            .checked_mul(10)
+            .and_then(|time| i64::try_from(time).ok())
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
+        if self
+            .last_input
+            .is_some_and(|(last_timestamp, last_sequence)| {
+                timestamp <= last_timestamp || sequence <= last_sequence
+            })
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(timestamp)
+    }
+
+    /// CPU conversion for backends without GPU conversion, and NV12 copies.
+    fn cpu_nv12(&mut self, frame: &CpuFrame, bytes: &[u8]) -> Result<Vec<u8>, Status> {
+        let conversion_started = Instant::now();
+        let nv12 = match frame.format {
+            PIXEL_BGRA8 => layout::bgra(
+                bytes,
+                frame.width as usize,
+                frame.height as usize,
+                frame.stride as usize,
+                self.config.color_mode,
+            ),
+            PIXEL_NV12 => layout::nv12(
+                bytes,
+                frame.width as usize,
+                frame.height as usize,
+                frame.stride as usize,
+            ),
+            _ => return Err(MEDIA_UNSUPPORTED),
+        }
+        .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        if frame.format == PIXEL_BGRA8 {
+            let conversion_us = conversion_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            self.color_conversion_frames = self.color_conversion_frames.saturating_add(1);
+            self.color_conversion_total_us =
+                self.color_conversion_total_us.saturating_add(conversion_us);
+            self.color_conversion_max_us = self.color_conversion_max_us.max(conversion_us);
+        }
+        Ok(nv12)
+    }
+
+    /// Validates, then duplicates descriptors only once acceptance is
+    /// certain: MEDIA_BUSY and MEDIA_UNSUPPORTED duplicate nothing.
+    ///
+    /// # Safety
+    /// Every descriptor in `frame` is open for the duration of this call.
+    #[cfg(unix)]
+    unsafe fn submit_dmabuf(&mut self, frame: &DmaBufFrame, force: u32) -> Status {
+        let Some(import) = self.input_support.dmabuf.clone() else {
+            return MEDIA_UNSUPPORTED;
+        };
+        let timestamp = match self.admit(
+            frame.width,
+            frame.height,
+            frame.timestamp_us,
+            frame.sequence,
+            force,
+        ) {
+            Ok(timestamp) => timestamp,
+            Err(status) => return status,
+        };
+        if let Err(status) = frame.validate() {
+            return status;
+        }
+        // Only 8-bit SDR RGB is converted today; HDR frames fall back to CPU.
+        if frame.color != DMABUF_COLOR_SRGB || !import.supports(frame.fourcc, frame.modifier) {
+            return MEDIA_UNSUPPORTED;
+        }
+        match self.backend.has_gpu_submit_capacity() {
+            Ok(true) => {}
+            Ok(false) => return MEDIA_BUSY,
+            Err(_) => {
+                self.failed = true;
+                return MEDIA_BACKEND_ERROR;
+            }
+        }
+        // SAFETY: validated shape; the caller keeps the descriptors open.
+        let input = match unsafe { crate::input::DmaBufInput::duplicate(frame) } {
+            Ok(input) => input,
+            Err(status) => return status,
+        };
+        let result = self
+            .backend
+            .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0);
+        self.record_submission(result, timestamp, frame.sequence, force != 0)
+    }
+
+    fn record_submission(
+        &mut self,
+        result: Result<SubmitResult, &'static str>,
+        timestamp: i64,
+        sequence: u64,
+        force_keyframe: bool,
+    ) -> Status {
+        match result {
+            Ok(SubmitResult::Accepted) => {}
+            Ok(SubmitResult::Busy) => return MEDIA_BUSY,
+            Err(_) => {
+                self.failed = true;
+                return MEDIA_BACKEND_ERROR;
+            }
+        }
+        self.metadata.push_back(Metadata {
+            timestamp,
+            sequence,
+            force_keyframe,
+        });
+        self.last_input = Some((timestamp, sequence));
+        STATUS_OK
+    }
+}
+
 fn validate_operation(operation: &str) -> Result<(), &'static str> {
     if operation.is_empty()
         || operation.len() > 128
@@ -457,9 +620,12 @@ fn validate_operation(operation: &str) -> Result<(), &'static str> {
 }
 
 fn open_reply(id: u64, config: &Configuration, packet_boundaries: bool) -> Value {
-    let packet_boundaries = packet_boundaries || config.codec == VideoCodec::Hevc;
+    let packet_boundaries = packet_boundaries || config.codec != VideoCodec::H264;
     json!({"ok":true,"session_id":id,"configuration":config,"codec":match config.codec { VideoCodec::H264 => "h264", VideoCodec::Hevc => "hevc", VideoCodec::Av1 => "av1" },"max_reference_frames":config.max_reference_frames,"packet_boundaries":packet_boundaries,"supports_packet_boundaries":true})
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod gpu_input_tests;

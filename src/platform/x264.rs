@@ -94,6 +94,7 @@ pub fn description() -> Option<EncoderDescription> {
         codec: "h264",
         hardware: false,
         vendor_id: None,
+        capabilities: Default::default(),
     })
 }
 
