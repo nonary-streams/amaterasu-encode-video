@@ -296,7 +296,12 @@ impl NativePlane {
                 processor,
                 captures,
                 unbound,
-                encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
+                encoder: runtime.bind_native(
+                    settings.encoder_service(),
+                    1,
+                    0,
+                    size_of::<EncoderApi>() as u32,
+                )?,
                 queues,
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),

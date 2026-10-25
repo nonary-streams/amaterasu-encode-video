@@ -28,7 +28,7 @@ fn close_known(stream: &Stream, send: &mut Send<'_>) {
     if let Some(session) = stream.session {
         let _ = rpc::submit(
             send,
-            ENCODE,
+            stream.encoder_service(),
             json!({"action":"close","session_id":session}),
             format!("{}-shutdown-encoder", stream.operation),
             None,

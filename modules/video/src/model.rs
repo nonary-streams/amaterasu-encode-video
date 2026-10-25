@@ -104,6 +104,10 @@ pub struct Settings {
     /// unchanged; binding also requires an exact signed native-use grant.
     #[serde(default)]
     pub cpu_processor_service: Option<String>,
+    /// Exact host-selected encoder provider. The broker must grant both its
+    /// control calls and native interface; no fallback to the built-in encoder.
+    #[serde(default)]
+    pub encoder_service: Option<String>,
     /// Elapsed budget checked after each synchronous native call. It cannot
     /// preempt a provider that does not return.
     #[serde(default = "default_cpu_processor_budget_us")]
@@ -140,6 +144,7 @@ impl Default for Settings {
             capture_observation: false,
             frame_observation: false,
             cpu_processor_service: None,
+            encoder_service: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: default_providers(),
             x11_capture_service: None,
@@ -160,6 +165,13 @@ impl Settings {
         {
             return Err("invalid_cpu_processor_service");
         }
+        if self
+            .encoder_service
+            .as_deref()
+            .is_some_and(|service| !valid_external_service(service))
+        {
+            return Err("invalid_encoder_service");
+        }
         if let Some(service) = &self.x11_capture_service
             && (!cfg!(target_os = "linux")
                 || !self.capture_providers.contains(&CaptureProvider::X11)
@@ -178,6 +190,12 @@ impl Settings {
         } else {
             provider.service()
         }
+    }
+
+    pub fn encoder_service(&self) -> &str {
+        self.encoder_service
+            .as_deref()
+            .unwrap_or("amaterasu.encode/1")
     }
 }
 
@@ -988,6 +1006,7 @@ mod tests {
             capture_observation: false,
             frame_observation: false,
             cpu_processor_service: None,
+            encoder_service: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::X11].into(),
             x11_capture_service: None,
@@ -1077,6 +1096,24 @@ mod tests {
     }
 
     #[test]
+    fn encoder_replacement_requires_an_exact_external_service() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.encoder_service(), "amaterasu.encode/1");
+        settings.encoder_service = Some("example.encode-test/1".into());
+        assert!(settings.validate().is_ok());
+        assert_eq!(settings.encoder_service(), "example.encode-test/1");
+        for invalid in [
+            "amaterasu.encode/1",
+            "example.encode-test/2",
+            "Example.encode-test/1",
+            "example..encode-test/1",
+        ] {
+            settings.encoder_service = Some(invalid.into());
+            assert_eq!(settings.validate(), Err("invalid_encoder_service"));
+        }
+    }
+
+    #[test]
     fn kms_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
         assert_eq!(CaptureProvider::Kms.service(), "amaterasu.capture-kms/1");
         assert_eq!(serde_json::to_value(CaptureProvider::Kms).unwrap(), "kms");
@@ -1086,6 +1123,7 @@ mod tests {
             capture_observation: false,
             frame_observation: false,
             cpu_processor_service: None,
+            encoder_service: None,
             cpu_processor_budget_us: default_cpu_processor_budget_us(),
             capture_providers: [CaptureProvider::Kms].into(),
             x11_capture_service: None,

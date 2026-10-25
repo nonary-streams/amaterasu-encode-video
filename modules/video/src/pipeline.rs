@@ -61,6 +61,7 @@ struct Stream {
     provider: CaptureProvider,
     /// Exact host-configured X11 service used by control RPC and native pixels.
     x11_capture_service: Option<String>,
+    encoder_service: Option<String>,
     frame_path: FramePath,
     owned_capture: owned_capture::OwnedOutputCapture,
     auto_capture: bool,
@@ -186,6 +187,9 @@ impl Stream {
         } else {
             self.provider.service()
         }
+    }
+    fn encoder_service(&self) -> &str {
+        self.encoder_service.as_deref().unwrap_or(ENCODE)
     }
     fn encoder_operation(&self) -> String {
         format!(
@@ -391,6 +395,7 @@ pub struct Pipeline {
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
     x11_capture_service: Option<String>,
+    encoder_service: Option<String>,
     drain_timeout: Duration,
     recent: VecDeque<(String, Value)>,
     epoch: String,
@@ -425,6 +430,7 @@ impl Pipeline {
             ),
             providers: settings.capture_providers,
             x11_capture_service: settings.x11_capture_service,
+            encoder_service: settings.encoder_service,
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
             epoch,
@@ -690,6 +696,7 @@ impl Pipeline {
                 owner: caller.into(),
                 provider,
                 x11_capture_service: self.x11_capture_service.clone(),
+                encoder_service: self.encoder_service.clone(),
                 frame_path: FramePath::Cpu,
                 owned_capture,
                 auto_capture,
@@ -1301,9 +1308,9 @@ fn request(stream: &Stream) -> (&str, Value) {
     match stream.stage {
         Stage::X11Enumerate => (stream.capture_service(), json!({"action":"enumerate"})),
         Stage::KmsEnumerate => (stream.capture_service(), json!({"action":"enumerate"})),
-        Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
+        Stage::SelectEncoder => (stream.encoder_service(), json!({"action":"enumerate"})),
         Stage::ProbeEncoder => (
-            ENCODE,
+            stream.encoder_service(),
             json!({
                 "action":"probe", "encoder":stream.encoder,
                 "configuration":stream.configuration,
@@ -1333,17 +1340,17 @@ fn request(stream: &Stream) -> (&str, Value) {
                 request,
             )
         }
-        Stage::Encoder => (ENCODE, encoder_open_request(stream)),
+        Stage::Encoder => (stream.encoder_service(), encoder_open_request(stream)),
         Stage::FindEncoder => (
-            ENCODE,
+            stream.encoder_service(),
             json!({"action":"lookup","operation_id":stream.encoder_operation()}),
         ),
         Stage::CloseEncoder => (
-            ENCODE,
+            stream.encoder_service(),
             json!({"action":"close","session_id":stream.session}),
         ),
         Stage::RestartCloseEncoder => (
-            ENCODE,
+            stream.encoder_service(),
             json!({"action":"close","session_id":stream.session}),
         ),
         Stage::FindCapture => (

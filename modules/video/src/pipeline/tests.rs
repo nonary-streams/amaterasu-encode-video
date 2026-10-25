@@ -51,6 +51,7 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
 struct Runtime {
     next: u64,
     external_x11_service: Option<String>,
+    external_encoder_service: Option<String>,
     operations: BTreeMap<String, u64>,
     failed_encoder_operations: std::collections::BTreeSet<String>,
     ended: std::collections::BTreeSet<u64>,
@@ -110,6 +111,8 @@ impl Runtime {
                     return Ok(Response::error("permission_denied", "parent ended"));
                 }
                 let action = payload["action"].as_str().unwrap();
+                let is_encoder =
+                    service == self.external_encoder_service.as_deref().unwrap_or(ENCODE);
                 let capture_provider =
                     if self.external_x11_service.as_deref() == Some(service.as_str()) {
                         Some(CaptureProvider::X11)
@@ -127,17 +130,17 @@ impl Runtime {
                 if action == "open" {
                     self.open_effects += 1;
                 }
-                let result = if service == ENCODE
+                let result = if is_encoder
                     && action == "close"
                     && let Some(code) = self.encoder_close_error_once.take()
                 {
                     error(code)
                 } else if self.fail_encoder_cleanup
-                    && service == ENCODE
+                    && is_encoder
                     && matches!(action, "lookup" | "close")
                 {
                     error("hardware_error")
-                } else if service == ENCODE && action == "enumerate" {
+                } else if is_encoder && action == "enumerate" {
                     self.encoder_enumeration_override
                         .clone()
                         .unwrap_or_else(|| {
@@ -148,15 +151,14 @@ impl Runtime {
                                 }]
                             })
                         })
-                } else if service == ENCODE && action == "probe" {
+                } else if is_encoder && action == "probe" {
                     self.encoder_probe_replies
                         .get(payload["encoder"]["clsid"].as_str().unwrap())
                         .cloned()
                         .unwrap_or_else(|| {
                             probe_reply(&payload["encoder"], &payload["configuration"], true)
                         })
-                } else if service == ENCODE && action == "open" && self.encoder_open_error.is_some()
-                {
+                } else if is_encoder && action == "open" && self.encoder_open_error.is_some() {
                     error(self.encoder_open_error.unwrap())
                 } else if let Some(provider) = capture_provider {
                     if action == "enumerate" {
@@ -214,7 +216,7 @@ impl Runtime {
                     } else {
                         json!({"ok":true,"stream":41})
                     }
-                } else if service == ENCODE && action == "open" {
+                } else if is_encoder && action == "open" {
                     if let Some(code) = self
                         .encoder_open_error_once
                         .take()
@@ -235,7 +237,7 @@ impl Runtime {
                         }
                         result
                     }
-                } else if service == ENCODE
+                } else if is_encoder
                     && action == "lookup"
                     && payload
                         .get("operation_id")
@@ -2297,6 +2299,49 @@ fn host_configured_x11_service_routes_enumerate_open_and_cleanup_to_one_provider
     assert!(!runtime.commands.iter().any(|command| matches!(command,
         Command::Request { service: target, .. }
         if target == CaptureProvider::X11.service()
+    )));
+}
+
+#[test]
+fn host_configured_encoder_routes_selection_open_and_cleanup_to_one_service() {
+    let service = "example.encode-test/1";
+    let (mut pipeline, mut runtime, mut plane) = setup_with_settings(Settings {
+        enabled: true,
+        encoder_service: Some(service.into()),
+        capture_providers: [CaptureProvider::Dxgi].into(),
+        ..Settings::default()
+    });
+    runtime.external_encoder_service = Some(service.into());
+    pipeline.handle("alice", 99, auto_open(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert!(pipeline.streams.is_empty());
+    let actions: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service: target,
+                payload,
+                ..
+            } if target == service => payload["action"].as_str(),
+            _ => None,
+        })
+        .collect();
+    assert!(actions.contains(&"enumerate"));
+    assert!(actions.contains(&"open"));
+    assert!(actions.contains(&"close"));
+    assert!(!runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service: target, .. } if target == ENCODE
     )));
 }
 

@@ -51,6 +51,24 @@ change the running package. Capture callbacks retain their current borrowed
 CPU/DMA-BUF lifetime and tick-thread contract. No live replacement is enabled
 by the default LinuxSession profile.
 
+### Host-configured encoder service replacement
+
+Trusted video settings may select one exact `"encoder_service":
+"example.encode-test/1"`. Without it, Video uses `amaterasu.encode/1`.
+The external service must implement the existing encoder control operations
+(`enumerate`, `probe`, `open`, `lookup`, `close`) and the native `EncoderApi`
+v1.0 interface. Enumeration, open, native submit/receive, recovery and close
+all bind to the same selected service. A failed explicit binding does not
+fall back to the built-in encoder. The name is a bounded external `/1`
+namespace; built-in `amaterasu.*` names are rejected as overrides.
+
+The signed package and trusted host policy must authorize Video's exact
+`call` and `native_use` grants for that provider, and retain the provider
+component through Video teardown. The setting grants no capability by itself.
+The current development composer has an external capture/processor fixture;
+it does not yet package an external encoder. No production profile or live
+encoder selection is changed here.
+
 ## Optional video lifecycle metadata observations
 
 Trusted host-owned video settings may opt in with `"capture_observation":true` for
