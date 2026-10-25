@@ -169,7 +169,7 @@ fn switch_capture_provider(stream: &mut Stream, provider: CaptureProvider) {
 
 /// Keeps provider-reported codes that are short identifiers; anything else is
 /// summarized so status never echoes arbitrary provider text.
-fn retained_reason(reason: &str) -> String {
+pub(super) fn retained_reason(reason: &str) -> String {
     let identifier = !reason.is_empty()
         && reason.len() <= MAX_REASON_BYTES
         && reason

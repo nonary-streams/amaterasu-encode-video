@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Stage {
     SelectEncoder,
     Capture,
@@ -1219,6 +1219,14 @@ fn apply_result(
         } else {
             "provider_failed"
         };
+        // Status reports only the coarse code; the log names the stage and the
+        // provider's own short code so a failed open can be diagnosed.
+        eprintln!(
+            "amaterasu video step failed stage={:?} provider={} reported={} code={code}",
+            stream.stage,
+            stream.provider.service(),
+            owned_capture::retained_reason(payload_error_code(&payload).unwrap_or("none")),
+        );
         failed_step(stream, code);
         return false;
     }
