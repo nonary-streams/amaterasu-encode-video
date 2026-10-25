@@ -1,8 +1,12 @@
 use super::*;
 use crate::model::{AmdAv1LatencyMode, EncoderSelection};
-use crate::plane::{CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame, Progress};
+use crate::plane::{
+    AcceptedFrame, AcceptedPacket, CaptureArrival, FrameMetadata, GeometryProgress, OwnedFrame,
+    Progress,
+};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_module_sdk::EncoderIdentity;
+use amaterasu_module_sdk::FrameMemory;
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 
 #[test]
@@ -46,6 +50,7 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
 #[derive(Default)]
 struct Runtime {
     next: u64,
+    external_x11_service: Option<String>,
     operations: BTreeMap<String, u64>,
     failed_encoder_operations: std::collections::BTreeSet<String>,
     ended: std::collections::BTreeSet<u64>,
@@ -105,7 +110,12 @@ impl Runtime {
                     return Ok(Response::error("permission_denied", "parent ended"));
                 }
                 let action = payload["action"].as_str().unwrap();
-                let capture_provider = capture_provider_for_service(&service);
+                let capture_provider =
+                    if self.external_x11_service.as_deref() == Some(service.as_str()) {
+                        Some(CaptureProvider::X11)
+                    } else {
+                        capture_provider_for_service(&service)
+                    };
                 if action == "open"
                     && let Some(provider) = capture_provider
                     && let Some(code) = self.capture_admission_errors.get(&provider)
@@ -327,6 +337,8 @@ struct FakePlane {
     calls: usize,
     drains: usize,
     report_capture_callback: bool,
+    observe_accepted_frame: bool,
+    observed_packet: Option<AcceptedPacket>,
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
     fail: bool,
@@ -453,6 +465,21 @@ impl Plane for FakePlane {
                     timestamp_us: input.timestamp_us,
                     sequence: input.sequence,
                 }),
+                accepted_frame: (self.observe_accepted_frame
+                    && (capture_submitted || repeat_attempted))
+                    .then_some(AcceptedFrame {
+                        width: input.configuration.width,
+                        height: input.configuration.height,
+                        format: if gpu { 0 } else { amaterasu_media::PIXEL_BGRA8 },
+                        memory: if gpu {
+                            FrameMemory::GpuOpaque
+                        } else {
+                            FrameMemory::CpuBorrowed
+                        },
+                        timestamp_us: input.timestamp_us,
+                        sequence: input.sequence,
+                    }),
+                encoded_packet: self.observed_packet.take(),
                 dmabuf_fresh: (gpu && (input.capture_due || repeat_attempted))
                     .then_some(input.capture_due),
                 dmabuf_presentation: (gpu
@@ -532,13 +559,17 @@ fn setup() -> (Pipeline, Runtime, FakePlane) {
 fn setup_with_providers(
     capture_providers: BTreeSet<CaptureProvider>,
 ) -> (Pipeline, Runtime, FakePlane) {
+    setup_with_settings(Settings {
+        enabled: true,
+        capture_providers,
+        ..Settings::default()
+    })
+}
+
+fn setup_with_settings(settings: Settings) -> (Pipeline, Runtime, FakePlane) {
     (
         Pipeline::new(
-            Settings {
-                enabled: true,
-                capture_providers,
-                ..Settings::default()
-            },
+            settings,
             "test".into(),
             Arc::new(Mutex::new(Queues::default())),
         ),
@@ -1628,7 +1659,7 @@ fn tick(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane, c
 fn optional_capture_observations_follow_native_read_and_stop_with_module() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     plane.report_capture_callback = true;
-    pipeline.observations = Observations::new(true);
+    pipeline.observations = Observations::new(true, false);
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
@@ -1647,7 +1678,7 @@ fn optional_capture_observations_follow_native_read_and_stop_with_module() {
         .iter()
         .filter_map(|command| match command {
             Command::Publish { topic, payload } => {
-                assert_eq!(topic, crate::observation::TOPIC);
+                assert_eq!(topic, crate::observation::CAPTURE_TOPIC);
                 Some(payload["point"].as_str().unwrap().to_owned())
             }
             _ => None,
@@ -1675,7 +1706,7 @@ fn failed_plane_preflight_does_not_publish_a_false_capture_marker() {
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 4);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
-    pipeline.observations = Observations::new(true);
+    pipeline.observations = Observations::new(true, false);
     plane.failure_code_once = Some("capture_interface");
     pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
     pipeline.tick(&mut plane, &mut |command| runtime.send(command));
@@ -1687,6 +1718,136 @@ fn failed_plane_preflight_does_not_publish_a_false_capture_marker() {
             .iter()
             .any(|command| matches!(command, Command::Publish { .. }))
     );
+}
+
+#[test]
+fn frame_and_packet_observations_are_deferred_and_never_include_pixels() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    pipeline.observations = Observations::new(false, true);
+    plane.observe_accepted_frame = true;
+    plane.observed_packet = Some(AcceptedPacket {
+        codec: amaterasu_media::CODEC_H264,
+        bytes: 37,
+        timestamp_us: 8,
+        keyframe: true,
+    });
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    let events: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Publish { topic, payload } => {
+                assert_eq!(topic, crate::observation::FRAME_TOPIC);
+                assert!(serde_json::to_vec(payload).unwrap().len() < 1024);
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["point"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "before_frame",
+            "before_encode",
+            "after_frame",
+            "after_encode"
+        ]
+    );
+    assert_eq!(
+        events[0]["subject"]["timestamp_100ns"],
+        events[1]["subject"]["timestamp_100ns"]
+    );
+    assert_eq!(
+        events[1]["subject"]["timestamp_100ns"],
+        events[2]["subject"]["timestamp_100ns"]
+    );
+    assert_eq!(events[3]["subject"]["bytes"], 37);
+    assert!(events.iter().all(|event| event.get("data").is_none()));
+}
+
+#[test]
+fn busy_rejected_and_zero_callback_pumps_publish_no_accepted_frame() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    pipeline.observations = Observations::new(false, true);
+    plane.observe_accepted_frame = true;
+    plane.dropped = true;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
+    plane.dropped = false;
+    plane.observe_accepted_frame = false;
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
+    plane.failure_code_once = Some("frame_rejected");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    pipeline.tick(&mut plane, &mut |command| runtime.send(command));
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Publish { .. }))
+    );
+}
+
+#[test]
+fn delayed_encoded_packet_from_drain_is_observed_without_a_new_frame() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    pipeline.observations = Observations::new(false, true);
+    plane.observed_packet = Some(AcceptedPacket {
+        codec: amaterasu_media::CODEC_H264,
+        bytes: 24,
+        timestamp_us: 4,
+        keyframe: false,
+    });
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Drain { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 3);
+    pipeline.flush_observations(&mut |command| runtime.send(command));
+    let points: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Publish { payload, .. } => Some(payload["point"].as_str().unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(points, ["after_encode"]);
 }
 
 #[test]
@@ -2075,6 +2236,68 @@ fn x11_open_reenumerates_exact_current_output_and_never_falls_back() {
             .any(|command| matches!(command, Command::Request { service, .. }
             if service == CaptureProvider::Wgc.service()))
     );
+}
+
+#[test]
+fn signed_x11_service_routes_enumerate_open_and_cleanup_to_one_provider() {
+    let service = "example.capture-test/1";
+    let output_id = "x11:DP-1/000000a4";
+    let (mut pipeline, mut runtime, mut plane) = setup_with_settings(Settings {
+        enabled: true,
+        capture_providers: [CaptureProvider::X11].into(),
+        x11_capture_service: Some(service.into()),
+        ..Settings::default()
+    });
+    runtime.external_x11_service = Some(service.into());
+    runtime.capture_enumeration_override = Some(json!({
+        "ok": true,
+        "outputs": [x11_output(output_id, "DP-1", 1920, 1080)],
+        "total": 1,
+        "next_offset": null
+    }));
+    let mut operation = open();
+    let Operation::Open {
+        capture_provider,
+        output,
+        ..
+    } = &mut operation
+    else {
+        unreachable!();
+    };
+    *capture_provider = CaptureProvider::X11;
+    *output = output_id.into();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Running as u8);
+
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+
+    let actions: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service: target,
+                payload,
+                ..
+            } if target == service => payload["action"].as_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(actions.first().map(String::as_str), Some("enumerate"));
+    assert!(actions.iter().any(|action| action == "open"));
+    assert!(actions.iter().any(|action| action == "close"));
+    assert!(!runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service: target, .. }
+        if target == CaptureProvider::X11.service()
+    )));
 }
 
 #[test]

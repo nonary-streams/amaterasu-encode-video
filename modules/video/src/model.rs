@@ -97,8 +97,15 @@ pub struct Settings {
     /// allow publishing the exact video observation topic; default is off.
     #[serde(default)]
     pub capture_observation: bool,
+    /// Separate opt-in metadata stream for accepted frames and encoded output.
+    #[serde(default)]
+    pub frame_observation: bool,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
+    /// Exact X11-slot replacement service from signed video package settings.
+    /// The runtime still requires an exact native-use grant and compatible ABI.
+    #[serde(default)]
+    pub x11_capture_service: Option<String>,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_ms: u64,
 }
@@ -120,7 +127,9 @@ impl Default for Settings {
         Self {
             enabled: false,
             capture_observation: false,
+            frame_observation: false,
             capture_providers: default_providers(),
+            x11_capture_service: None,
             drain_timeout_ms: default_drain_timeout(),
         }
     }
@@ -130,8 +139,42 @@ impl Settings {
         if self.capture_providers.is_empty() || !(100..=30000).contains(&self.drain_timeout_ms) {
             return Err("invalid_video_settings");
         }
+        if let Some(service) = &self.x11_capture_service
+            && (!cfg!(target_os = "linux")
+                || !self.capture_providers.contains(&CaptureProvider::X11)
+                || !valid_external_x11_service(service))
+        {
+            return Err("invalid_x11_capture_service");
+        }
         Ok(())
     }
+
+    pub fn capture_service(&self, provider: CaptureProvider) -> &str {
+        if provider == CaptureProvider::X11 {
+            self.x11_capture_service
+                .as_deref()
+                .unwrap_or_else(|| provider.service())
+        } else {
+            provider.service()
+        }
+    }
+}
+
+fn valid_external_x11_service(service: &str) -> bool {
+    let Some(namespace) = service.strip_suffix("/1") else {
+        return false;
+    };
+    service.len() <= 128
+        && namespace.contains('.')
+        && !namespace.starts_with("amaterasu.")
+        && namespace.split('.').all(|label| {
+            !label.is_empty()
+                && label.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        })
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -922,7 +965,9 @@ mod tests {
         let settings = Settings {
             enabled: true,
             capture_observation: false,
+            frame_observation: false,
             capture_providers: [CaptureProvider::X11].into(),
+            x11_capture_service: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());
@@ -934,6 +979,58 @@ mod tests {
     }
 
     #[test]
+    fn x11_replacement_requires_an_exact_external_service_in_signed_settings() {
+        let mut settings: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "capture_providers": ["x11"]
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.capture_service(CaptureProvider::X11),
+            "amaterasu.capture-x11/1"
+        );
+        settings.x11_capture_service = Some("example.capture-test/1".into());
+        let parsed: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "capture_providers": ["x11"],
+            "x11_capture_service": "example.capture-test/1"
+        }))
+        .unwrap();
+        assert_eq!(parsed.x11_capture_service, settings.x11_capture_service);
+        if cfg!(target_os = "linux") {
+            assert!(settings.validate().is_ok());
+            assert_eq!(
+                settings.capture_service(CaptureProvider::X11),
+                "example.capture-test/1"
+            );
+            assert_eq!(
+                settings.capture_service(CaptureProvider::Pipewire),
+                CaptureProvider::Pipewire.service()
+            );
+        } else {
+            assert_eq!(settings.validate(), Err("invalid_x11_capture_service"));
+        }
+
+        for invalid in [
+            "amaterasu.capture-x11/1",
+            "amaterasu.capture-kms/1",
+            "example.capture-test/2",
+            "example.capture-test/1/1",
+            "example..capture-test/1",
+            "Example.capture-test/1",
+            "example.capture-test/1\n",
+        ] {
+            settings.x11_capture_service = Some(invalid.into());
+            assert_eq!(settings.validate(), Err("invalid_x11_capture_service"));
+        }
+
+        settings.x11_capture_service = Some("example.capture-test/1".into());
+        settings.capture_providers.clear();
+        settings.capture_providers.insert(CaptureProvider::Pipewire);
+        assert_eq!(settings.validate(), Err("invalid_x11_capture_service"));
+    }
+
+    #[test]
     fn kms_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
         assert_eq!(CaptureProvider::Kms.service(), "amaterasu.capture-kms/1");
         assert_eq!(serde_json::to_value(CaptureProvider::Kms).unwrap(), "kms");
@@ -941,7 +1038,9 @@ mod tests {
         let settings = Settings {
             enabled: true,
             capture_observation: false,
+            frame_observation: false,
             capture_providers: [CaptureProvider::Kms].into(),
+            x11_capture_service: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());

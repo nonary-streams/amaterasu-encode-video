@@ -59,6 +59,8 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
+    /// Exact signed X11 service used by both control RPC and native pixels.
+    x11_capture_service: Option<String>,
     frame_path: FramePath,
     owned_capture: owned_capture::OwnedOutputCapture,
     auto_capture: bool,
@@ -176,6 +178,15 @@ impl StageTimings {
 }
 
 impl Stream {
+    fn capture_service(&self) -> &str {
+        if self.provider == CaptureProvider::X11 {
+            self.x11_capture_service
+                .as_deref()
+                .unwrap_or_else(|| self.provider.service())
+        } else {
+            self.provider.service()
+        }
+    }
     fn encoder_operation(&self) -> String {
         format!(
             "{}-encoder-attempt-{}",
@@ -379,6 +390,7 @@ impl Stream {
 pub struct Pipeline {
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
+    x11_capture_service: Option<String>,
     drain_timeout: Duration,
     recent: VecDeque<(String, Value)>,
     epoch: String,
@@ -407,8 +419,12 @@ impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
         Self {
             enabled: settings.enabled,
-            observations: Observations::new(settings.enabled && settings.capture_observation),
+            observations: Observations::new(
+                settings.enabled && settings.capture_observation,
+                settings.enabled && settings.frame_observation,
+            ),
             providers: settings.capture_providers,
+            x11_capture_service: settings.x11_capture_service,
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
             epoch,
@@ -673,6 +689,7 @@ impl Pipeline {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
+                x11_capture_service: self.x11_capture_service.clone(),
                 frame_path: FramePath::Cpu,
                 owned_capture,
                 auto_capture,
@@ -776,7 +793,7 @@ impl Pipeline {
             plane.release_stream(id);
         }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
-            output::tick(stream, id, &self.queues, plane);
+            output::tick(stream, id, &self.queues, plane, &mut self.observations);
             if !matches!(stream.stage, Stage::StopCapture | Stage::Draining)
                 && let Ok(mut queues) = self.queues.lock()
             {
@@ -995,6 +1012,11 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64, observations: &mut 
     }) {
         Ok(progress) => {
             observations.after_capture(capture_marker, progress.capture_callback_count > 0);
+            observations.record_pump(
+                capture_marker.filter(|_| progress.capture_callback_count > 0),
+                progress.accepted_frame,
+                progress.encoded_packet,
+            );
             let completed_at = Instant::now();
             stream.timing.record(&progress);
             stream.owned_capture.record_freshness(&progress);
@@ -1275,10 +1297,10 @@ fn advance(
     false
 }
 
-fn request(stream: &Stream) -> (&'static str, Value) {
+fn request(stream: &Stream) -> (&str, Value) {
     match stream.stage {
-        Stage::X11Enumerate => (stream.provider.service(), json!({"action":"enumerate"})),
-        Stage::KmsEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
+        Stage::X11Enumerate => (stream.capture_service(), json!({"action":"enumerate"})),
+        Stage::KmsEnumerate => (stream.capture_service(), json!({"action":"enumerate"})),
         Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::ProbeEncoder => (
             ENCODE,
@@ -1296,7 +1318,7 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             if stream.constant_rate {
                 request["constant_rate"] = json!(true);
             }
-            (stream.provider.service(), request)
+            (stream.capture_service(), request)
         }
         Stage::FallbackEnumerate => {
             let mut request = json!({"action":"enumerate"});
@@ -1325,11 +1347,11 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             json!({"action":"close","session_id":stream.session}),
         ),
         Stage::FindCapture => (
-            stream.provider.service(),
+            stream.capture_service(),
             json!({"action":"lookup","operation_id":stream.capture_operation}),
         ),
         Stage::CloseCapture | Stage::StopCapture | Stage::CpuFallbackCloseCapture => (
-            stream.provider.service(),
+            stream.capture_service(),
             json!({"action":"close","stream":stream.capture}),
         ),
         _ => unreachable!("only pending control stages submit"),
@@ -1561,7 +1583,7 @@ fn apply_result(
         eprintln!(
             "amaterasu video step failed stage={:?} provider={} reported={} code={code}",
             stream.stage,
-            stream.provider.service(),
+            stream.capture_service(),
             owned_capture::retained_reason(payload_error_code(&payload).unwrap_or("none")),
         );
         failed_step(stream, code);

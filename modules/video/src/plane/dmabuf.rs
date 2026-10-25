@@ -3,8 +3,9 @@
 //! descriptors for one synchronous callback, and the encoder duplicates any
 //! descriptor it keeps before `submit_dmabuf` returns. A v1.5 provider also
 //! reports its newest completed presentation, which drives push pacing.
-use super::{FrameMetadata, PresentationQuery, Progress, Pump, elapsed_micros};
+use super::{AcceptedFrame, FrameMetadata, PresentationQuery, Progress, Pump, elapsed_micros};
 use amaterasu_media::*;
+use amaterasu_module_sdk::FrameMemory;
 use amaterasu_module_sdk::abi::*;
 use std::{ffi::c_void, time::Instant};
 
@@ -82,6 +83,7 @@ struct Submission<'a> {
     /// Provider sequence of the delivered presentation.
     presentation: Option<u64>,
     frame: Option<FrameMetadata>,
+    accepted_frame: Option<AcceptedFrame>,
     encoder_submit_us: u64,
 }
 
@@ -117,6 +119,16 @@ impl Submission<'_> {
         self.encoder_submit_us = elapsed_micros(started);
         match status {
             STATUS_OK => {
+                self.accepted_frame = Some(AcceptedFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    // DRM fourcc is not a media CpuFrame format code. Keep the
+                    // typed observation's pixel-format label unknown.
+                    format: 0,
+                    memory: FrameMemory::GpuOpaque,
+                    timestamp_us: self.timestamp_us,
+                    sequence: self.sequence,
+                });
                 self.frame = Some(FrameMetadata {
                     width: frame.width,
                     height: frame.height,
@@ -178,6 +190,7 @@ pub fn deliver(
         fresh: None,
         presentation: None,
         frame: None,
+        accepted_frame: None,
         encoder_submit_us: 0,
     };
     let sink = DmaBufFrameSink {
@@ -209,6 +222,7 @@ pub fn deliver(
         dmabuf_fallback,
         dmabuf_presentation: submission.presentation,
         frame: submission.frame,
+        accepted_frame: submission.accepted_frame,
         capture_callback_us,
         capture_callback_count: 1,
         capture_frame_count: u64::from(delivered),

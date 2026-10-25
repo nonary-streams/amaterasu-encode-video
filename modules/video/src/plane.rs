@@ -4,12 +4,13 @@ mod dmabuf;
 mod preprocess;
 mod resize;
 use crate::{
-    model::{CaptureProvider, Configuration},
+    model::{CaptureProvider, Configuration, Settings},
     queue::Queues,
 };
 use amaterasu_media::*;
+use amaterasu_module_sdk::FrameMemory;
 use amaterasu_module_sdk::{ModuleResult, NativeBinding, RuntimeClient, abi::*};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -99,6 +100,12 @@ pub struct Progress {
     /// delivered, whether or not the encoder accepted it.
     pub dmabuf_presentation: Option<u64>,
     pub frame: Option<FrameMetadata>,
+    /// Metadata of one input that the encoder definitely accepted. This is
+    /// separate from `frame`: repeat input must not replace the repeat cache.
+    pub accepted_frame: Option<AcceptedFrame>,
+    /// One encoded packet admitted to the bounded output queue. It may belong
+    /// to an older input frame or be one fragment of an access unit.
+    pub encoded_packet: Option<AcceptedPacket>,
     pub owned_frame: Option<OwnedFrame>,
     pub capture_callback_us: u64,
     pub capture_callback_count: u64,
@@ -130,6 +137,24 @@ pub struct FrameMetadata {
     pub stride: u32,
     pub timestamp_us: u64,
     pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub memory: FrameMemory,
+    pub timestamp_us: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedPacket {
+    pub codec: u32,
+    pub bytes: u32,
+    pub timestamp_us: u64,
+    pub keyframe: bool,
 }
 pub trait Plane {
     fn verify_geometry(
@@ -178,25 +203,16 @@ impl NativePlane {
     pub fn bind(
         runtime: &RuntimeClient,
         queues: Arc<Mutex<Queues>>,
-        providers: &BTreeSet<CaptureProvider>,
+        settings: &Settings,
     ) -> ModuleResult<Self> {
-        let mut captures = BTreeMap::new();
-        let mut unbound = BTreeMap::new();
         // SAFETY: signed dependencies retain configured providers through binding
         // destruction. Calls stay on the module tick thread. Only the v1.0
         // prefixes are required; optional tails are checked before each use.
         unsafe {
-            for provider in providers {
-                match runtime.bind_native(provider.service(), 1, 0, CAPTURE_API_V1_0_SIZE) {
-                    Ok(binding) => {
-                        captures.insert(*provider, binding);
-                    }
-                    Err(_) if provider.binding_is_optional() => {
-                        unbound.insert(*provider, "capture_provider_unbound");
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            let (captures, unbound) =
+                bind_capture_providers(settings, |service, major, minor, size| {
+                    runtime.bind_native(service, major, minor, size)
+                })?;
             Ok(Self {
                 captures,
                 unbound,
@@ -207,6 +223,39 @@ impl NativePlane {
             })
         }
     }
+}
+
+/// Bind each signed settings slot to exactly one service. Only Vkms is optional;
+/// an explicitly replaced X11 slot never retries the built-in provider.
+type CaptureBindings<T> = (
+    BTreeMap<CaptureProvider, T>,
+    BTreeMap<CaptureProvider, &'static str>,
+);
+
+fn bind_capture_providers<T>(
+    settings: &Settings,
+    mut bind: impl FnMut(&str, u32, u32, u32) -> ModuleResult<T>,
+) -> ModuleResult<CaptureBindings<T>> {
+    settings.validate().map_err(str::to_owned)?;
+    let mut captures = BTreeMap::new();
+    let mut unbound = BTreeMap::new();
+    for provider in &settings.capture_providers {
+        match bind(
+            settings.capture_service(*provider),
+            1,
+            0,
+            CAPTURE_API_V1_0_SIZE,
+        ) {
+            Ok(binding) => {
+                captures.insert(*provider, binding);
+            }
+            Err(_) if provider.binding_is_optional() => {
+                unbound.insert(*provider, "capture_provider_unbound");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((captures, unbound))
 }
 
 struct Submission<'a> {
@@ -223,6 +272,7 @@ struct Submission<'a> {
     timestamp_us: u64,
     sequence: u64,
     frame: Option<FrameMetadata>,
+    accepted_frame: Option<AcceptedFrame>,
     owned_frame: Option<OwnedFrame>,
     encoder_submit_us: u64,
     frame_copy_us: u64,
@@ -375,6 +425,18 @@ unsafe fn submit_frame(
         status
     };
     if submission.status == STATUS_OK {
+        submission.accepted_frame = Some(AcceptedFrame {
+            width: frame.width,
+            height: frame.height,
+            format: frame.format,
+            memory: if resized.is_some() {
+                FrameMemory::CpuOwned
+            } else {
+                FrameMemory::CpuBorrowed
+            },
+            timestamp_us: submission.timestamp_us,
+            sequence: submission.sequence,
+        });
         if let Some(resized) = resized {
             submission.owned_frame = Some(resized);
             return STATUS_OK;
@@ -406,6 +468,7 @@ struct Destination<'a> {
     video: u64,
     transport_admission_us: u64,
     transport_admission_count: u64,
+    encoded_packet: Option<AcceptedPacket>,
 }
 
 unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) -> Status {
@@ -422,6 +485,15 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
         MEDIA_BUSY
     };
     destination.transport_admission_us = elapsed_micros(started);
+    if status == STATUS_OK && unsafe { (*packet).flags } & FLAG_END_OF_STREAM == 0 {
+        let packet = unsafe { &*packet };
+        destination.encoded_packet = u32::try_from(packet.len).ok().map(|bytes| AcceptedPacket {
+            codec: packet.codec,
+            bytes,
+            timestamp_us: packet.timestamp_us,
+            keyframe: packet.flags & FLAG_KEYFRAME != 0,
+        });
+    }
     status
 }
 
@@ -650,11 +722,12 @@ impl NativePlane {
         input: &Pump<'_>,
         mut progress: Progress,
     ) -> Result<Progress, &'static str> {
-        let (encoder_poll_us, transport_admission_us, destination_count) =
+        let (encoder_poll_us, transport_admission_us, destination_count, encoded_packet) =
             receive(encoder_api, input.encoder, input.video, &self.queues)?;
         progress.encoder_poll_us = encoder_poll_us;
         progress.transport_admission_us = transport_admission_us;
         progress.transport_admission_count = destination_count;
+        progress.encoded_packet = encoded_packet;
         Ok(progress)
     }
 }
@@ -681,6 +754,7 @@ fn capture(
         timestamp_us: input.timestamp_us,
         sequence: input.sequence,
         frame: None,
+        accepted_frame: None,
         owned_frame: None,
         encoder_submit_us: 0,
         frame_copy_us: 0,
@@ -737,6 +811,7 @@ fn capture(
         frame: (submission.called && submission.status == STATUS_OK)
             .then_some(submission.frame)
             .flatten(),
+        accepted_frame: submission.accepted_frame,
         owned_frame: submission.owned_frame,
         capture_callback_us: elapsed_micros(callback_started),
         capture_callback_count: 1,
@@ -803,6 +878,14 @@ fn repeat(
         capture_reused: false,
         capture_arrival: None,
         frame: None,
+        accepted_frame: (status == STATUS_OK).then_some(AcceptedFrame {
+            width: frame.width,
+            height: frame.height,
+            format: frame.format,
+            memory: FrameMemory::CpuOwned,
+            timestamp_us: input.timestamp_us,
+            sequence: input.sequence,
+        }),
         owned_frame: None,
         encoder_submit_us: elapsed_micros(started),
         ..Progress::default()
@@ -871,12 +954,13 @@ fn receive(
     encoder: u64,
     video: u64,
     queues: &Arc<Mutex<Queues>>,
-) -> Result<(u64, u64, u64), &'static str> {
+) -> Result<(u64, u64, u64, Option<AcceptedPacket>), &'static str> {
     let mut destination = Destination {
         queues,
         video,
         transport_admission_us: 0,
         transport_admission_count: 0,
+        encoded_packet: None,
     };
     let sink = PacketSink {
         context: (&mut destination as *mut Destination<'_>).cast(),
@@ -889,6 +973,7 @@ fn receive(
             elapsed_micros(started),
             destination.transport_admission_us,
             destination.transport_admission_count,
+            destination.encoded_packet,
         )),
         _ => Err("encoder_failed"),
     }
@@ -903,6 +988,48 @@ mod tests {
     use super::*;
     use crate::model::AmdAv1LatencyMode;
     use amaterasu_module_sdk::abi::AbiHeader;
+
+    #[test]
+    fn signed_x11_replacement_binds_only_the_exact_service() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let settings = Settings {
+            enabled: true,
+            capture_providers: [CaptureProvider::X11].into(),
+            x11_capture_service: Some("example.capture-test/1".into()),
+            ..Settings::default()
+        };
+        let mut calls = Vec::new();
+        let (captures, unbound) =
+            bind_capture_providers(&settings, |service, major, minor, size| {
+                calls.push((service.to_owned(), major, minor, size));
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(captures.get(&CaptureProvider::X11), Some(&7));
+        assert!(unbound.is_empty());
+        assert_eq!(
+            calls,
+            [("example.capture-test/1".into(), 1, 0, CAPTURE_API_V1_0_SIZE)]
+        );
+
+        for failure in [
+            "permission_denied",
+            "not_found",
+            "native_interface_version_mismatch",
+        ] {
+            let mut attempts = Vec::new();
+            let error = bind_capture_providers::<()>(&settings, |service, _, _, _| {
+                attempts.push(service.to_owned());
+                Err(failure.into())
+            })
+            .unwrap_err();
+            assert_eq!(error, failure);
+            assert_eq!(attempts, ["example.capture-test/1".to_owned()]);
+        }
+    }
+
     unsafe extern "C" fn busy(_: *mut c_void, _: u64, _: *const CpuFrame, _: u32) -> Status {
         MEDIA_BUSY
     }
@@ -956,6 +1083,7 @@ mod tests {
             timestamp_us: 7,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1049,6 +1177,7 @@ mod tests {
             timestamp_us: 12,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1163,6 +1292,7 @@ mod tests {
             timestamp_us: 12,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1248,6 +1378,7 @@ mod tests {
             timestamp_us: 12,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1347,6 +1478,7 @@ mod tests {
             timestamp_us: 7,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1414,6 +1546,7 @@ mod tests {
             timestamp_us: 2,
             sequence: 2,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,
@@ -1440,6 +1573,7 @@ mod tests {
             timestamp_us: 3,
             sequence: 3,
             frame: None,
+            accepted_frame: None,
             owned_frame: None,
             encoder_submit_us: 0,
             frame_copy_us: 0,

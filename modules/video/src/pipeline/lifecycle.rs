@@ -37,7 +37,7 @@ fn close_known(stream: &Stream, send: &mut Send<'_>) {
     if let Some(capture) = stream.capture {
         let _ = rpc::submit(
             send,
-            stream.provider.service(),
+            stream.capture_service(),
             json!({"action":"close","stream":capture}),
             format!("{}-shutdown-capture", stream.operation),
             None,

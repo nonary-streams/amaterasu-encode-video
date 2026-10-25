@@ -23,14 +23,45 @@ Disabled startup registers services but binds no lower interface and opens no
 devices. Unsupported hardware/platforms fail through real provider responses;
 there are no synthetic frames. Linux H.264 requires a registered real backend.
 
-## Optional capture metadata observations
+### Signed X11 capture service replacement
 
-The signed video settings may opt in with `"capture_observation":true`; the
-default is false. The signed runtime policy must also grant video `publish` on
-`amaterasu.video.capture-observation/1`. Without that grant the first rejected
-publication disables the observer for this module instance. No default policy
-grants the topic. An authorized subscriber may request the broker's bounded,
-coalescing event queue and detect gaps via publisher sequence numbers.
+The signed video module settings may set `"x11_capture_service":
+"example.capture-test/1"` with `"x11"` in `capture_providers`. Without this
+field, X11 still binds `amaterasu.capture-x11/1`. The external service name must
+be a bounded lower-case namespace ending in `/1`; built-in `amaterasu.*`
+services and overrides for a disabled X11 slot are rejected. This is a single
+exact replacement for the X11 slot, not a dynamically discovered registry or
+an override for every capture provider. There is no fallback to the built-in
+X11 service if its explicitly selected replacement cannot bind.
+
+The signed package must include the provider component and its dependency
+before video, grant that provider `native_provide` for this exact service, and
+grant video both `call` and `native_use` for the same service. The external
+module must implement the X11-slot control protocol (`enumerate`, `open`,
+`lookup`, `close`) as well as the native `CaptureApi` table: both paths route to
+the same exact service throughout teardown. The runtime rejects missing or
+duplicate registrations and checks the live `CaptureApi` v1.0 ABI prefix at
+bind time. Merely naming a service in settings neither grants it nor proves its
+capabilities. Provider option schemas can use the existing caller-scoped
+configuration service; this setting does not add browser-editable options or
+change the running package. Capture callbacks retain their current borrowed
+CPU/DMA-BUF lifetime and tick-thread contract. No live replacement is enabled
+by the default LinuxSession profile.
+
+## Optional video lifecycle metadata observations
+
+The signed video settings may opt in with `"capture_observation":true` for
+capture facts and `"frame_observation":true` for accepted frame/encode facts;
+both default to false. The signed runtime policy must also grant video
+`publish` on the exact corresponding topics
+`amaterasu.video.capture-observation/1` and
+`amaterasu.video.frame-observation/1`. Without a grant the first rejected
+publication disables only that source for this module instance. No default
+policy grants either topic. An authorized subscriber may request the broker's bounded,
+coalescing event queue. Broker publisher sequence/resync detects losses after a
+publish reaches the broker. Local observer queue drops are not reported to
+subscribers, and `event_id` spans both video topics, so its gaps are not a
+per-topic loss signal. Neither sequence proves delivery of every frame.
 
 Video records versioned `before_capture` and `after_capture` **observations** of
 one due native read. It publishes their small metadata envelopes on the module
@@ -38,18 +69,35 @@ tick only after native frame callbacks return. The before marker records the
 point before `Plane::pump` starts; its delivery is deferred, so it cannot veto
 or transform that capture. If a plane fails or never reaches a native read,
 both markers are omitted because callback progress is uncertain. At most eight
-capture attempts queue locally and one attempt
-(at most two broker sends) is drained per tick. Full queues drop new metadata;
+capture attempts queue locally and one batch (at most six broker sends) is
+drained per tick. Full queues drop new metadata;
 broker failure never fails the stream. Stop/unload discards pending metadata.
 Disabled operation does not allocate events, serialize payloads, or call the
 broker. These events include only geometry and a CPU-borrowed/GPU-opaque label:
 no frame pixels, DMA-BUF descriptors, process paths or client identifiers.
 
-The SDK describes additional frame/encode/packet hook points, but this video
-module does not wire those points yet. In particular, its encoder submit occurs
-inside a borrowed native capture callback, and invoking third-party code there
-would violate the current buffer-lifetime and cadence contract. This metadata
-source does not provide a transformation or a GPU zero-copy extension API.
+The separate frame topic emits `before_frame`, `before_encode`, and
+`after_frame` only for an input frame definitively accepted by the encoder.
+Busy, rejected, or uncertain submits do not produce a false accepted-frame
+sequence. CPU capture, owned conversion/repeat frames, and DMA-BUF input carry
+the same stream timestamp (converted from microseconds to 100 ns units) and a
+pixel-format label when the source ABI supplies one. DMA-BUF fourcc is not a
+CPU pixel-format code, so its label is `unknown` and its memory is `gpu_opaque`.
+`after_encode` marks one encoded packet admitted to video's bounded output
+queue, including packets returned during drain. It may arrive much later than
+its input, and a frame may produce multiple packet fragments. It is **not** a
+whole-frame completion event. Only codec, packet byte count, keyframe flag and
+timestamp are published; packet bytes remain in the native media queue. All
+these markers are delivered after native callbacks return and cannot modify
+the frame or packet. A synchronous transform/replacement API still requires a
+separate owner-safe memory and scheduling contract.
+
+SDK packet/network and input hook points are not wired by this video module.
+In particular, its encoder submit occurs inside a borrowed native capture
+callback, and invoking third-party code there would violate the current
+buffer-lifetime and cadence contract. These observations are not a GPU
+zero-copy extension API.
+
 The optional x264 fallback requires the `software-x264` feature, x264 development
 headers, and a matching runtime library. If no H.264 backend is available, Open
 fails with `h264_encoder_unavailable` after resource cleanup.

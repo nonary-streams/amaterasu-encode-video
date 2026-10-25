@@ -68,6 +68,7 @@ pub(super) fn tick(
     id: u64,
     queues: &Arc<Mutex<Queues>>,
     plane: &mut dyn Plane,
+    observations: &mut Observations,
 ) {
     let eos = queues.lock().is_ok_and(|queues| queues.eos_accepted(id));
     if eos {
@@ -114,8 +115,11 @@ pub(super) fn tick(
         sequence: 0,
         force_idr: false,
     };
-    if let Err(code) = plane.pump(input) {
-        stream.cleanup(code);
+    match plane.pump(input) {
+        Ok(progress) => {
+            observations.record_pump(None, progress.accepted_frame, progress.encoded_packet)
+        }
+        Err(code) => stream.cleanup(code),
     }
 }
 

@@ -1,11 +1,12 @@
 //! A single outstanding frame keeps CPU conversion off the input/runtime loop.
 //! The joined worker owns its FFmpeg context; only owned pixels cross threads.
-use super::{OwnedFrame, Progress, Pump, elapsed_micros};
+use super::{AcceptedFrame, OwnedFrame, Progress, Pump, elapsed_micros};
 use crate::model::Configuration;
 use amaterasu_media::{
     CaptureApiPrefix, ColorMode, CpuFrame, EncoderApi, FrameSink, MEDIA_BUSY, MEDIA_PENDING,
     PIXEL_BGRA8, PIXEL_NV12,
 };
+use amaterasu_module_sdk::FrameMemory;
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use std::{
     ffi::c_void,
@@ -245,6 +246,14 @@ impl Processor {
             progress.dropped = status == MEDIA_BUSY;
             if status == STATUS_OK {
                 progress.submitted = true;
+                progress.accepted_frame = Some(AcceptedFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    format: frame.format,
+                    memory: FrameMemory::CpuOwned,
+                    timestamp_us: frame.timestamp_us,
+                    sequence: frame.sequence,
+                });
                 progress.frame = Some(super::FrameMetadata {
                     width: frame.width,
                     height: frame.height,

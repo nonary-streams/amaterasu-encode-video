@@ -52,11 +52,7 @@ impl ManagedModule for Video {
         settings.validate()?;
         let queues = Arc::new(Mutex::new(queue::Queues::default()));
         let plane: Box<dyn Plane> = if settings.enabled {
-            Box::new(NativePlane::bind(
-                &runtime,
-                queues.clone(),
-                &settings.capture_providers,
-            )?)
+            Box::new(NativePlane::bind(&runtime, queues.clone(), &settings)?)
         } else {
             Box::new(Disabled)
         };

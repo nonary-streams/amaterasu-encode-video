@@ -8,9 +8,9 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
-amaterasu-abi = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "fe3004d5889df3eb0ce6f68c74fbef0f33c76e94" }
-amaterasu-module-sdk = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "fe3004d5889df3eb0ce6f68c74fbef0f33c76e94" }
-amaterasu-media = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "fe3004d5889df3eb0ce6f68c74fbef0f33c76e94" }
+amaterasu-abi = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "89b7660e11badd4e7571adb07ba1a44d1eae4fe9" }
+amaterasu-module-sdk = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "89b7660e11badd4e7571adb07ba1a44d1eae4fe9" }
+amaterasu-media = { git = "file:///tmp/amaterasu-modular-repos/foundation", rev = "89b7660e11badd4e7571adb07ba1a44d1eae4fe9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.3"
