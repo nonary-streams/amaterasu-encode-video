@@ -28,10 +28,10 @@ impl Registration {
     }
 }
 
-/// The v1.1 table is a strict extension of v1.0, so one binding serves both:
-/// v1.0 consumers read only the unchanged prefix.
+/// The v1.2 table preserves both earlier prefixes. Leased submissions finish
+/// all reads before returning, so provider code is never retained by the worker.
 struct Binding {
-    api: EncoderApiV1_1,
+    api: EncoderApiV1_2,
     owner: String,
     shared: Shared,
 }
@@ -52,8 +52,8 @@ unsafe extern "C" fn bind(
             let query = &*query;
             if !query.header.supports::<NativeInterfaceQuery>()
                 || query.interface_major != INTERFACE_MAJOR
-                || query.min_minor > ENCODER_DMABUF_INTERFACE_MINOR
-                || query.min_size > ENCODER_API_V1_1_SIZE
+                || query.min_minor > ENCODER_LEASE_INTERFACE_MINOR
+                || query.min_size > ENCODER_API_V1_2_SIZE
             {
                 return MEDIA_UNSUPPORTED;
             }
@@ -67,12 +67,12 @@ unsafe extern "C" fn bind(
             };
             let shared = (&*context.cast::<Shared>()).clone();
             let mut binding = Box::new(Binding {
-                api: EncoderApiV1_1 {
+                api: EncoderApiV1_2 {
                     base: NativeInterface {
                         header: AbiHeader {
-                            size: ENCODER_API_V1_1_SIZE,
+                            size: ENCODER_API_V1_2_SIZE,
                             major: INTERFACE_MAJOR,
-                            minor: ENCODER_DMABUF_INTERFACE_MINOR,
+                            minor: ENCODER_LEASE_INTERFACE_MINOR,
                         },
                         context: std::ptr::null_mut(),
                         release: Some(release),
@@ -81,6 +81,8 @@ unsafe extern "C" fn bind(
                     receive,
                     drain,
                     submit_dmabuf,
+                    submit_dmabuf_leased,
+                    cancel_dmabuf_leases,
                 },
                 owner,
                 shared,
@@ -142,6 +144,50 @@ unsafe extern "C" fn submit_dmabuf(
         // SAFETY: the producer keeps the frame's descriptors open for this call.
         unsafe { sessions.submit_dmabuf(&binding.owner, id, &*frame, force) }
     })
+}
+
+/// The borrowed lease remains immutable until this call returns. This initial
+/// implementation waits for the worker's safe GPU copy rather than retaining
+/// provider callbacks beyond the native call or across module teardown.
+unsafe extern "C" fn submit_dmabuf_leased(
+    context: *mut c_void,
+    id: u64,
+    lease: *const DmaBufFrameLease,
+    force: u32,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || lease.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains the binding and provider lends a live lease.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: the caller holds immutable source storage until return.
+        unsafe { sessions.submit_dmabuf_leased(&binding.owner, id, &*lease, force) }
+    })
+}
+
+/// Quiesces the stream while the caller still owns its capture and processor
+/// bindings. Closing joins native worker activity before ownership is returned.
+unsafe extern "C" fn cancel_dmabuf_leases(context: *mut c_void, id: u64) {
+    let _ = guarded(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the consumer owns this live native binding through cancellation.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        // Cancellation is a mandatory lifetime barrier, so it must wait rather
+        // than report busy while a concurrent source read is still in flight.
+        let mut sessions = binding
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Missing sessions were already retired. Ownership remains caller-scoped.
+        let _ = sessions.close(&binding.owner, id);
+        STATUS_OK
+    });
 }
 
 unsafe extern "C" fn receive(context: *mut c_void, id: u64, sink: PacketSink) -> Status {

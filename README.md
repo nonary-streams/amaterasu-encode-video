@@ -90,6 +90,22 @@ The factory table is heap-stable before registration and stays alive until
 runtime consumers release their bindings. Binding calls are serialized through
 session state; concurrent or reentrant calls return `MEDIA_BUSY`.
 
+The additive `EncoderApiV1_2` table adds `submit_dmabuf_leased` and the mandatory
+`cancel_dmabuf_leases` lifetime barrier. Cancellation closes the caller-owned
+encoder session and joins its worker before returning, while capture and
+processor bindings remain live. Immutable
+presentation leases remain borrowed for the native call; this encoder completes
+all source GPU reads on its worker before returning, including failure paths.
+It does not retain capture or processor callbacks after return. Native NVENC
+finishes GL reads before retiring the source image and synchronizes CUDA copies
+before using its private encode input. This initial safe-completion path can
+block the caller while native driver work runs; it does not apply the ordinary
+three-second asynchronous request timeout, because expiring the borrow while a
+worker still reads its pixels would violate ownership. The queue remains bounded.
+Backends without an explicit completion guarantee return `MEDIA_UNSUPPORTED`.
+The older v1.0/v1.1 table prefixes remain compatible; duplicating a DMA-BUF fd
+through v1.1 alone is not an immutable-content lease.
+
 Submit copies a validated CPU frame before returning. BGRA8 is converted to
 8-bit NV12 using the session's SDR color_mode (bt601_limited, bt601_full,
 bt709_limited, or bt709_full); alpha is ignored. The default is bt709_limited

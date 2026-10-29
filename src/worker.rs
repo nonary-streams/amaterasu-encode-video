@@ -126,6 +126,12 @@ pub(crate) trait WorkerBackend {
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
     }
+    /// Opt-in promise: submit_gpu finishes all source pixel reads on return,
+    /// including failure. Merely importing or duplicating descriptors is not
+    /// completion. Backends retaining input beyond return must leave false.
+    fn supports_gpu_completion(&self) -> bool {
+        false
+    }
     fn submit_gpu(
         &mut self,
         _input: GpuInput,
@@ -157,6 +163,11 @@ impl WorkerBackend for platform::Encoder {
         platform::Encoder::input_support(self)
     }
 
+    fn supports_gpu_completion(&self) -> bool {
+        // The only current DMA-BUF importer is native NVENC/CUDA. Its import
+        // finishes source GL reads and synchronizes copies before returning.
+        self.input_support().dmabuf.is_some()
+    }
     fn submit_gpu(
         &mut self,
         input: GpuInput,
@@ -173,6 +184,7 @@ pub struct Worker {
     cancel: Arc<CancellationGate>,
     background_encode: bool,
     input_support: InputSupport,
+    gpu_completion: bool,
     pending: VecDeque<Pending>,
     receive_result: Option<Option<Packet>>,
     receive_pending: bool,
@@ -219,8 +231,13 @@ impl Worker {
                     }
                 };
                 let background_encode = encoder.uses_background_encode();
+                let gpu_completion = encoder.supports_gpu_completion();
                 if ready
-                    .send(Ok((background_encode, encoder.input_support())))
+                    .send(Ok((
+                        background_encode,
+                        encoder.input_support(),
+                        gpu_completion,
+                    )))
                     .is_err()
                 {
                     return;
@@ -275,12 +292,13 @@ impl Worker {
             .map_err(|_| "encoder_worker_failed")
             .and_then(|value| value)
         {
-            Ok((background_encode, input_support)) => Ok(Self {
+            Ok((background_encode, input_support, gpu_completion)) => Ok(Self {
                 sender: Some(sender),
                 thread: Some(thread),
                 cancel,
                 background_encode,
                 input_support,
+                gpu_completion,
                 pending: VecDeque::new(),
                 receive_result: None,
                 receive_pending: false,
@@ -306,6 +324,17 @@ impl Worker {
     }
 
     fn request(&mut self, operation: Operation) -> Result<Reply, &'static str> {
+        self.request_completion(operation, true)
+    }
+
+    /// A borrowed GPU lease cannot expire while the worker still reads it.
+    /// This path therefore waits for native completion instead of timing out
+    /// and returning ownership while vendor code continues in the background.
+    fn request_completion(
+        &mut self,
+        operation: Operation,
+        allow_timeout: bool,
+    ) -> Result<Reply, &'static str> {
         if self.failed {
             return Err("encoder_failed");
         }
@@ -325,11 +354,18 @@ impl Worker {
                 reply,
             })
             .map_err(|_| "encoder_worker_failed")?;
-        let completed = match response.recv_timeout(Duration::from_secs(3)) {
+        let completion = if allow_timeout {
+            response
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|_| "encoder_timeout")
+        } else {
+            response.recv().map_err(|_| "encoder_worker_failed")
+        };
+        let completed = match completion {
             Ok(completed) => completed,
-            Err(_) => {
+            Err(error) => {
                 self.failed = true;
-                return Err("encoder_timeout");
+                return Err(error);
             }
         };
         self.record_completion(&completed);
@@ -501,6 +537,30 @@ impl Worker {
             self.metrics.busy_submissions = self.metrics.busy_submissions.saturating_add(1);
             Ok(SubmitResult::Busy)
         }
+    }
+
+    pub fn supports_gpu_completion(&self) -> bool {
+        self.gpu_completion
+    }
+
+    /// Submits GPU input while the source remains borrowed by the caller.
+    /// Unlike the asynchronous path, acceptance returns only after native code
+    /// has finished reading the input. Production DMA-BUF import synchronizes
+    /// its source reads before returning, including failed conversion paths.
+    pub fn submit_gpu_and_wait(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        if !self.gpu_completion {
+            return Err("gpu_input_completion_unsupported");
+        }
+        if !self.has_gpu_submit_capacity()? {
+            return Ok(SubmitResult::Busy);
+        }
+        self.request_completion(Operation::SubmitGpu(input, timestamp, force), false)?;
+        Ok(SubmitResult::Accepted)
     }
 
     pub fn receive(&mut self) -> Result<ReceiveResult, &'static str> {

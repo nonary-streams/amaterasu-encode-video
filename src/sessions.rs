@@ -38,6 +38,21 @@ pub trait Backend: Send {
     fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
         Ok(true)
     }
+    /// Whether the backend can finish all source reads before GPU submit
+    /// returns. Descriptor-only asynchronous backends must leave this false.
+    fn supports_gpu_completion(&self) -> bool {
+        false
+    }
+    /// Completes all reads of this GPU input before returning. Backends that
+    /// only queue descriptor copies must keep this unsupported.
+    fn submit_gpu_and_wait(
+        &mut self,
+        _input: GpuInput,
+        _timestamp: i64,
+        _force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        Err("gpu_input_completion_unsupported")
+    }
     fn submit_gpu(
         &mut self,
         _input: GpuInput,
@@ -74,6 +89,17 @@ impl Backend for Worker {
     }
     fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
         Worker::has_gpu_submit_capacity(self)
+    }
+    fn supports_gpu_completion(&self) -> bool {
+        Worker::supports_gpu_completion(self)
+    }
+    fn submit_gpu_and_wait(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        force: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        Worker::submit_gpu_and_wait(self, input, timestamp, force)
     }
     fn submit_gpu(
         &mut self,
@@ -382,7 +408,7 @@ impl Sessions {
         #[cfg(unix)]
         {
             // SAFETY: forwarded caller guarantee for the borrowed descriptors.
-            unsafe { session.submit_dmabuf(frame, force) }
+            unsafe { session.submit_dmabuf(frame, force, false) }
         }
         #[cfg(not(unix))]
         {
@@ -390,6 +416,39 @@ impl Sessions {
             MEDIA_UNSUPPORTED
         }
     }
+    /// Submits a lease without retaining it past this synchronous call.
+    ///
+    /// # Safety
+    /// The provider's initial lease, callbacks and immutable storage must remain
+    /// live until return. The worker completes its GPU reads before return.
+    pub unsafe fn submit_dmabuf_leased(
+        &mut self,
+        owner: &str,
+        id: u64,
+        lease: &DmaBufFrameLease,
+        force: u32,
+    ) -> Status {
+        if let Err(status) = lease.validate() {
+            return status;
+        }
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if let Err(status) = session.check_accepting() {
+            return status;
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: caller holds the lease's immutable storage until return.
+            unsafe { session.submit_dmabuf(&lease.frame, force, true) }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (session, force);
+            MEDIA_UNSUPPORTED
+        }
+    }
+
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
@@ -578,7 +637,12 @@ impl Session {
     /// # Safety
     /// Every descriptor in `frame` is open for the duration of this call.
     #[cfg(unix)]
-    unsafe fn submit_dmabuf(&mut self, frame: &DmaBufFrame, force: u32) -> Status {
+    unsafe fn submit_dmabuf(
+        &mut self,
+        frame: &DmaBufFrame,
+        force: u32,
+        wait_for_reads: bool,
+    ) -> Status {
         let Some(import) = self.input_support.dmabuf.clone() else {
             return MEDIA_UNSUPPORTED;
         };
@@ -607,14 +671,21 @@ impl Session {
                 return MEDIA_BACKEND_ERROR;
             }
         }
+        if wait_for_reads && !self.backend.supports_gpu_completion() {
+            return MEDIA_UNSUPPORTED;
+        }
         // SAFETY: validated shape; the caller keeps the descriptors open.
         let input = match unsafe { crate::input::DmaBufInput::duplicate(frame) } {
             Ok(input) => input,
             Err(status) => return status,
         };
-        let result = self
-            .backend
-            .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0);
+        let result = if wait_for_reads {
+            self.backend
+                .submit_gpu_and_wait(GpuInput::DmaBuf(input), timestamp, force != 0)
+        } else {
+            self.backend
+                .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0)
+        };
         self.record_submission(result, timestamp, frame.sequence, force != 0)
     }
 

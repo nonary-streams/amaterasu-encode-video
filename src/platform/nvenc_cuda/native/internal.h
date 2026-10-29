@@ -163,6 +163,7 @@ struct am_gl_api {
     PFNGLBINDVERTEXARRAYPROC bind_vertex_array;
     PFNGLDRAWARRAYSPROC draw_arrays;
     PFNGLFLUSHPROC flush;
+    PFNGLFINISHPROC finish;
     /* GL_OES_EGL_image; the desktop GL headers carry no typedef for it. */
     void(APIENTRY *egl_image_target_texture_2d)(GLenum target, void *image);
 };

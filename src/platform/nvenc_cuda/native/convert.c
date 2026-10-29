@@ -87,7 +87,7 @@ static int load_gl(const struct am_egl_api *egl, struct am_gl_api *gl) {
            AM_GL(gen_vertex_arrays, "glGenVertexArrays") &&
            AM_GL(delete_vertex_arrays, "glDeleteVertexArrays") &&
            AM_GL(bind_vertex_array, "glBindVertexArray") && AM_GL(draw_arrays, "glDrawArrays") &&
-           AM_GL(flush, "glFlush") &&
+           AM_GL(flush, "glFlush") && AM_GL(finish, "glFinish") &&
            AM_GL(egl_image_target_texture_2d, "glEGLImageTargetTexture2DOES");
 }
 
@@ -534,6 +534,11 @@ int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_
     } else {
         result = convert_texture(converter, source, status);
     }
+    /* A lease may be released as soon as this import returns. Complete the
+     * source texture reads on both success and failed conversion paths before
+     * dropping the imported image; descriptor duplication alone cannot protect
+     * immutable pixels from producer reuse. CUDA conversion output is private. */
+    gl->finish();
     gl->delete_textures(1, &source);
     egl->destroy_image(converter->display->display, image);
     return result;

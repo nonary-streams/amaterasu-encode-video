@@ -355,7 +355,7 @@ fn bgra_frames_reach_gpu_backends_unconverted_and_nv12_keeps_its_path() {
 }
 
 #[test]
-fn the_native_table_offers_dmabuf_submission_at_minor_one() {
+fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
     let registration = Registration::new(Arc::new(Mutex::new(Sessions::new(true))));
     let bind = |min_minor: u32, min_size: u32| {
         let query = NativeInterfaceQuery {
@@ -381,8 +381,8 @@ fn the_native_table_offers_dmabuf_submission_at_minor_one() {
     // SAFETY: a successful bind returns a live v1.1 table until release.
     unsafe {
         let api = &*output.cast::<EncoderApiV1_1>();
-        assert_eq!(api.base.header.minor, ENCODER_DMABUF_INTERFACE_MINOR);
-        assert_eq!(api.base.header.size, ENCODER_API_V1_1_SIZE);
+        assert_eq!(api.base.header.minor, ENCODER_LEASE_INTERFACE_MINOR);
+        assert_eq!(api.base.header.size, ENCODER_API_V1_2_SIZE);
         let (plane, _writer) = stand_in();
         let borrowed = frame(&plane, None, 1);
         assert_eq!(
@@ -402,11 +402,27 @@ fn the_native_table_offers_dmabuf_submission_at_minor_one() {
         let api = &*output.cast::<EncoderApi>();
         api.base.release.unwrap()(api.base.context);
     }
+    let (status, output) = bind(ENCODER_LEASE_INTERFACE_MINOR, ENCODER_API_V1_2_SIZE);
+    assert_eq!(status, STATUS_OK);
+    // SAFETY: the successful v1.2 query returns the complete additive table.
+    unsafe {
+        let api = &*output.cast::<EncoderApiV1_2>();
+        assert_eq!(api.base.header.size, ENCODER_API_V1_2_SIZE);
+        assert_eq!(
+            (api.submit_dmabuf_leased)(api.base.context, 99, std::ptr::null(), 0),
+            STATUS_INVALID_ARGUMENT
+        );
+        api.base.release.unwrap()(api.base.context);
+    }
     assert_eq!(
-        bind(ENCODER_DMABUF_INTERFACE_MINOR + 1, ENCODER_API_V1_1_SIZE).0,
+        std::mem::offset_of!(EncoderApiV1_2, submit_dmabuf_leased),
+        ENCODER_API_V1_1_SIZE as usize
+    );
+    assert_eq!(
+        bind(ENCODER_LEASE_INTERFACE_MINOR + 1, ENCODER_API_V1_2_SIZE).0,
         MEDIA_UNSUPPORTED
     );
-    assert_eq!(bind(0, ENCODER_API_V1_1_SIZE + 8).0, MEDIA_UNSUPPORTED);
+    assert_eq!(bind(0, ENCODER_API_V1_2_SIZE + 8).0, MEDIA_UNSUPPORTED);
 }
 
 /// Holds every GPU input it receives, blocking the first until released.
@@ -485,4 +501,306 @@ fn worker_capacity_guarantees_acceptance_and_close_drops_queued_frames() {
     for writer in &mut writers {
         assert!(reader_closed(writer));
     }
+}
+
+#[derive(Default)]
+struct LeaseCallbacks {
+    retained: std::sync::atomic::AtomicUsize,
+    released: std::sync::atomic::AtomicUsize,
+}
+
+unsafe extern "C" fn retain_test_lease(context: *mut std::ffi::c_void) -> Status {
+    // SAFETY: tests keep this callback state live throughout the borrowed call.
+    let callbacks = unsafe { &*context.cast::<LeaseCallbacks>() };
+    callbacks
+        .retained
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STATUS_OK
+}
+
+unsafe extern "C" fn release_test_lease(context: *mut std::ffi::c_void, fence: i32) {
+    // SAFETY: tests keep this callback state live throughout the borrowed call.
+    let callbacks = unsafe { &*context.cast::<LeaseCallbacks>() };
+    assert_eq!(fence, -1);
+    callbacks
+        .released
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn leased_frame(frame: DmaBufFrame, callbacks: &LeaseCallbacks) -> DmaBufFrameLease {
+    DmaBufFrameLease {
+        frame,
+        context: std::ptr::from_ref(callbacks).cast_mut().cast(),
+        retain: Some(retain_test_lease),
+        release: Some(release_test_lease),
+    }
+}
+
+fn assert_no_retained_lease(callbacks: &LeaseCallbacks) {
+    use std::sync::atomic::Ordering;
+    assert_eq!(callbacks.retained.load(Ordering::Relaxed), 0);
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn rejected_leased_submissions_consume_neither_references_nor_descriptors() {
+    let mut harness = gpu_harness();
+    let (plane, mut writer) = stand_in();
+    let callbacks = LeaseCallbacks::default();
+    let mut lease = leased_frame(frame(&plane, None, 1), &callbacks);
+    *harness.capacity.lock().unwrap() = false;
+    // SAFETY: the frame descriptors and callback state remain live until return.
+    assert_eq!(
+        unsafe {
+            harness
+                .sessions
+                .submit_dmabuf_leased("alice", harness.id, &lease, 0)
+        },
+        MEDIA_BUSY
+    );
+    *harness.capacity.lock().unwrap() = true;
+    // A backend that only duplicates descriptors cannot satisfy leased input
+    // completion, even when its format support otherwise matches this frame.
+    // SAFETY: the valid lease and descriptor stay live for the rejected call.
+    assert_eq!(
+        unsafe {
+            harness
+                .sessions
+                .submit_dmabuf_leased("alice", harness.id, &lease, 0)
+        },
+        MEDIA_UNSUPPORTED
+    );
+    lease.frame.color = DMABUF_COLOR_BT2020_PQ;
+    // SAFETY: as above; unsupported color is rejected before any worker call.
+    assert_eq!(
+        unsafe {
+            harness
+                .sessions
+                .submit_dmabuf_leased("alice", harness.id, &lease, 0)
+        },
+        MEDIA_UNSUPPORTED
+    );
+    lease.frame.color = DMABUF_COLOR_SRGB;
+    // SAFETY: as above; another owner's session is not accessible.
+    assert_eq!(
+        unsafe {
+            harness
+                .sessions
+                .submit_dmabuf_leased("mallory", harness.id, &lease, 0)
+        },
+        MEDIA_CLOSED
+    );
+    lease.retain = None;
+    // SAFETY: descriptor and state are live; the malformed callback table is rejected.
+    assert_eq!(
+        unsafe {
+            harness
+                .sessions
+                .submit_dmabuf_leased("alice", harness.id, &lease, 0)
+        },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_no_retained_lease(&callbacks);
+    assert!(harness.observed.lock().unwrap().dmabuf.is_empty());
+    drop(plane);
+    assert!(
+        reader_closed(&mut writer),
+        "a rejected frame retained a duplicate"
+    );
+}
+
+struct CompletionBackend {
+    entered: std::sync::mpsc::Sender<()>,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    fail: bool,
+}
+
+impl WorkerBackend for CompletionBackend {
+    fn uses_background_encode(&self) -> bool {
+        true
+    }
+    fn supports_gpu_completion(&self) -> bool {
+        true
+    }
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+        Ok(None)
+    }
+    fn drain(&mut self) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn input_support(&self) -> InputSupport {
+        InputSupport {
+            gpu_bgra_conversion: true,
+            dmabuf: Some(import_support()),
+        }
+    }
+    fn submit_gpu(&mut self, input: GpuInput, _: i64, _: bool) -> Result<(), &'static str> {
+        self.entered.send(()).unwrap();
+        let mut released = self.gate.0.lock().unwrap();
+        while !*released {
+            released = self.gate.1.wait(released).unwrap();
+        }
+        // This fake models a completed GPU copy, so it releases source access
+        // before reporting success or failure to the worker.
+        drop(input);
+        if self.fail {
+            Err("controlled_gpu_copy_failure")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct ReleaseCompletionGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for ReleaseCompletionGate {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+}
+
+#[test]
+fn leased_submission_returns_only_after_worker_finishes_source_reads() {
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::Duration;
+    for fail in [false, true] {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        // Release a blocked test backend even if a preceding assertion fails.
+        let release_gate = ReleaseCompletionGate(gate.clone());
+        let (entered, entry) = mpsc::channel();
+        let (done, completion) = mpsc::channel();
+        let (plane, mut writer) = stand_in();
+        let worker = Worker::with_backend(CompletionBackend {
+            entered,
+            gate,
+            fail,
+        });
+        let submitter = std::thread::spawn(move || {
+            let mut sessions = Sessions::new(true);
+            sessions
+                .insert("alice", configuration(), Box::new(worker), false)
+                .unwrap();
+            let id = sessions.latest_id();
+            let callbacks = LeaseCallbacks::default();
+            let lease = leased_frame(frame(&plane, None, 1), &callbacks);
+            // SAFETY: the initial lease keeps the source and callback owner live
+            // until the synchronous encoder call finishes, including failures.
+            let status = unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) };
+            assert_no_retained_lease(&callbacks);
+            sessions.close("alice", id).unwrap();
+            drop(plane);
+            done.send(status).unwrap();
+        });
+        entry.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            !reader_closed(&mut writer),
+            "source closed while backend still reads"
+        );
+        drop(release_gate);
+        let status = completion.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(status, if fail { MEDIA_BACKEND_ERROR } else { STATUS_OK });
+        submitter.join().unwrap();
+        assert!(
+            reader_closed(&mut writer),
+            "completed worker retained source descriptors"
+        );
+    }
+}
+
+fn bind_lease_encoder(registration: &Registration, owner: &str) -> *const EncoderApiV1_2 {
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: ENCODER_LEASE_INTERFACE_MINOR,
+        min_size: ENCODER_API_V1_2_SIZE,
+    };
+    let mut output = std::ptr::null();
+    // SAFETY: the factory, principal, query and output remain live for binding.
+    let status = unsafe {
+        registration.factory.bind.unwrap()(
+            registration.factory.context,
+            BorrowedBytes::new(owner.as_bytes()),
+            &query,
+            &mut output,
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+    output.cast()
+}
+
+#[test]
+fn native_lease_cancellation_is_owner_scoped_and_idempotent() {
+    let harness = gpu_harness();
+    let id = harness.id;
+    let shared = Arc::new(Mutex::new(harness.sessions));
+    let registration = Registration::new(shared.clone());
+    let alice = bind_lease_encoder(&registration, "alice");
+    let mallory = bind_lease_encoder(&registration, "mallory");
+    // SAFETY: both native bindings and the backing sessions remain live.
+    unsafe {
+        let mallory = &*mallory;
+        (mallory.cancel_dmabuf_leases)(mallory.base.context, id);
+        assert!(shared.lock().unwrap().status("alice", id).is_ok());
+        let alice = &*alice;
+        (alice.cancel_dmabuf_leases)(alice.base.context, id);
+        (alice.cancel_dmabuf_leases)(alice.base.context, id);
+        assert!(shared.lock().unwrap().status("alice", id).is_err());
+        alice.base.release.unwrap()(alice.base.context);
+        mallory.base.release.unwrap()(mallory.base.context);
+    }
+}
+
+#[test]
+fn native_lease_cancellation_waits_for_running_gpu_work_and_releases_source() {
+    use std::{
+        sync::mpsc::{self, TryRecvError},
+        time::Duration,
+    };
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let release_gate = ReleaseCompletionGate(gate.clone());
+    let (entered, entry) = mpsc::channel();
+    let worker = Worker::with_backend(CompletionBackend {
+        entered,
+        gate,
+        fail: false,
+    });
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert("alice", configuration(), Box::new(worker), false)
+        .unwrap();
+    let id = sessions.latest_id();
+    let (plane, mut writer) = stand_in();
+    // SAFETY: the old interface duplicates live descriptors for queued work.
+    assert_eq!(
+        unsafe { sessions.submit_dmabuf("alice", id, &frame(&plane, None, 1), 0) },
+        STATUS_OK
+    );
+    drop(plane);
+    entry.recv_timeout(Duration::from_secs(3)).unwrap();
+    let shared = Arc::new(Mutex::new(sessions));
+    let registration = Registration::new(shared.clone());
+    let binding = bind_lease_encoder(&registration, "alice") as usize;
+    let (done, completion) = mpsc::channel();
+    let cancel = std::thread::spawn(move || {
+        // SAFETY: this thread exclusively owns the binding through release;
+        // the registration and shared sessions outlive the thread join.
+        unsafe {
+            let api = &*(binding as *const EncoderApiV1_2);
+            (api.cancel_dmabuf_leases)(api.base.context, id);
+            api.base.release.unwrap()(api.base.context);
+        }
+        done.send(()).unwrap();
+    });
+    assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+    assert!(!reader_closed(&mut writer));
+    drop(release_gate);
+    completion.recv_timeout(Duration::from_secs(3)).unwrap();
+    cancel.join().unwrap();
+    assert!(shared.lock().unwrap().status("alice", id).is_err());
+    assert!(reader_closed(&mut writer));
 }
