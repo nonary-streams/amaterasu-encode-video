@@ -358,9 +358,39 @@ struct FakePlane {
     /// Newest completed presentation; sequence zero means none yet.
     presentation: amaterasu_media::PresentationStatus,
     presentation_queries: usize,
+    event_api: bool,
+    notices: VecDeque<amaterasu_module_sdk::capture::CaptureNotice>,
+    swap_decisions: Vec<(u64, u64, amaterasu_module_sdk::capture::SwapDecision)>,
+    swap_reply_error: bool,
+    retired_events: Vec<u64>,
 }
 
 impl Plane for FakePlane {
+    fn capture_notice(
+        &mut self,
+        _: u64,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<amaterasu_module_sdk::capture::CaptureNotice>, &'static str> {
+        Ok(self
+            .event_api
+            .then(|| self.notices.pop_front().unwrap_or_default()))
+    }
+    fn resolve_capture_swap(
+        &mut self,
+        video: u64,
+        id: u64,
+        decision: amaterasu_module_sdk::capture::SwapDecision,
+    ) -> Result<(), &'static str> {
+        if self.swap_reply_error {
+            return Err("capture_swap_reply_failed");
+        }
+        self.swap_decisions.push((video, id, decision));
+        Ok(())
+    }
+    fn release_stream(&mut self, video: u64) {
+        self.retired_events.push(video);
+    }
     fn verify_geometry(
         &mut self,
         _: CaptureProvider,
@@ -3841,6 +3871,7 @@ fn runtime_fallback_keeps_queued_packets_ahead_of_forced_x264_idr() {
     assert_eq!(received.0[2].3, fallback_idr);
 }
 
+mod capture_events;
 mod operations;
 mod owned_capture;
 mod presentation;

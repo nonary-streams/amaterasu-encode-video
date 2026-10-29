@@ -1,3 +1,4 @@
+mod capture_events;
 mod encoder;
 mod lifecycle;
 mod operations;
@@ -39,9 +40,8 @@ enum Stage {
     FallbackEnumerate,
     Encoder,
     RestartCloseEncoder,
-    /// Closing the vkms capture of a running stream before reopening its
-    /// output through the CPU provider; the encoder session stays open.
-    CpuFallbackCloseCapture,
+    /// Closing capture before an approved replacement; the encoder stays open.
+    ReplaceCapture,
     Activating,
     Running,
     StopCapture,
@@ -81,6 +81,9 @@ struct Stream {
     encoder: Option<EncoderIdentity>,
     fallback_encoder: Option<EncoderIdentity>,
     restart_pending: bool,
+    capture_swap_target: Option<(CaptureProvider, String)>,
+    capture_notifications: bool,
+    capture_event_ready: bool,
     encoder_index: Option<u32>,
     encoder_attempt: u8,
     requested_encoder: EncoderSelection,
@@ -100,7 +103,7 @@ struct Stream {
     session: Option<u64>,
     operation: String,
     capture_operation: String,
-    capture_attempt: u8,
+    capture_attempt: u64,
     no_resources: bool,
     stage: Stage,
     retries: u8,
@@ -293,7 +296,7 @@ impl Stream {
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::RestartCloseEncoder
-            | Stage::CpuFallbackCloseCapture
+            | Stage::ReplaceCapture
             | Stage::X11Enumerate
             | Stage::KmsEnumerate
             | Stage::ProbeEncoder
@@ -529,7 +532,7 @@ impl Pipeline {
                         | Stage::FallbackEnumerate
                         | Stage::Encoder
                         | Stage::RestartCloseEncoder
-                        | Stage::CpuFallbackCloseCapture
+                        | Stage::ReplaceCapture
                         | Stage::Activating
                         | Stage::Running
                         | Stage::StopCapture
@@ -715,6 +718,9 @@ impl Pipeline {
                 encoder,
                 fallback_encoder: None,
                 restart_pending: false,
+                capture_swap_target: None,
+                capture_notifications: false,
+                capture_event_ready: false,
                 encoder_index,
                 encoder_attempt: 0,
                 configuration,
@@ -798,6 +804,9 @@ impl Pipeline {
                 },
             );
         }
+        if stream.stage == Stage::Running {
+            capture_events::observe(stream, id, &self.providers, plane);
+        }
         if stream.stage != Stage::Running {
             plane.release_stream(id);
         }
@@ -819,7 +828,7 @@ impl Pipeline {
             }
             if !matches!(
                 stream.stage,
-                Stage::Running | Stage::RestartCloseEncoder | Stage::CpuFallbackCloseCapture
+                Stage::Running | Stage::RestartCloseEncoder | Stage::ReplaceCapture
             ) && let Ok(mut queues) = self.queues.lock()
             {
                 queues.close(id);
@@ -919,7 +928,11 @@ enum CaptureTrigger {
 
 fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let now = Instant::now();
-    let presentation_paced = match stream.observe_presentation(plane) {
+    let presentation_paced = match if stream.capture_notifications {
+        Ok(false)
+    } else {
+        stream.observe_presentation(plane)
+    } {
         Ok(paced) => paced,
         Err(code) => {
             stream.cleanup(code);
@@ -928,7 +941,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     };
     let mut trigger = if presentation_paced {
         stream.presentation_capture_due(now)
-    } else if now >= stream.next_frame {
+    } else if now >= stream.next_frame
+        && (!stream.capture_notifications || stream.capture_event_ready)
+    {
         CaptureTrigger::Timer
     } else {
         CaptureTrigger::None
@@ -953,6 +968,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 stream.cleanup(code);
                 return;
             }
+        }
+        if trigger != CaptureTrigger::None {
+            stream.capture_event_ready = false;
         }
         if trigger == CaptureTrigger::Timer
             && (stream.provider != CaptureProvider::Wgc || stream.constant_rate)
@@ -1000,6 +1018,15 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     }) {
         Ok(progress) => {
             let completed_at = Instant::now();
+            if stream.capture_notifications
+                && capture_due
+                && !progress.submitted
+                && (progress.capture_deferred
+                    || progress.dropped
+                    || progress.capture_frame_count == 0)
+            {
+                stream.capture_event_ready = true;
+            }
             stream.timing.record(&progress);
             stream.owned_capture.record_freshness(&progress);
             if let Some(reason) = progress.dmabuf_fallback {
@@ -1200,6 +1227,11 @@ fn advance(
         )
     } else if stream.stage == Stage::Encoder {
         stream.encoder_operation()
+    } else if stream.stage == Stage::ReplaceCapture {
+        format!(
+            "{}-replace-capture-{}-{}",
+            stream.operation, stream.capture_attempt, stream.retries
+        )
     } else if stream.stage == Stage::FallbackEnumerate {
         format!(
             "{}-fallback-enumerate-{}-{}",
@@ -1334,7 +1366,7 @@ fn request(stream: &Stream) -> (&str, Value) {
             stream.provider.service(),
             json!({"action":"lookup","operation_id":stream.capture_operation}),
         ),
-        Stage::CloseCapture | Stage::StopCapture | Stage::CpuFallbackCloseCapture => (
+        Stage::CloseCapture | Stage::StopCapture | Stage::ReplaceCapture => (
             stream.provider.service(),
             json!({"action":"close","stream":stream.capture}),
         ),
@@ -1372,7 +1404,7 @@ fn stage_name(stage: Stage) -> &'static str {
         Stage::FindEncoder => "find-encoder",
         Stage::CloseEncoder => "close-encoder",
         Stage::RestartCloseEncoder => "restart-close-encoder",
-        Stage::CpuFallbackCloseCapture => "cpu-fallback-close-capture",
+        Stage::ReplaceCapture => "cpu-fallback-close-capture",
         Stage::FindCapture => "find-capture",
         Stage::CloseCapture => "close-capture",
         Stage::StopCapture => "drain-close-capture",
@@ -1394,7 +1426,7 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
             | Stage::FallbackEnumerate
             | Stage::Encoder
             | Stage::RestartCloseEncoder
-            | Stage::CpuFallbackCloseCapture
+            | Stage::ReplaceCapture
             | Stage::Activating
             | Stage::StopCapture
     ) {
@@ -1552,7 +1584,7 @@ fn apply_result(
                 Stage::FindEncoder
                     | Stage::CloseEncoder
                     | Stage::RestartCloseEncoder
-                    | Stage::CpuFallbackCloseCapture
+                    | Stage::ReplaceCapture
                     | Stage::FindCapture
                     | Stage::CloseCapture
                     | Stage::StopCapture
@@ -1768,8 +1800,10 @@ fn apply_result(
                 Stage::CloseCapture
             }
         }
-        Stage::CpuFallbackCloseCapture => {
-            owned_capture::reopen_cpu_capture(stream);
+        Stage::ReplaceCapture => {
+            if !capture_events::reopen_requested_capture(stream) {
+                owned_capture::reopen_cpu_capture(stream);
+            }
             return false;
         }
         Stage::CloseCapture => return finish_cleanup(stream),

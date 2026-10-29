@@ -174,7 +174,7 @@ pub(super) fn begin_cpu_capture_fallback(stream: &mut Stream, reason: &'static s
     stream.last_pixels = None;
     stream.next_repeat_at = None;
     stream.retries = 0;
-    stream.stage = Stage::CpuFallbackCloseCapture;
+    stream.stage = Stage::ReplaceCapture;
     true
 }
 
@@ -188,6 +188,8 @@ pub(super) fn reopen_cpu_capture(stream: &mut Stream) {
 
 fn switch_capture_provider(stream: &mut Stream, provider: CaptureProvider) {
     stream.provider = provider;
+    stream.capture_notifications = false;
+    stream.capture_event_ready = false;
     stream.capture = None;
     stream.capture_attempt = stream.capture_attempt.saturating_add(1);
     stream.capture_operation = format!("{}-capture-{}", stream.operation, stream.capture_attempt);

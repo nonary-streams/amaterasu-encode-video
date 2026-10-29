@@ -234,7 +234,7 @@ fn runtime_dmabuf_unsupported_reopens_pipewire_once_and_keeps_the_encoder() {
     pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     let stream = &pipeline.streams[&1];
-    assert!(matches!(stream.stage, Stage::CpuFallbackCloseCapture));
+    assert!(matches!(stream.stage, Stage::ReplaceCapture));
     assert_eq!(stream.frame_path, FramePath::Cpu);
     assert!(pipeline.queues.lock().unwrap().geometry("alice", 1).is_ok());
 

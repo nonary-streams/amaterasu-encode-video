@@ -1,4 +1,5 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
+mod capture_events;
 mod dmabuf;
 mod gpu_processor;
 mod lease_lifecycle;
@@ -146,6 +147,22 @@ pub trait Plane {
     fn release_stream(&mut self, _: u64) {}
     /// Retires ownership after control cleanup has finished for one stream.
     fn finish_stream(&mut self, _: u64) {}
+    fn capture_notice(
+        &mut self,
+        _: u64,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<amaterasu_module_sdk::capture::CaptureNotice>, &'static str> {
+        Ok(None)
+    }
+    fn resolve_capture_swap(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: amaterasu_module_sdk::capture::SwapDecision,
+    ) -> Result<(), &'static str> {
+        Err("capture_events_unavailable")
+    }
     fn geometry(
         &mut self,
         _: CaptureProvider,
@@ -179,6 +196,7 @@ pub struct NativePlane {
     /// Optional providers whose startup binding failed, with the reason.
     unbound: BTreeMap<CaptureProvider, &'static str>,
     leased_streams: lease_lifecycle::LeasedStreams,
+    capture_events: capture_events::Subscriptions,
     queues: Arc<Mutex<Queues>>,
     #[cfg(amaterasu_swscale)]
     processors: preprocess::Processors,
@@ -235,6 +253,7 @@ impl NativePlane {
                     .transpose()?,
                 queues,
                 leased_streams: lease_lifecycle::LeasedStreams::default(),
+                capture_events: capture_events::Subscriptions::default(),
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),
             })
@@ -244,6 +263,7 @@ impl NativePlane {
 
 impl Drop for NativePlane {
     fn drop(&mut self) {
+        self.capture_events.clear();
         // The control shutdown path can only enqueue close requests. Native
         // retirement must complete now, before any provider binding is released.
         self.leased_streams.finish_all();
@@ -691,14 +711,35 @@ impl Plane for NativePlane {
     }
 
     fn finish_stream(&mut self, video: u64) {
+        self.capture_events.remove(video);
         self.leased_streams.finish(video);
     }
 
     fn release_stream(&mut self, video: u64) {
+        self.capture_events.remove(video);
         #[cfg(amaterasu_swscale)]
         self.processors.remove(video);
         #[cfg(not(amaterasu_swscale))]
         let _ = video;
+    }
+
+    fn capture_notice(
+        &mut self,
+        video: u64,
+        provider: CaptureProvider,
+        capture: u64,
+    ) -> Result<Option<amaterasu_module_sdk::capture::CaptureNotice>, &'static str> {
+        let binding = self.captures.get(&provider).ok_or("capture_bind_failed")?;
+        self.capture_events.notice(video, capture, binding)
+    }
+
+    fn resolve_capture_swap(
+        &mut self,
+        video: u64,
+        id: u64,
+        decision: amaterasu_module_sdk::capture::SwapDecision,
+    ) -> Result<(), &'static str> {
+        self.capture_events.resolve(video, id, decision)
     }
 }
 
