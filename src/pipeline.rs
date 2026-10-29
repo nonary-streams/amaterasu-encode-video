@@ -33,6 +33,7 @@ enum Stage {
     X11Enumerate,
     KmsEnumerate,
     SelectEncoder,
+    InspectEncoder,
     ProbeEncoder,
     Capture,
     FallbackEnumerate,
@@ -287,6 +288,7 @@ impl Stream {
     fn response(&self, id: u64) -> Value {
         let state = match self.stage {
             Stage::SelectEncoder
+            | Stage::InspectEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
             | Stage::Encoder
@@ -403,7 +405,7 @@ impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
         Self {
             enabled: settings.enabled,
-            providers: settings.capture_providers,
+            providers: settings.resolved_providers(),
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
             epoch,
@@ -569,6 +571,17 @@ impl Pipeline {
             rpc::complete(send, request, error("nvenc_settings_unsupported"));
             return;
         }
+        if let CaptureProvider::External(external) = specification.provider {
+            let requested = CaptureProvider::External(external);
+            if let Some(resolved) = self
+                .providers
+                .iter()
+                .copied()
+                .find(|candidate| candidate.identity() == requested.identity())
+            {
+                specification.provider = resolved;
+            }
+        }
         if specification.provider == CaptureProvider::Pipewire {
             // A sentinel is resolved by the trusted provider, which may restore
             // an earlier portal approval without a management selection RPC.
@@ -646,7 +659,7 @@ impl Pipeline {
             let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
             let operation = format!("video-{}-{id}", self.epoch);
             let requested_encoder = encoder.clone();
-            let stage = initial_stage(provider, &encoder);
+            let mut stage = initial_stage(provider, &encoder);
             let (encoder, encoder_index, _) = match encoder {
                 EncoderSelection::Identity(identity) => (Some(identity), None, Stage::Capture),
                 EncoderSelection::Index(index) => (None, Some(index), Stage::SelectEncoder),
@@ -659,6 +672,12 @@ impl Pipeline {
                 &output,
                 self.providers.contains(&CaptureProvider::Vkms),
             );
+            if stage == Stage::Capture
+                && matches!(requested_encoder, EncoderSelection::Identity(_))
+                && owned_capture.needs_encoder_inspection()
+            {
+                stage = Stage::InspectEncoder;
+            }
             let fallback_provider = if auto_capture && !constant_rate {
                 alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
             } else {
@@ -714,7 +733,10 @@ impl Pipeline {
                 capture_attempt: 0,
                 no_resources: matches!(
                     stage,
-                    Stage::SelectEncoder | Stage::X11Enumerate | Stage::KmsEnumerate
+                    Stage::SelectEncoder
+                        | Stage::InspectEncoder
+                        | Stage::X11Enumerate
+                        | Stage::KmsEnumerate
                 ),
                 stage,
                 retries: 0,
@@ -753,6 +775,15 @@ impl Pipeline {
             )
         {
             stream.cleanup("request_ended");
+        }
+        if stream.stage == Stage::InspectEncoder
+            && stream.opened_at.elapsed() >= Duration::from_secs(5)
+        {
+            // Enumeration cannot create a resource; settle its pending request before capture.
+            if let Some(request) = stream.pending.take() {
+                stream.unsettled = Some(request);
+            }
+            stream.stage = Stage::Capture;
         }
         if matches!(
             stream.stage,
@@ -807,6 +838,7 @@ impl Pipeline {
             return;
         }
         if advance(stream, id, &self.queues, plane, send) {
+            plane.finish_stream(id);
             if let Some(stream) = self.streams.remove(&id) {
                 self.remember_failure(id, &stream);
             }
@@ -1128,6 +1160,7 @@ fn advance(
                 Stage::X11Enumerate
                     | Stage::KmsEnumerate
                     | Stage::SelectEncoder
+                    | Stage::InspectEncoder
                     | Stage::ProbeEncoder
             )
         {
@@ -1185,6 +1218,7 @@ fn advance(
         Stage::X11Enumerate
             | Stage::KmsEnumerate
             | Stage::SelectEncoder
+            | Stage::InspectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -1224,6 +1258,9 @@ fn advance(
                 } else {
                     failed_step(stream, "request_failed");
                 }
+            } else if stream.stage == Stage::InspectEncoder {
+                // A definite refusal has no child resource; retain unknown inputs.
+                stream.stage = Stage::Capture;
             } else if stream.stage == Stage::FallbackEnumerate {
                 failed_step(stream, stream.fallback_error.unwrap_or("request_failed"));
             } else {
@@ -1243,11 +1280,11 @@ fn advance(
     false
 }
 
-fn request(stream: &Stream) -> (&'static str, Value) {
+fn request(stream: &Stream) -> (&str, Value) {
     match stream.stage {
         Stage::X11Enumerate => (stream.provider.service(), json!({"action":"enumerate"})),
         Stage::KmsEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
-        Stage::SelectEncoder => (ENCODE, json!({"action":"enumerate"})),
+        Stage::SelectEncoder | Stage::InspectEncoder => (ENCODE, json!({"action":"enumerate"})),
         Stage::ProbeEncoder => (
             ENCODE,
             json!({
@@ -1274,6 +1311,7 @@ fn request(stream: &Stream) -> (&'static str, Value) {
             (
                 stream
                     .fallback_provider
+                    .as_ref()
                     .expect("fallback enumeration has a provider")
                     .service(),
                 request,
@@ -1325,6 +1363,7 @@ fn stage_name(stage: Stage) -> &'static str {
         Stage::X11Enumerate => "x11-output-selection",
         Stage::KmsEnumerate => "kms-output-selection",
         Stage::SelectEncoder => "select-encoder",
+        Stage::InspectEncoder => "inspect-encoder",
         Stage::ProbeEncoder => "probe-encoder",
         Stage::Capture => "capture",
         Stage::FallbackEnumerate => "fallback-enumerate",
@@ -1349,6 +1388,7 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
         Stage::X11Enumerate
             | Stage::KmsEnumerate
             | Stage::SelectEncoder
+            | Stage::InspectEncoder
             | Stage::ProbeEncoder
             | Stage::Capture
             | Stage::FallbackEnumerate
@@ -1402,7 +1442,9 @@ fn apply_result(
     let payload = match result {
         Ok(payload) => payload,
         Err(code) => {
-            if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
+            if stream.stage == Stage::InspectEncoder {
+                stream.stage = Stage::Capture;
+            } else if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
                 stream.cleanup("capture_provider_unavailable");
             } else {
                 failed_step(stream, code);
@@ -1410,6 +1452,16 @@ fn apply_result(
             return false;
         }
     };
+    if stream.stage == Stage::InspectEncoder {
+        if let Some(identity) = stream.encoder.as_ref()
+            && let Some(accepts_dmabuf) =
+                inspect_explicit_encoder(identity, &stream.configuration, &payload)
+        {
+            stream.owned_capture.record_encoder_inputs(accepts_dmabuf);
+        }
+        stream.stage = Stage::Capture;
+        return false;
+    }
     if stream.stage == Stage::X11Enumerate {
         match x11_selection_output(&payload, &stream.capture_output, &stream.configuration) {
             Ok(()) => {
@@ -1948,7 +2000,7 @@ fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
         CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
         // Owned-output vkms fallback is handled separately, before activation.
         CaptureProvider::Pipewire | CaptureProvider::Vkms => None,
-        CaptureProvider::X11 | CaptureProvider::Kms => None,
+        CaptureProvider::X11 | CaptureProvider::Kms | CaptureProvider::External(_) => None,
     }
 }
 
@@ -2006,6 +2058,38 @@ fn encoder_accepts_dmabuf(entry: &Value) -> bool {
         .get("inputs")
         .and_then(Value::as_array)
         .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("dmabuf")))
+}
+
+/// Find the exact explicit identity only after validating the bounded registry.
+/// An absent or malformed input list leaves the capability unknown.
+fn inspect_explicit_encoder(
+    identity: &EncoderIdentity,
+    configuration: &Configuration,
+    payload: &Value,
+) -> Option<bool> {
+    let entries = payload.get("encoders")?.as_array()?;
+    if entries.len() > MAX_ENCODER_ENTRIES {
+        return None;
+    }
+    let index = entries.iter().position(|entry| {
+        serde_json::from_value::<EncoderIdentity>(
+            entry.get("identity").cloned().unwrap_or(Value::Null),
+        )
+        .ok()
+        .as_ref()
+            == Some(identity)
+    })?;
+    let choice =
+        resolve_encoder_selection(Some(index.try_into().ok()?), configuration, payload, false)
+            .ok()?;
+    if &choice.identity != identity {
+        return None;
+    }
+    let inputs = entries[index].get("inputs")?.as_array()?;
+    if !inputs.iter().all(Value::is_string) {
+        return None;
+    }
+    Some(inputs.iter().any(|input| input.as_str() == Some("dmabuf")))
 }
 
 fn x264_fallback_for_auto(
@@ -2553,7 +2637,7 @@ fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<Stri
         CaptureProvider::X11 => output_id
             .strip_prefix("x11:")
             .and_then(|value| value.rsplit_once('/').map(|(name, _)| name.to_owned())),
-        CaptureProvider::Kms => None,
+        CaptureProvider::Kms | CaptureProvider::External(_) => None,
     }
 }
 
@@ -2624,7 +2708,7 @@ fn accumulate_fallback_page(
                 }
                 CaptureProvider::Wgc => output.id == device_name,
                 CaptureProvider::Pipewire | CaptureProvider::Vkms => false,
-                CaptureProvider::X11 | CaptureProvider::Kms => false,
+                CaptureProvider::X11 | CaptureProvider::Kms | CaptureProvider::External(_) => false,
             };
         if matches && stream.fallback_match.replace(output.id).is_some() {
             return Err(());

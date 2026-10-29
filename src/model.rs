@@ -4,11 +4,10 @@ use amaterasu_module_sdk::EncoderBackend;
 pub use amaterasu_module_sdk::EncoderSelection;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The default is the platform's ordinary desktop capture provider.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureProvider {
     #[cfg_attr(not(target_os = "linux"), default)]
     Dxgi,
@@ -22,10 +21,114 @@ pub enum CaptureProvider {
     X11,
     /// An explicitly selected physical KMS primary-plane framebuffer.
     Kms,
+    External(ExternalProvider),
+}
+
+/// Bounded identity and trusted startup-resolved service. Requests never choose a service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExternalProvider {
+    identity: [u8; 64],
+    identity_len: u8,
+    service: [u8; 128],
+    service_len: u8,
+    dmabuf: bool,
+}
+
+fn valid_provider_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn valid_external_service(value: &str) -> bool {
+    let Some((name, version)) = value.rsplit_once('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.len() <= 126
+        && version == "1"
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+impl ExternalProvider {
+    fn new(identity: &str, service: &str, dmabuf: bool) -> Option<Self> {
+        if !valid_provider_identity(identity)
+            || (!service.is_empty() && !valid_external_service(service))
+        {
+            return None;
+        }
+        let mut result = Self {
+            identity: [0; 64],
+            identity_len: identity.len() as u8,
+            service: [0; 128],
+            service_len: service.len() as u8,
+            dmabuf,
+        };
+        result.identity[..identity.len()].copy_from_slice(identity.as_bytes());
+        result.service[..service.len()].copy_from_slice(service.as_bytes());
+        Some(result)
+    }
+    fn identity(&self) -> &str {
+        std::str::from_utf8(&self.identity[..self.identity_len as usize]).expect("validated ASCII")
+    }
+    fn service(&self) -> &str {
+        std::str::from_utf8(&self.service[..self.service_len as usize]).expect("validated ASCII")
+    }
+}
+
+impl Serialize for CaptureProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Dxgi => "dxgi",
+            Self::Wgc => "wgc",
+            Self::Pipewire => "pipewire",
+            Self::Vkms => "vkms",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
+            Self::External(value) => value.identity(),
+        })
+    }
+}
+impl<'de> Deserialize<'de> for CaptureProvider {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "dxgi" => Self::Dxgi,
+            "wgc" => Self::Wgc,
+            "pipewire" => Self::Pipewire,
+            "vkms" => Self::Vkms,
+            "x11" => Self::X11,
+            "kms" => Self::Kms,
+            _ => Self::External(
+                ExternalProvider::new(&value, "", false)
+                    .ok_or_else(|| serde::de::Error::custom("invalid capture provider"))?,
+            ),
+        })
+    }
 }
 
 impl CaptureProvider {
-    pub fn service(self) -> &'static str {
+    pub fn uses_external_dmabuf(&self) -> bool {
+        matches!(self, Self::External(provider) if provider.dmabuf)
+    }
+
+    pub fn identity(&self) -> &str {
+        match self {
+            Self::Dxgi => "dxgi",
+            Self::Wgc => "wgc",
+            Self::Pipewire => "pipewire",
+            Self::Vkms => "vkms",
+            Self::X11 => "x11",
+            Self::Kms => "kms",
+            Self::External(value) => value.identity(),
+        }
+    }
+
+    pub fn service(&self) -> &str {
         match self {
             Self::Dxgi => "amaterasu.capture-dxgi/1",
             Self::Wgc => "amaterasu.capture-wgc/1",
@@ -33,6 +136,7 @@ impl CaptureProvider {
             Self::Vkms => "amaterasu.capture-vkms/1",
             Self::X11 => "amaterasu.capture-x11/1",
             Self::Kms => "amaterasu.capture-kms/1",
+            Self::External(value) => value.service(),
         }
     }
 
@@ -45,7 +149,7 @@ impl CaptureProvider {
     /// Linux providers that read an owned or portal output at a fixed period
     /// and retain repeat deadlines independent of capture polling.
     pub fn uses_periodic_capture(self) -> bool {
-        matches!(self, Self::Pipewire | Self::Vkms)
+        matches!(self, Self::Pipewire | Self::Vkms) || self.uses_external_dmabuf()
     }
 }
 
@@ -89,12 +193,57 @@ impl AmdAv1LatencyMode {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub enum ExternalProviderRegistration {
+    Cpu(String),
+    Detailed(ExternalProviderOptions),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalProviderOptions {
+    service: String,
+    frame_transport: ExternalFrameTransport,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalFrameTransport {
+    Cpu,
+    Dmabuf,
+}
+
+impl ExternalProviderRegistration {
+    fn service(&self) -> &str {
+        match self {
+            Self::Cpu(service) => service,
+            Self::Detailed(options) => &options.service,
+        }
+    }
+    fn dmabuf(&self) -> bool {
+        matches!(
+            self,
+            Self::Detailed(ExternalProviderOptions {
+                frame_transport: ExternalFrameTransport::Dmabuf,
+                ..
+            })
+        )
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
+    #[serde(default)]
+    pub external_capture_providers: BTreeMap<String, ExternalProviderRegistration>,
+    #[serde(default)]
+    pub cpu_processor_service: Option<String>,
+    #[serde(default)]
+    pub gpu_processor_service: Option<String>,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_ms: u64,
 }
@@ -116,16 +265,69 @@ impl Default for Settings {
         Self {
             enabled: false,
             capture_providers: default_providers(),
+            external_capture_providers: BTreeMap::new(),
+            cpu_processor_service: None,
+            gpu_processor_service: None,
             drain_timeout_ms: default_drain_timeout(),
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.capture_providers.is_empty() || !(100..=30000).contains(&self.drain_timeout_ms) {
+        if (self.capture_providers.is_empty() && self.external_capture_providers.is_empty())
+            || self
+                .capture_providers
+                .iter()
+                .any(|p| matches!(p, CaptureProvider::External(_)))
+            || self
+                .cpu_processor_service
+                .as_ref()
+                .is_some_and(|service| !valid_external_service(service))
+            || self
+                .gpu_processor_service
+                .as_ref()
+                .is_some_and(|service| !valid_external_service(service))
+            || (self.cpu_processor_service.is_some() && self.gpu_processor_service.is_some())
+            || self.external_capture_providers.len() > 16
+            || self.external_capture_providers.iter().any(|(id, service)| {
+                !valid_provider_identity(id)
+                    || !valid_external_service(service.service())
+                    || matches!(
+                        id.as_str(),
+                        "dxgi" | "wgc" | "pipewire" | "vkms" | "x11" | "kms"
+                    )
+                    || self
+                        .capture_providers
+                        .iter()
+                        .any(|provider| provider.service() == service.service())
+            })
+            || self
+                .external_capture_providers
+                .values()
+                .map(ExternalProviderRegistration::service)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.external_capture_providers.len()
+            || !(100..=30000).contains(&self.drain_timeout_ms)
+        {
             return Err("invalid_video_settings");
         }
         Ok(())
+    }
+
+    pub fn resolved_providers(&self) -> BTreeSet<CaptureProvider> {
+        self.capture_providers
+            .iter()
+            .copied()
+            .chain(
+                self.external_capture_providers
+                    .iter()
+                    .filter_map(|(id, service)| {
+                        ExternalProvider::new(id, service.service(), service.dmabuf())
+                            .map(CaptureProvider::External)
+                    }),
+            )
+            .collect()
     }
 }
 
@@ -308,6 +510,8 @@ pub struct OpenSpec {
     pub configuration: Configuration,
 }
 
+// Provider identifiers are bounded inline values; control operations are short-lived.
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     SelectPortalSource {
         source_type: PortalSourceType,
@@ -350,6 +554,7 @@ pub enum Operation {
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum OperationInput {
     SelectPortalSource {
         source_type: PortalSourceType,
@@ -689,7 +894,7 @@ mod tests {
                     .unwrap_or(true)
             );
         }
-        assert!(serde_json::from_value::<Operation>(json!({"action":"open","capture_provider":"other","output":"x","encoder":0,"configuration":{"width":16,"height":16,"fps":1,"bitrate":100000}})).is_err());
+        assert!(serde_json::from_value::<Operation>(json!({"action":"open","capture_provider":"other/service","output":"x","encoder":0,"configuration":{"width":16,"height":16,"fps":1,"bitrate":100000}})).is_err());
         for source_type in ["monitor", "window"] {
             assert!(
                 serde_json::from_value::<Operation>(json!({
@@ -910,6 +1115,58 @@ mod tests {
     }
 
     #[test]
+    fn external_provider_registration_validates_names_services_and_uniqueness() {
+        let valid: Settings = serde_json::from_value(json!({"capture_providers": [], "external_capture_providers":{"vendor_1":"vendor.capture/1"}})).unwrap();
+        assert!(valid.validate().is_ok());
+        let provider = *valid.resolved_providers().iter().next().unwrap();
+        assert_eq!(provider.service(), "vendor.capture/1");
+        assert_eq!(serde_json::to_value(provider).unwrap(), "vendor_1");
+        for mapping in [
+            json!({"dxgi":"vendor.capture/1"}),
+            json!({"Bad":"vendor.capture/1"}),
+            json!({"vendor":"vendor.capture/2"}),
+            json!({"one":"vendor.capture/1", "two":"vendor.capture/1"}),
+            json!({"vendor":"vendor.capture/1/other"}),
+        ] {
+            let settings: Settings =
+                serde_json::from_value(json!({"external_capture_providers":mapping})).unwrap();
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn external_alias_can_bind_builtin_service_only_once() {
+        for builtin in [
+            CaptureProvider::Dxgi,
+            CaptureProvider::Wgc,
+            CaptureProvider::Pipewire,
+            CaptureProvider::Vkms,
+            CaptureProvider::X11,
+            CaptureProvider::Kms,
+        ] {
+            let alias = json!({"service": builtin.service(), "frame_transport": "dmabuf"});
+            let exclusive: Settings = serde_json::from_value(
+                json!({"capture_providers": [], "external_capture_providers":{"custom":alias}}),
+            )
+            .unwrap();
+            assert!(exclusive.validate().is_ok(), "{}", builtin.identity());
+            assert_eq!(
+                exclusive
+                    .resolved_providers()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .service(),
+                builtin.service()
+            );
+            let collision: Settings = serde_json::from_value(json!({"capture_providers": [builtin], "external_capture_providers":{"custom":alias}})).unwrap();
+            assert_eq!(collision.validate(), Err("invalid_video_settings"));
+        }
+        let alias_collision: Settings = serde_json::from_value(json!({"capture_providers":[], "external_capture_providers":{"vkms":{"service":"vendor.capture/1", "frame_transport":"dmabuf"}}})).unwrap();
+        assert_eq!(alias_collision.validate(), Err("invalid_video_settings"));
+    }
+
+    #[test]
     fn x11_provider_is_explicit_and_requires_a_signed_allowlist_entry() {
         assert_eq!(CaptureProvider::X11.service(), "amaterasu.capture-x11/1");
         assert_eq!(serde_json::to_value(CaptureProvider::X11).unwrap(), "x11");
@@ -917,6 +1174,9 @@ mod tests {
         let settings = Settings {
             enabled: true,
             capture_providers: [CaptureProvider::X11].into(),
+            external_capture_providers: BTreeMap::new(),
+            cpu_processor_service: None,
+            gpu_processor_service: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());
@@ -935,6 +1195,9 @@ mod tests {
         let settings = Settings {
             enabled: true,
             capture_providers: [CaptureProvider::Kms].into(),
+            external_capture_providers: BTreeMap::new(),
+            cpu_processor_service: None,
+            gpu_processor_service: None,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());
@@ -1018,5 +1281,19 @@ mod tests {
         let mut request = open_request();
         request["capture"] = json!("unknown");
         assert!(serde_json::from_value::<Operation>(request).is_err());
+    }
+
+    #[test]
+    fn processor_settings_validate_services_and_require_one_frame_domain() {
+        let valid: Settings =
+            serde_json::from_value(json!({"gpu_processor_service":"example.process/1"})).unwrap();
+        assert!(valid.validate().is_ok());
+        let both: Settings = serde_json::from_value(json!({"gpu_processor_service":"example.gpu/1", "cpu_processor_service":"example.cpu/1"})).unwrap();
+        assert_eq!(both.validate(), Err("invalid_video_settings"));
+        for service in ["", "no-version", "example /1", "../service/1"] {
+            let settings: Settings =
+                serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
+            assert_eq!(settings.validate(), Err("invalid_video_settings"));
+        }
     }
 }

@@ -54,7 +54,9 @@ impl ManagedModule for Video {
             Box::new(NativePlane::bind(
                 &runtime,
                 queues.clone(),
-                &settings.capture_providers,
+                &settings.resolved_providers(),
+                settings.cpu_processor_service.as_deref(),
+                settings.gpu_processor_service.as_deref(),
             )?)
         } else {
             Box::new(Disabled)

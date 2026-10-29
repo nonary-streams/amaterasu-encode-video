@@ -14,10 +14,11 @@ pub(super) struct OwnedOutputCapture {
     candidate: bool,
     /// `vkms` is in the startup provider allowlist.
     vkms_allowed: bool,
+    dmabuf_provider: Option<CaptureProvider>,
     /// The provider choice still runs before the first capture open.
     selection_pending: bool,
     /// Whether the selected encoder lists "dmabuf" among its inputs. `None`
-    /// when an explicit identity skipped the enumeration that reports inputs.
+    /// if the requested identity or its input capabilities could not be verified.
     encoder_accepts_dmabuf: Option<bool>,
     /// The CPU provider still available after leaving vkms; used at most once.
     cpu_provider: Option<CaptureProvider>,
@@ -35,15 +36,25 @@ impl OwnedOutputCapture {
             | CaptureProvider::Wgc
             | CaptureProvider::X11
             | CaptureProvider::Kms => false,
+            CaptureProvider::External(_) => provider.uses_external_dmabuf(),
         };
         let falls_back_to_pipewire = candidate && provider == CaptureProvider::Pipewire;
         Self {
             candidate,
-            vkms_allowed,
+            vkms_allowed: vkms_allowed || provider.uses_external_dmabuf(),
+            dmabuf_provider: candidate.then_some(if provider == CaptureProvider::Pipewire {
+                CaptureProvider::Vkms
+            } else {
+                provider
+            }),
             selection_pending: candidate,
             cpu_provider: falls_back_to_pipewire.then_some(CaptureProvider::Pipewire),
             ..Self::default()
         }
+    }
+
+    pub(super) fn needs_encoder_inspection(&self) -> bool {
+        self.candidate && self.vkms_allowed
     }
 
     /// Encoder selection ranks DMA-BUF-capable encoders first only when the
@@ -51,7 +62,9 @@ impl OwnedOutputCapture {
     pub(super) fn prefers_dmabuf(&self, plane: &dyn Plane) -> bool {
         self.candidate
             && self.vkms_allowed
-            && plane.dmabuf_unavailable(CaptureProvider::Vkms).is_none()
+            && self
+                .dmabuf_provider
+                .is_some_and(|provider| plane.dmabuf_unavailable(provider).is_none())
     }
 
     pub(super) fn record_encoder_inputs(&mut self, accepts_dmabuf: bool) {
@@ -62,7 +75,9 @@ impl OwnedOutputCapture {
         if !self.vkms_allowed {
             return Some("capture_vkms_not_configured");
         }
-        if let Some(reason) = plane.dmabuf_unavailable(CaptureProvider::Vkms) {
+        if let Some(reason) =
+            plane.dmabuf_unavailable(self.dmabuf_provider.expect("candidate has provider"))
+        {
             return Some(reason);
         }
         match self.encoder_accepts_dmabuf {
@@ -84,7 +99,9 @@ impl OwnedOutputCapture {
         if !self.candidate {
             return;
         }
-        response["vkms_fallback_reason"] = json!(self.fallback_reason);
+        if self.dmabuf_provider == Some(CaptureProvider::Vkms) {
+            response["vkms_fallback_reason"] = json!(self.fallback_reason);
+        }
         response["dmabuf_frames"] = json!({
             "fresh": self.fresh_frames,
             "reused": self.reused_frames,
@@ -103,10 +120,18 @@ pub(super) fn select_capture_provider(stream: &mut Stream, plane: &dyn Plane) {
     stream.owned_capture.selection_pending = false;
     match stream.owned_capture.unavailable_reason(plane) {
         None => {
-            stream.provider = CaptureProvider::Vkms;
+            stream.provider = stream
+                .owned_capture
+                .dmabuf_provider
+                .expect("candidate has provider");
             stream.frame_path = FramePath::DmaBuf;
         }
-        Some(reason) if stream.provider == CaptureProvider::Vkms => stream.cleanup(reason),
+        Some(reason)
+            if stream.provider == CaptureProvider::Vkms
+                || stream.provider.uses_external_dmabuf() =>
+        {
+            stream.cleanup(reason)
+        }
         Some(reason) => {
             stream.owned_capture.cpu_provider = None;
             stream.owned_capture.fallback_reason = Some(reason.into());

@@ -1,7 +1,10 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
 mod dmabuf;
+mod gpu_processor;
+mod lease_lifecycle;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
+mod processor;
 mod resize;
 use crate::{
     model::{CaptureProvider, Configuration},
@@ -141,6 +144,8 @@ pub trait Plane {
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str>;
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str>;
     fn release_stream(&mut self, _: u64) {}
+    /// Retires ownership after control cleanup has finished for one stream.
+    fn finish_stream(&mut self, _: u64) {}
     fn geometry(
         &mut self,
         _: CaptureProvider,
@@ -165,10 +170,15 @@ pub trait Plane {
 }
 
 pub struct NativePlane {
+    // Destroy downstream bindings before their source bindings. Drop first
+    // quiesces every tracked lease while all of these bindings remain alive.
+    encoder: NativeBinding,
+    gpu_processor: Option<NativeBinding>,
+    processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     /// Optional providers whose startup binding failed, with the reason.
     unbound: BTreeMap<CaptureProvider, &'static str>,
-    encoder: NativeBinding,
+    leased_streams: lease_lifecycle::LeasedStreams,
     queues: Arc<Mutex<Queues>>,
     #[cfg(amaterasu_swscale)]
     processors: preprocess::Processors,
@@ -179,6 +189,8 @@ impl NativePlane {
         runtime: &RuntimeClient,
         queues: Arc<Mutex<Queues>>,
         providers: &BTreeSet<CaptureProvider>,
+        processor_service: Option<&str>,
+        gpu_processor_service: Option<&str>,
     ) -> ModuleResult<Self> {
         let mut captures = BTreeMap::new();
         let mut unbound = BTreeMap::new();
@@ -201,7 +213,28 @@ impl NativePlane {
                 captures,
                 unbound,
                 encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
+                processor: processor_service
+                    .map(|service| {
+                        runtime.bind_native(
+                            service,
+                            CPU_PROCESSOR_INTERFACE_MAJOR,
+                            CPU_PROCESSOR_INTERFACE_MINOR,
+                            CPU_PROCESSOR_API_V1_0_SIZE,
+                        )
+                    })
+                    .transpose()?,
+                gpu_processor: gpu_processor_service
+                    .map(|service| {
+                        runtime.bind_native(
+                            service,
+                            GPU_PROCESSOR_INTERFACE_MAJOR,
+                            GPU_PROCESSOR_INTERFACE_MINOR,
+                            GPU_PROCESSOR_API_V1_0_SIZE,
+                        )
+                    })
+                    .transpose()?,
                 queues,
+                leased_streams: lease_lifecycle::LeasedStreams::default(),
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),
             })
@@ -209,8 +242,18 @@ impl NativePlane {
     }
 }
 
+impl Drop for NativePlane {
+    fn drop(&mut self) {
+        // The control shutdown path can only enqueue close requests. Native
+        // retirement must complete now, before any provider binding is released.
+        self.leased_streams.finish_all();
+    }
+}
+
 struct Submission<'a> {
     api: &'a EncoderApi,
+    processor: Option<&'a CpuProcessorApi>,
+    video: u64,
     encoder: u64,
     configuration: &'a Configuration,
     status: Status,
@@ -350,37 +393,58 @@ unsafe fn submit_frame(
     } else {
         frame
     };
-    submission.status = {
-        let mut forwarded = *frame;
-        forwarded.timestamp_us = submission.timestamp_us;
-        forwarded.sequence = submission.sequence;
-        submission.frame = Some(FrameMetadata {
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
-            timestamp_us: submission.timestamp_us,
-            sequence: submission.sequence,
-        });
-        // SAFETY: validated borrowed capture frame remains live; encoder copies on acceptance.
-        let started = Instant::now();
-        let status = unsafe {
-            (submission.api.submit)(
-                submission.api.base.context,
-                submission.encoder,
-                &forwarded,
-                u32::from(submission.force_idr),
-            )
-        };
-        submission.encoder_submit_us = elapsed_micros(started);
-        status
-    };
-    if submission.status == STATUS_OK {
-        if let Some(resized) = resized {
-            submission.owned_frame = Some(resized);
-            return STATUS_OK;
+    let mut forwarded = *frame;
+    forwarded.timestamp_us = submission.timestamp_us;
+    forwarded.sequence = submission.sequence;
+    submission.status = if let Some(processor) = submission.processor {
+        // SAFETY: the capture allocation and processor binding outlive this synchronous call.
+        match unsafe {
+            processor::dispatch(processor, submission.video, &forwarded, |output| {
+                // SAFETY: processor output is borrowed only during this callback.
+                submit_to_encoder(submission, output)
+            })
+        } {
+            processor::Outcome::Accepted => STATUS_OK,
+            processor::Outcome::Busy => MEDIA_BUSY,
+            processor::Outcome::Failed(status) => status,
+            processor::Outcome::ProtocolViolation => MEDIA_BACKEND_ERROR,
         }
-        // SAFETY: capture bytes remain borrowed until read_frame returns. A failed
-        // allocation only disables repeats; the encoder already copied its input.
+    } else {
+        // SAFETY: the capture allocation remains live for this synchronous submission.
+        unsafe { submit_to_encoder(submission, &forwarded) }
+    };
+    // Capture ownership ends here even on encoder backpressure: deliberately drop frame.
+    STATUS_OK
+}
+
+/// Submits and retains the exact accepted output, including processor output.
+unsafe fn submit_to_encoder(submission: &mut Submission<'_>, frame: &CpuFrame) -> Status {
+    if frame.width != submission.configuration.width
+        || frame.height != submission.configuration.height
+        || frame.validate().is_err()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    submission.frame = Some(FrameMetadata {
+        width: frame.width,
+        height: frame.height,
+        stride: frame.stride,
+        timestamp_us: frame.timestamp_us,
+        sequence: frame.sequence,
+    });
+    let started = Instant::now();
+    // SAFETY: the frame is borrowed synchronously and the encoder copies accepted bytes.
+    let status = unsafe {
+        (submission.api.submit)(
+            submission.api.base.context,
+            submission.encoder,
+            frame,
+            u32::from(submission.force_idr),
+        )
+    };
+    submission.encoder_submit_us = elapsed_micros(started);
+    if status == STATUS_OK {
+        // SAFETY: the producer retains the allocation until this callback returns.
         if let Ok(bytes) = unsafe { frame.bytes() } {
             let started = Instant::now();
             let mut owned = Vec::new();
@@ -397,8 +461,7 @@ unsafe fn submit_frame(
             submission.frame_copy_us = elapsed_micros(started);
         }
     }
-    // Capture ownership ends here even on encoder backpressure: deliberately drop frame.
-    STATUS_OK
+    status
 }
 
 struct Destination<'a> {
@@ -471,6 +534,9 @@ impl Plane for NativePlane {
     }
 
     fn dmabuf_unavailable(&self, provider: CaptureProvider) -> Option<&'static str> {
+        if self.processor.is_some() {
+            return Some("processor_requires_cpu");
+        }
         let Some(binding) = self.captures.get(&provider) else {
             return Some(
                 self.unbound
@@ -484,6 +550,13 @@ impl Plane for NativePlane {
         let encoder = unsafe { self.encoder.table::<EncoderApi>() };
         match (capture, encoder) {
             (Ok(capture), Ok(encoder)) => {
+                if let Err(reason) = dmabuf::use_lease_path(
+                    capture.base.header,
+                    encoder.base.header,
+                    self.gpu_processor.is_some(),
+                ) {
+                    return Some(reason);
+                }
                 dmabuf::path_unavailable(capture.base.header, encoder.base.header)
             }
             (Err(_), _) => Some("capture_interface"),
@@ -513,14 +586,24 @@ impl Plane for NativePlane {
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         // SAFETY: configured services promise these layouts; bindings remain live.
-        let encoder_api =
-            unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
         if input.frame_path == FramePath::DmaBuf {
+            if self.processor.is_some() {
+                return Err("processor_requires_cpu");
+            }
             let progress = self.deliver_dmabuf(&input)?;
+            let encoder_api =
+                unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
             return self.receive_packets(encoder_api, &input, progress);
         }
+        // SAFETY: the configured binding retains this validated native prefix.
+        let encoder_api =
+            unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        if self.gpu_processor.is_some() {
+            return Err("gpu_processor_requires_dmabuf");
+        }
         #[cfg(amaterasu_swscale)]
-        let processed = if input.provider == CaptureProvider::Pipewire
+        let processed = if self.processor.is_none()
+            && input.provider == CaptureProvider::Pipewire
             && input.configuration.color_mode.is_default()
             && input.capture != 0
         {
@@ -576,6 +659,10 @@ impl Plane for NativePlane {
                 capture_timestamp_api,
                 freshness_api,
                 encoder_api,
+                self.processor
+                    .as_ref()
+                    .map(|binding| unsafe { processor::table(binding) })
+                    .transpose()?,
                 &input,
             )?
         } else {
@@ -603,6 +690,10 @@ impl Plane for NativePlane {
         }
     }
 
+    fn finish_stream(&mut self, video: u64) {
+        self.leased_streams.finish(video);
+    }
+
     fn release_stream(&mut self, video: u64) {
         #[cfg(amaterasu_swscale)]
         self.processors.remove(video);
@@ -614,7 +705,7 @@ impl Plane for NativePlane {
 impl NativePlane {
     /// Reads one DMA-BUF presentation for a due capture, or re-reads the latest
     /// one as a keepalive repeat when only a repeat is due.
-    fn deliver_dmabuf(&self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+    fn deliver_dmabuf(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
         if !input.capture_due && !input.repeat_due {
             return Ok(Progress::default());
         }
@@ -640,7 +731,49 @@ impl NativePlane {
             unsafe { binding.table::<CaptureApiV1_4>() }.map_err(|_| "capture_interface")?;
         let encoder_api =
             unsafe { self.encoder.table::<EncoderApiV1_1>() }.map_err(|_| "encoder_interface")?;
-        dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due)
+        if dmabuf::use_lease_path(
+            capture_prefix.base.header,
+            encoder_prefix.base.header,
+            self.gpu_processor.is_some(),
+        )? {
+            let leased_capture =
+                unsafe { binding.table::<CaptureApiV1_6>() }.map_err(|_| "capture_interface")?;
+            let processor = self
+                .gpu_processor
+                .as_ref()
+                .map(|binding| unsafe { gpu_processor::table(binding) })
+                .transpose()?;
+            let leased_encoder = unsafe { self.encoder.table::<EncoderApiV1_2>() }
+                .map_err(|_| "encoder_interface")?;
+            // Register before calling either native stage: even a rejected
+            // submission can have processor-owned GPU work requiring cleanup.
+            // SAFETY: all tables are validated and their bindings outlive this
+            // plane's mandatory shutdown barrier.
+            unsafe {
+                self.leased_streams
+                    .register(input.video, input.encoder, leased_encoder, processor);
+            }
+            let progress = dmabuf::deliver_leased(
+                leased_capture,
+                leased_encoder,
+                processor,
+                input,
+                !input.capture_due,
+            )?;
+            if let Some(reason) = progress.dmabuf_fallback {
+                if self.gpu_processor.is_some() {
+                    return Err(reason);
+                }
+                if reason == "capture_dmabuf_lease_unsupported" {
+                    return dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due);
+                }
+            }
+            Ok(progress)
+        } else if self.gpu_processor.is_some() {
+            Err("gpu_processor_requires_frame_lease")
+        } else {
+            dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due)
+        }
     }
 
     /// Polls at most one encoded packet into the stream's bounded queue.
@@ -664,10 +797,13 @@ fn capture(
     capture_timestamp_api: Option<&CaptureApiV1_3>,
     freshness_api: Option<&CaptureApiV1_2>,
     encoder: &EncoderApi,
+    processor: Option<&CpuProcessorApi>,
     input: &Pump<'_>,
 ) -> Result<Progress, &'static str> {
     let mut submission = Submission {
         api: encoder,
+        processor,
+        video: input.video,
         encoder: input.encoder,
         configuration: input.configuration,
         status: MEDIA_PENDING,
@@ -912,6 +1048,150 @@ mod tests {
     unsafe extern "C" fn drain(_: *mut c_void, _: u64) -> Status {
         STATUS_OK
     }
+    #[derive(Default)]
+    struct ProcessorFixture {
+        mode: u8,
+        process_count: usize,
+        encoded: Vec<u8>,
+    }
+
+    unsafe extern "C" fn fixture_process(
+        context: *mut c_void,
+        _: u64,
+        frame: *const CpuFrame,
+        sink: FrameSink,
+    ) -> Status {
+        // SAFETY: tests retain the fixture and frame for the synchronous callback.
+        let mode = {
+            let fixture = unsafe { &mut *context.cast::<ProcessorFixture>() };
+            fixture.process_count += 1;
+            fixture.mode
+        };
+        if mode == 1 {
+            return MEDIA_BUSY;
+        }
+        if mode == 2 {
+            return MEDIA_BACKEND_ERROR;
+        }
+        let mut bytes = vec![9; 16 * 16 * 4];
+        let mut output = unsafe { *frame };
+        output.data = bytes.as_mut_ptr();
+        let result = unsafe { (sink.write)(sink.context, &output) };
+        if mode == 3 {
+            MEDIA_BACKEND_ERROR
+        } else {
+            result
+        }
+    }
+    unsafe extern "C" fn fixture_encode(
+        context: *mut c_void,
+        _: u64,
+        frame: *const CpuFrame,
+        _: u32,
+    ) -> Status {
+        // SAFETY: tests supply a valid fixture and processor-borrowed frame.
+        let fixture = unsafe { &mut *context.cast::<ProcessorFixture>() };
+        fixture.encoded = unsafe { (&*frame).bytes().unwrap() }.to_vec();
+        STATUS_OK
+    }
+
+    #[test]
+    fn processor_output_is_encoded_once_and_retained_for_repeats() {
+        let mut fixture = ProcessorFixture::default();
+        let context = (&mut fixture as *mut ProcessorFixture).cast();
+        let api = EncoderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderApi>(),
+                context,
+                release: None,
+            },
+            submit: fixture_encode,
+            receive,
+            drain,
+        };
+        let processor = CpuProcessorApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<CpuProcessorApi>(),
+                context,
+                release: None,
+            },
+            process: fixture_process,
+        };
+        let configuration: Configuration = serde_json::from_value(
+            serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100000}),
+        )
+        .unwrap();
+        let bytes = [3; 16 * 16 * 4];
+        let frame = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_BGRA8,
+            stride: 64,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        let mut submission = Submission {
+            api: &api,
+            processor: Some(&processor),
+            video: 42,
+            encoder: 1,
+            configuration: &configuration,
+            status: MEDIA_PENDING,
+            called: false,
+            allow_resize: false,
+            track_wgc_arrival: false,
+            capture_reused: false,
+            capture_arrival: None,
+            force_idr: false,
+            timestamp_us: 7,
+            sequence: 3,
+            frame: None,
+            owned_frame: None,
+            encoder_submit_us: 0,
+            frame_copy_us: 0,
+        };
+        // SAFETY: fixture, frame and bytes remain live during synchronous submission.
+        unsafe { submit_frame(&mut submission, &frame, None, None) };
+        assert_eq!(submission.status, STATUS_OK);
+        assert_eq!(fixture.encoded, vec![9; bytes.len()]);
+        assert_eq!(
+            submission.owned_frame.as_ref().unwrap().bytes,
+            fixture.encoded
+        );
+        assert_eq!(fixture.process_count, 1);
+        let owned = submission.owned_frame.as_ref().unwrap();
+        let input = Pump {
+            video: 42,
+            provider: CaptureProvider::Dxgi,
+            frame_path: FramePath::Cpu,
+            capture: 1,
+            encoder: 1,
+            configuration: &configuration,
+            capture_due: false,
+            constant_rate: false,
+            repeat_due: true,
+            repeat_frame: Some(owned),
+            timestamp_us: 8,
+            sequence: 4,
+            force_idr: false,
+        };
+        assert!(repeat(&api, owned, &input).unwrap().submitted);
+        assert_eq!(fixture.process_count, 1);
+        assert_eq!(fixture.encoded, vec![9; bytes.len()]);
+        for (mode, expected) in [
+            (1, MEDIA_BUSY),
+            (2, MEDIA_BACKEND_ERROR),
+            (3, MEDIA_BACKEND_ERROR),
+        ] {
+            fixture.mode = mode;
+            submission.owned_frame = None;
+            unsafe { submit_frame(&mut submission, &frame, None, None) };
+            assert_eq!(submission.status, expected);
+        }
+    }
+
     #[test]
     fn capture_callback_drops_busy_frame_and_rejects_size_mismatch() {
         let api = EncoderApi {
@@ -944,6 +1224,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1037,6 +1319,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1151,6 +1435,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1236,6 +1522,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 2,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1335,6 +1623,8 @@ mod tests {
         };
         let mut submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1402,6 +1692,8 @@ mod tests {
         };
         let mut fresh_submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,
@@ -1428,6 +1720,8 @@ mod tests {
 
         let mut cached_submission = Submission {
             api: &api,
+            processor: None,
+            video: 0,
             encoder: 1,
             configuration: &configuration,
             status: MEDIA_PENDING,

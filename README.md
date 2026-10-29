@@ -89,8 +89,9 @@ capture Open:
 - the selected encoder's enumerate description lists `"dmabuf"` in its optional
   `inputs` array (absent or malformed means CPU input only). For `encoder: "auto"`
   on such a stream, a supported hardware encoder that accepts DMA-BUF is ranked
-  ahead of other hardware. An explicit encoder identity skips enumeration, so its
-  inputs are unknown and the stream keeps PipeWire.
+  ahead of other hardware. An explicit encoder identity is matched against the
+  bounded registry without replacing it; unavailable, absent, duplicate or
+  malformed capability data leaves its inputs unknown.
 
 On the DMA-BUF path each due capture calls `read_dmabuf_frame` and submits the
 borrowed frame through `submit_dmabuf` inside the capture callback, carrying video's
@@ -504,3 +505,66 @@ cleans up with `packet_boundaries_unavailable`. Metadata advertises
 The mode participates in operation-ID equality. EOS remains a separate empty
 packet without the boundary flag. Consumers must opt in and verify the returned
 mode before relying on the new flag.
+
+## External capture providers
+
+A signed video startup policy may register up to 16 trusted native providers:
+
+```json
+{"enabled":true,"capture_providers":["dxgi"],"external_capture_providers":{"vendor":"vendor.capture/1"}}
+```
+
+The registration maps a 1–64 byte lowercase ASCII identifier (letters, digits,
+`_` and `-`) to a unique exact major-1 service name. Built-in provider names are reserved. A built-in service may be registered under
+an external alias only when its built-in provider is absent from `capture_providers`;
+this avoids binding the same service twice. Open selects it with `"capture_provider":"vendor"`;
+requests cannot supply a service name, and unknown identifiers fail admission.
+Every configured provider must bind at startup. The signed component policy must
+provide the matching dependency, `call` and `native_use` grants for video, and
+appropriate delegated `call` authority for the initiating consumer. Native
+modules are trusted code, not sandboxed by these grants.
+
+A string value registers a CPU-frame provider. To opt into DMA-BUF instead,
+use `"vendor":{"service":"vendor.capture/1","frame_transport":"dmabuf"}`.
+An object can also explicitly set `"frame_transport":"cpu"`. External providers
+implement the existing capture control open/lookup/close contract. CPU providers
+use the v1.0 frame interface; DMA-BUF providers require the v1.4 capture and v1.1
+encoder tails and an encoder whose enumeration lists DMA-BUF input. Optional
+v1.5 presentation pacing is detected from the native table. External DMA-BUF
+streams are pinned and fail if their required capability is unavailable; they
+do not fall back to PipeWire. Video applies frame validation, owner isolation,
+settlement and cleanup. Registration alone does not install, start, or grant a
+provider.
+
+An optional `cpu_processor_service` startup setting names a major-1 native CPU
+processor service. Video binds it at startup under its signed dependency and
+native-use grant and synchronously passes each newly captured CPU frame through
+it before encoding. Repeats use the accepted processed pixels and do not invoke
+the processor again. A processor protocol violation or failure terminates the
+stream, including a violation after encoder submission. Processing requires CPU
+frames: an automatically chosen VKMS path can fall back to PipeWire, while a
+pinned DMA-BUF provider fails with `processor_requires_cpu`. The built-in
+PipeWire conversion fast path is bypassed when a processor is configured.
+
+
+An optional `gpu_processor_service` selects a native GPU processor instead of
+`cpu_processor_service`; configuring both is rejected. GPU processing requires
+capture v1.6 immutable DMA-BUF leases and encoder v1.2 lease submission. Each
+pump retains and releases its temporary input/output references before returning;
+an encoder that continues reading afterward owns a separate retained reference.
+A processor must deliver exactly one output on success, preserve capture sequence,
+timestamp and freshness, and propagate sink refusal. Missing lease support fails
+the stream rather than skipping the configured processor. Without a processor,
+old capture and encoder pairs keep the borrowed DMA-BUF route, and a provider
+that declines leases for one stream is retried through its existing v1.4 callback.
+Native dependencies must outlive every retained reference. Encoder v1.2 and
+GPU processor v1.0 provide mandatory synchronous `cancel_dmabuf_leases` barriers.
+Video records active leased streams before entering native processing; final
+control cleanup cancels their encoder then processor work. On module shutdown,
+`NativePlane` cancels every encoder first, then every processor, before releasing
+any native source binding. These barriers may block on native GPU calls and must
+retire retained references and completion fences before returning. Completed
+streams are removed from tracking, and encoder replacement retires the previous
+encoder. The built-in encoder's initial v1.2 implementation completes its source
+GPU copy synchronously rather than retaining provider callbacks on its worker.
+These contracts do not establish GPU hardware or client playback qualification.

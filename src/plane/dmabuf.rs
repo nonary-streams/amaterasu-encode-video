@@ -42,6 +42,14 @@ pub fn latest_presentation(
 }
 
 /// The encoder table advertises v1.1 and is large enough to hold `submit_dmabuf`.
+pub fn lease_tail_available(header: AbiHeader) -> bool {
+    header.minor >= CAPTURE_LEASE_INTERFACE_MINOR && header.size >= CAPTURE_API_V1_6_SIZE
+}
+
+pub fn encoder_lease_tail_available(header: AbiHeader) -> bool {
+    header.minor >= ENCODER_LEASE_INTERFACE_MINOR && header.size >= ENCODER_API_V1_2_SIZE
+}
+
 pub fn encoder_tail_available(header: AbiHeader) -> bool {
     header.minor >= ENCODER_DMABUF_INTERFACE_MINOR && header.size >= ENCODER_API_V1_1_SIZE
 }
@@ -55,6 +63,24 @@ pub fn path_unavailable(capture: AbiHeader, encoder: AbiHeader) -> Option<&'stat
     } else {
         None
     }
+}
+
+/// Selects the additive ownership path without changing the legacy ABI route.
+/// A configured GPU processor is mandatory, so it cannot silently be skipped.
+pub fn use_lease_path(
+    capture: AbiHeader,
+    encoder: AbiHeader,
+    processor: bool,
+) -> Result<bool, &'static str> {
+    let capture_lease = lease_tail_available(capture);
+    let encoder_lease = encoder_lease_tail_available(encoder);
+    if processor && !capture_lease {
+        return Err("gpu_processor_requires_frame_lease");
+    }
+    if processor && !encoder_lease {
+        return Err("gpu_processor_requires_encoder_lease");
+    }
+    Ok(capture_lease && encoder_lease)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +239,208 @@ pub fn deliver(
         capture_callback_count: 1,
         capture_frame_count: u64::from(delivered),
         encoder_submit_us: submission.encoder_submit_us,
+        ..Progress::default()
+    })
+}
+
+struct LeasedSubmission<'a> {
+    common: Submission<'a>,
+    encoder: &'a EncoderApiV1_2,
+    processor: Option<&'a GpuProcessorApi>,
+    video: u64,
+    calls: usize,
+    invalid: bool,
+}
+
+impl LeasedSubmission<'_> {
+    /// The encoder retains this immutable lease if work continues after submit.
+    /// It must release all accepted input before stream close completes.
+    unsafe fn forward(&mut self, lease: &DmaBufFrameLease) -> Outcome {
+        let frame = &lease.frame;
+        self.common.presentation = Some(frame.sequence);
+        if lease.validate().is_err() {
+            return Outcome::Rejected;
+        }
+        if frame.width != self.common.width || frame.height != self.common.height {
+            return Outcome::Unsupported("dmabuf_size_mismatch");
+        }
+        let mut forwarded = *lease;
+        forwarded.frame.timestamp_us = self.common.timestamp_us;
+        forwarded.frame.sequence = self.common.sequence;
+        let started = Instant::now();
+        // SAFETY: the retained input owner and both bindings remain live during
+        // submit. An accepting encoder acquires its own reference before return.
+        let status = unsafe {
+            (self.encoder.submit_dmabuf_leased)(
+                self.encoder.base.context,
+                self.common.encoder,
+                &forwarded,
+                u32::from(self.common.force_idr),
+            )
+        };
+        self.common.encoder_submit_us = elapsed_micros(started);
+        match status {
+            STATUS_OK => {
+                self.common.frame = Some(FrameMetadata {
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.planes[0].pitch,
+                    timestamp_us: self.common.timestamp_us,
+                    sequence: self.common.sequence,
+                });
+                Outcome::Accepted
+            }
+            MEDIA_BUSY => Outcome::Busy,
+            MEDIA_UNSUPPORTED => Outcome::Unsupported("encoder_dmabuf_lease_unsupported"),
+            _ => Outcome::Rejected,
+        }
+    }
+}
+
+unsafe extern "C" fn submit_leased_frame(
+    context: *mut c_void,
+    lease: *const DmaBufFrameLease,
+    freshness: u32,
+) -> Status {
+    if context.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the read owns this stack context for the synchronous callback.
+    let submission = unsafe { &mut *context.cast::<LeasedSubmission<'_>>() };
+    submission.calls += 1;
+    if submission.calls != 1
+        || lease.is_null()
+        || !matches!(freshness, CAPTURE_FRAME_FRESH | CAPTURE_FRAME_CACHED_REUSE)
+    {
+        submission.invalid = true;
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: capture lends this descriptor through the callback.
+    let lease = unsafe { &*lease };
+    submission.common.fresh = Some(freshness == CAPTURE_FRAME_FRESH);
+    // SAFETY: capture and processor bindings outlive the synchronous pump; the
+    // temporary retained reference is dropped before the callback returns.
+    let retained = match unsafe { super::gpu_processor::ScopedLease::retain(lease) } {
+        Ok(retained) => retained,
+        Err(status) => {
+            submission.common.outcome = if status == MEDIA_BUSY {
+                Outcome::Busy
+            } else {
+                Outcome::Rejected
+            };
+            return STATUS_OK;
+        }
+    };
+    submission.common.outcome = if let Some(processor) = submission.processor {
+        // SAFETY: retained frame and processor table stay alive throughout the
+        // synchronous processing callback and encoder submission.
+        match unsafe {
+            super::gpu_processor::dispatch(
+                processor,
+                submission.video,
+                retained.descriptor(),
+                freshness,
+                |output| {
+                    let outcome = submission.forward(output);
+                    submission.common.outcome = outcome;
+                    match outcome {
+                        Outcome::Accepted => STATUS_OK,
+                        Outcome::Busy => MEDIA_BUSY,
+                        Outcome::Unsupported(_) => MEDIA_UNSUPPORTED,
+                        _ => STATUS_INVALID_ARGUMENT,
+                    }
+                },
+            )
+        } {
+            super::processor::Outcome::Accepted => Outcome::Accepted,
+            super::processor::Outcome::Busy => Outcome::Busy,
+            super::processor::Outcome::Failed(MEDIA_UNSUPPORTED) => {
+                if matches!(submission.common.outcome, Outcome::Unsupported(_)) {
+                    submission.common.outcome
+                } else {
+                    Outcome::Unsupported("gpu_processor_unsupported")
+                }
+            }
+            _ => Outcome::Rejected,
+        }
+    } else {
+        // SAFETY: this retained frame outlives synchronous submission.
+        unsafe { submission.forward(retained.descriptor()) }
+    };
+    STATUS_OK
+}
+
+/// Exchanges immutable GPU ownership with capture, an optional processor, and
+/// a lease-aware encoder. No video-owned reference survives this call.
+pub fn deliver_leased(
+    capture: &CaptureApiV1_6,
+    encoder: &EncoderApiV1_2,
+    processor: Option<&GpuProcessorApi>,
+    input: &Pump<'_>,
+    repeat: bool,
+) -> Result<Progress, &'static str> {
+    // SAFETY: EncoderApiV1_2 is an additive extension of the exact v1.1 prefix.
+    let legacy_encoder = unsafe { &*(encoder as *const EncoderApiV1_2).cast::<EncoderApiV1_1>() };
+    let mut submission = LeasedSubmission {
+        common: Submission {
+            api: legacy_encoder,
+            encoder: input.encoder,
+            width: input.configuration.width,
+            height: input.configuration.height,
+            force_idr: input.force_idr,
+            timestamp_us: input.timestamp_us,
+            sequence: input.sequence,
+            outcome: Outcome::NotDelivered,
+            fresh: None,
+            presentation: None,
+            frame: None,
+            encoder_submit_us: 0,
+        },
+        encoder,
+        processor,
+        video: input.video,
+        calls: 0,
+        invalid: false,
+    };
+    let sink = DmaBufLeaseSink {
+        context: (&mut submission as *mut LeasedSubmission<'_>).cast(),
+        write: submit_leased_frame,
+    };
+    let started = Instant::now();
+    // SAFETY: the stack sink remains alive through this synchronous read.
+    let status =
+        unsafe { (capture.read_dmabuf_frame_leased)(capture.base.context, input.capture, sink) };
+    if submission.invalid
+        || submission.calls > 1
+        || (status == STATUS_OK && submission.calls != 1)
+        || (submission.calls == 1 && status != STATUS_OK)
+    {
+        return Err("capture_lease_protocol");
+    }
+    let common = submission.common;
+    let fallback = match status {
+        STATUS_OK | MEDIA_BUSY | MEDIA_PENDING => None,
+        MEDIA_UNSUPPORTED => Some("capture_dmabuf_lease_unsupported"),
+        _ => return Err("capture_failed"),
+    };
+    let dmabuf_fallback = match common.outcome {
+        Outcome::Rejected => return Err("frame_rejected"),
+        Outcome::Unsupported(reason) => Some(reason),
+        _ => fallback,
+    };
+    Ok(Progress {
+        dropped: common.outcome == Outcome::Busy,
+        submitted: common.outcome == Outcome::Accepted,
+        repeat_attempted: repeat,
+        capture_reused: common.fresh == Some(false),
+        dmabuf_fresh: common.fresh,
+        dmabuf_fallback,
+        dmabuf_presentation: common.presentation,
+        frame: common.frame,
+        capture_callback_us: elapsed_micros(started),
+        capture_callback_count: 1,
+        capture_frame_count: u64::from(submission.calls == 1),
+        encoder_submit_us: common.encoder_submit_us,
         ..Progress::default()
     })
 }

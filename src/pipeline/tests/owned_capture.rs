@@ -489,3 +489,337 @@ fn hevc_and_av1_with_multiple_references_keep_dmabuf_hardware_and_probe_codec() 
         assert_eq!(probe["configuration"]["max_reference_frames"], 4);
     }
 }
+
+#[test]
+fn registered_dmabuf_provider_uses_its_own_binding_and_presentation_without_fallback() {
+    for ready in [true, false] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "capture_providers": [],
+            "external_capture_providers": {"acme":{"service":"acme.capture/1", "frame_transport":"dmabuf"}}
+        })).unwrap();
+        assert!(settings.validate().is_ok());
+        let mut pipeline = Pipeline::new(
+            settings,
+            "test".into(),
+            Arc::new(Mutex::new(Queues::default())),
+        );
+        let mut runtime = Runtime {
+            encoder_enumeration_override: Some(dmabuf_registry()),
+            ..Runtime::default()
+        };
+        let mut plane = FakePlane {
+            dmabuf_ready: ready,
+            presentation_api: true,
+            ..FakePlane::default()
+        };
+        let provider = serde_json::from_value(json!("acme")).unwrap();
+        pipeline.handle("alice", 77, owned_open(provider), &mut |command| {
+            runtime.send(command)
+        });
+        tick(&mut pipeline, &mut runtime, &mut plane, 20);
+        if ready {
+            let stream = &pipeline.streams[&1];
+            assert!(matches!(stream.stage, Stage::Running));
+            assert_eq!(stream.provider.service(), "acme.capture/1");
+            assert_eq!(stream.frame_path, FramePath::DmaBuf);
+            assert!(plane.frame_paths.contains(&FramePath::DmaBuf));
+            assert!(
+                plane
+                    .inputs
+                    .iter()
+                    .any(|input| input.0.service() == "acme.capture/1")
+            );
+            assert!(plane.presentation_queries > 0);
+            assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "acme.capture/1" && payload["action"] == "open")));
+        } else {
+            assert!(pipeline.streams.is_empty());
+            assert_eq!(
+                pipeline.recent[0].1["error"],
+                "capture_dmabuf_interface_unavailable"
+            );
+            assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "acme.capture/1" && payload["action"] == "open")));
+        }
+    }
+}
+
+#[test]
+fn vkms_service_can_be_selected_by_a_registered_dmabuf_alias() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true,
+        "capture_providers": [],
+        "external_capture_providers": {"virtual_screen":{"service":"amaterasu.capture-vkms/1", "frame_transport":"dmabuf"}}
+    })).unwrap();
+    assert!(settings.validate().is_ok());
+    let mut pipeline = Pipeline::new(
+        settings,
+        "test".into(),
+        Arc::new(Mutex::new(Queues::default())),
+    );
+    let mut runtime = Runtime {
+        encoder_enumeration_override: Some(dmabuf_registry()),
+        ..Runtime::default()
+    };
+    let mut plane = FakePlane {
+        dmabuf_ready: true,
+        presentation_api: true,
+        ..FakePlane::default()
+    };
+    let provider = serde_json::from_value(json!("virtual_screen")).unwrap();
+    pipeline.handle("alice", 77, owned_open(provider), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    let stream = &pipeline.streams[&1];
+    assert!(matches!(stream.stage, Stage::Running));
+    assert_eq!(stream.provider.identity(), "virtual_screen");
+    assert_eq!(stream.provider.service(), "amaterasu.capture-vkms/1");
+    assert_eq!(stream.frame_path, FramePath::DmaBuf);
+    assert!(
+        plane
+            .inputs
+            .iter()
+            .any(|input| input.0.identity() == "virtual_screen"
+                && input.0.service() == "amaterasu.capture-vkms/1")
+    );
+    assert!(plane.presentation_queries > 0);
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "amaterasu.capture-vkms/1" && payload["action"] == "open")));
+}
+
+#[test]
+fn explicit_encoder_identity_checks_dmabuf_capability_and_keeps_the_identity() {
+    let entry = nvenc_entry(NVENC_H264, "h264", Some(json!(["cpu", "dmabuf"])));
+    let identity: EncoderIdentity = serde_json::from_value(entry["identity"].clone()).unwrap();
+    let cases = [
+        (registry(vec![entry.clone()]), Some(true), None),
+        (
+            registry(vec![nvenc_entry(NVENC_H264, "h264", Some(json!(["cpu"])))]),
+            Some(false),
+            Some("encoder_dmabuf_input_unavailable"),
+        ),
+        (
+            registry(vec![nvenc_entry(NVENC_H264, "h264", None)]),
+            None,
+            Some("encoder_inputs_unknown"),
+        ),
+        (
+            registry(vec![nvenc_entry(
+                NVENC_H264,
+                "h264",
+                Some(json!(["dmabuf", 1])),
+            )]),
+            None,
+            Some("encoder_inputs_unknown"),
+        ),
+        (
+            registry(vec![entry.clone(), entry.clone()]),
+            None,
+            Some("encoder_inputs_unknown"),
+        ),
+        (
+            registry(vec![nvenc_entry(
+                "amaterasu.other",
+                "h264",
+                Some(json!(["dmabuf"])),
+            )]),
+            None,
+            Some("encoder_inputs_unknown"),
+        ),
+        (
+            json!({"ok":true,"enabled":true,"encoders":"invalid"}),
+            None,
+            Some("encoder_inputs_unknown"),
+        ),
+    ];
+    for (enumeration, capability, reason) in cases {
+        for provider in [CaptureProvider::Vkms, CaptureProvider::Pipewire] {
+            let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
+            runtime.encoder_enumeration_override = Some(enumeration.clone());
+            let mut operation = owned_open(provider);
+            let Operation::Open { encoder, .. } = &mut operation else {
+                unreachable!()
+            };
+            *encoder = EncoderSelection::Identity(identity.clone());
+            pipeline.handle("alice", 77, operation, &mut |command| runtime.send(command));
+            tick(&mut pipeline, &mut runtime, &mut plane, 25);
+            if capability == Some(true) {
+                let stream = &pipeline.streams[&1];
+                assert_eq!(stream.provider, CaptureProvider::Vkms);
+                assert_eq!(stream.encoder.as_ref(), Some(&identity));
+                assert_eq!(stream.frame_path, FramePath::DmaBuf);
+            } else if provider == CaptureProvider::Pipewire {
+                let stream = &pipeline.streams[&1];
+                assert_eq!(stream.provider, CaptureProvider::Pipewire);
+                assert_eq!(stream.encoder.as_ref(), Some(&identity));
+                assert_eq!(stream.response(1)["vkms_fallback_reason"], reason.unwrap());
+            } else {
+                assert!(pipeline.streams.is_empty());
+                assert_eq!(pipeline.recent[0].1["error"], reason.unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn external_dmabuf_alias_accepts_matching_explicit_encoder_identity() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true, "capture_providers": [],
+        "external_capture_providers": {"virtual_screen":{"service":"amaterasu.capture-vkms/1", "frame_transport":"dmabuf"}}
+    })).unwrap();
+    let mut pipeline = Pipeline::new(
+        settings,
+        "test".into(),
+        Arc::new(Mutex::new(Queues::default())),
+    );
+    let mut runtime = Runtime {
+        encoder_enumeration_override: Some(dmabuf_registry()),
+        ..Runtime::default()
+    };
+    let mut plane = FakePlane {
+        dmabuf_ready: true,
+        ..FakePlane::default()
+    };
+    let provider = serde_json::from_value(json!("virtual_screen")).unwrap();
+    let mut operation = owned_open(provider);
+    let expected: EncoderIdentity = serde_json::from_value(
+        nvenc_entry(NVENC_H264, "h264", Some(json!(["dmabuf"])))["identity"].clone(),
+    )
+    .unwrap();
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Identity(expected.clone());
+    pipeline.handle("alice", 77, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 25);
+    let stream = &pipeline.streams[&1];
+    assert_eq!(stream.provider.identity(), "virtual_screen");
+    assert_eq!(stream.encoder.as_ref(), Some(&expected));
+    assert_eq!(stream.frame_path, FramePath::DmaBuf);
+}
+
+fn begin_explicit_encoder_inspection() -> (Pipeline, Runtime, FakePlane) {
+    let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
+    runtime.hold_encoder_enumeration = true;
+    let mut operation = owned_open(CaptureProvider::Pipewire);
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Identity(
+        serde_json::from_value(
+            nvenc_entry(NVENC_H264, "h264", Some(json!(["dmabuf"])))["identity"].clone(),
+        )
+        .unwrap(),
+    );
+    pipeline.handle("alice", 77, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].stage, Stage::InspectEncoder);
+    (pipeline, runtime, plane)
+}
+
+#[test]
+fn timed_out_explicit_encoder_inspection_settles_before_pipewire_open() {
+    let (mut pipeline, mut runtime, mut plane) = begin_explicit_encoder_inspection();
+    let pending = pipeline.streams[&1].pending.unwrap();
+    pipeline.streams.get_mut(&1).unwrap().opened_at = Instant::now() - Duration::from_secs(6);
+    tick(&mut pipeline, &mut runtime, &mut plane, 15);
+    assert_eq!(pipeline.streams[&1].provider, CaptureProvider::Pipewire);
+    assert_eq!(
+        pipeline.streams[&1].response(1)["vkms_fallback_reason"],
+        "encoder_inputs_unknown"
+    );
+    let cancel = runtime
+        .commands
+        .iter()
+        .position(|cmd| matches!(cmd, Command::Cancel {request} if *request == pending))
+        .unwrap();
+    let release = runtime
+        .commands
+        .iter()
+        .position(|cmd| matches!(cmd, Command::ReleaseResult {request} if *request == pending))
+        .unwrap();
+    let open = runtime.commands.iter().position(|cmd| matches!(cmd, Command::Request {service, payload, ..} if service == CaptureProvider::Pipewire.service() && payload["action"] == "open")).unwrap();
+    assert!(cancel < release && release < open);
+}
+
+#[test]
+fn timed_out_explicit_encoder_inspection_cancellation_failure_blocks_open() {
+    let (mut pipeline, mut runtime, mut plane) = begin_explicit_encoder_inspection();
+    let pending = pipeline.streams[&1].pending.unwrap();
+    runtime.cancel_failures = 3;
+    pipeline.streams.get_mut(&1).unwrap().opened_at = Instant::now() - Duration::from_secs(6);
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Failed);
+    assert_eq!(pipeline.streams[&1].unsettled, Some(pending));
+    assert_eq!(
+        pipeline.streams[&1].error,
+        Some("request_cancellation_unconfirmed")
+    );
+    assert!(
+        !runtime.commands.iter().any(
+            |cmd| matches!(cmd, Command::Request {payload, ..} if payload["action"] == "open")
+        )
+    );
+    pipeline.handle(
+        "alice",
+        78,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(pipeline.streams.is_empty());
+    assert!(
+        !runtime.commands.iter().any(
+            |cmd| matches!(cmd, Command::Request {payload, ..} if payload["action"] == "open")
+        )
+    );
+}
+
+#[test]
+fn uncertain_explicit_encoder_inspection_waits_for_parent_end_before_retry() {
+    let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
+    runtime.lose_accept = true;
+    runtime.parent_failures = 3;
+    let mut operation = owned_open(CaptureProvider::Pipewire);
+    let Operation::Open { encoder, .. } = &mut operation else {
+        unreachable!()
+    };
+    *encoder = EncoderSelection::Identity(
+        serde_json::from_value(
+            nvenc_entry(NVENC_H264, "h264", Some(json!(["dmabuf"])))["identity"].clone(),
+        )
+        .unwrap(),
+    );
+    pipeline.handle("alice", 77, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Failed);
+    assert!(pipeline.streams[&1].uncertain.is_some());
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|cmd| matches!(cmd, Command::Request { .. }))
+            .count(),
+        1
+    );
+    pipeline.handle(
+        "alice",
+        78,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(runtime.ended.contains(&77));
+    assert!(pipeline.streams.is_empty());
+    assert!(
+        !runtime.commands.iter().any(
+            |cmd| matches!(cmd, Command::Request {payload, ..} if payload["action"] == "open")
+        )
+    );
+    let completion = runtime
+        .commands
+        .iter()
+        .rposition(|cmd| matches!(cmd, Command::Complete { request: 77, .. }))
+        .unwrap();
+    let retry = runtime.commands.iter().rposition(|cmd| matches!(cmd, Command::Request {service, payload, ..} if service == ENCODE && payload["action"] == "enumerate")).unwrap();
+    assert!(completion < retry);
+}
