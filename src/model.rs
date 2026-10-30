@@ -32,6 +32,7 @@ pub struct ExternalProvider {
     service: [u8; 128],
     service_len: u8,
     dmabuf: bool,
+    generic_cpu: bool,
 }
 
 fn valid_provider_identity(value: &str) -> bool {
@@ -55,7 +56,7 @@ fn valid_external_service(value: &str) -> bool {
 }
 
 impl ExternalProvider {
-    fn new(identity: &str, service: &str, dmabuf: bool) -> Option<Self> {
+    fn new(identity: &str, service: &str, dmabuf: bool, generic_cpu: bool) -> Option<Self> {
         if !valid_provider_identity(identity)
             || (!service.is_empty() && !valid_external_service(service))
         {
@@ -67,6 +68,7 @@ impl ExternalProvider {
             service: [0; 128],
             service_len: service.len() as u8,
             dmabuf,
+            generic_cpu,
         };
         result.identity[..identity.len()].copy_from_slice(identity.as_bytes());
         result.service[..service.len()].copy_from_slice(service.as_bytes());
@@ -104,7 +106,7 @@ impl<'de> Deserialize<'de> for CaptureProvider {
             "x11" => Self::X11,
             "kms" => Self::Kms,
             _ => Self::External(
-                ExternalProvider::new(&value, "", false)
+                ExternalProvider::new(&value, "", false, false)
                     .ok_or_else(|| serde::de::Error::custom("invalid capture provider"))?,
             ),
         })
@@ -112,6 +114,10 @@ impl<'de> Deserialize<'de> for CaptureProvider {
 }
 
 impl CaptureProvider {
+    pub fn uses_generic_cpu(&self) -> bool {
+        matches!(self, Self::External(provider) if provider.generic_cpu)
+    }
+
     pub fn uses_external_dmabuf(&self) -> bool {
         matches!(self, Self::External(provider) if provider.dmabuf)
     }
@@ -211,6 +217,7 @@ pub struct ExternalProviderOptions {
 pub enum ExternalFrameTransport {
     Cpu,
     Dmabuf,
+    GenericCpu,
 }
 
 impl ExternalProviderRegistration {
@@ -219,6 +226,15 @@ impl ExternalProviderRegistration {
             Self::Cpu(service) => service,
             Self::Detailed(options) => &options.service,
         }
+    }
+    fn generic_cpu(&self) -> bool {
+        matches!(
+            self,
+            Self::Detailed(ExternalProviderOptions {
+                frame_transport: ExternalFrameTransport::GenericCpu,
+                ..
+            })
+        )
     }
     fn dmabuf(&self) -> bool {
         matches!(
@@ -323,8 +339,13 @@ impl Settings {
                 self.external_capture_providers
                     .iter()
                     .filter_map(|(id, service)| {
-                        ExternalProvider::new(id, service.service(), service.dmabuf())
-                            .map(CaptureProvider::External)
+                        ExternalProvider::new(
+                            id,
+                            service.service(),
+                            service.dmabuf(),
+                            service.generic_cpu(),
+                        )
+                        .map(CaptureProvider::External)
                     }),
             )
             .collect()
@@ -1112,6 +1133,24 @@ mod tests {
             assert_eq!(auto_capture, expected_auto, "mode {mode}");
             assert_eq!(constant_rate, expected_rate, "mode {mode}");
         }
+    }
+
+    #[test]
+    fn generic_cpu_resource_negotiation_requires_explicit_registration() {
+        let settings: Settings = serde_json::from_value(json!({"capture_providers": [], "external_capture_providers": {"vendor": {"service": "vendor.capture/1", "frame_transport": "generic_cpu"}}})).unwrap();
+        assert!(settings.validate().is_ok());
+        let provider = *settings.resolved_providers().iter().next().unwrap();
+        assert!(provider.uses_generic_cpu());
+        assert!(!provider.uses_external_dmabuf());
+        let legacy: Settings = serde_json::from_value(json!({"capture_providers": [], "external_capture_providers": {"vendor": "vendor.capture/1"}})).unwrap();
+        assert!(
+            !legacy
+                .resolved_providers()
+                .iter()
+                .next()
+                .unwrap()
+                .uses_generic_cpu()
+        );
     }
 
     #[test]

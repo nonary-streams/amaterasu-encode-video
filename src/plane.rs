@@ -7,6 +7,7 @@ mod lease_lifecycle;
 mod preprocess;
 mod processor;
 mod resize;
+mod resource_cpu;
 use crate::{
     model::{CaptureProvider, Configuration},
     queue::Queues,
@@ -197,6 +198,7 @@ pub struct NativePlane {
     unbound: BTreeMap<CaptureProvider, &'static str>,
     leased_streams: lease_lifecycle::LeasedStreams,
     capture_events: capture_events::Subscriptions,
+    resource_selections: BTreeMap<u64, resource_cpu::CachedSelection>,
     queues: Arc<Mutex<Queues>>,
     #[cfg(amaterasu_swscale)]
     processors: preprocess::Processors,
@@ -254,6 +256,7 @@ impl NativePlane {
                 queues,
                 leased_streams: lease_lifecycle::LeasedStreams::default(),
                 capture_events: capture_events::Subscriptions::default(),
+                resource_selections: BTreeMap::new(),
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),
             })
@@ -674,8 +677,21 @@ impl Plane for NativePlane {
             } else {
                 None
             };
+            let resource_api = if input.provider.uses_generic_cpu() {
+                if !capture_resources_available(capture_api.base.header) {
+                    return Err("capture_resources_unavailable");
+                }
+                // SAFETY: minor and size were both checked above.
+                Some(
+                    unsafe { binding.table::<CaptureApiV1_8>() }
+                        .map_err(|_| "capture_interface")?,
+                )
+            } else {
+                None
+            };
             capture(
                 capture_api,
+                resource_api.map(|api| (api, &mut self.resource_selections)),
                 capture_timestamp_api,
                 freshness_api,
                 encoder_api,
@@ -711,11 +727,13 @@ impl Plane for NativePlane {
     }
 
     fn finish_stream(&mut self, video: u64) {
+        self.resource_selections.remove(&video);
         self.capture_events.remove(video);
         self.leased_streams.finish(video);
     }
 
     fn release_stream(&mut self, video: u64) {
+        self.resource_selections.remove(&video);
         self.capture_events.remove(video);
         #[cfg(amaterasu_swscale)]
         self.processors.remove(video);
@@ -835,6 +853,10 @@ impl NativePlane {
 
 fn capture(
     capture: &CaptureApiPrefix,
+    resource: Option<(
+        &CaptureApiV1_8,
+        &mut BTreeMap<u64, resource_cpu::CachedSelection>,
+    )>,
     capture_timestamp_api: Option<&CaptureApiV1_3>,
     freshness_api: Option<&CaptureApiV1_2>,
     encoder: &EncoderApi,
@@ -863,7 +885,15 @@ fn capture(
         frame_copy_us: 0,
     };
     let callback_started = Instant::now();
-    let result = if let Some(capture_timestamp_api) = capture_timestamp_api {
+    let result = if let Some((resource_api, resource_selections)) = resource {
+        resource_cpu::read(
+            resource_api,
+            input.capture,
+            input.provider,
+            resource_selections,
+            &mut submission,
+        )?
+    } else if let Some(capture_timestamp_api) = capture_timestamp_api {
         let sink = FreshFrameSinkV1_3 {
             context: (&mut submission as *mut Submission<'_>).cast(),
             write: submit_with_capture_timestamp,
