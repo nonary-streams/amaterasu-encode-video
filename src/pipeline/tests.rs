@@ -4759,3 +4759,20 @@ fn external_options_require_explicit_alias_and_preserve_replay_identity() {
         "operation_conflict"
     );
 }
+#[test]
+fn capture_observations_require_a_complete_supported_native_identity() {
+    let mut payload = json!({"observed_capture": {
+        "version": 1, "protocol": "wayland-wl-output", "registry_global": 17,
+        "output_name": "Virtual-9", "width": 1920, "height": 1080,
+        "refresh_millihz": 60000
+    }});
+    let observed = super::observed_capture(&payload).unwrap().unwrap();
+    assert_eq!(observed.registry_global, 17);
+    assert_eq!(observed.output_name, "Virtual-9");
+    payload["observed_capture"]["registry_global"] = json!(0);
+    assert!(super::observed_capture(&payload).is_err());
+    payload["observed_capture"]["registry_global"] = json!(17);
+    payload["observed_capture"]["refresh_millihz"] = json!(0);
+    assert!(super::observed_capture(&payload).is_err());
+    assert!(super::observed_capture(&json!({})).unwrap().is_none());
+}

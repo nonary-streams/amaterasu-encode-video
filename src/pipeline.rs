@@ -21,7 +21,7 @@ use crate::{
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
 use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -51,6 +51,41 @@ enum Stage {
     FindCapture,
     CloseCapture,
     Failed,
+}
+
+/// Native capture observations describe the selected Wayland object, not the
+/// display provider's ownership or allocation incarnation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedCapture {
+    version: u32,
+    protocol: String,
+    registry_global: u32,
+    output_name: String,
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+}
+
+fn observed_capture(payload: &Value) -> Result<Option<ObservedCapture>, &'static str> {
+    let Some(value) = payload.get("observed_capture") else {
+        return Ok(None);
+    };
+    let observed: ObservedCapture =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_observation")?;
+    if observed.version != 1
+        || observed.protocol != "wayland-wl-output"
+        || observed.registry_global == 0
+        || observed.output_name.is_empty()
+        || observed.output_name.len() > 127
+        || observed.output_name.chars().any(char::is_control)
+        || observed.width == 0
+        || observed.height == 0
+        || observed.refresh_millihz == 0
+    {
+        return Err("invalid_capture_observation");
+    }
+    Ok(Some(observed))
 }
 
 struct Stream {
@@ -104,6 +139,7 @@ struct Stream {
     uncertain: Option<Command>,
     settlement_attempts: u8,
     capture: Option<u64>,
+    observed_capture: Option<ObservedCapture>,
     desktop_geometry: Option<CaptureGeometry>,
     touch_port: Option<Value>,
     session: Option<u64>,
@@ -353,6 +389,13 @@ impl Stream {
         }
         if let Some(geometry) = self.desktop_geometry {
             response["desktop_geometry"] = json!(geometry);
+        }
+        if self.stage == Stage::Running
+            && let Some(observed) = &self.observed_capture
+        {
+            // This is the observation made when capture opened, not a live
+            // status query. A lifecycle binding must revalidate separately.
+            response["capture_open_observation"] = json!(observed);
         }
         if let Some(touch_port) = &self.touch_port {
             response["touch_port"] = touch_port.clone();
@@ -870,6 +913,7 @@ impl Pipeline {
                 uncertain: None,
                 settlement_attempts: 0,
                 capture: None,
+                observed_capture: None,
                 desktop_geometry: None,
                 touch_port: None,
                 session: None,
@@ -1927,6 +1971,13 @@ fn apply_result(
                 return false;
             };
             stream.capture = Some(capture);
+            stream.observed_capture = match observed_capture(&payload) {
+                Ok(observed) => observed,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
             if stream.generic_input
                 && (payload.get("resource_capture_clock") != Some(&resource_capture_clock(stream))
                     || payload
