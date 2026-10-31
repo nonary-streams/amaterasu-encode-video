@@ -37,7 +37,9 @@ unsafe extern "C" fn dispatch(
             assert_eq!(service, SERVICE);
             Response::Ok
         }
-        Command::NativeRegister { service, factory } => {
+        Command::NativeRegisterTyped {
+            service, factory, ..
+        } => {
             assert_eq!(service, SERVICE);
             state.registered_factory = factory;
             state.registrations += 1;

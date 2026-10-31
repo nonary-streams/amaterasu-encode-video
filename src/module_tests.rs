@@ -18,7 +18,7 @@ unsafe extern "C" fn invoke(
     let response = match command {
         Command::GetSettings {} => Response::Result { payload: json!({}) },
         Command::Register { .. } => Response::Ok,
-        Command::NativeRegister { factory, .. } => {
+        Command::NativeRegisterTyped { factory, .. } => {
             state.registered_factory = factory;
             Response::Ok
         }

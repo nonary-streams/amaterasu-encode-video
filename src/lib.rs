@@ -53,7 +53,11 @@ impl ManagedModule for EncodeModule {
         // SAFETY: factory context/table remain stable until consumers release all
         // bindings; shared ownership pins session state independently of binding.
         unsafe {
-            runtime.register_native(SERVICE, &registration.factory)?;
+            runtime.register_native_typed(
+                SERVICE,
+                amaterasu_module_sdk::media::native_contracts::ENCODER,
+                &registration.factory,
+            )?;
         }
         Ok(Self {
             runtime,
