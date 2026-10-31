@@ -3,9 +3,11 @@
 //! descriptors for one synchronous callback, and the encoder duplicates any
 //! descriptor it keeps before `submit_dmabuf` returns. A v1.5 provider also
 //! reports its newest completed presentation, which drives push pacing.
+mod resource;
 use super::{FrameMetadata, PresentationQuery, Progress, Pump, elapsed_micros};
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::*;
+pub(super) use resource::{CachedSelection, deliver as deliver_resource};
 use std::{ffi::c_void, time::Instant};
 
 /// The capture table advertises v1.4 and is large enough to hold

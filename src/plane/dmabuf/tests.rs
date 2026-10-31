@@ -928,6 +928,7 @@ struct RuntimeFixture<'a> {
     harness: &'a Harness,
     capture: usize,
     encoder: usize,
+    external_encoder: usize,
     processor: usize,
 }
 
@@ -944,6 +945,7 @@ unsafe extern "C" fn invoke_lifecycle_runtime(
         Command::NativeBind { service, .. } => {
             let (binding, address) = match service.as_str() {
                 super::super::ENCODE => (1, fixture.encoder),
+                "example.encode/1" => (4, fixture.external_encoder),
                 "fixture.gpu-processor/1" => (2, fixture.processor),
                 "amaterasu.capture-vkms/1" => (3, fixture.capture),
                 _ => panic!("unexpected fixture service {service}"),
@@ -954,6 +956,7 @@ unsafe extern "C" fn invoke_lifecycle_runtime(
             let event = match binding {
                 1 => "encoder_release",
                 2 => "processor_release",
+                4 => "external_encoder_release",
                 3 => {
                     assert_eq!(
                         fixture.harness.retained.get(),
@@ -993,6 +996,7 @@ fn native_plane_drop_retires_encoder_and_processor_before_releasing_source_bindi
             harness: &harness,
             capture: std::ptr::from_ref(&capture) as usize,
             encoder: std::ptr::from_ref(&encoder) as usize,
+            external_encoder: 0,
             processor: std::ptr::from_ref(&processor) as usize,
         };
         // SAFETY: fixture, runtime endpoint and table allocations outlive the plane.
@@ -1007,6 +1011,9 @@ fn native_plane_drop_retires_encoder_and_processor_before_releasing_source_bindi
             &runtime,
             Arc::new(Mutex::new(crate::queue::Queues::default())),
             &[CaptureProvider::Vkms].into(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             None,
             Some("fixture.gpu-processor/1"),
         )
@@ -1047,6 +1054,7 @@ fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
         harness: &harness,
         capture: std::ptr::from_ref(&capture) as usize,
         encoder: std::ptr::from_ref(&encoder) as usize,
+        external_encoder: 0,
         processor: std::ptr::from_ref(&processor) as usize,
     };
     // SAFETY: all native tables and fixture state outlive the plane's bindings.
@@ -1061,6 +1069,9 @@ fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
         &runtime,
         Arc::new(Mutex::new(crate::queue::Queues::default())),
         &[CaptureProvider::Vkms].into(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
         None,
         Some("fixture.gpu-processor/1"),
     )
@@ -1080,5 +1091,222 @@ fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
             "processor_release",
             "capture_release",
         ]
+    );
+}
+
+unsafe extern "C" fn resource_enumerate(
+    context: *mut c_void,
+    _: u64,
+    sink: CaptureResourceOfferSink,
+    generation: *mut u64,
+) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    let source = frame(harness);
+    let caps = DmaBufResourceCapabilities {
+        fourcc: source.fourcc,
+        color: source.color,
+        modifier: source.modifier,
+        min_width: 16,
+        max_width: 16,
+        min_height: 16,
+        max_height: 16,
+        device_id: [0; 16],
+    };
+    let none = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    let offer = CaptureResourceOffer {
+        id: 7,
+        ownership: FRAME_OWNERSHIP_RETAINABLE,
+        accessibility: FRAME_ACCESS_GPU,
+        reserved: 0,
+        resource: FrameDescriptor {
+            kind: FRAME_RESOURCE_DMABUF,
+            version: 1,
+            size: std::mem::size_of::<DmaBufResourceCapabilities>() as u32,
+            data: (&caps as *const DmaBufResourceCapabilities).cast(),
+            ..none
+        },
+        acquire_sync: none,
+        completion_sync: FrameDescriptor {
+            kind: FRAME_SYNC_SYNC_FILE,
+            version: 1,
+            ..none
+        },
+    };
+    unsafe {
+        *generation = 2;
+        (sink.write)(sink.context, &offer)
+    }
+}
+unsafe extern "C" fn resource_select(_: *mut c_void, _: u64, generation: u64, id: u64) -> Status {
+    if generation == 2 && id == 7 {
+        STATUS_OK
+    } else {
+        MEDIA_UNSUPPORTED
+    }
+}
+unsafe extern "C" fn resource_retain(context: *mut c_void) -> Status {
+    unsafe { retain_lease(context) }
+}
+unsafe extern "C" fn resource_release(context: *mut c_void, completion: *const FrameDescriptor) {
+    let descriptor = unsafe { &*completion };
+    assert_eq!(descriptor.kind, FRAME_SYNC_NONE);
+    unsafe { release_lease(context, -1) };
+}
+unsafe extern "C" fn resource_read(
+    context: *mut c_void,
+    _: u64,
+    sink: CaptureResourceFrameSink,
+) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    let gpu = frame(harness);
+    let none = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    let wrapped = CaptureResourceFrame {
+        offer_generation: 2,
+        offer_id: 7,
+        timestamp_us: gpu.timestamp_us,
+        capture_pacing_timestamp_us: gpu.timestamp_us,
+        sequence: gpu.sequence,
+        width: gpu.width,
+        height: gpu.height,
+        freshness: CAPTURE_FRAME_FRESH,
+        reserved: 0,
+        color: Default::default(),
+        clock: Default::default(),
+        pacing_clock: Default::default(),
+        resource: FrameDescriptor {
+            kind: FRAME_RESOURCE_DMABUF,
+            version: 1,
+            size: std::mem::size_of::<DmaBufFrame>() as u32,
+            data: (&gpu as *const DmaBufFrame).cast(),
+            ..none
+        },
+        acquire_sync: none,
+        context,
+        retain: resource_retain,
+        release: resource_release,
+    };
+    harness.in_capture_callback.set(true);
+    let status = unsafe { (sink.write)(sink.context, &wrapped) };
+    harness.in_capture_callback.set(false);
+    status
+}
+unsafe extern "C" fn no_subscribe(_: *mut c_void, _: u64, _: CaptureEventSink) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_unsubscribe(_: *mut c_void, _: u64) {}
+unsafe extern "C" fn no_swap(_: *mut c_void, _: u64, _: u64, _: u32, _: BorrowedBytes) -> Status {
+    MEDIA_UNSUPPORTED
+}
+#[test]
+fn negotiated_resource_reaches_encoder_and_retains_until_completion() {
+    let harness = Harness::default();
+    let mut base = leased_capture_api(&harness);
+    base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_8_SIZE,
+        major: INTERFACE_MAJOR,
+        minor: CAPTURE_RESOURCE_INTERFACE_MINOR,
+    };
+    let capture = CaptureApiV1_8 {
+        base: CaptureApiV1_7 {
+            base,
+            subscribe_events: no_subscribe,
+            unsubscribe_events: no_unsubscribe,
+            resolve_swap: no_swap,
+        },
+        enumerate_resources: resource_enumerate,
+        select_resource: resource_select,
+        read_resource_frame: resource_read,
+    };
+    let encoder = leased_encoder_api(&harness);
+    let configuration = configuration();
+    let mut cache = std::collections::BTreeMap::new();
+    let result = deliver_resource(
+        &capture,
+        &encoder,
+        None,
+        &pump(&configuration, true, true),
+        &mut cache,
+    )
+    .unwrap();
+    assert!(result.submitted);
+    assert_eq!(result.dmabuf_presentation, Some(44));
+    assert_eq!(
+        harness.submitted.borrow()[0],
+        SubmittedFrame {
+            inside_capture_callback: true,
+            fd: 7,
+            sequence: 9,
+            timestamp_us: 1234,
+            force_idr: 1
+        }
+    );
+    assert_eq!(harness.retained.get(), 1);
+    finish_encoder(&harness);
+    assert_eq!(harness.retained.get(), 0);
+    assert_eq!(harness.released.get(), 2);
+}
+
+#[test]
+fn native_plane_selects_exact_registered_encoder_table() {
+    use crate::plane::{NativePlane, Plane};
+    use amaterasu_module_sdk::RuntimeClient;
+    use std::sync::{Arc, Mutex};
+    let harness = Harness::default();
+    let capture = leased_capture_api(&harness);
+    let builtin = leased_encoder_api(&harness);
+    let external = leased_encoder_api(&harness);
+    let processor = gpu_processor_api(&harness);
+    let fixture = RuntimeFixture {
+        harness: &harness,
+        capture: std::ptr::from_ref(&capture) as usize,
+        encoder: std::ptr::from_ref(&builtin) as usize,
+        external_encoder: std::ptr::from_ref(&external) as usize,
+        processor: std::ptr::from_ref(&processor) as usize,
+    };
+    // SAFETY: the runtime endpoint and all tables outlive the plane.
+    let runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::from_ref(&fixture).cast_mut().cast(),
+            invoke: invoke_lifecycle_runtime,
+        })
+    };
+    let mut plane = NativePlane::bind(
+        &runtime,
+        Arc::new(Mutex::new(crate::queue::Queues::default())),
+        &[CaptureProvider::Vkms].into(),
+        &[("vendor".to_owned(), "example.encode/1".to_owned())].into(),
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    plane.select_encoder("example.encode/1");
+    // SAFETY: both bindings and their v1 prefixes are alive for this test.
+    let selected = unsafe { plane.encoders[&plane.active_encoder].table::<EncoderApi>() }.unwrap();
+    assert_eq!(
+        std::ptr::from_ref(selected) as usize,
+        std::ptr::from_ref(&external) as usize
+    );
+    plane.select_encoder(super::super::ENCODE);
+    let selected = unsafe { plane.encoders[&plane.active_encoder].table::<EncoderApi>() }.unwrap();
+    assert_eq!(
+        std::ptr::from_ref(selected) as usize,
+        std::ptr::from_ref(&builtin) as usize
     );
 }

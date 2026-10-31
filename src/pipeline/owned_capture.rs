@@ -120,7 +120,7 @@ impl OwnedOutputCapture {
 /// selected encoder accepts DMA-BUF input. Otherwise the stream keeps PipeWire
 /// and records the reason; pinned vkms streams fail with that reason instead.
 pub(super) fn select_capture_provider(stream: &mut Stream, plane: &dyn Plane) {
-    if !stream.owned_capture.selection_pending {
+    if stream.generic_input || !stream.owned_capture.selection_pending {
         return;
     }
     stream.owned_capture.selection_pending = false;

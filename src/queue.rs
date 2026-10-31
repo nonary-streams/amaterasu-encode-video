@@ -3,7 +3,7 @@ use amaterasu_media::{
     EncodedPacket, FLAG_END_OF_STREAM, MAX_PACKET_BYTES, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
     PacketSink,
 };
-use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use std::collections::{BTreeMap, VecDeque};
 
 struct Packet {
@@ -117,6 +117,13 @@ impl Queues {
         if let Err(status) = packet.validate() {
             return status;
         }
+        if stream
+            .clock_origin_us
+            .checked_add(packet.timestamp_us)
+            .is_none()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
         if stream.packets.len() >= 4 || stream.bytes.saturating_add(packet.len) > MAX_PACKET_BYTES {
             return MEDIA_BUSY;
         }
@@ -159,7 +166,7 @@ impl Queues {
             flags: packet.flags,
             data: packet.bytes.as_ptr(),
             len: packet.bytes.len(),
-            timestamp_us: stream.clock_origin_us.saturating_add(packet.timestamp_us),
+            timestamp_us: stream.clock_origin_us + packet.timestamp_us,
             sequence: packet.sequence,
         };
         // SAFETY: queue owns packet during callback; rejection retains it.
@@ -185,6 +192,34 @@ mod tests {
         // SAFETY: queue borrows this packet for the callback.
         assert_eq!(unsafe { (*packet).bytes() }.unwrap(), &[1, 2, 3]);
         STATUS_OK
+    }
+    #[test]
+    fn rejects_timestamp_that_overflows_the_negotiated_host_epoch() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", u64::MAX - 1);
+        let bytes = [1];
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: 0,
+            data: bytes.as_ptr(),
+            len: 1,
+            timestamp_us: 2,
+            sequence: 1,
+        };
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_INVALID_ARGUMENT);
+        assert_eq!(
+            unsafe {
+                queues.receive(
+                    "alice",
+                    1,
+                    PacketSink {
+                        context: std::ptr::null_mut(),
+                        write: reject,
+                    },
+                )
+            },
+            MEDIA_PENDING
+        );
     }
     #[test]
     fn bounded_queue_preserves_rejected_packet_and_enforces_owner() {

@@ -57,6 +57,12 @@ struct Stream {
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
+    encoder_provider: Option<String>,
+    encoder_service: String,
+    source_id: Option<u64>,
+    encoder_options: Option<Value>,
+    source_started: bool,
+    generic_input: bool,
     frame_path: FramePath,
     owned_capture: owned_capture::OwnedOutputCapture,
     auto_capture: bool,
@@ -112,6 +118,7 @@ struct Stream {
     opened_at: Instant,
     /// The host clock at `opened_at`; packet timestamps are offsets from it.
     clock_origin_us: u64,
+    clock_epoch: [u8; 16],
     last_output_at: Option<Instant>,
     last_repeat_attempt_at: Option<Instant>,
     next_repeat_at: Option<Instant>,
@@ -319,6 +326,8 @@ impl Stream {
             "supports_packet_boundaries": true,
             "output": self.output,
             "capture_provider":self.provider,
+            "encoder_provider":self.encoder_provider,
+            "source_id":self.source_id,
             "frame_path": self.frame_path.name(),
             "constant_rate": self.constant_rate,
             "wgc_pacing_smoothing": self.wgc_pacing_smoothing,
@@ -382,6 +391,9 @@ pub struct Pipeline {
     require_frame_lease: bool,
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
+    encoder_providers: BTreeMap<String, String>,
+    source_encoders: BTreeMap<String, crate::model::SourceEncoderRegistration>,
+    encoder_consumers: BTreeSet<String>,
     drain_timeout: Duration,
     recent: VecDeque<(String, Value)>,
     epoch: String,
@@ -411,6 +423,13 @@ impl Pipeline {
             require_frame_lease: settings.require_frame_lease,
             enabled: settings.enabled,
             providers: settings.resolved_providers(),
+            encoder_providers: settings.external_encoder_providers,
+            source_encoders: settings.source_encoder_providers,
+            encoder_consumers: settings
+                .external_encoder_consumers
+                .keys()
+                .cloned()
+                .collect(),
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
             recent: VecDeque::new(),
             epoch,
@@ -466,6 +485,7 @@ impl Pipeline {
                 minimum_fps_target,
                 output,
                 encoder,
+                encoder_provider,
                 configuration,
             } => self.open(
                 caller,
@@ -480,6 +500,40 @@ impl Pipeline {
                     minimum_fps_target,
                     output,
                     encoder,
+                    encoder_provider,
+                    source_id: None,
+                    encoder_options: None,
+                    configuration: *configuration,
+                },
+                send,
+            ),
+            Operation::OpenWithOptions { specification } => {
+                self.open(caller, request, *specification, send)
+            }
+            Operation::OpenSource {
+                packet_boundaries,
+                operation_id,
+                source_id,
+                encoder_options,
+                encoder_provider,
+                encoder,
+                configuration,
+            } => self.open(
+                caller,
+                request,
+                OpenSpec {
+                    packet_boundaries,
+                    operation_id,
+                    provider: CaptureProvider::default(),
+                    auto_capture: false,
+                    constant_rate: false,
+                    wgc_pacing_smoothing: false,
+                    minimum_fps_target: 0.0,
+                    output: String::new(),
+                    encoder,
+                    encoder_provider: Some(encoder_provider),
+                    source_id: Some(source_id),
+                    encoder_options,
                     configuration: *configuration,
                 },
                 send,
@@ -576,7 +630,9 @@ impl Pipeline {
             rpc::complete(send, request, error("nvenc_settings_unsupported"));
             return;
         }
-        if let CaptureProvider::External(external) = specification.provider {
+        if specification.source_id.is_none()
+            && let CaptureProvider::External(external) = specification.provider
+        {
             let requested = CaptureProvider::External(external);
             if let Some(resolved) = self
                 .providers
@@ -587,7 +643,8 @@ impl Pipeline {
                 specification.provider = resolved;
             }
         }
-        if specification.provider == CaptureProvider::Pipewire {
+        if specification.source_id.is_none() && specification.provider == CaptureProvider::Pipewire
+        {
             // A sentinel is resolved by the trusted provider, which may restore
             // an earlier portal approval without a management selection RPC.
             let named_owned_output = is_owned_kwin_output(&specification.output);
@@ -607,9 +664,61 @@ impl Pipeline {
             rpc::complete(send, request, error("amd_av1_latency_mode_unsupported"));
             return;
         }
+        let encoder_service = if let Some(source_id) = specification.source_id {
+            let registration = specification
+                .encoder_provider
+                .as_deref()
+                .and_then(|alias| self.source_encoders.get(alias));
+            let Some(registration) =
+                registration.filter(|registration| registration.source_ids.contains(&source_id))
+            else {
+                rpc::complete(send, request, error("encoder_source_not_allowed"));
+                return;
+            };
+            if !matches!(specification.encoder, EncoderSelection::Identity(_)) {
+                rpc::complete(send, request, error("source_encoder_identity_required"));
+                return;
+            }
+            registration.control_service.clone()
+        } else {
+            match specification.encoder_provider.as_deref() {
+                None => ENCODE.to_owned(),
+                Some(alias) => match self.encoder_providers.get(alias) {
+                    Some(service) => service.clone(),
+                    None => {
+                        rpc::complete(send, request, error("encoder_provider_not_allowed"));
+                        return;
+                    }
+                },
+            }
+        };
+        if specification.encoder_options.is_some() && specification.encoder_provider.is_none() {
+            rpc::complete(
+                send,
+                request,
+                error("encoder_options_require_external_provider"),
+            );
+            return;
+        }
+        if specification
+            .encoder_options
+            .as_ref()
+            .is_some_and(|options| {
+                !options.is_object()
+                    || serde_json::to_vec(options).map_or(true, |bytes| bytes.len() > 64 * 1024)
+            })
+        {
+            rpc::complete(send, request, error("invalid_encoder_options"));
+            return;
+        }
         if !self.admit_operation(caller, request, &specification, send) {
             return;
         }
+        let generic_input = specification.source_id.is_none()
+            && specification
+                .encoder_provider
+                .as_ref()
+                .is_some_and(|alias| self.encoder_consumers.contains(alias));
         let retained_specification = specification.clone();
         let OpenSpec {
             packet_boundaries,
@@ -621,16 +730,23 @@ impl Pipeline {
             minimum_fps_target,
             output,
             encoder,
+            encoder_provider,
+            source_id,
+            encoder_options,
             configuration,
         } = specification;
-        let failure = if !self.providers.contains(&provider) {
+        let failure = if source_id.is_none() && !self.providers.contains(&provider) {
             Some("capture_provider_not_allowed")
         } else if constant_rate && provider != CaptureProvider::Wgc {
             Some("constant_rate_requires_wgc")
         } else if !valid_minimum_fps_target(minimum_fps_target)
-            || !configuration.validate()
+            || !(if source_id.is_some() {
+                configuration.validate_source()
+            } else {
+                configuration.validate()
+            })
             || encoder.validate().is_err()
-            || output.is_empty()
+            || (source_id.is_none() && output.is_empty())
             || output.len() > 512
             || output.chars().any(char::is_control)
         {
@@ -642,6 +758,11 @@ impl Pipeline {
         };
         if let Some(code) = failure {
             rpc::complete(send, request, error(code));
+            return;
+        }
+        let mut clock_epoch = [0u8; 16];
+        if getrandom::fill(&mut clock_epoch).is_err() || clock_epoch == [0; 16] {
+            rpc::complete(send, request, error("encoder_clock_unavailable"));
             return;
         }
         let Some(id) = self.next_id.checked_add(1) else {
@@ -664,7 +785,11 @@ impl Pipeline {
             let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
             let operation = format!("video-{}-{id}", self.epoch);
             let requested_encoder = encoder.clone();
-            let mut stage = initial_stage(provider, &encoder);
+            let mut stage = if source_id.is_some() {
+                Stage::Encoder
+            } else {
+                initial_stage(provider, &encoder)
+            };
             let (encoder, encoder_index, _) = match encoder {
                 EncoderSelection::Identity(identity) => (Some(identity), None, Stage::Capture),
                 EncoderSelection::Index(index) => (None, Some(index), Stage::SelectEncoder),
@@ -698,6 +823,12 @@ impl Pipeline {
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
+                encoder_provider,
+                encoder_service,
+                source_id,
+                encoder_options,
+                source_started: false,
+                generic_input,
                 frame_path: FramePath::Cpu,
                 owned_capture,
                 auto_capture,
@@ -758,6 +889,7 @@ impl Pipeline {
                 next_frame: Instant::now(),
                 opened_at,
                 clock_origin_us,
+                clock_epoch,
                 last_output_at: None,
                 last_repeat_attempt_at: None,
                 next_repeat_at: None,
@@ -773,6 +905,12 @@ impl Pipeline {
         });
     }
 
+    pub fn stop_native(&self, plane: &mut dyn Plane) {
+        for id in self.streams.keys().copied() {
+            plane.finish_stream(id);
+        }
+    }
+
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         self.portal.tick(send);
         if self.streams.is_empty() {
@@ -782,6 +920,8 @@ impl Pipeline {
         let id = *self.streams.keys().nth(self.cursor).unwrap();
         self.cursor += 1;
         let stream = self.streams.get_mut(&id).unwrap();
+        plane.select_encoder(&stream.encoder_service);
+        plane.set_stream_clock(id, stream.clock_origin_us, stream.clock_epoch);
         if let Some(parent) = stream.parent
             && !matches!(
                 send(Command::CheckRequest { request: parent }),
@@ -812,10 +952,13 @@ impl Pipeline {
                 },
             );
         }
-        if stream.stage == Stage::Running {
+        if stream.stage == Stage::Running && stream.source_id.is_none() && !stream.generic_input {
             capture_events::observe(stream, id, &self.providers, plane);
         }
-        if stream.stage != Stage::Running {
+        if stream.stage != Stage::Running
+            && !((stream.source_id.is_some() || stream.generic_input)
+                && stream.stage == Stage::Draining)
+        {
             plane.release_stream(id);
         }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
@@ -830,7 +973,34 @@ impl Pipeline {
             }
         }
         if stream.stage == Stage::Running {
-            pump(plane, stream, id);
+            if let Some(source_id) = stream.source_id {
+                if !stream.source_started {
+                    match plane.start_source(
+                        id,
+                        stream.session.unwrap(),
+                        source_id,
+                        &stream.configuration,
+                        stream.clock_origin_us,
+                        stream.clock_epoch,
+                    ) {
+                        Ok(()) => stream.source_started = true,
+                        Err(code) => {
+                            stream.cleanup(code);
+                            return;
+                        }
+                    }
+                }
+                match plane.pump_source(id, stream.session.unwrap(), stream.force_idr) {
+                    Ok(completed) => {
+                        if completed {
+                            stream.force_idr = false;
+                        }
+                    }
+                    Err(code) => stream.cleanup(code),
+                }
+            } else {
+                pump(plane, stream, id);
+            }
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
                 if let Some(capture) = stream.capture {
@@ -1218,7 +1388,7 @@ fn advance(
             return false;
         }
     }
-    if stream.stage == Stage::Encoder {
+    if stream.stage == Stage::Encoder && stream.source_id.is_none() {
         match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => return false,
@@ -1283,7 +1453,7 @@ fn advance(
     };
     match rpc::deliver(send, command.clone()) {
         rpc::Admission::Accepted(request) => {
-            if stream.stage == Stage::Capture {
+            if matches!(stream.stage, Stage::Capture | Stage::Encoder) {
                 stream.no_resources = false;
             }
             stream.pending = Some(request);
@@ -1330,9 +1500,12 @@ fn request(stream: &Stream) -> (&str, Value) {
     match stream.stage {
         Stage::X11Enumerate => (stream.provider.service(), json!({"action":"enumerate"})),
         Stage::KmsEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
-        Stage::SelectEncoder | Stage::InspectEncoder => (ENCODE, json!({"action":"enumerate"})),
+        Stage::SelectEncoder | Stage::InspectEncoder => (
+            stream.encoder_service.as_str(),
+            json!({"action":"enumerate"}),
+        ),
         Stage::ProbeEncoder => (
-            ENCODE,
+            &stream.encoder_service,
             json!({
                 "action":"probe", "encoder":stream.encoder,
                 "configuration":stream.configuration,
@@ -1344,6 +1517,10 @@ fn request(stream: &Stream) -> (&str, Value) {
                 "output":stream.capture_output,
                 "operation_id":stream.capture_operation,
             });
+            if stream.generic_input {
+                request["resource_capture_clock"] = resource_capture_clock(stream);
+                request["resource_callback_contract"] = json!("cross_service_safe");
+            }
             if stream.constant_rate {
                 request["constant_rate"] = json!(true);
             }
@@ -1363,17 +1540,17 @@ fn request(stream: &Stream) -> (&str, Value) {
                 request,
             )
         }
-        Stage::Encoder => (ENCODE, encoder_open_request(stream)),
+        Stage::Encoder => (&stream.encoder_service, encoder_open_request(stream)),
         Stage::FindEncoder => (
-            ENCODE,
+            &stream.encoder_service,
             json!({"action":"lookup","operation_id":stream.encoder_operation()}),
         ),
         Stage::CloseEncoder => (
-            ENCODE,
+            &stream.encoder_service,
             json!({"action":"close","session_id":stream.session}),
         ),
         Stage::RestartCloseEncoder => (
-            ENCODE,
+            &stream.encoder_service,
             json!({"action":"close","session_id":stream.session}),
         ),
         Stage::FindCapture => (
@@ -1388,6 +1565,24 @@ fn request(stream: &Stream) -> (&str, Value) {
     }
 }
 
+fn resource_capture_clock(stream: &Stream) -> Value {
+    let epoch_id = stream
+        .clock_epoch
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    json!({"domain":"host_monotonic", "epoch_id":epoch_id})
+}
+
+fn resource_output_clock(stream: &Stream) -> Value {
+    let epoch_id = stream
+        .clock_epoch
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    json!({"domain":"stream_relative", "epoch_id":epoch_id, "host_origin_us":stream.clock_origin_us})
+}
+
 fn encoder_open_request(stream: &Stream) -> Value {
     let mut request = json!({
         "action": "open",
@@ -1398,6 +1593,17 @@ fn encoder_open_request(stream: &Stream) -> Value {
         "configuration": stream.configuration,
         "operation_id": stream.encoder_operation(),
     });
+    if stream.generic_input {
+        request["resource_output_clock"] = resource_output_clock(stream);
+        request["resource_callback_contract"] = json!("cross_service_safe");
+    }
+    if let Some(options) = &stream.encoder_options {
+        request["encoder_options"] = options.clone();
+    }
+    if let Some(source_id) = stream.source_id {
+        request["mode"] = json!("source");
+        request["source_id"] = json!(source_id);
+    }
     if stream.packet_boundaries {
         request["packet_boundaries"] = json!(true);
     }
@@ -1450,7 +1656,9 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
         if stream.retries >= 3 {
             stream.error = Some("cleanup_failed");
             stream.unresolved = true;
-            stream.stage = if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder) {
+            stream.stage = if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder)
+                && stream.source_id.is_none()
+            {
                 Stage::FindCapture
             } else {
                 Stage::Failed
@@ -1500,8 +1708,12 @@ fn apply_result(
     };
     if stream.stage == Stage::InspectEncoder {
         if let Some(identity) = stream.encoder.as_ref()
-            && let Some(accepts_dmabuf) =
-                inspect_explicit_encoder(identity, &stream.configuration, &payload)
+            && let Some(accepts_dmabuf) = inspect_explicit_encoder(
+                identity,
+                &stream.configuration,
+                &payload,
+                stream.encoder_provider.is_some(),
+            )
         {
             stream.owned_capture.record_encoder_inputs(accepts_dmabuf);
         }
@@ -1644,11 +1856,12 @@ fn apply_result(
             if software_only && let Some(entries) = candidates_payload["encoders"].as_array_mut() {
                 entries.retain(|entry| entry["hardware"].as_bool() == Some(false));
             }
-            match resolve_encoder_selection(
+            match resolve_encoder_selection_for(
                 stream.encoder_index,
                 &stream.configuration,
                 &candidates_payload,
                 prefer_dmabuf,
+                stream.encoder_provider.is_some(),
             ) {
                 Ok(choice) => {
                     stream.fallback_encoder = x264_fallback_for_auto(
@@ -1675,11 +1888,12 @@ fn apply_result(
                                     .is_ok_and(|identity| identity != last.identity)
                                 });
                             }
-                            match resolve_encoder_selection(
+                            match resolve_encoder_selection_for(
                                 None,
                                 &stream.configuration,
                                 &candidates_payload,
                                 prefer_dmabuf,
+                                stream.encoder_provider.is_some(),
                             ) {
                                 Ok(next) => stream.encoder_candidates.push_back(next),
                                 Err(_) => break,
@@ -1713,6 +1927,16 @@ fn apply_result(
                 return false;
             };
             stream.capture = Some(capture);
+            if stream.generic_input
+                && (payload.get("resource_capture_clock") != Some(&resource_capture_clock(stream))
+                    || payload
+                        .get("resource_callback_contract")
+                        .and_then(Value::as_str)
+                        != Some("cross_service_safe"))
+            {
+                stream.cleanup("resource_capture_clock_unconfirmed");
+                return false;
+            }
             let geometry = match capture_geometry(&payload) {
                 Ok(geometry) => geometry,
                 Err(code) => {
@@ -1771,6 +1995,25 @@ fn apply_result(
             if !accept_encoder(stream, &payload) {
                 return false;
             }
+            if stream.generic_input {
+                stream.frame_path = FramePath::Generic;
+            }
+            if let Some(source_id) = stream.source_id {
+                if let Err(code) = plane.start_source(
+                    id,
+                    stream.session.unwrap(),
+                    source_id,
+                    &stream.configuration,
+                    stream.clock_origin_us,
+                    stream.clock_epoch,
+                ) {
+                    stream.cleanup(code);
+                    return false;
+                }
+                stream.source_started = true;
+                activate_or_resume(stream, id, queues, send);
+                return false;
+            }
             match verify_stream_geometry(plane, stream) {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                 Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
@@ -1779,7 +2022,9 @@ fn apply_result(
             return false;
         }
         Stage::FindEncoder => {
-            if missing {
+            if missing && stream.source_id.is_some() {
+                return finish_cleanup(stream);
+            } else if missing {
                 Stage::FindCapture
             } else {
                 let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
@@ -1790,6 +2035,7 @@ fn apply_result(
                 Stage::CloseEncoder
             }
         }
+        Stage::CloseEncoder if stream.source_id.is_some() => return finish_cleanup(stream),
         Stage::CloseEncoder => Stage::FindCapture,
         Stage::RestartCloseEncoder => {
             stream.session = None;
@@ -2114,6 +2360,7 @@ fn inspect_explicit_encoder(
     identity: &EncoderIdentity,
     configuration: &Configuration,
     payload: &Value,
+    external: bool,
 ) -> Option<bool> {
     let entries = payload.get("encoders")?.as_array()?;
     if entries.len() > MAX_ENCODER_ENTRIES {
@@ -2127,9 +2374,14 @@ fn inspect_explicit_encoder(
         .as_ref()
             == Some(identity)
     })?;
-    let choice =
-        resolve_encoder_selection(Some(index.try_into().ok()?), configuration, payload, false)
-            .ok()?;
+    let choice = resolve_encoder_selection_for(
+        Some(index.try_into().ok()?),
+        configuration,
+        payload,
+        false,
+        external,
+    )
+    .ok()?;
     if &choice.identity != identity {
         return None;
     }
@@ -2270,11 +2522,22 @@ fn encoder_supports_configuration(
 /// accepts DMA-BUF input ahead of other hardware. AV1 has no software encoder,
 /// so it never falls back past hardware. No missing/out-of-range selection is
 /// guessed.
+#[cfg(test)]
 fn resolve_encoder_selection(
     index: Option<u32>,
     configuration: &Configuration,
     payload: &Value,
     prefer_dmabuf: bool,
+) -> Result<EncoderChoice, &'static str> {
+    resolve_encoder_selection_for(index, configuration, payload, prefer_dmabuf, false)
+}
+
+fn resolve_encoder_selection_for(
+    index: Option<u32>,
+    configuration: &Configuration,
+    payload: &Value,
+    prefer_dmabuf: bool,
+    external: bool,
 ) -> Result<EncoderChoice, &'static str> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(encoder_selection_error(payload_error_code(payload)));
@@ -2335,7 +2598,7 @@ fn resolve_encoder_selection(
             if codec == codec_name(configuration.codec) {
                 hardware.push((identity.clone(), accepts_dmabuf));
             }
-        } else if identity.clsid == software_encoder_id(configuration.codec)
+        } else if (external || identity.clsid == software_encoder_id(configuration.codec))
             && codec == codec_name(configuration.codec)
         {
             software.push((identity.clone(), accepts_dmabuf));
@@ -2354,7 +2617,7 @@ fn resolve_encoder_selection(
         if selected_codec != codec_name(configuration.codec) {
             return Err(codec_unavailable(configuration.codec));
         }
-        if !encoder_supports_configuration(selected, configuration) {
+        if !external && !encoder_supports_configuration(selected, configuration) {
             return Err("encoder_configuration_unsupported");
         }
         return Ok(EncoderChoice {
@@ -2363,7 +2626,7 @@ fn resolve_encoder_selection(
         });
     }
     let supported = |(identity, _): &(EncoderIdentity, bool)| {
-        encoder_supports_configuration(identity, configuration)
+        external || encoder_supports_configuration(identity, configuration)
     };
     let dmabuf_hardware = hardware
         .iter()
@@ -2813,6 +3076,20 @@ fn capture_touch_port(
 }
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
+    if stream.generic_input
+        && (payload
+            .get("resource_callback_contract")
+            .and_then(Value::as_str)
+            != Some("cross_service_safe")
+            || payload.get("resource_output_clock") != Some(&resource_output_clock(stream))
+            || payload
+                .get("resource_sequence_policy")
+                .and_then(Value::as_str)
+                != Some("strict_source_echo"))
+    {
+        stream.cleanup("resource_clock_unconfirmed");
+        return false;
+    }
     if payload.get("codec").and_then(Value::as_str) != Some(codec_name(stream.configuration.codec))
     {
         stream.cleanup("encoder_codec_mismatch");

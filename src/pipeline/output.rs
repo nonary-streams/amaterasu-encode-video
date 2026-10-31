@@ -40,7 +40,11 @@ impl Pipeline {
                 drain_sent: false,
             });
             stream.force_idr = false;
-            stream.stage = Stage::StopCapture;
+            stream.stage = if stream.source_id.is_some() || stream.generic_input {
+                Stage::Draining
+            } else {
+                Stage::StopCapture
+            };
         } else {
             stream.force_idr = true;
         }
@@ -91,13 +95,23 @@ pub(super) fn tick(
         return;
     }
     if !grace.drain_sent {
-        match plane.drain(stream.session.unwrap()) {
+        match if stream.source_id.is_some() {
+            plane.drain_source(id)
+        } else {
+            plane.drain(stream.session.unwrap())
+        } {
             Ok(accepted) => grace.drain_sent = accepted,
             Err(code) => {
                 stream.cleanup(code);
                 return;
             }
         }
+    }
+    if stream.source_id.is_some() {
+        if let Err(code) = plane.pump_source(id, stream.session.unwrap(), false) {
+            stream.cleanup(code);
+        }
+        return;
     }
     let input = Pump {
         video: id,

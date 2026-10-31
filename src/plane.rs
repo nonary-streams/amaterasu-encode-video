@@ -6,8 +6,11 @@ mod lease_lifecycle;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
 mod processor;
+mod provider_output;
 mod resize;
 mod resource_cpu;
+mod resource_generic;
+mod source;
 use crate::{
     model::{CaptureProvider, Configuration},
     queue::Queues,
@@ -28,6 +31,8 @@ pub enum FramePath {
     Cpu,
     /// Borrowed DMA-BUF descriptors forwarded unchanged inside the capture callback.
     DmaBuf,
+    /// Negotiated producer resource forwarded to an independent consumer.
+    Generic,
 }
 
 impl FramePath {
@@ -35,6 +40,7 @@ impl FramePath {
         match self {
             Self::Cpu => "cpu",
             Self::DmaBuf => "dmabuf",
+            Self::Generic => "generic",
         }
     }
 }
@@ -145,6 +151,27 @@ pub trait Plane {
         Ok(None)
     }
 
+    /// Select the trusted service for the stream currently being advanced.
+    fn select_encoder(&mut self, _: &str) {}
+    fn set_stream_clock(&mut self, _: u64, _: u64, _: [u8; 16]) {}
+    fn start_source(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        Err("encoder_source_unavailable")
+    }
+    fn pump_source(&mut self, _: u64, _: u64, _: bool) -> Result<bool, &'static str> {
+        Err("encoder_source_unavailable")
+    }
+    fn drain_source(&mut self, _: u64) -> Result<bool, &'static str> {
+        Err("encoder_source_unavailable")
+    }
+
     fn verify_geometry(
         &mut self,
         provider: CaptureProvider,
@@ -199,7 +226,13 @@ pub struct NativePlane {
     require_frame_lease: bool,
     // Destroy downstream bindings before their source bindings. Drop first
     // quiesces every tracked lease while all of these bindings remain alive.
-    encoder: NativeBinding,
+    encoders: BTreeMap<String, NativeBinding>,
+    active_encoder: String,
+    source_encoders: BTreeMap<String, NativeBinding>,
+    resource_consumers: BTreeMap<String, NativeBinding>,
+    resource_bridges: BTreeMap<u64, (String, resource_generic::ResourceBridge)>,
+    stream_clocks: BTreeMap<u64, (u64, [u8; 16])>,
+    sources: BTreeMap<u64, (String, source::Source)>,
     gpu_processor: Option<NativeBinding>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
@@ -208,6 +241,7 @@ pub struct NativePlane {
     leased_streams: lease_lifecycle::LeasedStreams,
     capture_events: capture_events::Subscriptions,
     resource_selections: BTreeMap<u64, resource_cpu::CachedSelection>,
+    dmabuf_resource_selections: BTreeMap<u64, dmabuf::CachedSelection>,
     queues: Arc<Mutex<Queues>>,
     #[cfg(amaterasu_swscale)]
     processors: preprocess::Processors,
@@ -218,11 +252,14 @@ impl NativePlane {
         self.require_frame_lease = required;
         self
     }
-
+    #[allow(clippy::too_many_arguments)] // Independent signed service registries and processors.
     pub fn bind(
         runtime: &RuntimeClient,
         queues: Arc<Mutex<Queues>>,
         providers: &BTreeSet<CaptureProvider>,
+        encoder_providers: &BTreeMap<String, String>,
+        source_providers: &BTreeMap<String, crate::model::SourceEncoderRegistration>,
+        consumer_providers: &BTreeMap<String, String>,
         processor_service: Option<&str>,
         gpu_processor_service: Option<&str>,
     ) -> ModuleResult<Self> {
@@ -243,11 +280,51 @@ impl NativePlane {
                     Err(error) => return Err(error),
                 }
             }
+            let mut encoders = BTreeMap::new();
+            for service in (!providers.is_empty())
+                .then_some(ENCODE)
+                .into_iter()
+                .chain(encoder_providers.values().map(String::as_str))
+            {
+                encoders.insert(
+                    service.to_owned(),
+                    runtime.bind_native(service, 1, 0, size_of::<EncoderApi>() as u32)?,
+                );
+            }
+            let mut source_encoders = BTreeMap::new();
+            for registration in source_providers.values() {
+                let binding = runtime.bind_native(
+                    &registration.native_service,
+                    ENCODER_PROVIDER_INTERFACE_MAJOR,
+                    ENCODER_PROVIDER_INTERFACE_MINOR,
+                    ENCODER_PROVIDER_API_V1_0_SIZE,
+                )?;
+                source_encoders.insert(registration.control_service.clone(), binding);
+            }
+            let mut resource_consumers = BTreeMap::new();
+            for (alias, service) in consumer_providers {
+                let control = encoder_providers
+                    .get(alias)
+                    .ok_or("missing consumer encoder")?;
+                let binding = runtime.bind_native(
+                    service,
+                    FRAME_RESOURCE_CONSUMER_INTERFACE_MAJOR,
+                    FRAME_RESOURCE_CONSUMER_INTERFACE_MINOR,
+                    FRAME_RESOURCE_CONSUMER_API_V1_0_SIZE,
+                )?;
+                resource_consumers.insert(control.clone(), binding);
+            }
             Ok(Self {
                 require_frame_lease: false,
+                resource_consumers,
+                resource_bridges: BTreeMap::new(),
+                stream_clocks: BTreeMap::new(),
+                source_encoders,
+                sources: BTreeMap::new(),
                 captures,
                 unbound,
-                encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
+                encoders,
+                active_encoder: ENCODE.to_owned(),
                 processor: processor_service
                     .map(|service| {
                         runtime.bind_native(
@@ -272,6 +349,7 @@ impl NativePlane {
                 leased_streams: lease_lifecycle::LeasedStreams::default(),
                 capture_events: capture_events::Subscriptions::default(),
                 resource_selections: BTreeMap::new(),
+                dmabuf_resource_selections: BTreeMap::new(),
                 #[cfg(amaterasu_swscale)]
                 processors: preprocess::Processors::default(),
             })
@@ -281,6 +359,22 @@ impl NativePlane {
 
 impl Drop for NativePlane {
     fn drop(&mut self) {
+        for (_, (service, mut bridge)) in std::mem::take(&mut self.resource_bridges) {
+            if let Some(binding) = self.resource_consumers.get(&service)
+                && let Ok(api) = unsafe { binding.table::<FrameResourceConsumerApi>() }
+            {
+                // SAFETY: consumer binding remains live through cancellation.
+                unsafe { bridge.cancel(api) };
+            }
+        }
+        for (_, (service, source)) in std::mem::take(&mut self.sources) {
+            if let Some(binding) = self.source_encoders.get(&service)
+                && let Ok(api) = unsafe { binding.table::<EncoderProviderApi>() }
+            {
+                // SAFETY: source session is retired before its retained binding.
+                unsafe { source.finish(api) };
+            }
+        }
         self.capture_events.clear();
         // The control shutdown path can only enqueue close requests. Native
         // retirement must complete now, before any provider binding is released.
@@ -527,6 +621,82 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn select_encoder(&mut self, service: &str) {
+        debug_assert!(
+            self.encoders.contains_key(service) || self.source_encoders.contains_key(service)
+        );
+        self.active_encoder.clear();
+        self.active_encoder.push_str(service);
+    }
+
+    fn set_stream_clock(&mut self, video: u64, origin: u64, epoch: [u8; 16]) {
+        self.stream_clocks.insert(video, (origin, epoch));
+    }
+    fn start_source(
+        &mut self,
+        video: u64,
+        session: u64,
+        source_id: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        clock_epoch: [u8; 16],
+    ) -> Result<(), &'static str> {
+        let binding = self
+            .source_encoders
+            .get(&self.active_encoder)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: the signed service supplies this independently validated table.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        if !encoder_provider_available(api.base.header) {
+            return Err("encoder_interface");
+        }
+        // SAFETY: control service authorized this session and bindings outlive it.
+        let source = unsafe {
+            source::Source::open(
+                api,
+                video,
+                session,
+                source_id,
+                configuration,
+                clock_origin_us,
+                clock_epoch,
+            )
+        }?;
+        self.sources
+            .insert(video, (self.active_encoder.clone(), source));
+        Ok(())
+    }
+    fn pump_source(&mut self, video: u64, _: u64, force_idr: bool) -> Result<bool, &'static str> {
+        let (service, source) = self
+            .sources
+            .get_mut(&video)
+            .ok_or("encoder_source_unavailable")?;
+        let binding = self
+            .source_encoders
+            .get(service)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: this is the same live binding that configured the source.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        let mut queues = self.queues.lock().map_err(|_| "queue_failed")?;
+        unsafe { source.pump(api, &mut queues, force_idr) }
+    }
+    fn drain_source(&mut self, video: u64) -> Result<bool, &'static str> {
+        let (service, source) = self
+            .sources
+            .get_mut(&video)
+            .ok_or("encoder_source_unavailable")?;
+        let binding = self
+            .source_encoders
+            .get(service)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: this is the source session's live provider binding.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        unsafe { source.drain(api) }
+    }
+
     fn verify_geometry(
         &mut self,
         provider: CaptureProvider,
@@ -585,7 +755,12 @@ impl Plane for NativePlane {
         };
         // SAFETY: both bindings were validated with their complete v1.0 prefixes.
         let capture = unsafe { binding.table::<CaptureApiPrefix>() };
-        let encoder = unsafe { self.encoder.table::<EncoderApi>() };
+        let encoder = unsafe {
+            self.encoders
+                .get(&self.active_encoder)
+                .expect("validated encoder binding")
+                .table::<EncoderApi>()
+        };
         match (capture, encoder) {
             (Ok(capture), Ok(encoder)) => {
                 if self.require_frame_lease
@@ -593,6 +768,13 @@ impl Plane for NativePlane {
                         dmabuf::require_lease_path(capture.base.header, encoder.base.header)
                 {
                     return Some(reason);
+                }
+                if capture_resources_available(capture.base.header) {
+                    return if dmabuf::encoder_lease_tail_available(encoder.base.header) {
+                        None
+                    } else {
+                        Some("encoder_dmabuf_lease_interface_unavailable")
+                    };
                 }
                 if let Err(reason) = dmabuf::use_lease_path(
                     capture.base.header,
@@ -656,18 +838,39 @@ impl Plane for NativePlane {
             return Err("capture_frame_lease_required");
         }
         // SAFETY: configured services promise these layouts; bindings remain live.
+        if input.frame_path == FramePath::Generic {
+            let progress = self.deliver_generic(&input)?;
+            let encoder = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .ok_or("encoder_interface")?
+                    .table::<EncoderApi>()
+            }
+            .map_err(|_| "encoder_interface")?;
+            return self.receive_packets(encoder, &input, progress);
+        }
         if input.frame_path == FramePath::DmaBuf {
             if self.processor.is_some() {
                 return Err("processor_requires_cpu");
             }
             let progress = self.deliver_dmabuf(&input)?;
-            let encoder_api =
-                unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+            let encoder_api = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .expect("validated encoder binding")
+                    .table::<EncoderApi>()
+            }
+            .map_err(|_| "encoder_interface")?;
             return self.receive_packets(encoder_api, &input, progress);
         }
         // SAFETY: the configured binding retains this validated native prefix.
-        let encoder_api =
-            unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        let encoder_api = unsafe {
+            self.encoders
+                .get(&self.active_encoder)
+                .expect("validated encoder binding")
+                .table::<EncoderApi>()
+        }
+        .map_err(|_| "encoder_interface")?;
         if self.gpu_processor.is_some() {
             return Err("gpu_processor_requires_dmabuf");
         }
@@ -765,7 +968,13 @@ impl Plane for NativePlane {
 
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str> {
         // SAFETY: exact encoder v1 binding stays live through the synchronous call.
-        let api = unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        let api = unsafe {
+            self.encoders
+                .get(&self.active_encoder)
+                .expect("validated encoder binding")
+                .table::<EncoderApi>()
+        }
+        .map_err(|_| "encoder_interface")?;
         match unsafe { (api.drain)(api.base.context, encoder) } {
             STATUS_OK => Ok(true),
             MEDIA_BUSY | MEDIA_PENDING => Ok(false),
@@ -774,13 +983,31 @@ impl Plane for NativePlane {
     }
 
     fn finish_stream(&mut self, video: u64) {
+        self.release_stream(video);
+        self.stream_clocks.remove(&video);
         self.resource_selections.remove(&video);
+        self.dmabuf_resource_selections.remove(&video);
         self.capture_events.remove(video);
         self.leased_streams.finish(video);
     }
 
     fn release_stream(&mut self, video: u64) {
+        if let Some((service, mut bridge)) = self.resource_bridges.remove(&video)
+            && let Some(binding) = self.resource_consumers.get(&service)
+            && let Ok(api) = unsafe { binding.table::<FrameResourceConsumerApi>() }
+        {
+            // SAFETY: the consumer binding remains live until cancellation completes.
+            unsafe { bridge.cancel(api) };
+        }
+        if let Some((service, source)) = self.sources.remove(&video)
+            && let Some(binding) = self.source_encoders.get(&service)
+            && let Ok(api) = unsafe { binding.table::<EncoderProviderApi>() }
+        {
+            // SAFETY: the provider binding and control session are still live.
+            unsafe { source.finish(api) };
+        }
         self.resource_selections.remove(&video);
+        self.dmabuf_resource_selections.remove(&video);
         self.capture_events.remove(video);
         #[cfg(amaterasu_swscale)]
         self.processors.remove(video);
@@ -809,6 +1036,81 @@ impl Plane for NativePlane {
 }
 
 impl NativePlane {
+    fn deliver_generic(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+        if !input.capture_due {
+            return Ok(Progress::default());
+        }
+        if self.processor.is_some() || self.gpu_processor.is_some() {
+            return Err("generic_processor_unsupported");
+        }
+        let capture = self
+            .captures
+            .get(&input.provider)
+            .ok_or("capture_provider_unavailable")?;
+        let prefix =
+            unsafe { capture.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+        if !capture_resources_available(prefix.base.header) {
+            return Err("capture_resources_unavailable");
+        }
+        let capture =
+            unsafe { capture.table::<CaptureApiV1_8>() }.map_err(|_| "capture_interface")?;
+        let consumer = self
+            .resource_consumers
+            .get(&self.active_encoder)
+            .ok_or("resource_consumer_unavailable")?;
+        // SAFETY: these distinct signed bindings are checked for their expected tables.
+        let consumer = unsafe { consumer.table::<FrameResourceConsumerApi>() }
+            .map_err(|_| "resource_consumer_interface")?;
+        let (_, epoch) = self
+            .stream_clocks
+            .get(&input.video)
+            .copied()
+            .ok_or("resource_clock_unavailable")?;
+        let (_, bridge) = match self.resource_bridges.entry(input.video) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                self.active_encoder.clone(),
+                resource_generic::ResourceBridge::new(input.capture, input.encoder, 0, epoch)
+                    .map_err(|_| "resource_negotiation_failed")?,
+            )),
+        };
+        // SAFETY: both session-owned bindings remain live through cancellation.
+        let status = match unsafe {
+            bridge.forward(
+                capture,
+                consumer,
+                if input.force_idr {
+                    FRAME_RESOURCE_SUBMIT_FORCE_IDR
+                } else {
+                    0
+                },
+            )
+        } {
+            Ok(status) => status,
+            Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING))
+                if !bridge.is_retired() =>
+            {
+                return Ok(Progress {
+                    capture_deferred: true,
+                    ..Progress::default()
+                });
+            }
+            Err(_) => return Err("resource_negotiation_failed"),
+        };
+        match status {
+            STATUS_OK => Ok(Progress {
+                submitted: true,
+                capture_frame_count: 1,
+                ..Progress::default()
+            }),
+            MEDIA_BUSY | MEDIA_PENDING => Ok(Progress {
+                capture_deferred: true,
+                ..Progress::default()
+            }),
+            _ => Err("resource_submission_failed"),
+        }
+    }
+
     /// Reads one DMA-BUF presentation for a due capture, or re-reads the latest
     /// one as a keepalive repeat when only a repeat is due.
     fn deliver_dmabuf(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
@@ -823,8 +1125,53 @@ impl NativePlane {
         // read only after their advertised minor and size cover them.
         let capture_prefix =
             unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
-        let encoder_prefix =
-            unsafe { self.encoder.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        let encoder_prefix = unsafe {
+            self.encoders
+                .get(&self.active_encoder)
+                .expect("validated encoder binding")
+                .table::<EncoderApi>()
+        }
+        .map_err(|_| "encoder_interface")?;
+        if capture_resources_available(capture_prefix.base.header) {
+            if !dmabuf::encoder_lease_tail_available(encoder_prefix.base.header) {
+                return Ok(Progress {
+                    dmabuf_fallback: Some("encoder_dmabuf_lease_interface_unavailable"),
+                    ..Progress::default()
+                });
+            }
+            let capture =
+                unsafe { binding.table::<CaptureApiV1_8>() }.map_err(|_| "capture_interface")?;
+            let encoder = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .expect("validated encoder binding")
+                    .table::<EncoderApiV1_2>()
+            }
+            .map_err(|_| "encoder_interface")?;
+            let processor = self
+                .gpu_processor
+                .as_ref()
+                .map(|binding| unsafe { gpu_processor::table(binding) })
+                .transpose()?;
+            // SAFETY: these bindings remain live until mandatory cancellation completes.
+            unsafe {
+                self.leased_streams
+                    .register(input.video, input.encoder, encoder, processor);
+            }
+            let progress = dmabuf::deliver_resource(
+                capture,
+                encoder,
+                processor,
+                input,
+                &mut self.dmabuf_resource_selections,
+            )?;
+            if (processor.is_some() || self.require_frame_lease)
+                && let Some(reason) = progress.dmabuf_fallback
+            {
+                return Err(reason);
+            }
+            return Ok(progress);
+        }
         if let Some(reason) =
             dmabuf::path_unavailable(capture_prefix.base.header, encoder_prefix.base.header)
         {
@@ -835,8 +1182,13 @@ impl NativePlane {
         }
         let capture_api =
             unsafe { binding.table::<CaptureApiV1_4>() }.map_err(|_| "capture_interface")?;
-        let encoder_api =
-            unsafe { self.encoder.table::<EncoderApiV1_1>() }.map_err(|_| "encoder_interface")?;
+        let encoder_api = unsafe {
+            self.encoders
+                .get(&self.active_encoder)
+                .expect("validated encoder binding")
+                .table::<EncoderApiV1_1>()
+        }
+        .map_err(|_| "encoder_interface")?;
         if dmabuf::use_lease_path(
             capture_prefix.base.header,
             encoder_prefix.base.header,
@@ -849,8 +1201,13 @@ impl NativePlane {
                 .as_ref()
                 .map(|binding| unsafe { gpu_processor::table(binding) })
                 .transpose()?;
-            let leased_encoder = unsafe { self.encoder.table::<EncoderApiV1_2>() }
-                .map_err(|_| "encoder_interface")?;
+            let leased_encoder = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .expect("validated encoder binding")
+                    .table::<EncoderApiV1_2>()
+            }
+            .map_err(|_| "encoder_interface")?;
             // Register before calling either native stage: even a rejected
             // submission can have processor-owned GPU work requiring cleanup.
             // SAFETY: all tables are validated and their bindings outlive this

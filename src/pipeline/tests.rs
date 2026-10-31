@@ -70,6 +70,8 @@ struct Runtime {
     capture_page_size: Option<usize>,
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
+    omit_capture_contract: bool,
+    omit_encoder_contract: bool,
     encoder_open_error: Option<&'static str>,
     encoder_open_error_once: Option<&'static str>,
     encoder_close_error_once: Option<&'static str>,
@@ -117,17 +119,19 @@ impl Runtime {
                 if action == "open" {
                     self.open_effects += 1;
                 }
-                let result = if service == ENCODE
+                let result = if (service == ENCODE || service == "example.encode/1")
                     && action == "close"
                     && let Some(code) = self.encoder_close_error_once.take()
                 {
                     error(code)
                 } else if self.fail_encoder_cleanup
-                    && service == ENCODE
+                    && (service == ENCODE || service == "example.encode/1")
                     && matches!(action, "lookup" | "close")
                 {
                     error("hardware_error")
-                } else if service == ENCODE && action == "enumerate" {
+                } else if (service == ENCODE || service == "example.encode/1")
+                    && action == "enumerate"
+                {
                     self.encoder_enumeration_override
                         .clone()
                         .unwrap_or_else(|| {
@@ -138,14 +142,17 @@ impl Runtime {
                                 }]
                             })
                         })
-                } else if service == ENCODE && action == "probe" {
+                } else if (service == ENCODE || service == "example.encode/1") && action == "probe"
+                {
                     self.encoder_probe_replies
                         .get(payload["encoder"]["clsid"].as_str().unwrap())
                         .cloned()
                         .unwrap_or_else(|| {
                             probe_reply(&payload["encoder"], &payload["configuration"], true)
                         })
-                } else if service == ENCODE && action == "open" && self.encoder_open_error.is_some()
+                } else if (service == ENCODE || service == "example.encode/1")
+                    && action == "open"
+                    && self.encoder_open_error.is_some()
                 {
                     error(self.encoder_open_error.unwrap())
                 } else if let Some(provider) = capture_provider {
@@ -187,6 +194,13 @@ impl Runtime {
                             error(code)
                         } else {
                             let mut result = json!({"ok":true,"stream":41});
+                            if let Some(clock) = payload.get("resource_capture_clock") {
+                                result["resource_capture_clock"] = clock.clone();
+                                if !self.omit_capture_contract {
+                                    result["resource_callback_contract"] =
+                                        json!("cross_service_safe");
+                                }
+                            }
                             if let Some(geometry) = &self.capture_geometry {
                                 result["desktop_geometry"] = geometry.clone();
                             }
@@ -204,7 +218,7 @@ impl Runtime {
                     } else {
                         json!({"ok":true,"stream":41})
                     }
-                } else if service == ENCODE && action == "open" {
+                } else if (service == ENCODE || service == "example.encode/1") && action == "open" {
                     if let Some(code) = self
                         .encoder_open_error_once
                         .take()
@@ -214,6 +228,14 @@ impl Runtime {
                         error(code)
                     } else {
                         let mut result = json!({"ok":true,"session_id":51,"packet_boundaries":payload["packet_boundaries"]});
+                        if payload.get("resource_output_clock").is_some() {
+                            result["resource_output_clock"] =
+                                payload["resource_output_clock"].clone();
+                            result["resource_sequence_policy"] = json!("strict_source_echo");
+                            if !self.omit_encoder_contract {
+                                result["resource_callback_contract"] = json!("cross_service_safe");
+                            }
+                        }
                         result["codec"] = payload["configuration"]
                             .get("codec")
                             .and_then(Value::as_str)
@@ -225,7 +247,7 @@ impl Runtime {
                         }
                         result
                     }
-                } else if service == ENCODE
+                } else if (service == ENCODE || service == "example.encode/1")
                     && action == "lookup"
                     && payload
                         .get("operation_id")
@@ -258,7 +280,7 @@ impl Runtime {
                 if self.hold_encoder_probes
                     && self.commands.iter().any(|command| {
                         matches!(command, Command::Request { service, operation_id, payload, .. }
-                        if service == ENCODE && payload["action"] == "probe"
+                        if (service == ENCODE || service == "example.encode/1") && payload["action"] == "probe"
                         && self.operations.get(operation_id) == Some(&request))
                     })
                 {
@@ -267,7 +289,7 @@ impl Runtime {
                 if self.hold_encoder_enumeration
                     && self.commands.iter().any(|command| {
                         matches!(command, Command::Request { service, operation_id, payload, .. }
-                        if service == ENCODE && payload["action"] == "enumerate"
+                        if (service == ENCODE || service == "example.encode/1") && payload["action"] == "enumerate"
                         && self.operations.get(operation_id) == Some(&request))
                     })
                 {
@@ -332,6 +354,10 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 
 #[derive(Default)]
 struct FakePlane {
+    selected_encoders: Vec<String>,
+    source_starts: Vec<(u64, u64, u64)>,
+    source_pumps: Vec<(u64, bool)>,
+    source_drains: usize,
     calls: usize,
     drains: usize,
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
@@ -366,6 +392,29 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn select_encoder(&mut self, service: &str) {
+        self.selected_encoders.push(service.to_owned());
+    }
+    fn start_source(
+        &mut self,
+        video: u64,
+        session: u64,
+        source: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        self.source_starts.push((video, session, source));
+        Ok(())
+    }
+    fn pump_source(&mut self, video: u64, _: u64, idr: bool) -> Result<bool, &'static str> {
+        self.source_pumps.push((video, idr));
+        Ok(true)
+    }
+    fn drain_source(&mut self, _: u64) -> Result<bool, &'static str> {
+        self.source_drains += 1;
+        Ok(true)
+    }
     fn capture_notice(
         &mut self,
         _: u64,
@@ -663,6 +712,7 @@ fn open() -> Operation {
         minimum_fps_target: 20.0,
         output: "display-1".into(),
         encoder: EncoderSelection::Identity(encoder_identity()),
+        encoder_provider: None,
         configuration: Box::new(Configuration {
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             slices_per_frame: 1,
@@ -2752,6 +2802,7 @@ fn provider_allowlist_controls_native_selection_and_every_cleanup_call() {
             minimum_fps_target,
             output,
             encoder,
+            encoder_provider: None,
             configuration,
         },
         _ => unreachable!(),
@@ -4402,4 +4453,309 @@ fn registered_external_capture_routes_control_and_cpu_frames_by_identity() {
     tick(&mut pipeline, &mut runtime, &mut plane, 16);
     assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "acme.capture/1" && payload["action"] == "close")));
     assert!(pipeline.streams.contains_key(&2));
+}
+
+#[test]
+fn external_encoder_keeps_control_and_native_affinity_through_cleanup() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline
+        .encoder_providers
+        .insert("vendor".into(), "example.encode/1".into());
+    let mut operation = auto_open();
+    if let Operation::Open {
+        encoder_provider,
+        operation_id,
+        ..
+    } = &mut operation
+    {
+        *encoder_provider = Some("vendor".into());
+        *operation_id = Some("external-test".into());
+    }
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert_eq!(
+        pipeline.streams[&1].response(1)["encoder_provider"],
+        "vendor"
+    );
+    assert!(
+        plane
+            .selected_encoders
+            .iter()
+            .all(|service| service == "example.encode/1")
+    );
+    for action in ["enumerate", "probe", "open"] {
+        assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "example.encode/1" && payload["action"] == action)), "missing {action}");
+    }
+    pipeline.handle("bob", 100, Operation::Close { stream: 1 }, &mut |command| {
+        runtime.send(command)
+    });
+    assert!(pipeline.streams.contains_key(&1));
+    pipeline.handle(
+        "alice",
+        101,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "example.encode/1" && payload["action"] == "close" && payload["session_id"] == 51)));
+    assert!(
+        !runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Request {service, ..} if service == ENCODE))
+    );
+}
+
+#[test]
+fn external_encoder_rejects_unknown_and_raw_service_selection() {
+    let (mut pipeline, mut runtime, _) = setup();
+    for provider in ["missing", "example.encode/1"] {
+        let mut operation = open();
+        if let Operation::Open {
+            encoder_provider, ..
+        } = &mut operation
+        {
+            *encoder_provider = Some(provider.into());
+        }
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            "encoder_provider_not_allowed"
+        );
+    }
+    assert!(pipeline.streams.is_empty());
+}
+
+#[test]
+fn source_open_owns_operation_without_opening_capture_and_routes_cleanup() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.encode-provider/1".into(),
+            source_ids: [42].into(),
+        },
+    );
+    let source = |source_id| Operation::OpenSource {
+        packet_boundaries: true,
+        operation_id: Some("source-op".into()),
+        source_id,
+        encoder_options: None,
+        encoder_provider: "fixture".into(),
+        encoder: EncoderSelection::Identity(encoder_identity()),
+        configuration: Box::new(open_configuration()),
+    };
+    pipeline.handle("alice", 99, source(42), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert_eq!(plane.source_starts, vec![(1, 51, 42)]);
+    assert!(plane.geometry_checks.is_empty());
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "example.encode/1" && payload["action"] == "open" && payload["source_id"] == 42 && payload["mode"] == "source")));
+    assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if capture_provider_for_service(service).is_some() && payload["action"] == "open")));
+    pipeline.handle("alice", 100, source(42), &mut |command| {
+        runtime.send(command)
+    });
+    assert_eq!(runtime.completed.last().unwrap().1["stream"], 1);
+    pipeline.handle("alice", 101, source(43), &mut |command| {
+        runtime.send(command)
+    });
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "encoder_source_not_allowed"
+    );
+    pipeline.handle("bob", 102, Operation::Close { stream: 1 }, &mut |command| {
+        runtime.send(command)
+    });
+    assert_eq!(runtime.completed.last().unwrap().1["code"], "not_found");
+    pipeline.handle(
+        "alice",
+        103,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 10);
+    assert!(!pipeline.streams.contains_key(&1));
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "example.encode/1" && payload["action"] == "close" && payload["session_id"] == 51)));
+    assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if capture_provider_for_service(service).is_some() && matches!(payload["action"].as_str(), Some("lookup" | "close")))));
+}
+
+#[test]
+fn explicitly_registered_generic_consumer_routes_capture_to_generic_plane() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline
+        .encoder_providers
+        .insert("vendor".into(), "example.encode/1".into());
+    pipeline.encoder_consumers.insert("vendor".into());
+    let mut operation = open();
+    if let Operation::Open {
+        encoder_provider, ..
+    } = &mut operation
+    {
+        *encoder_provider = Some("vendor".into());
+    }
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(pipeline.streams[&1].frame_path, FramePath::Generic);
+    assert!(plane.frame_paths.contains(&FramePath::Generic));
+}
+
+#[test]
+fn generic_drain_keeps_capture_and_consumer_until_output_finishes() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline
+        .encoder_providers
+        .insert("vendor".into(), "example.encode/1".into());
+    pipeline.encoder_consumers.insert("vendor".into());
+    let mut operation = open();
+    if let Operation::Open {
+        encoder_provider, ..
+    } = &mut operation
+    {
+        *encoder_provider = Some("vendor".into());
+    }
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 6);
+    plane.retired_events.clear();
+    runtime.commands.clear();
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::Drain { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Draining);
+    assert_eq!(plane.drains, 1);
+    assert!(plane.retired_events.is_empty());
+    assert!(!runtime.commands.iter().any(
+        |command| matches!(command, Command::Request {payload, ..} if payload["action"] == "close")
+    ));
+}
+
+#[test]
+fn generic_missing_callback_ack_fails_before_frame_forwarding() {
+    for missing_capture in [true, false] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        pipeline
+            .encoder_providers
+            .insert("vendor".into(), "example.encode/1".into());
+        pipeline.encoder_consumers.insert("vendor".into());
+        runtime.omit_capture_contract = missing_capture;
+        runtime.omit_encoder_contract = !missing_capture;
+        let mut operation = open();
+        if let Operation::Open {
+            encoder_provider, ..
+        } = &mut operation
+        {
+            *encoder_provider = Some("vendor".into());
+        }
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 12);
+        assert!(plane.frame_paths.is_empty());
+        let expected = if missing_capture {
+            "resource_capture_clock_unconfirmed"
+        } else {
+            "resource_clock_unconfirmed"
+        };
+        assert!(
+            pipeline
+                .recent
+                .iter()
+                .any(|(_, status)| status["error"] == expected)
+        );
+    }
+}
+
+#[test]
+fn source_options_are_forwarded_and_part_of_operation_identity() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.encode-provider/1".into(),
+            source_ids: [42].into(),
+        },
+    );
+    let source = |options| Operation::OpenSource {
+        packet_boundaries: false,
+        operation_id: Some("source-options".into()),
+        source_id: 42,
+        encoder_options: Some(options),
+        encoder_provider: "fixture".into(),
+        encoder: EncoderSelection::Identity(encoder_identity()),
+        configuration: Box::new(open_configuration()),
+    };
+    pipeline.handle("alice", 99, source(json!({"quality":7})), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {payload, ..} if payload["action"] == "open" && payload["encoder_options"] == json!({"quality":7}))));
+    pipeline.handle("alice", 100, source(json!({"quality":8})), &mut |command| {
+        runtime.send(command)
+    });
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "operation_conflict"
+    );
+}
+
+#[test]
+fn external_options_require_explicit_alias_and_preserve_replay_identity() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline
+        .encoder_providers
+        .insert("vendor".into(), "example.encode/1".into());
+    let specification = |alias: Option<&str>, quality| OpenSpec {
+        packet_boundaries: false,
+        operation_id: Some("external-options".into()),
+        provider: CaptureProvider::Dxgi,
+        auto_capture: false,
+        constant_rate: false,
+        wgc_pacing_smoothing: true,
+        minimum_fps_target: 20.0,
+        output: "display-1".into(),
+        encoder: EncoderSelection::Identity(encoder_identity()),
+        encoder_provider: alias.map(str::to_owned),
+        source_id: None,
+        encoder_options: Some(json!({"quality":quality})),
+        configuration: open_configuration(),
+    };
+    pipeline.handle(
+        "alice",
+        98,
+        Operation::OpenWithOptions {
+            specification: Box::new(specification(None, 1)),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "encoder_options_require_external_provider"
+    );
+    pipeline.handle(
+        "alice",
+        99,
+        Operation::OpenWithOptions {
+            specification: Box::new(specification(Some("vendor"), 1)),
+        },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "example.encode/1" && payload["action"] == "open" && payload["encoder_options"] == json!({"quality":1}))));
+    pipeline.handle(
+        "alice",
+        100,
+        Operation::OpenWithOptions {
+            specification: Box::new(specification(Some("vendor"), 2)),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "operation_conflict"
+    );
 }

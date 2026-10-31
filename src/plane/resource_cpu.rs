@@ -17,7 +17,7 @@ struct Offers {
     invalid: bool,
 }
 
-fn none(descriptor: &FrameDescriptor) -> bool {
+pub(super) fn none(descriptor: &FrameDescriptor) -> bool {
     descriptor.kind == FRAME_SYNC_NONE
         && descriptor.version == 0
         && descriptor.size == 0
@@ -28,7 +28,7 @@ fn none(descriptor: &FrameDescriptor) -> bool {
 
 // The legacy CPU submission does not carry source color metadata. Accept only
 // unspecified color until that interface can validate or convert it.
-fn unspecified_color(color: &FrameColorMetadata) -> bool {
+pub(super) fn unspecified_color(color: &FrameColorMetadata) -> bool {
     let no_components =
         color.primaries == 0 && color.transfer == 0 && color.matrix == 0 && color.range == 0;
     no_components
@@ -38,7 +38,7 @@ fn unspecified_color(color: &FrameColorMetadata) -> bool {
 
 // This bridge does not use provider timestamps for pacing or compare clock
 // domains. Validate both envelopes independently without inferring an epoch.
-fn valid_clock(clock: &FrameClockMetadata) -> bool {
+pub(super) fn valid_clock(clock: &FrameClockMetadata) -> bool {
     if clock.version == 0 {
         return clock.size == 0
             && clock.domain == 0

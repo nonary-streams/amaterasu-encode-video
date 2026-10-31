@@ -247,6 +247,14 @@ impl ExternalProviderRegistration {
     }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceEncoderRegistration {
+    pub control_service: String,
+    pub native_service: String,
+    pub source_ids: BTreeSet<u64>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -256,6 +264,12 @@ pub struct Settings {
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default)]
     pub external_capture_providers: BTreeMap<String, ExternalProviderRegistration>,
+    #[serde(default)]
+    pub external_encoder_providers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub external_encoder_consumers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub source_encoder_providers: BTreeMap<String, SourceEncoderRegistration>,
     #[serde(default)]
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
@@ -285,6 +299,9 @@ impl Default for Settings {
             enabled: false,
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
+            external_encoder_providers: BTreeMap::new(),
+            external_encoder_consumers: BTreeMap::new(),
+            source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
             require_frame_lease: false,
@@ -293,8 +310,56 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    fn source_services_distinct(&self) -> bool {
+        let mut occupied: BTreeSet<&str> = BTreeSet::new();
+        occupied.insert("amaterasu.encode/1");
+        for provider in &self.capture_providers {
+            if !occupied.insert(provider.service()) {
+                return false;
+            }
+        }
+        for registration in self.external_capture_providers.values() {
+            if !occupied.insert(registration.service()) {
+                return false;
+            }
+        }
+        for service in self.external_encoder_providers.values() {
+            if !occupied.insert(service) {
+                return false;
+            }
+        }
+        for service in [
+            self.cpu_processor_service.as_deref(),
+            self.gpu_processor_service.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !occupied.insert(service) {
+                return false;
+            }
+        }
+        for service in self.external_encoder_consumers.values() {
+            if !occupied.insert(service) {
+                return false;
+            }
+        }
+        let mut source_controls = BTreeSet::new();
+        self.source_encoder_providers.values().all(|registration| {
+            source_controls.insert(registration.control_service.as_str())
+                && (self
+                    .external_encoder_providers
+                    .values()
+                    .any(|service| service == &registration.control_service)
+                    || occupied.insert(&registration.control_service))
+                && occupied.insert(&registration.native_service)
+        })
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
-        if (self.capture_providers.is_empty() && self.external_capture_providers.is_empty())
+        if (self.capture_providers.is_empty()
+            && self.external_capture_providers.is_empty()
+            && self.source_encoder_providers.is_empty())
+            || !self.source_services_distinct()
             || self
                 .capture_providers
                 .iter()
@@ -308,6 +373,43 @@ impl Settings {
                 .as_ref()
                 .is_some_and(|service| !valid_external_service(service))
             || (self.cpu_processor_service.is_some() && self.gpu_processor_service.is_some())
+            || self.external_encoder_consumers.len() > 16
+            || self
+                .external_encoder_consumers
+                .iter()
+                .any(|(alias, service)| {
+                    !self.external_encoder_providers.contains_key(alias)
+                        || !valid_external_service(service)
+                })
+            || self.source_encoder_providers.len() > 16
+            || self
+                .source_encoder_providers
+                .iter()
+                .any(|(id, registration)| {
+                    !valid_provider_identity(id)
+                        || id == "builtin"
+                        || self.external_encoder_providers.contains_key(id)
+                        || !valid_external_service(&registration.control_service)
+                        || !valid_external_service(&registration.native_service)
+                        || registration.control_service == registration.native_service
+                        || registration.control_service == "amaterasu.encode/1"
+                        || registration.source_ids.is_empty()
+                        || registration.source_ids.contains(&0)
+                        || registration.source_ids.len() > 64
+                })
+            || self.external_encoder_providers.len() > 16
+            || self.external_encoder_providers.iter().any(|(id, service)| {
+                !valid_provider_identity(id)
+                    || id == "builtin"
+                    || !valid_external_service(service)
+                    || service == "amaterasu.encode/1"
+            })
+            || self
+                .external_encoder_providers
+                .values()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.external_encoder_providers.len()
             || self.external_capture_providers.len() > 16
             || self.external_capture_providers.iter().any(|(id, service)| {
                 !valid_provider_identity(id)
@@ -493,6 +595,30 @@ impl Configuration {
         Ok(())
     }
 
+    pub fn validate_source(&self) -> bool {
+        self.video_stream_format.validate().is_ok()
+            && ((self.video_stream_format.bit_depth == 8
+                && self.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Sdr)
+                || (cfg!(target_os = "linux")
+                    && self.video_stream_format.bit_depth == 10
+                    && self.video_stream_format.dynamic_range
+                        == amaterasu_module_sdk::DynamicRange::Hdr))
+            && (1..=16384).contains(&self.width)
+            && (1..=16384).contains(&self.height)
+            && self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
+            && (1..=1000).contains(&self.fps)
+            && (1..=1_000_000_000).contains(&self.bitrate)
+            && self.max_reference_frames <= 16
+            && self.slices_per_frame >= 1
+            && self.color_mode.is_default()
+            && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
+            && self.nvenc_settings == amaterasu_module_sdk::NvencSettings::default()
+            && self.sw_preset.is_none()
+            && self.sw_tune.is_none()
+    }
+
     pub fn validate(&self) -> bool {
         self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
@@ -537,6 +663,9 @@ pub struct OpenSpec {
     pub minimum_fps_target: f64,
     pub output: String,
     pub encoder: EncoderSelection,
+    pub encoder_provider: Option<String>,
+    pub source_id: Option<u64>,
+    pub encoder_options: Option<serde_json::Value>,
     pub configuration: Configuration,
 }
 
@@ -562,6 +691,19 @@ pub enum Operation {
         wgc_pacing_smoothing: bool,
         minimum_fps_target: f64,
         output: String,
+        encoder: EncoderSelection,
+        encoder_provider: Option<String>,
+        configuration: Box<Configuration>,
+    },
+    OpenWithOptions {
+        specification: Box<OpenSpec>,
+    },
+    OpenSource {
+        packet_boundaries: bool,
+        operation_id: Option<String>,
+        source_id: u64,
+        encoder_options: Option<serde_json::Value>,
+        encoder_provider: String,
         encoder: EncoderSelection,
         configuration: Box<Configuration>,
     },
@@ -611,8 +753,15 @@ enum OperationInput {
         wgc_pacing_smoothing: bool,
         #[serde(default = "default_minimum_fps_target")]
         minimum_fps_target: f64,
+        #[serde(default)]
         output: String,
+        #[serde(default)]
+        source_id: Option<u64>,
+        #[serde(default)]
+        encoder_options: Option<serde_json::Value>,
         encoder: EncoderSelection,
+        #[serde(default)]
+        encoder_provider: Option<String>,
         configuration: Box<Configuration>,
     },
     Lookup {
@@ -711,9 +860,35 @@ impl<'de> Deserialize<'de> for Operation {
                 wgc_pacing_smoothing,
                 minimum_fps_target,
                 output,
+                source_id,
+                encoder_options,
                 encoder,
+                encoder_provider,
                 configuration,
             } => {
+                if let Some(source_id) = source_id {
+                    let Some(encoder_provider) = encoder_provider else {
+                        return Err(serde::de::Error::custom("source encoder provider required"));
+                    };
+                    if capture_provider.0.is_some()
+                        || capture.0.is_some()
+                        || constant_rate.0.is_some()
+                        || !output.is_empty()
+                    {
+                        return Err(serde::de::Error::custom(
+                            "source mode cannot specify capture",
+                        ));
+                    }
+                    return Ok(Self::OpenSource {
+                        packet_boundaries,
+                        operation_id,
+                        source_id,
+                        encoder_options,
+                        encoder_provider,
+                        encoder,
+                        configuration,
+                    });
+                }
                 let (provider, auto_capture, constant_rate) = if let Some(capture) = capture.0 {
                     // The canonical source mode owns its rate behavior, even when
                     // a caller also supplies the legacy constant_rate field. The
@@ -726,6 +901,25 @@ impl<'de> Deserialize<'de> for Operation {
                         constant_rate.0.unwrap_or(false),
                     )
                 };
+                if let Some(options) = encoder_options {
+                    return Ok(Self::OpenWithOptions {
+                        specification: Box::new(OpenSpec {
+                            packet_boundaries,
+                            operation_id,
+                            provider,
+                            auto_capture,
+                            constant_rate,
+                            wgc_pacing_smoothing,
+                            minimum_fps_target,
+                            output,
+                            encoder,
+                            encoder_provider,
+                            source_id: None,
+                            encoder_options: Some(options),
+                            configuration: *configuration,
+                        }),
+                    });
+                }
                 Self::Open {
                     packet_boundaries,
                     operation_id,
@@ -736,6 +930,7 @@ impl<'de> Deserialize<'de> for Operation {
                     minimum_fps_target,
                     output,
                     encoder,
+                    encoder_provider,
                     configuration,
                 }
             }
@@ -1223,6 +1418,9 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
+            external_encoder_providers: BTreeMap::new(),
+            external_encoder_consumers: BTreeMap::new(),
+            source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
             require_frame_lease: false,
@@ -1245,6 +1443,9 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
+            external_encoder_providers: BTreeMap::new(),
+            external_encoder_consumers: BTreeMap::new(),
+            source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
             require_frame_lease: false,
@@ -1345,5 +1546,108 @@ mod tests {
                 serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
             assert_eq!(settings.validate(), Err("invalid_video_settings"));
         }
+    }
+    #[test]
+    fn external_encoder_settings_reject_untrusted_or_duplicate_services() {
+        let valid: Settings = serde_json::from_value(
+            json!({"external_encoder_providers":{"vendor":"example.encode/1"}}),
+        )
+        .unwrap();
+        assert!(valid.validate().is_ok());
+        for mapping in [
+            json!({"builtin":"example.encode/1"}),
+            json!({"vendor":"amaterasu.encode/1"}),
+            json!({"vendor":"example.encode/2"}),
+            json!({"a":"example.encode/1","b":"example.encode/1"}),
+        ] {
+            let settings: Settings =
+                serde_json::from_value(json!({"external_encoder_providers":mapping})).unwrap();
+            assert_eq!(settings.validate(), Err("invalid_video_settings"));
+        }
+        let mapping: BTreeMap<String, String> = (0..17)
+            .map(|n| (format!("p{n}"), format!("example.encoder{n}/1")))
+            .collect();
+        let settings: Settings =
+            serde_json::from_value(json!({"external_encoder_providers":mapping})).unwrap();
+        assert_eq!(settings.validate(), Err("invalid_video_settings"));
+    }
+    #[test]
+    fn source_and_resource_services_must_be_distinct_and_source_only_is_allowed() {
+        let valid = json!({"capture_providers":[], "source_encoder_providers": {"s":{"control_service":"example.control/1", "native_service":"example.native/1", "source_ids":[42]}}});
+        assert!(
+            serde_json::from_value::<Settings>(valid.clone())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        let mut collision = valid.clone();
+        collision["source_encoder_providers"]["other"] = json!({"control_service":"example.other/1", "native_service":"example.native/1", "source_ids":[43]});
+        assert_eq!(
+            serde_json::from_value::<Settings>(collision)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+        let mut collision = valid.clone();
+        collision["gpu_processor_service"] = json!("example.native/1");
+        assert_eq!(
+            serde_json::from_value::<Settings>(collision)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+        let mut bad_source = valid;
+        bad_source["source_encoder_providers"]["s"]["source_ids"] = json!([0]);
+        assert_eq!(
+            serde_json::from_value::<Settings>(bad_source)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+        let shared = json!({"external_encoder_providers":{"v":"example.control/1"}, "source_encoder_providers":{"s":{"control_service":"example.control/1","native_service":"example.source/1","source_ids":[42]}}, "external_encoder_consumers":{"v":"example.consumer/1"}});
+        assert!(
+            serde_json::from_value::<Settings>(shared)
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        let ambiguous = json!({"external_capture_providers":{"c":"example.shared/1"}, "external_encoder_providers":{"v":"example.shared/1"}});
+        assert_eq!(
+            serde_json::from_value::<Settings>(ambiguous)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+        let collision = json!({"external_encoder_providers":{"v":"example.encoder/1"},"external_encoder_consumers":{"v":"example.encoder/1"}});
+        assert_eq!(
+            serde_json::from_value::<Settings>(collision)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+        let orphan = json!({"external_encoder_consumers":{"v":"example.consumer/1"}});
+        assert_eq!(
+            serde_json::from_value::<Settings>(orphan)
+                .unwrap()
+                .validate(),
+            Err("invalid_video_settings")
+        );
+    }
+    #[test]
+    fn source_validation_allows_standard_sdr_codecs_and_rejects_unhandled_depth() {
+        for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+            let mut configuration: Configuration = serde_json::from_value(
+                json!({"width":4096,"height":2160,"fps":144,"bitrate":1_000_000}),
+            )
+            .unwrap();
+            configuration.codec = codec;
+            configuration.normalize_codec().unwrap();
+            assert!(configuration.validate_source());
+        }
+        let mut configuration: Configuration =
+            serde_json::from_value(json!({"width":16,"height":16,"fps":60,"bitrate":1_000_000}))
+                .unwrap();
+        configuration.video_stream_format.bit_depth = 10;
+        assert!(!configuration.validate_source());
     }
 }

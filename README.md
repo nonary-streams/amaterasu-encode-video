@@ -530,8 +530,15 @@ An object can also explicitly set `"frame_transport":"cpu"`. External providers
 implement the existing capture control open/lookup/close contract. CPU providers
 use the v1.0 frame interface; DMA-BUF providers require the v1.4 capture and v1.1
 encoder tails and an encoder whose enumeration lists DMA-BUF input. Optional
-v1.5 presentation pacing is detected from the native table. External DMA-BUF
-streams are pinned and fail if their required capability is unavailable; they
+v1.5 presentation pacing is detected from the native table. Providers advertising
+capture v1.8 use a negotiated standard retainable DMA-BUF resource instead and
+require an encoder with v1.2 lease submission. Video checks the offered format,
+size and synchronization schemas; the encoder checks importability on submission.
+Video selects the first structurally compatible offer and does not retry later
+offers if the encoder rejects its format or modifier. The current VKMS provider
+publishes one offer. The producer's immutable reference remains retained for asynchronous GPU work,
+and completion fences are transferred back through the resource release contract.
+External DMA-BUF streams are pinned and fail if their required capability is unavailable; they
 do not fall back to PipeWire. Video applies frame validation, owner isolation,
 settlement and cleanup. Registration alone does not install, start, or grant a
 provider.

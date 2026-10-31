@@ -56,6 +56,9 @@ impl ManagedModule for Video {
                     &runtime,
                     queues.clone(),
                     &settings.resolved_providers(),
+                    &settings.external_encoder_providers,
+                    &settings.source_encoder_providers,
+                    &settings.external_encoder_consumers,
                     settings.cpu_processor_service.as_deref(),
                     settings.gpu_processor_service.as_deref(),
                 )?
@@ -122,6 +125,7 @@ impl ManagedModule for Video {
 impl Drop for Video {
     fn drop(&mut self) {
         let runtime = &self.runtime;
+        self.pipeline.stop_native(&mut *self.plane);
         self.pipeline
             .shutdown(&mut |command| runtime.send_ephemeral(command));
     }
