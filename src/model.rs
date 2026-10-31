@@ -183,6 +183,11 @@ impl Configuration {
     pub fn software_tune(&self) -> &str {
         self.sw_tune.as_deref().unwrap_or("zerolatency")
     }
+    pub fn is_hdr(&self) -> bool {
+        self.video_stream_format.bit_depth == 10
+            && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         self.video_stream_format.validate()?;
         if self.video_stream_format != amaterasu_module_sdk::VideoStreamFormat::H264_SDR
@@ -191,8 +196,9 @@ impl Configuration {
         {
             return Err("conflicting_video_codec");
         }
-        if self.video_stream_format.bit_depth != 8
-            || self.video_stream_format.dynamic_range != amaterasu_module_sdk::DynamicRange::Sdr
+        if !(self.video_stream_format.bit_depth == 8
+            && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Sdr)
+            && !(cfg!(target_os = "linux") && self.is_hdr() && self.color_mode.is_default())
         {
             return Err("video_format_unsupported_by_encoder");
         }
@@ -315,6 +321,8 @@ pub struct EncoderDescription {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DescriptionCapabilities {
+    #[serde(skip_serializing_if = "is_false")]
+    pub hdr10: bool,
     /// Accepted frame sources: `cpu` (CpuFrame) and `dmabuf` (DmaBufFrame).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<&'static str>,
@@ -393,6 +401,7 @@ mod tests {
             ["codec", "hardware", "identity", "name", "vendor_id"]
         );
         description.capabilities = DescriptionCapabilities {
+            hdr10: false,
             inputs: vec!["cpu", "dmabuf"],
             max_width: Some(4096),
             max_height: Some(2304),

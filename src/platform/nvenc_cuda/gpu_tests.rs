@@ -381,6 +381,7 @@ impl GbmBuffer {
                 HEIGHT,
                 TOP_XRGB,
                 BOTTOM_XRGB,
+                u32::from_le_bytes(*b"XR24"),
                 &mut buffer,
             )
         };
@@ -500,4 +501,163 @@ fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
     assert_stream_signal(codec, mode, &probe(codec, &path));
     assert_decoded_colours(&decode(codec, &path), mode);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
+fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
+    let top = (719 << 20) | (321 << 10) | 183;
+    let bottom = (201 << 20) | (553 << 10) | 877;
+    let node = CString::new(
+        std::env::var("AMATERASU_TEST_RENDER_NODE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
+    )
+    .unwrap();
+    let mut raw = TestBuffer {
+        device: std::ptr::null_mut(),
+        buffer: std::ptr::null_mut(),
+        render_fd: -1,
+        dmabuf_fd: -1,
+        pitch: 0,
+        offset: 0,
+        modifier: 0,
+    };
+    // SAFETY: the test retains this owned allocation through all synchronous reads.
+    let result = unsafe {
+        amaterasu_nvcuda_test_allocate_gbm(
+            node.as_ptr(),
+            WIDTH,
+            HEIGHT,
+            top,
+            bottom,
+            u32::from_le_bytes(*b"AR30"),
+            &mut raw,
+        )
+    };
+    assert_eq!(result, 0, "RGB10 allocation failed");
+    let buffer = GbmBuffer(raw);
+    for codec in [Codec::Hevc, Codec::Av1] {
+        let description = published()
+            .into_iter()
+            .find(|entry| entry.codec == codec.token())
+            .unwrap();
+        let mut config = configuration(codec, ColorMode::Bt709Limited);
+        config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: if codec == Codec::Hevc {
+                amaterasu_module_sdk::VideoCodec::Hevc
+            } else {
+                amaterasu_module_sdk::VideoCodec::Av1
+            },
+            bit_depth: 10,
+            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+        };
+        let mut encoder = Encoder::open(&description.identity, &config)
+            .unwrap_or_else(|error| panic!("{error}: {:?}", super::last_open_failure()));
+        let mut packets = Vec::new();
+        for sequence in 1..=FRAMES {
+            let mut frame = buffer.frame(sequence);
+            frame.fourcc = u32::from_le_bytes(*b"AR30");
+            frame.color = DMABUF_COLOR_BT2020_PQ;
+            // SAFETY: allocation and descriptors outlive this synchronous duplication.
+            let owned = unsafe { crate::input::DmaBufInput::duplicate(&frame) }.unwrap();
+            encoder
+                .submit_gpu(
+                    GpuInput::DmaBuf(owned),
+                    (sequence * 333_333) as i64,
+                    sequence == 1,
+                )
+                .unwrap();
+            packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
+        }
+        encoder.drain().unwrap();
+        packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
+        assert_eq!(packets.len() as u64, FRAMES);
+        let path = stream_file(
+            codec,
+            "hdr10",
+            packets.into_iter().map(|packet| packet.bytes),
+        );
+        let info = probe(codec, &path);
+        let stream = &info;
+        assert_eq!(stream["pix_fmt"], "yuv420p10le", "{stream}");
+        assert_eq!(stream["color_range"], "tv", "{stream}");
+        if codec == Codec::Hevc {
+            assert_eq!(stream["profile"], "Main 10", "{stream}");
+        }
+        assert_eq!(stream["color_primaries"], "bt2020", "{stream}");
+        assert_eq!(stream["color_transfer"], "smpte2084", "{stream}");
+        assert_eq!(stream["color_space"], "bt2020nc", "{stream}");
+        let decoded = Command::new("ffmpeg")
+            .args(["-v", "error", "-threads", "2", "-f", demuxer(codec), "-i"])
+            .arg(&path)
+            .args([
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let pixels: Vec<u16> = decoded
+            .stdout
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| u16::from_le_bytes([v[0], v[1]]))
+            .collect();
+        assert_eq!(pixels.len(), (WIDTH * HEIGHT * 3 / 2) as usize);
+        let rows = super::color::hdr_conversion_rows();
+        for (color, y) in [(top, HEIGHT / 4), (bottom, HEIGHT * 3 / 4)] {
+            let rgb = [
+                ((color >> 20) & 1023) as f32 / 1023.0,
+                ((color >> 10) & 1023) as f32 / 1023.0,
+                (color & 1023) as f32 / 1023.0,
+            ];
+            let expected = |row: [f32; 4]| {
+                ((row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + row[3]) * 1023.0).round()
+                    as u16
+            };
+            let at = (y * WIDTH + WIDTH / 2) as usize;
+            let chroma_at = ((y / 2) * (WIDTH / 2) + WIDTH / 4) as usize;
+            for (actual, want) in [
+                (pixels[at], expected(rows.luma)),
+                (
+                    pixels[(WIDTH * HEIGHT) as usize + chroma_at],
+                    expected(rows.cb),
+                ),
+                (
+                    pixels[(WIDTH * HEIGHT * 5 / 4) as usize + chroma_at],
+                    expected(rows.cr),
+                ),
+            ] {
+                assert!(
+                    actual.abs_diff(want) <= 8,
+                    "{codec:?} sample {actual}, expected {want}"
+                );
+            }
+        }
+        if let Some(directory) = std::env::var_os("AMATERASU_HDR_TEST_OUTPUT") {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::copy(
+                &path,
+                directory.join(format!("hdr10-{}.bin", codec.token())),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join(format!("hdr10-{}.json", codec.token())),
+                serde_json::to_vec_pretty(&probe(codec, &path)).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

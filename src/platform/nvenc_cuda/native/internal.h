@@ -173,6 +173,7 @@ struct am_gl_pass {
     GLuint program;
     GLint source;
     GLint rows[2];
+    GLint ten_bit;
 };
 
 /* GPU RGB -> NV12 converter owned by one encoder. The EGL context is current
@@ -196,6 +197,7 @@ struct am_converter {
     CUgraphicsResource chroma_resource;
     uint32_t width;
     uint32_t height;
+    uint32_t bit_depth;
     float luma_row[4];
     float cb_row[4];
     float cr_row[4];

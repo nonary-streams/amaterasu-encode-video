@@ -56,6 +56,7 @@ fn record_open_failure(status: NativeStatus) {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct NativeCodecCaps {
+    hdr10: u32,
     supported: u32,
     max_width: u32,
     max_height: u32,
@@ -76,6 +77,7 @@ impl NativeDevice {
         pci_bus_id: [0; 32],
         name: [0; 256],
         codecs: [NativeCodecCaps {
+            hdr10: 0,
             supported: 0,
             max_width: 0,
             max_height: 0,
@@ -89,6 +91,7 @@ impl NativeDevice {
             pci_bus_id: c_string(&self.pci_bus_id),
             name: c_string(&self.name),
             codecs: self.codecs.map(|caps| CodecCaps {
+                hdr10: caps.hdr10 != 0,
                 supported: caps.supported != 0,
                 max_width: caps.max_width,
                 max_height: caps.max_height,
@@ -248,6 +251,7 @@ unsafe extern "C" {
         height: u32,
         top_xrgb: u32,
         bottom_xrgb: u32,
+        format: u32,
         buffer: *mut TestBuffer,
     ) -> i32;
     pub(super) fn amaterasu_nvcuda_test_release_gbm(buffer: *mut TestBuffer);
@@ -379,8 +383,8 @@ impl Encoder {
             draining: false,
         };
         encoder.input_support = InputSupport {
-            gpu_bgra_conversion: true,
-            dmabuf: encoder.import_support(),
+            gpu_bgra_conversion: !configuration.is_hdr(),
+            dmabuf: encoder.import_support(configuration.is_hdr()),
         };
         Ok(encoder)
     }
@@ -389,9 +393,20 @@ impl Encoder {
         self.input_support.clone()
     }
 
-    fn import_support(&self) -> Option<Arc<DmaBufImportSupport>> {
+    fn import_support(&self, hdr: bool) -> Option<Arc<DmaBufImportSupport>> {
         let mut support = DmaBufImportSupport::default();
         for fourcc in IMPORT_FOURCCS {
+            if hdr
+                && ![
+                    u32::from_le_bytes(*b"XR30"),
+                    u32::from_le_bytes(*b"AR30"),
+                    u32::from_le_bytes(*b"XB30"),
+                    u32::from_le_bytes(*b"AB30"),
+                ]
+                .contains(&fourcc)
+            {
+                continue;
+            }
             let mut modifiers = [0u64; MAX_MODIFIERS_PER_FORMAT];
             let mut count = 0u32;
             let mut implicit = 0u32;
@@ -627,6 +642,7 @@ mod tests {
             *slot = *byte as c_char;
         }
         device.codecs[2] = NativeCodecCaps {
+            hdr10: 0,
             supported: 1,
             max_width: 8192,
             max_height: 8192,

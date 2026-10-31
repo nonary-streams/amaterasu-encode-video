@@ -125,16 +125,21 @@ static struct am_test_egl_api egl_api;
 /* Clears image rows [0, rows). A texture attached to a framebuffer keeps GL
  * row 0 at the first row of its memory, which is image row 0 of the DMA-BUF. */
 static void clear_leading_rows(const struct am_test_egl_api *egl, uint32_t width, uint32_t rows,
-                               uint32_t xrgb) {
+                               uint32_t xrgb, uint32_t format) {
     egl->scissor(0, 0, (int)width, (int)rows);
-    egl->clear_color((float)((xrgb >> 16) & 0xff) / 255.0f, (float)((xrgb >> 8) & 0xff) / 255.0f,
-                     (float)(xrgb & 0xff) / 255.0f, 1.0f);
+    if (format == GBM_FORMAT_ARGB2101010) {
+        egl->clear_color((float)((xrgb >> 20) & 1023) / 1023.0f, (float)((xrgb >> 10) & 1023) / 1023.0f,
+                         (float)(xrgb & 1023) / 1023.0f, 1.0f);
+    } else {
+        egl->clear_color((float)((xrgb >> 16) & 0xff) / 255.0f, (float)((xrgb >> 8) & 0xff) / 255.0f,
+                         (float)(xrgb & 0xff) / 255.0f, 1.0f);
+    }
     egl->clear(AM_TEST_GL_COLOR_BUFFER_BIT);
 }
 
 /* Renders image rows [0, height/2) as `top_xrgb` and the rest as `bottom_xrgb`. */
 static int fill(struct gbm_device *device, const struct am_nvcuda_test_buffer *out,
-                uint32_t width, uint32_t height, uint32_t top_xrgb, uint32_t bottom_xrgb) {
+                uint32_t width, uint32_t height, uint32_t top_xrgb, uint32_t bottom_xrgb, uint32_t format) {
     struct am_test_egl_api *egl = &egl_api;
     if (egl->get_proc_address == NULL && !load_test_egl(egl)) {
         return 0;
@@ -156,7 +161,7 @@ static int fill(struct gbm_device *device, const struct am_nvcuda_test_buffer *o
     const EGLAttrib image_attributes[] = {
         EGL_WIDTH, (EGLAttrib)width,
         EGL_HEIGHT, (EGLAttrib)height,
-        EGL_LINUX_DRM_FOURCC_EXT, (EGLAttrib)GBM_FORMAT_XRGB8888,
+        EGL_LINUX_DRM_FOURCC_EXT, (EGLAttrib)format,
         EGL_DMA_BUF_PLANE0_FD_EXT, out->dmabuf_fd,
         EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLAttrib)out->offset,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLAttrib)out->pitch,
@@ -180,8 +185,8 @@ static int fill(struct gbm_device *device, const struct am_nvcuda_test_buffer *o
         if (egl->check_framebuffer_status(AM_TEST_GL_FRAMEBUFFER) ==
             AM_TEST_GL_FRAMEBUFFER_COMPLETE) {
             egl->enable(AM_TEST_GL_SCISSOR_TEST);
-            clear_leading_rows(egl, width, height, bottom_xrgb);
-            clear_leading_rows(egl, width, height / 2, top_xrgb);
+            clear_leading_rows(egl, width, height, bottom_xrgb, format);
+            clear_leading_rows(egl, width, height / 2, top_xrgb, format);
             egl->finish();
             filled = 1;
         }
@@ -201,7 +206,7 @@ static struct am_test_gbm_api gbm_api;
 
 int amaterasu_nvcuda_test_allocate_gbm(const char *render_node, uint32_t width,
                                        uint32_t height, uint32_t top_xrgb,
-                                       uint32_t bottom_xrgb,
+                                       uint32_t bottom_xrgb, uint32_t format,
                                        struct am_nvcuda_test_buffer *out) {
     struct am_test_gbm_api *gbm = &gbm_api;
     memset(out, 0, sizeof(*out));
@@ -217,7 +222,7 @@ int amaterasu_nvcuda_test_allocate_gbm(const char *render_node, uint32_t width,
     struct gbm_device *device = gbm->create_device(out->render_fd);
     struct gbm_bo *buffer =
         device != NULL
-            ? gbm->bo_create(device, width, height, GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING)
+            ? gbm->bo_create(device, width, height, format, GBM_BO_USE_RENDERING)
             : NULL;
     out->device = device;
     out->buffer = buffer;
@@ -230,7 +235,7 @@ int amaterasu_nvcuda_test_allocate_gbm(const char *render_node, uint32_t width,
     out->offset = gbm->bo_get_offset(buffer, 0);
     out->modifier = gbm->bo_get_modifier(buffer);
     if (out->dmabuf_fd < 0 ||
-        !fill(device, out, width, height, top_xrgb, bottom_xrgb)) {
+        !fill(device, out, width, height, top_xrgb, bottom_xrgb, format)) {
         amaterasu_nvcuda_test_release_gbm(out);
         return AM_NVCUDA_ALLOCATION_FAILED;
     }

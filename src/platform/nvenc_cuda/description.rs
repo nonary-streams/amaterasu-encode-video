@@ -11,6 +11,7 @@ const HARDWARE_URL_PREFIX: &str = "pci:";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecCaps {
+    pub hdr10: bool,
     pub supported: bool,
     pub max_width: u32,
     pub max_height: u32,
@@ -78,6 +79,7 @@ fn describe(device: &DeviceRecord, codec: Codec) -> Option<EncoderDescription> {
         hardware: true,
         vendor_id: Some(NVIDIA_VENDOR_ID),
         capabilities: DescriptionCapabilities {
+            hdr10: codec != Codec::H264 && caps.hdr10 && device.dmabuf_import,
             inputs,
             max_width: Some(caps.max_width.min(CONFIGURATION_MAX_WIDTH)),
             max_height: Some(caps.max_height.min(CONFIGURATION_MAX_HEIGHT)),
@@ -91,6 +93,7 @@ mod tests {
 
     fn caps(max_width: u32, max_height: u32) -> CodecCaps {
         CodecCaps {
+            hdr10: true,
             supported: true,
             max_width,
             max_height,

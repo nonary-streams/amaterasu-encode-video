@@ -68,6 +68,7 @@ struct am_nvcuda_struct_versions {
 };
 
 struct am_nvcuda_codec_caps {
+    uint32_t hdr10;
     uint32_t supported;
     uint32_t max_width;
     uint32_t max_height;
@@ -86,6 +87,7 @@ struct am_nvcuda_device {
 
 struct am_nvcuda_settings {
     uint32_t codec;
+    uint32_t bit_depth;
     uint32_t width;
     uint32_t height;
     uint32_t fps;
@@ -186,7 +188,7 @@ struct am_nvcuda_test_buffer {
 };
 int amaterasu_nvcuda_test_allocate_gbm(const char *render_node, uint32_t width,
                                        uint32_t height, uint32_t top_xrgb,
-                                       uint32_t bottom_xrgb,
+                                       uint32_t bottom_xrgb, uint32_t format,
                                        struct am_nvcuda_test_buffer *buffer);
 void amaterasu_nvcuda_test_release_gbm(struct am_nvcuda_test_buffer *buffer);
 

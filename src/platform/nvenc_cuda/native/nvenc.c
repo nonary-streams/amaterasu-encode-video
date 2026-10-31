@@ -32,6 +32,7 @@ struct am_nvcuda_encoder {
     int bitstream_locked;
     struct am_converter converter;
     uint32_t codec;
+    uint32_t bit_depth;
     uint32_t width;
     uint32_t height;
     int draining;
@@ -77,10 +78,10 @@ static const GUID *codec_guid(uint32_t codec) {
 
 /* Moonlight's constrained H.264 decoders get Baseline (no CABAC, no B);
  * HEVC and AV1 use their 8-bit 4:2:0 Main profiles. */
-static const GUID *profile_guid(uint32_t codec) {
+static const GUID *profile_guid(uint32_t codec, uint32_t bit_depth) {
     switch (codec) {
     case AM_NVCUDA_CODEC_H264: return &NV_ENC_H264_PROFILE_BASELINE_GUID;
-    case AM_NVCUDA_CODEC_HEVC: return &NV_ENC_HEVC_PROFILE_MAIN_GUID;
+    case AM_NVCUDA_CODEC_HEVC: return bit_depth == 10 ? &NV_ENC_HEVC_PROFILE_MAIN10_GUID : &NV_ENC_HEVC_PROFILE_MAIN_GUID;
     case AM_NVCUDA_CODEC_AV1: return &NV_ENC_AV1_PROFILE_MAIN_GUID;
     default: return NULL;
     }
@@ -157,8 +158,8 @@ static int codec_listed(const NV_ENCODE_API_FUNCTION_LIST *functions, void *sess
     return 0;
 }
 
-static int accepts_nv12(const NV_ENCODE_API_FUNCTION_LIST *functions, void *session,
-                        const GUID *codec) {
+static int accepts_format(const NV_ENCODE_API_FUNCTION_LIST *functions, void *session,
+                        const GUID *codec, NV_ENC_BUFFER_FORMAT format) {
     NV_ENC_BUFFER_FORMAT formats[AM_MAX_INPUT_FORMATS];
     uint32_t count = 0;
     if (functions->nvEncGetInputFormats(session, *codec, formats, AM_MAX_INPUT_FORMATS,
@@ -166,7 +167,7 @@ static int accepts_nv12(const NV_ENCODE_API_FUNCTION_LIST *functions, void *sess
         return 0;
     }
     for (uint32_t index = 0; index < count && index < AM_MAX_INPUT_FORMATS; ++index) {
-        if (formats[index] == NV_ENC_BUFFER_FORMAT_NV12) {
+        if (formats[index] == format) {
             return 1;
         }
     }
@@ -182,7 +183,7 @@ static void probe_codec(const NV_ENCODE_API_FUNCTION_LIST *functions,
     int max_width = 0;
     int max_height = 0;
     int rate_control = 0;
-    if (!codec_listed(functions, session, guid) || !accepts_nv12(functions, session, guid) ||
+    if (!codec_listed(functions, session, guid) || !accepts_format(functions, session, guid, NV_ENC_BUFFER_FORMAT_NV12) ||
         !query_cap(functions, versions, session, guid, NV_ENC_CAPS_WIDTH_MAX, &max_width) ||
         !query_cap(functions, versions, session, guid, NV_ENC_CAPS_HEIGHT_MAX, &max_height) ||
         !query_cap(functions, versions, session, guid, NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES,
@@ -190,6 +191,10 @@ static void probe_codec(const NV_ENCODE_API_FUNCTION_LIST *functions,
         (rate_control & NV_ENC_PARAMS_RC_CBR) == 0 || max_width <= 0 || max_height <= 0) {
         return;
     }
+    int ten_bit = 0;
+    caps->hdr10 = codec != AM_NVCUDA_CODEC_H264 &&
+        query_cap(functions, versions, session, guid, NV_ENC_CAPS_SUPPORT_10BIT_ENCODE, &ten_bit) &&
+        ten_bit && accepts_format(functions, session, guid, NV_ENC_BUFFER_FORMAT_YUV420_10BIT);
     caps->supported = 1;
     caps->max_width = (uint32_t)max_width;
     caps->max_height = (uint32_t)max_height;
@@ -281,7 +286,8 @@ int amaterasu_nvcuda_enumerate(const struct am_nvcuda_struct_versions *candidate
 }
 
 static int validate_settings(const struct am_nvcuda_settings *settings) {
-    return codec_guid(settings->codec) != NULL && settings->width >= 16 &&
+    return codec_guid(settings->codec) != NULL &&
+           (settings->bit_depth == 8 || (settings->bit_depth == 10 && settings->codec != AM_NVCUDA_CODEC_H264)) && settings->width >= 16 &&
            settings->height >= 16 && settings->width % 2 == 0 && settings->height % 2 == 0 &&
            settings->fps >= 1 && settings->fps <= 240 && settings->bitrate >= 100000 &&
            settings->reference_frames <= 16 && settings->full_range <= 1;
@@ -324,8 +330,8 @@ static void configure_hevc(NV_ENC_CONFIG_HEVC *hevc, const struct am_nvcuda_sett
     hevc->sliceMode = 3;
     hevc->sliceModeData = 1;
     hevc->chromaFormatIDC = 1;
-    hevc->inputBitDepth = NV_ENC_BIT_DEPTH_8;
-    hevc->outputBitDepth = NV_ENC_BIT_DEPTH_8;
+    hevc->inputBitDepth = settings->bit_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+    hevc->outputBitDepth = hevc->inputBitDepth;
     hevc->maxNumRefFramesInDPB = settings->reference_frames;
     hevc->numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
     configure_vui(&hevc->hevcVUIParameters, settings);
@@ -338,8 +344,8 @@ static void configure_av1(NV_ENC_CONFIG_AV1 *av1, const struct am_nvcuda_setting
     av1->repeatSeqHdr = 1;
     av1->idrPeriod = NVENC_INFINITE_GOPLENGTH;
     av1->chromaFormatIDC = 1;
-    av1->inputBitDepth = NV_ENC_BIT_DEPTH_8;
-    av1->outputBitDepth = NV_ENC_BIT_DEPTH_8;
+    av1->inputBitDepth = settings->bit_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+    av1->outputBitDepth = av1->inputBitDepth;
     av1->colorPrimaries = (NV_ENC_VUI_COLOR_PRIMARIES)settings->color_primaries;
     av1->transferCharacteristics =
         (NV_ENC_VUI_TRANSFER_CHARACTERISTIC)settings->transfer_characteristics;
@@ -364,6 +370,15 @@ static int configure_encoder(struct am_nvcuda_encoder *encoder,
         am_set_status(status, AM_STAGE_CAPS, 0);
         return AM_NVCUDA_UNSUPPORTED;
     }
+    if (settings->bit_depth == 10) {
+        int ten_bit = 0;
+        if (!query_cap(&encoder->functions, &encoder->versions, encoder->session, codec,
+                       NV_ENC_CAPS_SUPPORT_10BIT_ENCODE, &ten_bit) || !ten_bit ||
+            !accepts_format(&encoder->functions, encoder->session, codec, NV_ENC_BUFFER_FORMAT_YUV420_10BIT)) {
+            am_set_status(status, AM_STAGE_CAPS, 0);
+            return AM_NVCUDA_UNSUPPORTED;
+        }
+    }
     int custom_vbv = 0;
     int multiple_references = 0;
     query_cap(&encoder->functions, &encoder->versions, encoder->session, codec,
@@ -385,7 +400,7 @@ static int configure_encoder(struct am_nvcuda_encoder *encoder,
 
     NV_ENC_CONFIG config = preset.presetCfg;
     config.version = encoder->versions.config;
-    config.profileGUID = *profile_guid(settings->codec);
+    config.profileGUID = *profile_guid(settings->codec, settings->bit_depth);
     config.gopLength = NVENC_INFINITE_GOPLENGTH;
     config.frameIntervalP = 1;
     config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
@@ -460,7 +475,7 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
     /* One allocation: luma rows followed by interleaved chroma rows, both at
      * the same pitch, which is the layout NVENC expects for NV12. */
     CUresult cuda_status = encoder->driver->cuda.mem_alloc_pitch(
-        &encoder->input, &encoder->input_pitch, encoder->width,
+        &encoder->input, &encoder->input_pitch, encoder->width * (encoder->bit_depth == 10 ? 2 : 1),
         (size_t)encoder->height + encoder->height / 2, 16);
     if (cuda_status != CUDA_SUCCESS || encoder->input_pitch > UINT32_MAX) {
         am_set_status(status, AM_STAGE_INPUT, (int32_t)cuda_status);
@@ -474,7 +489,7 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
     resource.height = encoder->height;
     resource.pitch = (uint32_t)encoder->input_pitch;
     resource.resourceToRegister = (void *)(uintptr_t)encoder->input;
-    resource.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+    resource.bufferFormat = encoder->bit_depth == 10 ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
     resource.bufferUsage = NV_ENC_INPUT_IMAGE;
     native_status = encoder->functions.nvEncRegisterResource(encoder->session, &resource);
     if (native_status != NV_ENC_SUCCESS || resource.registeredResource == NULL) {
@@ -541,6 +556,7 @@ struct am_nvcuda_encoder *amaterasu_nvcuda_open(
     }
     encoder->driver = driver;
     encoder->codec = settings->codec;
+    encoder->bit_depth = settings->bit_depth;
     encoder->width = settings->width;
     encoder->height = settings->height;
     *result = open_encoder(encoder, pci_bus_id, candidates, candidate_count, settings, status);
@@ -569,7 +585,7 @@ static int input_writable(const struct am_nvcuda_encoder *encoder) {
 int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_t *nv12,
                                  size_t length, struct am_nvcuda_status *status) {
     size_t luma_bytes = encoder != NULL ? (size_t)encoder->width * encoder->height : 0;
-    if (!input_writable(encoder) || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
+    if (!input_writable(encoder) || encoder->bit_depth != 8 || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
@@ -594,7 +610,7 @@ int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_
 
 int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, const uint8_t *bgra,
                                  size_t length, struct am_nvcuda_status *status) {
-    if (!input_writable(encoder) || bgra == NULL ||
+    if (!input_writable(encoder) || encoder->bit_depth != 8 || bgra == NULL ||
         length != (size_t)encoder->width * encoder->height * 4u) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;

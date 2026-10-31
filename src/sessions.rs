@@ -600,6 +600,9 @@ impl Session {
 
     /// CPU conversion for backends without GPU conversion, and NV12 copies.
     fn cpu_nv12(&mut self, frame: &CpuFrame, bytes: &[u8]) -> Result<Vec<u8>, Status> {
+        if self.config.is_hdr() {
+            return Err(MEDIA_UNSUPPORTED);
+        }
         let conversion_started = Instant::now();
         let nv12 = match frame.format {
             PIXEL_BGRA8 => layout::bgra(
@@ -659,8 +662,12 @@ impl Session {
         if let Err(status) = frame.validate() {
             return status;
         }
-        // Only 8-bit SDR RGB is converted today; HDR frames fall back to CPU.
-        if frame.color != DMABUF_COLOR_SRGB || !import.supports(frame.fourcc, frame.modifier) {
+        let expected_color = if self.config.is_hdr() {
+            DMABUF_COLOR_BT2020_PQ
+        } else {
+            DMABUF_COLOR_SRGB
+        };
+        if frame.color != expected_color || !import.supports(frame.fourcc, frame.modifier) {
             return MEDIA_UNSUPPORTED;
         }
         match self.backend.has_gpu_submit_capacity() {

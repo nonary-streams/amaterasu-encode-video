@@ -11,6 +11,7 @@ use crate::model::Configuration;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeSettings {
     pub codec: u32,
+    pub bit_depth: u32,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -51,10 +52,19 @@ pub fn reference_frames(configuration: &Configuration, codec: Codec) -> u32 {
 }
 
 pub fn native_settings(configuration: &Configuration, codec: Codec) -> NativeSettings {
-    let color = signal(configuration.color_mode);
-    let rows = conversion_rows(configuration.color_mode);
+    let color = if configuration.is_hdr() {
+        super::color::hdr_signal()
+    } else {
+        signal(configuration.color_mode)
+    };
+    let rows = if configuration.is_hdr() {
+        super::color::hdr_conversion_rows()
+    } else {
+        conversion_rows(configuration.color_mode)
+    };
     NativeSettings {
         codec: codec.native_id(),
+        bit_depth: configuration.video_stream_format.bit_depth.into(),
         width: configuration.width,
         height: configuration.height,
         fps: configuration.fps,

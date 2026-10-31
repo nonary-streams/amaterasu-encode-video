@@ -428,6 +428,7 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
 /// Holds every GPU input it receives, blocking the first until released.
 struct HoldingBackend {
     gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
     held: Arc<Mutex<Vec<GpuInput>>>,
 }
 
@@ -451,6 +452,8 @@ impl WorkerBackend for HoldingBackend {
         }
     }
     fn submit_gpu(&mut self, input: GpuInput, _: i64, _: bool) -> Result<(), &'static str> {
+        *self.entered.0.lock().unwrap() = true;
+        self.entered.1.notify_all();
         let (released, changed) = &*self.gate;
         let mut released = released.lock().unwrap();
         while !*released {
@@ -465,8 +468,10 @@ impl WorkerBackend for HoldingBackend {
 fn worker_capacity_guarantees_acceptance_and_close_drops_queued_frames() {
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let held = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let mut worker = Worker::with_backend(HoldingBackend {
         gate: gate.clone(),
+        entered: entered.clone(),
         held: held.clone(),
     });
     assert!(worker.input_support().dmabuf.is_some());
@@ -486,6 +491,21 @@ fn worker_capacity_guarantees_acceptance_and_close_drops_queued_frames() {
         assert!(accepted <= 3, "capacity must stay bounded");
     }
     assert!(accepted >= 1);
+    // Establish that one input actually reached the backend before cancelling;
+    // otherwise a fast test thread can cancel the entire queue before it starts.
+    let (started, _) = entered
+        .1
+        .wait_timeout_while(
+            entered.0.lock().unwrap(),
+            std::time::Duration::from_secs(5),
+            |started| !*started,
+        )
+        .unwrap();
+    assert!(
+        *started,
+        "the worker did not start its first GPU submission"
+    );
+    drop(started);
     // Close while the first input is still inside the backend: queued
     // inputs are discarded with the channel, closing their duplicates.
     let closer = std::thread::spawn(move || drop(worker));

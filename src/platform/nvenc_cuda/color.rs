@@ -105,6 +105,44 @@ pub fn conversion_rows(mode: ColorMode) -> ConversionRows {
     }
 }
 
+/// HDR10 RGB input is already PQ/BT.2020; conversion changes only the matrix
+/// and limited-range code values, never the transfer function or primaries.
+pub fn hdr_signal() -> ColorSignal {
+    ColorSignal {
+        primaries: 9,
+        transfer: 16,
+        matrix: 9,
+        full_range: false,
+    }
+}
+
+pub fn hdr_conversion_rows() -> ConversionRows {
+    let kr = 0.2627_f64;
+    let kb = 0.0593_f64;
+    let kg = 1.0 - kr - kb;
+    let row = |weights: [f64; 3], scale: f64, offset: f64| {
+        [
+            (weights[0] * scale) as f32,
+            (weights[1] * scale) as f32,
+            (weights[2] * scale) as f32,
+            offset as f32,
+        ]
+    };
+    ConversionRows {
+        luma: row([kr, kg, kb], 876.0 / 1023.0, 64.0 / 1023.0),
+        cb: row(
+            [-kr / (2.0 * (1.0 - kb)), -kg / (2.0 * (1.0 - kb)), 0.5],
+            896.0 / 1023.0,
+            512.0 / 1023.0,
+        ),
+        cr: row(
+            [0.5, -kg / (2.0 * (1.0 - kr)), -kb / (2.0 * (1.0 - kr))],
+            896.0 / 1023.0,
+            512.0 / 1023.0,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -32,16 +32,19 @@ static const char vertex_source[] =
 static const char luma_source[] =
     "#version 330 core\n"
     "uniform sampler2D source;\n"
+    "uniform int ten_bit;\n"
     "uniform vec4 luma_row;\n"
     "layout(location = 0) out float luma;\n"
     "void main() {\n"
     "    vec3 rgb = texelFetch(source, ivec2(gl_FragCoord.xy), 0).rgb;\n"
-    "    luma = dot(luma_row.rgb, rgb) + luma_row.a;\n"
+    "    float code = clamp(dot(luma_row.rgb, rgb) + luma_row.a, 0.0, 1.0);\n"
+    "    luma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
     "}\n";
 
 static const char chroma_source[] =
     "#version 330 core\n"
     "uniform sampler2D source;\n"
+    "uniform int ten_bit;\n"
     "uniform vec4 cb_row;\n"
     "uniform vec4 cr_row;\n"
     "layout(location = 0) out vec2 chroma;\n"
@@ -51,7 +54,8 @@ static const char chroma_source[] =
     "                texelFetch(source, origin + ivec2(1, 0), 0).rgb +\n"
     "                texelFetch(source, origin + ivec2(0, 1), 0).rgb +\n"
     "                texelFetch(source, origin + ivec2(1, 1), 0).rgb) * 0.25;\n"
-    "    chroma = vec2(dot(cb_row.rgb, rgb) + cb_row.a, dot(cr_row.rgb, rgb) + cr_row.a);\n"
+    "    vec2 code = clamp(vec2(dot(cb_row.rgb, rgb) + cb_row.a, dot(cr_row.rgb, rgb) + cr_row.a), 0.0, 1.0);\n"
+    "    chroma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
     "}\n";
 
 static int load_gl_symbol(const struct am_egl_api *egl, const char *name, void *destination) {
@@ -185,9 +189,10 @@ static int build_pass(const struct am_gl_api *gl, const char *fragment_source,
     }
     pass->program = program;
     pass->source = gl->get_uniform_location(program, "source");
+    pass->ten_bit = gl->get_uniform_location(program, "ten_bit");
     pass->rows[0] = gl->get_uniform_location(program, first_row);
     pass->rows[1] = second_row != NULL ? gl->get_uniform_location(program, second_row) : -1;
-    return pass->source >= 0 && pass->rows[0] >= 0 && (second_row == NULL || pass->rows[1] >= 0);
+    return pass->ten_bit >= 0 && pass->source >= 0 && pass->rows[0] >= 0 && (second_row == NULL || pass->rows[1] >= 0);
 }
 
 static void set_sampling(const struct am_gl_api *gl) {
@@ -204,7 +209,7 @@ static GLuint allocate_texture(const struct am_gl_api *gl, GLint internal_format
     gl->bind_texture(GL_TEXTURE_2D, texture);
     set_sampling(gl);
     gl->tex_image_2d(GL_TEXTURE_2D, 0, internal_format, (GLsizei)width, (GLsizei)height, 0,
-                     format, GL_UNSIGNED_BYTE, NULL);
+                     format, (internal_format == GL_R16 || internal_format == GL_RG16) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, NULL);
     gl->bind_texture(GL_TEXTURE_2D, 0);
     return texture;
 }
@@ -234,9 +239,9 @@ static int create_gl_resources(struct am_converter *converter, struct am_nvcuda_
     converter->upload_texture =
         allocate_texture(gl, GL_RGBA8, GL_BGRA, converter->width, converter->height);
     converter->luma_texture =
-        allocate_texture(gl, GL_R8, GL_RED, converter->width, converter->height);
+        allocate_texture(gl, converter->bit_depth == 10 ? GL_R16 : GL_R8, GL_RED, converter->width, converter->height);
     converter->chroma_texture =
-        allocate_texture(gl, GL_RG8, GL_RG, converter->width / 2, converter->height / 2);
+        allocate_texture(gl, converter->bit_depth == 10 ? GL_RG16 : GL_RG8, GL_RG, converter->width / 2, converter->height / 2);
     converter->luma_framebuffer = attach_framebuffer(gl, converter->luma_texture);
     converter->chroma_framebuffer = attach_framebuffer(gl, converter->chroma_texture);
     GLenum error = gl->get_error();
@@ -273,6 +278,7 @@ int am_converter_open(struct am_converter *converter, const struct am_driver *dr
     converter->driver = driver;
     converter->width = settings->width;
     converter->height = settings->height;
+    converter->bit_depth = settings->bit_depth;
     memcpy(converter->luma_row, settings->luma_row, sizeof(converter->luma_row));
     memcpy(converter->cb_row, settings->cb_row, sizeof(converter->cb_row));
     memcpy(converter->cr_row, settings->cr_row, sizeof(converter->cr_row));
@@ -332,6 +338,7 @@ static void draw_pass(const struct am_converter *converter, const struct am_gl_p
     gl->active_texture(GL_TEXTURE0);
     gl->bind_texture(GL_TEXTURE_2D, source);
     gl->uniform1i(pass->source, 0);
+    gl->uniform1i(pass->ten_bit, converter->bit_depth == 10);
     gl->uniform4fv(pass->rows[0], 1, first_row);
     if (second_row != NULL) {
         gl->uniform4fv(pass->rows[1], 1, second_row);
@@ -575,9 +582,9 @@ int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destinati
         cuda->graphics_mapped_array(&luma, converter->luma_resource, 0, 0) == CUDA_SUCCESS &&
         cuda->graphics_mapped_array(&chroma, converter->chroma_resource, 0, 0) ==
             CUDA_SUCCESS &&
-        copy_plane(cuda, luma, destination, pitch, converter->width, converter->height) &&
+        copy_plane(cuda, luma, destination, pitch, converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height) &&
         copy_plane(cuda, chroma, destination + pitch * converter->height, pitch,
-                   converter->width, converter->height / 2);
+                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height / 2);
     CUresult unmapped = cuda->graphics_unmap(2, resources, NULL);
     CUresult synchronized = cuda->ctx_synchronize();
     if (!copied || unmapped != CUDA_SUCCESS || synchronized != CUDA_SUCCESS) {
