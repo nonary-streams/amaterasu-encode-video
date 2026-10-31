@@ -5,6 +5,7 @@ use super::*;
 impl Pipeline {
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         self.enabled = false;
+        self.observations.shutdown(send);
         if let Ok(mut queues) = self.queues.lock() {
             queues.clear();
         }

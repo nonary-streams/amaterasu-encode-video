@@ -4762,7 +4762,7 @@ fn external_options_require_explicit_alias_and_preserve_replay_identity() {
 #[test]
 fn capture_observations_require_a_complete_supported_native_identity() {
     let mut payload = json!({"observed_capture": {
-        "version": 1, "protocol": "wayland-wl-output", "registry_global": 17,
+        "version": 1, "protocol": "wayland-wl-output", "compositor_id":"ab".repeat(32), "registry_global": 17,
         "output_name": "Virtual-9", "width": 1920, "height": 1080,
         "refresh_millihz": 60000
     }});
@@ -4775,4 +4775,273 @@ fn capture_observations_require_a_complete_supported_native_identity() {
     payload["observed_capture"]["refresh_millihz"] = json!(0);
     assert!(super::observed_capture(&payload).is_err());
     assert!(super::observed_capture(&json!({})).unwrap().is_none());
+}
+
+#[test]
+fn fresh_capture_observation_rechecks_ownership_and_live_lease() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.provider = CaptureProvider::Pipewire;
+    stream.capture_output = "kwin:Virtual-12".into();
+    let capture = stream.capture.unwrap();
+    let operation = stream.capture_operation.clone();
+    let mut replies = Vec::new();
+    let mut source = json!({"ok":true,"stream":capture,"output":"kwin:Virtual-12","operation_id":operation,
+        "observed_capture":{"version":1,"protocol":"wayland-wl-output","compositor_id":"ab".repeat(32),"registry_global":73,
+        "output_name":"Virtual-12","width":1920,"height":1080,"refresh_millihz":60000}});
+    let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+        Ok(match command {
+            Command::Request {
+                service,
+                payload,
+                parent,
+                ..
+            } => {
+                assert_eq!(service, "amaterasu.capture-pipewire/1");
+                assert_eq!(payload["action"], "lookup");
+                assert_eq!(parent, Some(201));
+                Response::Accepted { id: 900 }
+            }
+            Command::CheckRequest { .. } => Response::Ok,
+            Command::TakeResult { .. } => Response::Result {
+                payload: source.clone(),
+            },
+            Command::Complete { request, payload } => {
+                replies.push((request, payload));
+                Response::Ok
+            }
+            _ => Response::Ok,
+        })
+    };
+    pipeline.handle(
+        "alice",
+        201,
+        Operation::ObserveCapture { stream: 1 },
+        &mut send,
+    );
+    pipeline.observations.tick(&pipeline.streams, &mut send);
+    drop(send);
+    assert_eq!(replies[0].1["observed_capture"]["width"], 1920);
+    source["observed_capture"]["width"] = json!(2560);
+    let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+        Ok(match command {
+            Command::Request { .. } => Response::Accepted { id: 901 },
+            Command::CheckRequest { .. } => Response::Ok,
+            Command::TakeResult { .. } => Response::Result {
+                payload: source.clone(),
+            },
+            Command::Complete { request, payload } => {
+                replies.push((request, payload));
+                Response::Ok
+            }
+            _ => Response::Ok,
+        })
+    };
+    pipeline.handle(
+        "alice",
+        202,
+        Operation::ObserveCapture { stream: 1 },
+        &mut send,
+    );
+    pipeline.observations.tick(&pipeline.streams, &mut send);
+    pipeline.handle(
+        "alice",
+        203,
+        Operation::ObserveCapture { stream: 1 },
+        &mut send,
+    );
+    pipeline.streams.get_mut(&1).unwrap().capture = Some(capture + 1);
+    pipeline.observations.tick(&pipeline.streams, &mut send);
+    pipeline.handle(
+        "mallory",
+        204,
+        Operation::ObserveCapture { stream: 1 },
+        &mut send,
+    );
+    drop(send);
+    assert_eq!(replies[1].1["observed_capture"]["width"], 2560);
+    assert_eq!(replies[2].1["code"], "capture_observation_unavailable");
+    assert_eq!(replies[3].1["code"], "not_found");
+}
+
+#[test]
+fn capture_observation_fails_closed_for_cancel_and_missing_native_evidence() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let mut completions = Vec::new();
+    let mut commands = Vec::new();
+    {
+        let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+            commands.push(command.clone());
+            Ok(match command {
+                Command::Request { .. } => Response::Accepted { id: 901 },
+                Command::CheckRequest { .. } => Response::error("request_ended", ""),
+                Command::Complete { request, payload } => {
+                    completions.push((request, payload));
+                    Response::Ok
+                }
+                _ => Response::Ok,
+            })
+        };
+        pipeline.handle(
+            "alice",
+            201,
+            Operation::ObserveCapture { stream: 1 },
+            &mut send,
+        );
+        let stream = pipeline.streams.get_mut(&1).unwrap();
+        stream.provider = CaptureProvider::Pipewire;
+        stream.capture_output = "kwin:Virtual-12".into();
+        pipeline.handle(
+            "alice",
+            202,
+            Operation::ObserveCapture { stream: 1 },
+            &mut send,
+        );
+        pipeline.observations.tick(&pipeline.streams, &mut send);
+    }
+    assert_eq!(completions[0].1["code"], "capture_observation_unavailable");
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { request: 901 }))
+    );
+    assert!(!completions.iter().any(|(request, _)| *request == 202));
+    let stream = &pipeline.streams[&1];
+    let payload = json!({"ok":true,"stream":stream.capture,"output":stream.capture_output,"operation_id":stream.capture_operation});
+    let mut result = Value::Null;
+    {
+        let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+            Ok(match command {
+                Command::Request { .. } => Response::Accepted { id: 902 },
+                Command::CheckRequest { .. } => Response::Ok,
+                Command::TakeResult { .. } => Response::Result {
+                    payload: payload.clone(),
+                },
+                Command::Complete { payload, .. } => {
+                    result = payload;
+                    Response::Ok
+                }
+                _ => Response::Ok,
+            })
+        };
+        pipeline.handle(
+            "alice",
+            203,
+            Operation::ObserveCapture { stream: 1 },
+            &mut send,
+        );
+        pipeline.observations.tick(&pipeline.streams, &mut send);
+    }
+    assert_eq!(result["code"], "capture_observation_unavailable");
+}
+
+#[test]
+fn observation_recovers_lost_admission_and_retries_result_release() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.provider = CaptureProvider::Pipewire;
+    stream.capture_output = "kwin:Virtual-12".into();
+    let payload = json!({"ok":true,"stream":stream.capture,"output":stream.capture_output,"operation_id":stream.capture_operation,
+        "observed_capture":{"version":1,"protocol":"wayland-wl-output","compositor_id":"ab".repeat(32),"registry_global":73,
+        "output_name":"Virtual-12","width":1920,"height":1080,"refresh_millihz":60000}});
+    let mut admissions = Vec::new();
+    let mut release_count = 0;
+    let mut completions = Vec::new();
+    let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+        Ok(match command {
+            Command::Request { .. } => {
+                admissions.push(command);
+                if admissions.len() == 1 {
+                    return Err("lost admission".into());
+                }
+                Response::Accepted { id: 800 }
+            }
+            Command::CheckRequest { .. } => Response::Ok,
+            Command::TakeResult { .. } => Response::Result {
+                payload: payload.clone(),
+            },
+            Command::ReleaseResult { .. } => {
+                release_count += 1;
+                if release_count == 1 {
+                    return Err("lost release".into());
+                }
+                Response::Ok
+            }
+            Command::Complete { request, payload } => {
+                completions.push((request, payload));
+                Response::Ok
+            }
+            _ => Response::Ok,
+        })
+    };
+    pipeline.handle(
+        "alice",
+        201,
+        Operation::ObserveCapture { stream: 1 },
+        &mut send,
+    );
+    pipeline.observations.tick(&pipeline.streams, &mut send);
+    pipeline.observations.tick(&pipeline.streams, &mut send);
+    drop(send);
+    assert_eq!(admissions.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&admissions[0]).unwrap(),
+        serde_json::to_value(&admissions[1]).unwrap()
+    );
+    assert_eq!(release_count, 2);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].1["ok"], true);
+}
+
+#[test]
+fn repeated_observations_release_each_broker_result() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.provider = CaptureProvider::Pipewire;
+    stream.capture_output = "kwin:Virtual-12".into();
+    let payload = json!({"ok":true,"stream":stream.capture,"output":stream.capture_output,"operation_id":stream.capture_operation,
+        "observed_capture":{"version":1,"protocol":"wayland-wl-output","compositor_id":"ab".repeat(32),"registry_global":73,
+        "output_name":"Virtual-12","width":1920,"height":1080,"refresh_millihz":60000}});
+    let mut releases = 0;
+    let mut successes = 0;
+    let mut send = |command: Command| -> amaterasu_module_sdk::ModuleResult<Response> {
+        Ok(match command {
+            Command::Request { .. } => Response::Accepted { id: 800 },
+            Command::CheckRequest { .. } => Response::Ok,
+            Command::TakeResult { .. } => Response::Result {
+                payload: payload.clone(),
+            },
+            Command::ReleaseResult { .. } => {
+                releases += 1;
+                Response::Ok
+            }
+            Command::Complete { payload, .. } => {
+                if payload["ok"] == true {
+                    successes += 1;
+                }
+                Response::Ok
+            }
+            _ => Response::Ok,
+        })
+    };
+    for request in 200..240 {
+        pipeline.handle(
+            "alice",
+            request,
+            Operation::ObserveCapture { stream: 1 },
+            &mut send,
+        );
+        pipeline.observations.tick(&pipeline.streams, &mut send);
+    }
+    drop(send);
+    assert_eq!(releases, 40);
+    assert_eq!(successes, 40);
 }

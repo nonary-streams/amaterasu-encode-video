@@ -1,6 +1,7 @@
 mod capture_events;
 mod encoder;
 mod lifecycle;
+mod observation;
 mod operations;
 mod output;
 mod owned_capture;
@@ -60,6 +61,7 @@ enum Stage {
 struct ObservedCapture {
     version: u32,
     protocol: String,
+    compositor_id: String,
     registry_global: u32,
     output_name: String,
     width: u32,
@@ -75,6 +77,11 @@ fn observed_capture(payload: &Value) -> Result<Option<ObservedCapture>, &'static
         serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_observation")?;
     if observed.version != 1
         || observed.protocol != "wayland-wl-output"
+        || observed.compositor_id.len() != 64
+        || !observed
+            .compositor_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || observed.registry_global == 0
         || observed.output_name.is_empty()
         || observed.output_name.len() > 127
@@ -139,7 +146,6 @@ struct Stream {
     uncertain: Option<Command>,
     settlement_attempts: u8,
     capture: Option<u64>,
-    observed_capture: Option<ObservedCapture>,
     desktop_geometry: Option<CaptureGeometry>,
     touch_port: Option<Value>,
     session: Option<u64>,
@@ -390,13 +396,6 @@ impl Stream {
         if let Some(geometry) = self.desktop_geometry {
             response["desktop_geometry"] = json!(geometry);
         }
-        if self.stage == Stage::Running
-            && let Some(observed) = &self.observed_capture
-        {
-            // This is the observation made when capture opened, not a live
-            // status query. A lifecycle binding must revalidate separately.
-            response["capture_open_observation"] = json!(observed);
-        }
         if let Some(touch_port) = &self.touch_port {
             response["touch_port"] = touch_port.clone();
         }
@@ -445,6 +444,7 @@ pub struct Pipeline {
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), operations::Record>,
     portal: portal::Control,
+    observations: observation::Control,
     pub queues: Arc<Mutex<Queues>>,
 }
 
@@ -481,6 +481,7 @@ impl Pipeline {
             streams: BTreeMap::new(),
             operations: BTreeMap::new(),
             portal: portal::Control::default(),
+            observations: observation::Control::default(),
             queues,
         }
     }
@@ -582,6 +583,10 @@ impl Pipeline {
                 send,
             ),
             Operation::Lookup { operation_id } => self.lookup(caller, request, &operation_id, send),
+            Operation::ObserveCapture { stream } => {
+                self.observations
+                    .begin(caller, request, stream, &self.epoch, &self.streams, send)
+            }
             Operation::ForceIdr { stream } => {
                 self.output_action(caller, request, stream, false, send)
             }
@@ -913,7 +918,6 @@ impl Pipeline {
                 uncertain: None,
                 settlement_attempts: 0,
                 capture: None,
-                observed_capture: None,
                 desktop_geometry: None,
                 touch_port: None,
                 session: None,
@@ -957,6 +961,7 @@ impl Pipeline {
 
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         self.portal.tick(send);
+        self.observations.tick(&self.streams, send);
         if self.streams.is_empty() {
             return;
         }
@@ -1971,13 +1976,10 @@ fn apply_result(
                 return false;
             };
             stream.capture = Some(capture);
-            stream.observed_capture = match observed_capture(&payload) {
-                Ok(observed) => observed,
-                Err(code) => {
-                    stream.cleanup(code);
-                    return false;
-                }
-            };
+            if let Err(code) = observed_capture(&payload) {
+                stream.cleanup(code);
+                return false;
+            }
             if stream.generic_input
                 && (payload.get("resource_capture_clock") != Some(&resource_capture_clock(stream))
                     || payload

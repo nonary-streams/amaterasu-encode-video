@@ -710,6 +710,9 @@ pub enum Operation {
     Lookup {
         operation_id: String,
     },
+    ObserveCapture {
+        stream: u64,
+    },
     Close {
         stream: u64,
     },
@@ -766,6 +769,9 @@ enum OperationInput {
     },
     Lookup {
         operation_id: String,
+    },
+    ObserveCapture {
+        stream: u64,
     },
     Close {
         stream: u64,
@@ -935,6 +941,7 @@ impl<'de> Deserialize<'de> for Operation {
                 }
             }
             OperationInput::Lookup { operation_id } => Self::Lookup { operation_id },
+            OperationInput::ObserveCapture { stream } => Self::ObserveCapture { stream },
             OperationInput::Close { stream } => Self::Close { stream },
             OperationInput::ForceIdr { stream } => Self::ForceIdr { stream },
             OperationInput::Drain { stream } => Self::Drain { stream },
