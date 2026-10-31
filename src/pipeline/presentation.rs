@@ -140,7 +140,7 @@ impl PresentationPacing {
     /// the frame-rate cap.
     pub(super) fn record(
         &mut self,
-        completed_at: Instant,
+        submitted_at: Instant,
         interval: Duration,
         delivery: PresentationDelivery,
     ) {
@@ -166,7 +166,7 @@ impl PresentationPacing {
         } else if delivery.pushed {
             self.fresh_pushes = self.fresh_pushes.saturating_add(1);
         }
-        self.advance_rate_cap(completed_at, interval);
+        self.advance_rate_cap(submitted_at, interval);
     }
 
     /// Keeps submits on a 1/fps grid. Each submit claims the next grid slot,

@@ -269,3 +269,16 @@ fn cpu_streams_never_query_presentations() {
     assert_eq!(plane.presentation_queries, 0);
     assert_eq!(status(&pipeline)["pacing"], "timer");
 }
+
+#[test]
+fn slow_gpu_submission_does_not_charge_a_second_frame_interval() {
+    let (mut pipeline, mut runtime, mut plane) = presentation_stream();
+    plane.pump_delay = Duration::from_millis(25);
+    present(&mut plane, 1, 1_000_000);
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    // The previous submit itself took longer than the 60 fps interval.
+    // A newly available presentation must not wait another interval after it.
+    present(&mut plane, 2, 1_016_667);
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    assert_eq!(counters(&pipeline).0, 2);
+}

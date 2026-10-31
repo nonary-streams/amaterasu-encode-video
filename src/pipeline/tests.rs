@@ -359,6 +359,7 @@ struct FakePlane {
     source_pumps: Vec<(u64, bool)>,
     source_drains: usize,
     calls: usize,
+    pump_delay: Duration,
     drains: usize,
     inputs: Vec<(CaptureProvider, bool, bool, bool, bool, u64, u64)>,
     dropped: bool,
@@ -481,6 +482,9 @@ impl Plane for FakePlane {
     }
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
+        if !self.pump_delay.is_zero() {
+            std::thread::sleep(self.pump_delay);
+        }
         self.calls += 1;
         self.inputs.push((
             input.provider,

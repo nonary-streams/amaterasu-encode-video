@@ -1269,8 +1269,11 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 return;
             }
             if presentation_paced {
+                // Pace capture starts. A synchronous GPU submission may spend
+                // most of a frame interval here; charging that time again
+                // delays the next fresh presentation after every encode.
                 stream.presentation.record(
-                    completed_at,
+                    now,
                     frame_interval,
                     presentation::PresentationDelivery {
                         pushed: trigger == CaptureTrigger::Presentation,
