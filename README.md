@@ -528,7 +528,12 @@ A string value registers a CPU-frame provider. To opt into DMA-BUF instead,
 use `"vendor":{"service":"vendor.capture/1","frame_transport":"dmabuf"}`.
 An object can also explicitly set `"frame_transport":"cpu"`. External providers
 implement the existing capture control open/lookup/close contract. CPU providers
-use the v1.0 frame interface; DMA-BUF providers require the v1.4 capture and v1.1
+require the v1.0 frame interface and can advertise the v1.2 freshness tail. Video
+uses that tail for any provider, including startup-selected external aliases;
+freshness is independent of provider identity. A stream declining that optional
+operation is read through the legacy callback only if no frame was delivered.
+Delivery followed by an unsupported result fails rather than duplicating the
+submission. DMA-BUF providers require the v1.4 capture and v1.1
 encoder tails and an encoder whose enumeration lists DMA-BUF input. Optional
 v1.5 presentation pacing is detected from the native table. Providers advertising
 capture v1.8 use a negotiated standard retainable DMA-BUF resource instead and
@@ -575,3 +580,26 @@ streams are removed from tracking, and encoder replacement retires the previous
 encoder. The built-in encoder's initial v1.2 implementation completes its source
 GPU copy synchronously rather than retaining provider callbacks on its worker.
 These contracts do not establish GPU hardware or client playback qualification.
+
+## Remaining provider abstraction boundaries
+
+The v1.2 source freshness contract is generic, but legacy capture v1.3 timing is
+still interpreted only for WGC. Its timestamps feed the WGC-specific pacing
+estimator; another provider needs an explicit negotiated clock/timing contract
+before video can safely apply that estimator. Constant-rate mode also remains
+restricted to WGC because the current control negotiation does not advertise
+that capability for other providers. A startup alias or a larger native table
+alone is not proof of compatible pacing semantics.
+
+External source encoders already select separate configured control and native
+services, but their output is adapted into the legacy `EncodedPacket`/`VideoApi`
+contract. That path still accepts H.264, HEVC, or AV1, with the corresponding
+framing and bounded output sizes. The legacy forwarding plane accepts at most
+8 MiB and 1024 fragments per access unit, with strictly increasing access-unit
+IDs. The source adapter rejects output beyond those limits before queueing the
+offending chunk. Supporting an unfamiliar codec or a large
+opaque encoded record requires producer-to-transport format negotiation and an
+output path carrying those agreed schemas end to end. Adding a provider alias
+does not remove those constraints. The generic binary transfer API supplies a
+buffer primitive; migrating this output path and validating its transport is
+separate integration work.

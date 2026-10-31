@@ -14,6 +14,8 @@ struct AccessUnit {
     submission: u64,
     timestamp: u64,
     picture_flags: u32,
+    bytes: usize,
+    fragments: usize,
 }
 
 /// Immutable negotiated identity. This adapter only accepts the formats that
@@ -188,7 +190,18 @@ impl ProviderOutput {
             submission: chunk.submission_id,
             timestamp: chunk.timestamp_us,
             picture_flags: chunk.flags & ENCODER_CHUNK_KEYFRAME,
+            bytes: self
+                .current
+                .map_or(0, |unit| unit.bytes)
+                .checked_add(chunk.bytes.len)
+                .ok_or(STATUS_INVALID_ARGUMENT)?,
+            fragments: self.current.map_or(0, |unit| unit.fragments) + 1,
         };
+        if unit.bytes > MAX_VIDEO_ACCESS_UNIT_BYTES
+            || unit.fragments > MAX_VIDEO_ACCESS_UNIT_FRAGMENTS
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
         match self.current {
             Some(current)
                 if start
@@ -202,7 +215,7 @@ impl ProviderOutput {
             None if !start
                 || self
                     .last
-                    .is_some_and(|last| unit.id == last.id || unit.timestamp < last.timestamp) =>
+                    .is_some_and(|last| unit.id <= last.id || unit.timestamp < last.timestamp) =>
             {
                 return Err(STATUS_INVALID_ARGUMENT);
             }

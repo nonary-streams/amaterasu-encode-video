@@ -241,3 +241,97 @@ fn detects_bad_callback_contract_and_stops() {
         STATUS_INVALID_ARGUMENT
     );
 }
+
+#[test]
+fn rejects_access_units_that_the_forwarding_plane_cannot_accept() {
+    let data = [1];
+    let mut mock = Mock {
+        chunk: chunk(&data),
+        calls: 0,
+        repeat: false,
+        no_callback: false,
+    };
+    let api = api(&mut mock);
+    let mut queues = Queues::default();
+    queues.open(9, "alice", 0);
+    let mut output = ProviderOutput::new(4, 9, &config()).unwrap();
+
+    let oversized = vec![0; MAX_VIDEO_ACCESS_UNIT_BYTES + 1];
+    mock.chunk.bytes = BorrowedBytes::new(&oversized);
+    std::hint::black_box(&mock);
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+    mock.chunk.bytes = BorrowedBytes::new(&data);
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_START;
+    for index in 0..MAX_VIDEO_ACCESS_UNIT_FRAGMENTS {
+        if index != 0 {
+            mock.chunk.flags = 0;
+        }
+        std::hint::black_box(&mock);
+        assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+        assert_eq!(pop(&mut queues), STATUS_OK);
+    }
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_END;
+    std::hint::black_box(&mock);
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+}
+
+#[test]
+fn rejects_oversized_cumulative_access_unit_before_queueing_last_chunk() {
+    let data = vec![0; MAX_VIDEO_ACCESS_UNIT_BYTES / 2 + 1];
+    let mut mock = Mock {
+        chunk: chunk(&data[..MAX_VIDEO_ACCESS_UNIT_BYTES / 2]),
+        calls: 0,
+        repeat: false,
+        no_callback: false,
+    };
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_START;
+    let api = api(&mut mock);
+    let mut queues = Queues::default();
+    queues.open(9, "alice", 0);
+    let mut output = ProviderOutput::new(4, 9, &config()).unwrap();
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    assert_eq!(pop(&mut queues), STATUS_OK);
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_END;
+    mock.chunk.bytes = BorrowedBytes::new(&data);
+    std::hint::black_box(&mock);
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+    mock.chunk.bytes = BorrowedBytes::new(&data[..MAX_VIDEO_ACCESS_UNIT_BYTES / 2]);
+    std::hint::black_box(&mock);
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    assert_eq!(pop(&mut queues), STATUS_OK);
+}
+
+#[test]
+fn rejects_decreasing_access_unit_sequences_before_queueing() {
+    let data = [1];
+    let mut mock = Mock {
+        chunk: chunk(&data),
+        calls: 0,
+        repeat: false,
+        no_callback: false,
+    };
+    let api = api(&mut mock);
+    let mut queues = Queues::default();
+    queues.open(9, "alice", 0);
+    let mut output = ProviderOutput::new(4, 9, &config()).unwrap();
+    mock.chunk.access_unit_id = 2;
+    std::hint::black_box(&mock);
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    mock.chunk.access_unit_id = 1;
+    std::hint::black_box(&mock);
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(pop(&mut queues), STATUS_OK);
+    assert_eq!(pop(&mut queues), MEDIA_PENDING);
+}

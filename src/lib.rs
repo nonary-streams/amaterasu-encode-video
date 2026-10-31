@@ -80,7 +80,7 @@ impl ManagedModule for Video {
         })?;
         // SAFETY: factory is boxed before registration and retained through module
         // lifetime. Signed dependency order stops consumers before destroying video.
-        unsafe { runtime.register_native(SERVICE, &factory.api) }?;
+        unsafe { amaterasu_module_sdk::video::register(&runtime, SERVICE, &factory.api) }?;
         Ok(Self {
             runtime,
             pipeline,

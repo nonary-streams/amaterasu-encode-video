@@ -1,6 +1,8 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
 mod capture_events;
 mod dmabuf;
+#[cfg(test)]
+mod freshness_tests;
 mod gpu_processor;
 mod lease_lifecycle;
 #[cfg(amaterasu_swscale)]
@@ -16,7 +18,9 @@ use crate::{
     queue::Queues,
 };
 use amaterasu_media::*;
-use amaterasu_module_sdk::{ModuleResult, NativeBinding, RuntimeClient, abi::*};
+use amaterasu_module_sdk::{
+    ModuleResult, NativeBinding, RuntimeClient, abi::*, media::native_contracts,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -270,7 +274,13 @@ impl NativePlane {
         // prefixes are required; optional tails are checked before each use.
         unsafe {
             for provider in providers {
-                match runtime.bind_native(provider.service(), 1, 0, CAPTURE_API_V1_0_SIZE) {
+                match runtime.bind_native_typed(
+                    provider.service(),
+                    native_contracts::CAPTURE,
+                    1,
+                    0,
+                    CAPTURE_API_V1_0_SIZE,
+                ) {
                     Ok(binding) => {
                         captures.insert(*provider, binding);
                     }
@@ -288,13 +298,20 @@ impl NativePlane {
             {
                 encoders.insert(
                     service.to_owned(),
-                    runtime.bind_native(service, 1, 0, size_of::<EncoderApi>() as u32)?,
+                    runtime.bind_native_typed(
+                        service,
+                        native_contracts::ENCODER,
+                        1,
+                        0,
+                        size_of::<EncoderApi>() as u32,
+                    )?,
                 );
             }
             let mut source_encoders = BTreeMap::new();
             for registration in source_providers.values() {
-                let binding = runtime.bind_native(
+                let binding = runtime.bind_native_typed(
                     &registration.native_service,
+                    native_contracts::ENCODER_PROVIDER,
                     ENCODER_PROVIDER_INTERFACE_MAJOR,
                     ENCODER_PROVIDER_INTERFACE_MINOR,
                     ENCODER_PROVIDER_API_V1_0_SIZE,
@@ -306,8 +323,9 @@ impl NativePlane {
                 let control = encoder_providers
                     .get(alias)
                     .ok_or("missing consumer encoder")?;
-                let binding = runtime.bind_native(
+                let binding = runtime.bind_native_typed(
                     service,
+                    native_contracts::FRAME_RESOURCE_CONSUMER,
                     FRAME_RESOURCE_CONSUMER_INTERFACE_MAJOR,
                     FRAME_RESOURCE_CONSUMER_INTERFACE_MINOR,
                     FRAME_RESOURCE_CONSUMER_API_V1_0_SIZE,
@@ -327,8 +345,9 @@ impl NativePlane {
                 active_encoder: ENCODE.to_owned(),
                 processor: processor_service
                     .map(|service| {
-                        runtime.bind_native(
+                        runtime.bind_native_typed(
                             service,
+                            native_contracts::CPU_PROCESSOR,
                             CPU_PROCESSOR_INTERFACE_MAJOR,
                             CPU_PROCESSOR_INTERFACE_MINOR,
                             CPU_PROCESSOR_API_V1_0_SIZE,
@@ -337,8 +356,9 @@ impl NativePlane {
                     .transpose()?,
                 gpu_processor: gpu_processor_service
                     .map(|service| {
-                        runtime.bind_native(
+                        runtime.bind_native_typed(
                             service,
+                            native_contracts::GPU_PROCESSOR,
                             GPU_PROCESSOR_INTERFACE_MAJOR,
                             GPU_PROCESSOR_INTERFACE_MINOR,
                             GPU_PROCESSOR_API_V1_0_SIZE,
@@ -904,21 +924,19 @@ impl Plane for NativePlane {
             // part of that prefix, so old providers do not expose an optional tail.
             let capture_api =
                 unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
-            let capture_timestamp_api = if input.provider == CaptureProvider::Wgc
-                && capture_timestamp_tail_available(capture_api.base.header)?
-            {
-                // SAFETY: v1.3 minor and full table size were verified above.
-                Some(
-                    unsafe { binding.table::<CaptureApiV1_3>() }
-                        .map_err(|_| "capture_interface")?,
-                )
-            } else {
-                None
-            };
-            let freshness_api = if capture_timestamp_api.is_none()
-                && input.provider == CaptureProvider::Wgc
-                && freshness_tail_available(capture_api.base.header)?
-            {
+            let capture_timestamp_api =
+                if capture_timestamp_tail_available(capture_api.base.header)? {
+                    // SAFETY: v1.3 minor and full table size were verified above.
+                    Some(
+                        unsafe { binding.table::<CaptureApiV1_3>() }
+                            .map_err(|_| "capture_interface")?,
+                    )
+                } else {
+                    None
+                };
+            // Keep the freshness tail available as a per-stream fallback.
+            // Reading the timestamp does not itself enable WGC pacing.
+            let freshness_api = if freshness_tail_available(capture_api.base.header)? {
                 // SAFETY: both v1.2 minor and full table size were verified above.
                 Some(
                     unsafe { binding.table::<CaptureApiV1_2>() }
@@ -1291,7 +1309,8 @@ fn capture(
         frame_copy_us: 0,
     };
     let callback_started = Instant::now();
-    let result = if let Some((resource_api, resource_selections)) = resource {
+    let uses_resource = resource.is_some();
+    let mut result = if let Some((resource_api, resource_selections)) = resource {
         resource_cpu::read(
             resource_api,
             input.capture,
@@ -1335,6 +1354,38 @@ fn capture(
         // SAFETY: stack sink borrows one frame and encoder copies accepted input.
         unsafe { (capture.read_frame)(capture.base.context, input.capture, sink) }
     };
+    // Optional callbacks may be unavailable for an individual stream. Retry only
+    // if no callback ran, preserving at-most-once frame submission.
+    if !uses_resource
+        && (capture_timestamp_api.is_some() || freshness_api.is_some())
+        && result == MEDIA_UNSUPPORTED
+        && !submission.called
+    {
+        if capture_timestamp_api.is_some()
+            && let Some(freshness_api) = freshness_api
+        {
+            let sink = FreshFrameSinkV1_2 {
+                context: (&mut submission as *mut Submission<'_>).cast(),
+                write: submit_with_freshness,
+            };
+            // SAFETY: the stack sink and borrowed frame remain live for this call.
+            result = unsafe {
+                (freshness_api.read_frame_with_freshness)(
+                    freshness_api.base.context,
+                    input.capture,
+                    sink,
+                )
+            };
+        }
+        if result == MEDIA_UNSUPPORTED && !submission.called {
+            let sink = FrameSink {
+                context: (&mut submission as *mut Submission<'_>).cast(),
+                write: submit,
+            };
+            // SAFETY: the stack sink and borrowed frame remain live for this call.
+            result = unsafe { (capture.read_frame)(capture.base.context, input.capture, sink) };
+        }
+    }
     if !matches!(result, STATUS_OK | MEDIA_PENDING | MEDIA_BUSY) {
         return Err("capture_failed");
     }

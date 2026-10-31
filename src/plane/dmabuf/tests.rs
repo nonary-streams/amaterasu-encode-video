@@ -946,7 +946,22 @@ unsafe extern "C" fn invoke_lifecycle_runtime(
     let fixture = unsafe { &*context.cast::<RuntimeFixture<'_>>() };
     let command: Command = serde_json::from_slice(unsafe { input.read() }.unwrap()).unwrap();
     let response = match command {
-        Command::NativeBind { service, .. } => {
+        Command::NativeBindTyped {
+            service, contract, ..
+        } => {
+            let expected_contract = match service.as_str() {
+                super::super::ENCODE | "example.encode/1" => {
+                    amaterasu_module_sdk::media::native_contracts::ENCODER
+                }
+                "fixture.gpu-processor/1" => {
+                    amaterasu_module_sdk::media::native_contracts::GPU_PROCESSOR
+                }
+                "amaterasu.capture-vkms/1" => {
+                    amaterasu_module_sdk::media::native_contracts::CAPTURE
+                }
+                _ => panic!("unexpected fixture service {service}"),
+            };
+            assert_eq!(contract, expected_contract);
             let (binding, address) = match service.as_str() {
                 super::super::ENCODE => (1, fixture.encoder),
                 "example.encode/1" => (4, fixture.external_encoder),
