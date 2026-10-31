@@ -141,6 +141,31 @@ unsafe extern "C" fn release(context: *mut c_void, fd: i32) {
     }
     unsafe { drop_reference(context) };
 }
+/// The generic envelope can describe the same color space already carried by
+/// the DMA-BUF. Absence and individually unknown components are compatible;
+/// explicit metadata must agree, because this adapter does no color conversion.
+fn color_matches_resource(color: &FrameColorMetadata, resource_color: u32) -> bool {
+    if super::super::resource_cpu::unspecified_color(color) {
+        return true;
+    }
+    if color.version != 1 || color.size != size_of::<FrameColorMetadata>() as u32 {
+        return false;
+    }
+    let (primaries, transfer) = match resource_color {
+        DMABUF_COLOR_SRGB => (FRAME_PRIMARIES_BT709, FRAME_TRANSFER_SRGB),
+        DMABUF_COLOR_BT2020_PQ => (FRAME_PRIMARIES_BT2020, FRAME_TRANSFER_PQ),
+        _ => return false,
+    };
+    [
+        (color.primaries, primaries),
+        (color.transfer, transfer),
+        (color.matrix, FRAME_MATRIX_RGB),
+        (color.range, FRAME_RANGE_FULL),
+    ]
+    .into_iter()
+    .all(|(actual, expected)| actual == FRAME_COLOR_UNKNOWN || actual == expected)
+}
+
 struct Delivery<'a> {
     common: LeasedSubmission<'a>,
     selected: CachedSelection,
@@ -165,7 +190,6 @@ unsafe extern "C" fn frame(context: *mut c_void, frame: *const CaptureResourceFr
         || frame.offer_generation != state.selected.generation
         || frame.offer_id != state.selected.selection.id
         || frame.reserved != 0
-        || !super::super::resource_cpu::unspecified_color(&frame.color)
         || !super::super::resource_cpu::valid_clock(&frame.clock)
         || !super::super::resource_cpu::valid_clock(&frame.pacing_clock)
         || !matches!(
@@ -186,6 +210,7 @@ unsafe extern "C" fn frame(context: *mut c_void, frame: *const CaptureResourceFr
     let gpu = unsafe { r.data.cast::<DmaBufFrame>().read_unaligned() };
     let caps = state.selected.selection.caps;
     if gpu.validate().is_err()
+        || !color_matches_resource(&frame.color, gpu.color)
         || gpu.width != frame.width
         || gpu.height != frame.height
         || gpu.timestamp_us != frame.timestamp_us
@@ -610,5 +635,53 @@ mod tests {
             STATUS_INVALID_ARGUMENT
         );
         assert!(invalid.invalid);
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_contradictory_color_without_inventing_a_conversion() {
+        let valid = FrameColorMetadata {
+            version: 1,
+            size: size_of::<FrameColorMetadata>() as u32,
+            primaries: FRAME_PRIMARIES_BT709,
+            transfer: FRAME_TRANSFER_SRGB,
+            matrix: FRAME_MATRIX_RGB,
+            range: FRAME_RANGE_FULL,
+        };
+        assert!(color_matches_resource(&valid, DMABUF_COLOR_SRGB));
+        assert!(!color_matches_resource(&valid, DMABUF_COLOR_BT2020_PQ));
+        for invalid in [
+            FrameColorMetadata { size: 0, ..valid },
+            FrameColorMetadata {
+                version: 2,
+                ..valid
+            },
+            FrameColorMetadata {
+                range: FRAME_RANGE_LIMITED,
+                ..valid
+            },
+            FrameColorMetadata {
+                matrix: FRAME_MATRIX_BT709,
+                ..valid
+            },
+            FrameColorMetadata {
+                transfer: FRAME_TRANSFER_PQ,
+                ..valid
+            },
+        ] {
+            assert!(!color_matches_resource(&invalid, DMABUF_COLOR_SRGB));
+        }
+        assert!(color_matches_resource(
+            &FrameColorMetadata {
+                primaries: FRAME_COLOR_UNKNOWN,
+                transfer: FRAME_COLOR_UNKNOWN,
+                ..valid
+            },
+            DMABUF_COLOR_SRGB
+        ));
     }
 }

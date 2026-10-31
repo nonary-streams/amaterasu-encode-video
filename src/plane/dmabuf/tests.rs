@@ -47,6 +47,8 @@ struct Harness {
     deliver_freshness: Cell<Option<u32>>,
     capture_status: Cell<Status>,
     frame_width: Cell<u32>,
+    frame_color: Cell<u32>,
+    resource_color: Cell<FrameColorMetadata>,
     plane_count: Cell<u32>,
     encoder_status: Cell<Status>,
     in_capture_callback: Cell<bool>,
@@ -78,6 +80,8 @@ impl Default for Harness {
             deliver_freshness: Cell::new(Some(CAPTURE_FRAME_FRESH)),
             capture_status: Cell::new(STATUS_OK),
             frame_width: Cell::new(16),
+            frame_color: Cell::new(DMABUF_COLOR_SRGB),
+            resource_color: Cell::new(FrameColorMetadata::default()),
             plane_count: Cell::new(1),
             encoder_status: Cell::new(STATUS_OK),
             in_capture_callback: Cell::new(false),
@@ -113,7 +117,7 @@ fn frame(harness: &Harness) -> DmaBufFrame {
         plane_count: harness.plane_count.get(),
         modifier: DRM_FORMAT_MOD_INVALID,
         planes,
-        color: DMABUF_COLOR_SRGB,
+        color: harness.frame_color.get(),
         reserved: 0,
         timestamp_us: 900,
         sequence: 44,
@@ -1184,7 +1188,7 @@ unsafe extern "C" fn resource_read(
         height: gpu.height,
         freshness: CAPTURE_FRAME_FRESH,
         reserved: 0,
-        color: Default::default(),
+        color: harness.resource_color.get(),
         clock: Default::default(),
         pacing_clock: Default::default(),
         resource: FrameDescriptor {
@@ -1309,4 +1313,62 @@ fn native_plane_selects_exact_registered_encoder_table() {
         std::ptr::from_ref(selected) as usize,
         std::ptr::from_ref(&builtin) as usize
     );
+}
+
+#[test]
+fn vkms_resource_color_metadata_reaches_the_encoder() {
+    for (color, primaries, transfer) in [
+        (
+            DMABUF_COLOR_SRGB,
+            FRAME_PRIMARIES_BT709,
+            FRAME_TRANSFER_SRGB,
+        ),
+        (
+            DMABUF_COLOR_BT2020_PQ,
+            FRAME_PRIMARIES_BT2020,
+            FRAME_TRANSFER_PQ,
+        ),
+    ] {
+        let harness = Harness::default();
+        harness.frame_color.set(color);
+        harness.resource_color.set(FrameColorMetadata {
+            version: 1,
+            size: std::mem::size_of::<FrameColorMetadata>() as u32,
+            primaries,
+            transfer,
+            matrix: FRAME_MATRIX_RGB,
+            range: FRAME_RANGE_FULL,
+        });
+        let mut base = leased_capture_api(&harness);
+        base.base.header = AbiHeader {
+            size: CAPTURE_API_V1_8_SIZE,
+            major: INTERFACE_MAJOR,
+            minor: CAPTURE_RESOURCE_INTERFACE_MINOR,
+        };
+        let capture = CaptureApiV1_8 {
+            base: CaptureApiV1_7 {
+                base,
+                subscribe_events: no_subscribe,
+                unsubscribe_events: no_unsubscribe,
+                resolve_swap: no_swap,
+            },
+            enumerate_resources: resource_enumerate,
+            select_resource: resource_select,
+            read_resource_frame: resource_read,
+        };
+        let encoder = leased_encoder_api(&harness);
+        let config = configuration();
+        let result = deliver_resource(
+            &capture,
+            &encoder,
+            None,
+            &pump(&config, true, false),
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("valid VKMS color metadata must not close the video stream");
+        assert!(result.submitted);
+        assert_eq!(harness.submitted.borrow().len(), 1);
+        finish_encoder(&harness);
+        assert_eq!(harness.retained.get(), 0);
+    }
 }
