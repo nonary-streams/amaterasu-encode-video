@@ -10,6 +10,7 @@ const MAX_REASON_BYTES: usize = 64;
 
 #[derive(Default)]
 pub(super) struct OwnedOutputCapture {
+    require_lease: bool,
     /// PipeWire capture of an owned KWin output, or explicitly pinned vkms capture.
     candidate: bool,
     /// `vkms` is in the startup provider allowlist.
@@ -28,6 +29,10 @@ pub(super) struct OwnedOutputCapture {
 }
 
 impl OwnedOutputCapture {
+    pub(super) fn require_lease(&mut self) {
+        self.require_lease = true;
+        self.cpu_provider = None;
+    }
     pub(super) fn new(provider: CaptureProvider, output: &str, vkms_allowed: bool) -> Self {
         let candidate = match provider {
             CaptureProvider::Pipewire => is_owned_kwin_output(output),
@@ -96,6 +101,7 @@ impl OwnedOutputCapture {
     }
 
     pub(super) fn write_status(&self, response: &mut Value) {
+        response["frame_lease_required"] = json!(self.require_lease);
         if !self.candidate {
             return;
         }
@@ -127,7 +133,8 @@ pub(super) fn select_capture_provider(stream: &mut Stream, plane: &dyn Plane) {
             stream.frame_path = FramePath::DmaBuf;
         }
         Some(reason)
-            if stream.provider == CaptureProvider::Vkms
+            if stream.owned_capture.require_lease
+                || stream.provider == CaptureProvider::Vkms
                 || stream.provider.uses_external_dmabuf() =>
         {
             stream.cleanup(reason)

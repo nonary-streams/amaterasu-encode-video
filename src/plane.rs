@@ -137,6 +137,14 @@ pub struct FrameMetadata {
     pub sequence: u64,
 }
 pub trait Plane {
+    fn hdr_metadata(
+        &mut self,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<HdrMetadata>, &'static str> {
+        Ok(None)
+    }
+
     fn verify_geometry(
         &mut self,
         provider: CaptureProvider,
@@ -188,6 +196,7 @@ pub trait Plane {
 }
 
 pub struct NativePlane {
+    require_frame_lease: bool,
     // Destroy downstream bindings before their source bindings. Drop first
     // quiesces every tracked lease while all of these bindings remain alive.
     encoder: NativeBinding,
@@ -205,6 +214,11 @@ pub struct NativePlane {
 }
 
 impl NativePlane {
+    pub fn with_required_frame_leases(mut self, required: bool) -> Self {
+        self.require_frame_lease = required;
+        self
+    }
+
     pub fn bind(
         runtime: &RuntimeClient,
         queues: Arc<Mutex<Queues>>,
@@ -230,6 +244,7 @@ impl NativePlane {
                 }
             }
             Ok(Self {
+                require_frame_lease: false,
                 captures,
                 unbound,
                 encoder: runtime.bind_native(ENCODE, 1, 0, size_of::<EncoderApi>() as u32)?,
@@ -573,6 +588,12 @@ impl Plane for NativePlane {
         let encoder = unsafe { self.encoder.table::<EncoderApi>() };
         match (capture, encoder) {
             (Ok(capture), Ok(encoder)) => {
+                if self.require_frame_lease
+                    && let Err(reason) =
+                        dmabuf::require_lease_path(capture.base.header, encoder.base.header)
+                {
+                    return Some(reason);
+                }
                 if let Err(reason) = dmabuf::use_lease_path(
                     capture.base.header,
                     encoder.base.header,
@@ -607,7 +628,33 @@ impl Plane for NativePlane {
         dmabuf::latest_presentation(api, capture)
     }
 
+    fn hdr_metadata(
+        &mut self,
+        provider: CaptureProvider,
+        stream: u64,
+    ) -> Result<Option<HdrMetadata>, &'static str> {
+        let Some(binding) = self.captures.get(&provider) else {
+            return Ok(None);
+        };
+        // SAFETY: inspect the prefix before using the optional v1.9 tail.
+        let prefix =
+            unsafe { binding.table::<NativeInterface>() }.map_err(|_| "capture_interface")?;
+        if prefix.header.minor < 9 || prefix.header.size < size_of::<CaptureApiV1_9>() as u32 {
+            return Ok(None);
+        }
+        let api = unsafe { binding.table::<CaptureApiV1_9>() }.map_err(|_| "capture_interface")?;
+        let mut metadata = HdrMetadata::default();
+        match unsafe { (api.hdr_metadata)(binding.context(), stream, &mut metadata) } {
+            STATUS_OK if metadata.enabled <= 1 && metadata.reserved == 0 => Ok(Some(metadata)),
+            MEDIA_PENDING | MEDIA_BUSY => Ok(None),
+            _ => Err("capture_hdr_metadata_unavailable"),
+        }
+    }
+
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
+        if self.require_frame_lease && input.frame_path != FramePath::DmaBuf {
+            return Err("capture_frame_lease_required");
+        }
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::DmaBuf {
             if self.processor.is_some() {
@@ -820,7 +867,7 @@ impl NativePlane {
                 !input.capture_due,
             )?;
             if let Some(reason) = progress.dmabuf_fallback {
-                if self.gpu_processor.is_some() {
+                if self.gpu_processor.is_some() || self.require_frame_lease {
                     return Err(reason);
                 }
                 if reason == "capture_dmabuf_lease_unsupported" {
@@ -828,6 +875,8 @@ impl NativePlane {
                 }
             }
             Ok(progress)
+        } else if self.require_frame_lease {
+            Err("capture_frame_lease_required")
         } else if self.gpu_processor.is_some() {
             Err("gpu_processor_requires_frame_lease")
         } else {

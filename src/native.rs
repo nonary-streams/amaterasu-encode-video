@@ -1,5 +1,5 @@
 use crate::queue::Queues;
-use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, VideoApiV1_1};
+use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, VideoApiV1_2};
 use amaterasu_module_sdk::abi::*;
 use std::{
     ffi::c_void,
@@ -27,7 +27,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: VideoApiV1_1,
+    api: VideoApiV1_2,
     queues: Arc<Mutex<Queues>>,
     caller: String,
 }
@@ -49,8 +49,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 1
-            || query.min_size as usize > size_of::<VideoApiV1_1>()
+            || query.min_minor > 2
+            || query.min_size as usize > size_of::<VideoApiV1_2>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -64,18 +64,19 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: VideoApiV1_1 {
+            api: VideoApiV1_2 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: size_of::<VideoApiV1_1>() as u32,
+                        size: size_of::<VideoApiV1_2>() as u32,
                         major: 1,
-                        minor: 1,
+                        minor: 2,
                     },
                     context: std::ptr::null_mut(),
                     release: Some(release),
                 },
                 receive,
                 geometry,
+                hdr_metadata,
             },
             queues: factory.queues.clone(),
             caller,
@@ -147,6 +148,34 @@ unsafe extern "C" fn geometry(
 
 fn guarded(operation: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
+unsafe extern "C" fn hdr_metadata(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut amaterasu_media::HdrMetadata,
+) -> Status {
+    guarded(|| {
+        if context.is_null()
+            || output.is_null()
+            || !(output as usize).is_multiple_of(align_of::<amaterasu_media::HdrMetadata>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller retains this binding and a writable output for the call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        match queues.hdr(&binding.caller, stream) {
+            Ok(Some(metadata)) => {
+                unsafe { output.write(metadata) };
+                STATUS_OK
+            }
+            Ok(None) => amaterasu_media::MEDIA_PENDING,
+            Err(status) => status,
+        }
+    })
 }
 
 #[cfg(test)]

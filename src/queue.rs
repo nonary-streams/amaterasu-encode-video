@@ -22,6 +22,7 @@ struct Stream {
     /// host latency; inside video they stay relative to the stream's open.
     clock_origin_us: u64,
     geometry: Option<amaterasu_media::CaptureGeometry>,
+    hdr: Option<amaterasu_media::HdrMetadata>,
     packets: VecDeque<Packet>,
     bytes: usize,
     eos_queued: bool,
@@ -45,6 +46,7 @@ impl Queues {
                 owner: owner.into(),
                 clock_origin_us,
                 geometry: None,
+                hdr: None,
                 packets: VecDeque::new(),
                 bytes: 0,
                 eos_queued: false,
@@ -71,6 +73,22 @@ impl Queues {
             .ok_or(MEDIA_CLOSED)
     }
 
+    pub fn set_hdr(&mut self, id: u64, hdr: Option<amaterasu_media::HdrMetadata>) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.hdr = hdr;
+        }
+    }
+    pub fn hdr(
+        &self,
+        owner: &str,
+        id: u64,
+    ) -> Result<Option<amaterasu_media::HdrMetadata>, Status> {
+        self.streams
+            .get(&id)
+            .filter(|stream| stream.owner == owner)
+            .map(|stream| stream.hdr)
+            .ok_or(MEDIA_CLOSED)
+    }
     pub fn close(&mut self, id: u64) {
         self.streams.remove(&id);
     }

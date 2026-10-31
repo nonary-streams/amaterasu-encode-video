@@ -51,13 +51,16 @@ impl ManagedModule for Video {
         settings.validate()?;
         let queues = Arc::new(Mutex::new(queue::Queues::default()));
         let plane: Box<dyn Plane> = if settings.enabled {
-            Box::new(NativePlane::bind(
-                &runtime,
-                queues.clone(),
-                &settings.resolved_providers(),
-                settings.cpu_processor_service.as_deref(),
-                settings.gpu_processor_service.as_deref(),
-            )?)
+            Box::new(
+                NativePlane::bind(
+                    &runtime,
+                    queues.clone(),
+                    &settings.resolved_providers(),
+                    settings.cpu_processor_service.as_deref(),
+                    settings.gpu_processor_service.as_deref(),
+                )?
+                .with_required_frame_leases(settings.require_frame_lease),
+            )
         } else {
             Box::new(Disabled)
         };

@@ -50,6 +50,16 @@ pub fn encoder_lease_tail_available(header: AbiHeader) -> bool {
     header.minor >= ENCODER_LEASE_INTERFACE_MINOR && header.size >= ENCODER_API_V1_2_SIZE
 }
 
+pub fn require_lease_path(capture: AbiHeader, encoder: AbiHeader) -> Result<(), &'static str> {
+    if !lease_tail_available(capture) {
+        return Err("capture_frame_lease_required");
+    }
+    if !encoder_lease_tail_available(encoder) {
+        return Err("encoder_frame_lease_required");
+    }
+    Ok(())
+}
+
 pub fn encoder_tail_available(header: AbiHeader) -> bool {
     header.minor >= ENCODER_DMABUF_INTERFACE_MINOR && header.size >= ENCODER_API_V1_1_SIZE
 }

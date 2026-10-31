@@ -1,4 +1,39 @@
 use super::*;
+
+#[test]
+fn lease_requirement_rejects_each_borrowed_native_table() {
+    let capture = AbiHeader {
+        size: CAPTURE_API_V1_6_SIZE,
+        major: 1,
+        minor: CAPTURE_LEASE_INTERFACE_MINOR,
+    };
+    let encoder = AbiHeader {
+        size: ENCODER_API_V1_2_SIZE,
+        major: 1,
+        minor: ENCODER_LEASE_INTERFACE_MINOR,
+    };
+    assert_eq!(require_lease_path(capture, encoder), Ok(()));
+    assert_eq!(
+        require_lease_path(
+            AbiHeader {
+                minor: 5,
+                ..capture
+            },
+            encoder
+        ),
+        Err("capture_frame_lease_required")
+    );
+    assert_eq!(
+        require_lease_path(
+            capture,
+            AbiHeader {
+                minor: 1,
+                ..encoder
+            }
+        ),
+        Err("encoder_frame_lease_required")
+    );
+}
 use crate::model::{CaptureProvider, Configuration};
 use crate::plane::FramePath;
 use std::cell::{Cell, RefCell};

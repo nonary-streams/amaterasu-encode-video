@@ -260,6 +260,9 @@ pub struct Settings {
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
     pub gpu_processor_service: Option<String>,
+    /// Refuse borrowed/CPU fallbacks when this composition requires retained GPU frames.
+    #[serde(default)]
+    pub require_frame_lease: bool,
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_ms: u64,
 }
@@ -284,6 +287,7 @@ impl Default for Settings {
             external_capture_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
         }
     }
@@ -491,8 +495,13 @@ impl Configuration {
 
     pub fn validate(&self) -> bool {
         self.video_stream_format.validate().is_ok()
-            && self.video_stream_format.bit_depth == 8
-            && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Sdr
+            && ((self.video_stream_format.bit_depth == 8
+                && self.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Sdr)
+                || (cfg!(target_os = "linux")
+                    && self.video_stream_format.bit_depth == 10
+                    && self.video_stream_format.dynamic_range
+                        == amaterasu_module_sdk::DynamicRange::Hdr))
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -1216,6 +1225,7 @@ mod tests {
             external_capture_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());
@@ -1237,6 +1247,7 @@ mod tests {
             external_capture_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
         assert!(settings.validate().is_ok());

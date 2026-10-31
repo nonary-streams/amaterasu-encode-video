@@ -171,6 +171,48 @@ fn owned_output_uses_dmabuf_only_when_capture_encoder_and_inputs_all_allow_it() 
 }
 
 #[test]
+fn required_frame_lease_prevents_owned_output_cpu_fallbacks() {
+    for fail_at_open in [false, true] {
+        let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
+        pipeline.require_frame_lease = true;
+        if fail_at_open {
+            runtime
+                .capture_open_errors
+                .insert(CaptureProvider::Vkms, "lease_source_unavailable");
+        } else {
+            plane.dmabuf_ready = false;
+        }
+        start(&mut pipeline, &mut runtime, &mut plane);
+        tick(&mut pipeline, &mut runtime, &mut plane, 16);
+        assert!(pipeline.streams.is_empty());
+        assert!(
+            capture_opens(&runtime)
+                .iter()
+                .all(|(service, _)| service != CaptureProvider::Pipewire.service())
+        );
+        assert!(!plane.frame_paths.contains(&FramePath::Cpu));
+    }
+}
+
+#[test]
+fn required_frame_lease_prevents_runtime_cpu_fallback() {
+    let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
+    pipeline.require_frame_lease = true;
+    start(&mut pipeline, &mut runtime, &mut plane);
+    assert_eq!(status(&pipeline)["frame_lease_required"], true);
+    plane.dmabuf_fallback_once = Some("capture_dmabuf_lease_unsupported");
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 24);
+    assert!(pipeline.streams.is_empty());
+    assert!(!plane.frame_paths.contains(&FramePath::Cpu));
+    assert!(
+        capture_opens(&runtime)
+            .iter()
+            .all(|(service, _)| service != CaptureProvider::Pipewire.service())
+    );
+}
+
+#[test]
 fn explicit_encoder_identity_keeps_cpu_capture_because_inputs_are_unknown() {
     let (mut pipeline, mut runtime, mut plane) = owned_setup(linux_providers());
     let mut request = owned_open(CaptureProvider::Pipewire);

@@ -379,6 +379,7 @@ impl Stream {
 }
 
 pub struct Pipeline {
+    require_frame_lease: bool,
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
     drain_timeout: Duration,
@@ -407,6 +408,7 @@ fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage
 impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
         Self {
+            require_frame_lease: settings.require_frame_lease,
             enabled: settings.enabled,
             providers: settings.resolved_providers(),
             drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
@@ -670,18 +672,24 @@ impl Pipeline {
                     (None, None, Stage::SelectEncoder)
                 }
             };
-            let owned_capture = owned_capture::OwnedOutputCapture::new(
+            let mut owned_capture = owned_capture::OwnedOutputCapture::new(
                 provider,
                 &output,
                 self.providers.contains(&CaptureProvider::Vkms),
             );
+            if self.require_frame_lease
+                || configuration.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Hdr
+            {
+                owned_capture.require_lease();
+            }
             if stage == Stage::Capture
                 && matches!(requested_encoder, EncoderSelection::Identity(_))
                 && owned_capture.needs_encoder_inspection()
             {
                 stage = Stage::InspectEncoder;
             }
-            let fallback_provider = if auto_capture && !constant_rate {
+            let fallback_provider = if auto_capture && !constant_rate && !self.require_frame_lease {
                 alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
             } else {
                 None
@@ -825,6 +833,12 @@ impl Pipeline {
             pump(plane, stream, id);
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
+                if let Some(capture) = stream.capture {
+                    match plane.hdr_metadata(stream.provider, capture) {
+                        Ok(metadata) => queues.set_hdr(id, metadata),
+                        Err(code) => stream.cleanup(code),
+                    }
+                }
             }
             if !matches!(
                 stream.stage,
