@@ -488,7 +488,7 @@ fn worker_capacity_guarantees_acceptance_and_close_drops_queued_frames() {
             Ok(SubmitResult::Accepted)
         );
         accepted += 1;
-        assert!(accepted <= 3, "capacity must stay bounded");
+        assert!(accepted <= 1, "only one GPU frame may wait for encoding");
     }
     assert!(accepted >= 1);
     // Establish that one input actually reached the backend before cancelling;
@@ -684,51 +684,41 @@ impl Drop for ReleaseCompletionGate {
 }
 
 #[test]
-fn leased_submission_returns_only_after_worker_finishes_source_reads() {
-    use std::sync::mpsc::{self, TryRecvError};
+fn leased_submission_does_not_block_and_shutdown_retires_the_reference() {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::time::Duration;
     for fail in [false, true] {
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        // Release a blocked test backend even if a preceding assertion fails.
         let release_gate = ReleaseCompletionGate(gate.clone());
         let (entered, entry) = mpsc::channel();
-        let (done, completion) = mpsc::channel();
         let (plane, mut writer) = stand_in();
         let worker = Worker::with_backend(CompletionBackend {
             entered,
             gate,
             fail,
         });
-        let submitter = std::thread::spawn(move || {
-            let mut sessions = Sessions::new(true);
-            sessions
-                .insert("alice", configuration(), Box::new(worker), false)
-                .unwrap();
-            let id = sessions.latest_id();
-            let callbacks = LeaseCallbacks::default();
-            let lease = leased_frame(frame(&plane, None, 1), &callbacks);
-            // SAFETY: the initial lease keeps the source and callback owner live
-            // until the synchronous encoder call finishes, including failures.
-            let status = unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) };
-            assert_no_retained_lease(&callbacks);
-            sessions.close("alice", id).unwrap();
-            drop(plane);
-            done.send(status).unwrap();
-        });
+        let mut sessions = Sessions::new(true);
+        sessions
+            .insert("alice", configuration(), Box::new(worker), false)
+            .unwrap();
+        let id = sessions.latest_id();
+        let callbacks = LeaseCallbacks::default();
+        let lease = leased_frame(frame(&plane, None, 1), &callbacks);
+        // SAFETY: callback state remains alive until close retires the reference.
+        assert_eq!(
+            unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) },
+            STATUS_OK
+        );
         entry.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
-        assert!(
-            !reader_closed(&mut writer),
-            "source closed while backend still reads"
-        );
+        assert_eq!(callbacks.retained.load(Ordering::Relaxed), 1);
+        assert_eq!(callbacks.released.load(Ordering::Relaxed), 0);
+        drop(plane);
+        assert!(!reader_closed(&mut writer));
         drop(release_gate);
-        let status = completion.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(status, if fail { MEDIA_BACKEND_ERROR } else { STATUS_OK });
-        submitter.join().unwrap();
-        assert!(
-            reader_closed(&mut writer),
-            "completed worker retained source descriptors"
-        );
+        sessions.close("alice", id).unwrap();
+        assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+        assert!(reader_closed(&mut writer));
     }
 }
 
@@ -823,4 +813,112 @@ fn native_lease_cancellation_waits_for_running_gpu_work_and_releases_source() {
     cancel.join().unwrap();
     assert!(shared.lock().unwrap().status("alice", id).is_err());
     assert!(reader_closed(&mut writer));
+}
+
+struct ImmediateGpuPacket(Option<Packet>);
+impl Backend for ImmediateGpuPacket {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
+        unreachable!()
+    }
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(self.0.take()))
+    }
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+    fn input_support(&self) -> InputSupport {
+        InputSupport {
+            gpu_bgra_conversion: true,
+            dmabuf: Some(import_support()),
+        }
+    }
+    fn supports_gpu_completion(&self) -> bool {
+        true
+    }
+    fn submit_gpu(
+        &mut self,
+        input: GpuInput,
+        timestamp: i64,
+        _: bool,
+    ) -> Result<SubmitResult, &'static str> {
+        drop(input);
+        self.0 = Some(Packet {
+            bytes: vec![1, 2, 3],
+            timestamp_100ns: timestamp,
+            keyframe: false,
+        });
+        Ok(SubmitResult::Accepted)
+    }
+}
+#[test]
+fn encoded_output_retires_the_retained_reference_before_session_close() {
+    use std::sync::atomic::Ordering;
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(ImmediateGpuPacket(None)),
+            false,
+        )
+        .unwrap();
+    let id = sessions.latest_id();
+    let (plane, _writer) = stand_in();
+    let callbacks = LeaseCallbacks::default();
+    let lease = leased_frame(frame(&plane, None, 1), &callbacks);
+    // SAFETY: descriptors and callbacks remain alive through close.
+    assert_eq!(
+        unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) },
+        STATUS_OK
+    );
+    assert_eq!(callbacks.retained.load(Ordering::Relaxed), 1);
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 0);
+    unsafe extern "C" fn accept(_: *mut std::ffi::c_void, _: *const EncodedPacket) -> Status {
+        STATUS_OK
+    }
+    // SAFETY: the sink does not dereference its unused context.
+    assert_eq!(
+        unsafe {
+            sessions.receive(
+                "alice",
+                id,
+                PacketSink {
+                    context: std::ptr::null_mut(),
+                    write: accept,
+                },
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+    sessions.close("alice", id).unwrap();
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn provider_backpressure_does_not_queue_or_release_an_unowned_reference() {
+    unsafe extern "C" fn full(_: *mut std::ffi::c_void) -> Status {
+        MEDIA_BUSY
+    }
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(ImmediateGpuPacket(None)),
+            false,
+        )
+        .unwrap();
+    let id = sessions.latest_id();
+    let (plane, _writer) = stand_in();
+    let callbacks = LeaseCallbacks::default();
+    let mut lease = leased_frame(frame(&plane, None, 1), &callbacks);
+    lease.retain = Some(full);
+    // SAFETY: callback state and descriptor remain live; full retains nothing.
+    assert_eq!(
+        unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) },
+        MEDIA_BUSY
+    );
+    assert!(sessions.values[&id].metadata.is_empty());
+    assert_no_retained_lease(&callbacks);
 }

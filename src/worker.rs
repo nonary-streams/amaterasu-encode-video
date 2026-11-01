@@ -512,9 +512,13 @@ impl Worker {
             return Ok(true);
         }
         self.poll_background()?;
-        // Each pending entry occupies at most one channel slot, so fewer
-        // pending entries than slots guarantees the next try_send succeeds.
-        Ok(self.pending.len() < ASYNC_QUEUE_CAPACITY)
+        // A second waiting GPU frame adds a full encode interval of latency.
+        // Keep one submit in flight; receive/drain work may use the other slot.
+        Ok(self.pending.len() < ASYNC_QUEUE_CAPACITY
+            && !self
+                .pending
+                .iter()
+                .any(|pending| matches!(pending.kind, AsyncKind::Submit)))
     }
 
     pub fn submit_gpu(
@@ -541,26 +545,6 @@ impl Worker {
 
     pub fn supports_gpu_completion(&self) -> bool {
         self.gpu_completion
-    }
-
-    /// Submits GPU input while the source remains borrowed by the caller.
-    /// Unlike the asynchronous path, acceptance returns only after native code
-    /// has finished reading the input. Production DMA-BUF import synchronizes
-    /// its source reads before returning, including failed conversion paths.
-    pub fn submit_gpu_and_wait(
-        &mut self,
-        input: GpuInput,
-        timestamp: i64,
-        force: bool,
-    ) -> Result<SubmitResult, &'static str> {
-        if !self.gpu_completion {
-            return Err("gpu_input_completion_unsupported");
-        }
-        if !self.has_gpu_submit_capacity()? {
-            return Ok(SubmitResult::Busy);
-        }
-        self.request_completion(Operation::SubmitGpu(input, timestamp, force), false)?;
-        Ok(SubmitResult::Accepted)
     }
 
     pub fn receive(&mut self) -> Result<ReceiveResult, &'static str> {

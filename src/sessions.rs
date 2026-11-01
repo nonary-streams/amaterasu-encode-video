@@ -43,16 +43,6 @@ pub trait Backend: Send {
     fn supports_gpu_completion(&self) -> bool {
         false
     }
-    /// Completes all reads of this GPU input before returning. Backends that
-    /// only queue descriptor copies must keep this unsupported.
-    fn submit_gpu_and_wait(
-        &mut self,
-        _input: GpuInput,
-        _timestamp: i64,
-        _force: bool,
-    ) -> Result<SubmitResult, &'static str> {
-        Err("gpu_input_completion_unsupported")
-    }
     fn submit_gpu(
         &mut self,
         _input: GpuInput,
@@ -93,14 +83,6 @@ impl Backend for Worker {
     fn supports_gpu_completion(&self) -> bool {
         Worker::supports_gpu_completion(self)
     }
-    fn submit_gpu_and_wait(
-        &mut self,
-        input: GpuInput,
-        timestamp: i64,
-        force: bool,
-    ) -> Result<SubmitResult, &'static str> {
-        Worker::submit_gpu_and_wait(self, input, timestamp, force)
-    }
     fn submit_gpu(
         &mut self,
         input: GpuInput,
@@ -123,7 +105,10 @@ pub struct Session {
     config: Configuration,
     backend: Box<dyn Backend>,
     input_support: InputSupport,
+    // Field order is deliberate: backend shutdown joins the worker before
+    // retained provider references below are released on the module thread.
     metadata: VecDeque<Metadata>,
+    retained_frames: BTreeMap<i64, RetainedFrame>,
     last_input: Option<(i64, u64)>,
     pending: Option<Packet>,
     draining: bool,
@@ -132,6 +117,29 @@ pub struct Session {
     color_conversion_total_us: u64,
     color_conversion_max_us: u64,
     color_conversion_frames: u64,
+}
+
+/// Owned provider reference; callbacks stay on the module thread. Only duplicated
+/// descriptors cross to the encoder worker, never this callback/context pair.
+struct RetainedFrame {
+    lease: DmaBufFrameLease,
+    owner: std::thread::ThreadId,
+}
+// SAFETY: moving the record does not access its raw pointer. Drop checks thread
+// affinity before invoking provider code; native entry points require calls on
+// the owning module thread. Worker requests never contain this record.
+unsafe impl Send for RetainedFrame {}
+impl Drop for RetainedFrame {
+    fn drop(&mut self) {
+        // SAFETY: a successful retain owns this reference. Encoded output or
+        // joined backend shutdown proves all GPU source reads have completed.
+        assert_eq!(
+            self.owner,
+            std::thread::current().id(),
+            "frame lease released off its module thread"
+        );
+        unsafe { (self.lease.release.expect("validated lease"))(self.lease.context, -1) };
+    }
 }
 
 struct OpenRecord {
@@ -281,6 +289,7 @@ impl Sessions {
                 backend,
                 input_support,
                 metadata: VecDeque::new(),
+                retained_frames: BTreeMap::new(),
                 last_input: None,
                 pending: None,
                 draining: false,
@@ -408,7 +417,7 @@ impl Sessions {
         #[cfg(unix)]
         {
             // SAFETY: forwarded caller guarantee for the borrowed descriptors.
-            unsafe { session.submit_dmabuf(frame, force, false) }
+            unsafe { session.submit_dmabuf(frame, force, None) }
         }
         #[cfg(not(unix))]
         {
@@ -416,11 +425,11 @@ impl Sessions {
             MEDIA_UNSUPPORTED
         }
     }
-    /// Submits a lease without retaining it past this synchronous call.
+    /// Retains immutable pixels until encoded output or joined worker shutdown.
     ///
     /// # Safety
     /// The provider's initial lease, callbacks and immutable storage must remain
-    /// live until return. The worker completes its GPU reads before return.
+    /// live until the retained reference is released on the module thread.
     pub unsafe fn submit_dmabuf_leased(
         &mut self,
         owner: &str,
@@ -440,7 +449,7 @@ impl Sessions {
         #[cfg(unix)]
         {
             // SAFETY: caller holds the lease's immutable storage until return.
-            unsafe { session.submit_dmabuf(&lease.frame, force, true) }
+            unsafe { session.submit_dmabuf(&lease.frame, force, Some(lease)) }
         }
         #[cfg(not(unix))]
         {
@@ -522,6 +531,7 @@ impl Sessions {
             session.failed = true;
             return MEDIA_BACKEND_ERROR;
         }
+        session.retained_frames.remove(&packet.timestamp_100ns);
         let encoded = EncodedPacket {
             codec: session.config.codec().abi_id(),
             // Encoder packets are whole access units (AV1: temporal units).
@@ -644,7 +654,7 @@ impl Session {
         &mut self,
         frame: &DmaBufFrame,
         force: u32,
-        wait_for_reads: bool,
+        lease: Option<&DmaBufFrameLease>,
     ) -> Status {
         let Some(import) = self.input_support.dmabuf.clone() else {
             return MEDIA_UNSUPPORTED;
@@ -678,7 +688,7 @@ impl Session {
                 return MEDIA_BACKEND_ERROR;
             }
         }
-        if wait_for_reads && !self.backend.supports_gpu_completion() {
+        if lease.is_some() && !self.backend.supports_gpu_completion() {
             return MEDIA_UNSUPPORTED;
         }
         // SAFETY: validated shape; the caller keeps the descriptors open.
@@ -686,14 +696,30 @@ impl Session {
             Ok(input) => input,
             Err(status) => return status,
         };
-        let result = if wait_for_reads {
-            self.backend
-                .submit_gpu_and_wait(GpuInput::DmaBuf(input), timestamp, force != 0)
+        let retained = if let Some(lease) = lease {
+            // SAFETY: validated provider callbacks and initial reference remain
+            // live during this call. Failed retain transfers no ownership.
+            let status = unsafe { (lease.retain.expect("validated lease"))(lease.context) };
+            if status != STATUS_OK {
+                return status;
+            }
+            Some(RetainedFrame {
+                lease: *lease,
+                owner: std::thread::current().id(),
+            })
         } else {
-            self.backend
-                .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0)
+            None
         };
-        self.record_submission(result, timestamp, frame.sequence, force != 0)
+        let result = self
+            .backend
+            .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0);
+        let status = self.record_submission(result, timestamp, frame.sequence, force != 0);
+        if status == STATUS_OK
+            && let Some(retained) = retained
+        {
+            self.retained_frames.insert(timestamp, retained);
+        }
+        status
     }
 
     fn record_submission(

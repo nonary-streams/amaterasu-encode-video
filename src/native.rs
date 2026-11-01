@@ -28,8 +28,8 @@ impl Registration {
     }
 }
 
-/// The v1.2 table preserves both earlier prefixes. Leased submissions finish
-/// all reads before returning, so provider code is never retained by the worker.
+/// The v1.2 table preserves both earlier prefixes. Provider references remain
+/// on the module thread until encoded output or joined encoder shutdown.
 struct Binding {
     api: EncoderApiV1_2,
     owner: String,
@@ -146,9 +146,8 @@ unsafe extern "C" fn submit_dmabuf(
     })
 }
 
-/// The borrowed lease remains immutable until this call returns. This initial
-/// implementation waits for the worker's safe GPU copy rather than retaining
-/// provider callbacks beyond the native call or across module teardown.
+/// The encoder retains immutable storage before queueing GPU work. References
+/// are retired on the module thread after output or during joined cancellation.
 unsafe extern "C" fn submit_dmabuf_leased(
     context: *mut c_void,
     id: u64,
