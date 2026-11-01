@@ -600,7 +600,7 @@ impl Session {
 
     /// CPU conversion for backends without GPU conversion, and NV12 copies.
     fn cpu_nv12(&mut self, frame: &CpuFrame, bytes: &[u8]) -> Result<Vec<u8>, Status> {
-        if self.config.is_hdr() {
+        if self.config.is_ten_bit() {
             return Err(MEDIA_UNSUPPORTED);
         }
         let conversion_started = Instant::now();

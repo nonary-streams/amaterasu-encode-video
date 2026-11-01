@@ -183,8 +183,12 @@ impl Configuration {
     pub fn software_tune(&self) -> &str {
         self.sw_tune.as_deref().unwrap_or("zerolatency")
     }
-    pub fn is_hdr(&self) -> bool {
+    pub fn is_ten_bit(&self) -> bool {
         self.video_stream_format.bit_depth == 10
+    }
+
+    pub fn is_hdr(&self) -> bool {
+        self.is_ten_bit()
             && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr
     }
 
@@ -198,7 +202,9 @@ impl Configuration {
         }
         if !(self.video_stream_format.bit_depth == 8
             && self.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Sdr)
-            && !(cfg!(target_os = "linux") && self.is_hdr() && self.color_mode.is_default())
+            && !(cfg!(target_os = "linux")
+                && self.is_ten_bit()
+                && (!self.is_hdr() || self.color_mode.is_default()))
         {
             return Err("video_format_unsupported_by_encoder");
         }

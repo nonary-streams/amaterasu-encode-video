@@ -131,8 +131,10 @@ impl Encoder {
         configuration: &Configuration,
         emitter: Option<amaterasu_module_sdk::LogEmitter>,
     ) -> Result<Self, &'static str> {
-        if configuration.is_hdr() && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.") {
-            return Err("hdr_encoder_unsupported");
+        if configuration.is_ten_bit()
+            && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.")
+        {
+            return Err("ten_bit_encoder_unsupported");
         }
         if x264::selected(identity) {
             return x264::open_with_log_emitter(identity, configuration, emitter)
@@ -145,8 +147,10 @@ impl Encoder {
         identity: &EncoderIdentity,
         configuration: &Configuration,
     ) -> Result<Self, &'static str> {
-        if configuration.is_hdr() && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.") {
-            return Err("hdr_encoder_unsupported");
+        if configuration.is_ten_bit()
+            && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.")
+        {
+            return Err("ten_bit_encoder_unsupported");
         }
         #[cfg(target_os = "linux")]
         if nvenc_cuda::selected(identity) {

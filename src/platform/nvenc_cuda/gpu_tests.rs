@@ -83,11 +83,20 @@ fn expected_yuv(xrgb: u32, mode: ColorMode) -> [u8; 3] {
 }
 
 fn encode_cpu_frames(codec: Codec, mode: ColorMode, nv12_input: bool) -> Vec<Packet> {
+    encode_cpu_configuration(codec, mode, nv12_input, configuration(codec, mode))
+}
+
+fn encode_cpu_configuration(
+    codec: Codec,
+    mode: ColorMode,
+    nv12_input: bool,
+    configuration: Configuration,
+) -> Vec<Packet> {
     let description = published()
         .into_iter()
         .find(|entry| entry.codec == codec.token())
         .unwrap_or_else(|| panic!("{} is not published", codec.token()));
-    let mut encoder = Encoder::open(&description.identity, &configuration(codec, mode))
+    let mut encoder = Encoder::open(&description.identity, &configuration)
         .unwrap_or_else(|error| panic!("{error}: {:?}", super::last_open_failure()));
     let bgra = bgra_frame();
     let nv12 = layout::bgra(
@@ -504,8 +513,47 @@ fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
 }
 
 #[test]
+#[ignore = "requires NVIDIA NVENC with ten-bit HEVC and AV1"]
+fn nvenc_cuda_gpu_encodes_ten_bit_sdr_cpu_input() {
+    for codec in [Codec::Hevc, Codec::Av1] {
+        for mode in [ColorMode::Bt709Limited, ColorMode::Bt709Full] {
+            let mut config = configuration(codec, mode);
+            config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+                codec: if codec == Codec::Hevc {
+                    amaterasu_module_sdk::VideoCodec::Hevc
+                } else {
+                    amaterasu_module_sdk::VideoCodec::Av1
+                },
+                bit_depth: 10,
+                dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
+            };
+            let packets = encode_cpu_configuration(codec, mode, false, config);
+            let path = stream_file(
+                codec,
+                "cpu-sdr10",
+                packets.into_iter().map(|packet| packet.bytes),
+            );
+            let info = probe(codec, &path);
+            assert_eq!(info["pix_fmt"], "yuv420p10le");
+            assert_eq!(info["color_transfer"], "bt709");
+            assert_eq!(info["color_primaries"], "bt709");
+            assert_eq!(
+                info["color_range"],
+                if mode == ColorMode::Bt709Full {
+                    "pc"
+                } else {
+                    "tv"
+                }
+            );
+            assert_decoded_colours(&decode(codec, &path), mode);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
-fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
+fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
     let top = (719 << 20) | (321 << 10) | 183;
     let bottom = (201 << 20) | (553 << 10) | 877;
     let node = CString::new(
@@ -536,7 +584,15 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
     };
     assert_eq!(result, 0, "RGB10 allocation failed");
     let buffer = GbmBuffer(raw);
-    for codec in [Codec::Hevc, Codec::Av1] {
+    for (codec, dynamic_range) in [Codec::Hevc, Codec::Av1].into_iter().flat_map(|codec| {
+        [
+            amaterasu_module_sdk::DynamicRange::Sdr,
+            amaterasu_module_sdk::DynamicRange::Hdr,
+        ]
+        .into_iter()
+        .map(move |range| (codec, range))
+    }) {
+        let hdr = dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
         let description = published()
             .into_iter()
             .find(|entry| entry.codec == codec.token())
@@ -549,15 +605,26 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
                 amaterasu_module_sdk::VideoCodec::Av1
             },
             bit_depth: 10,
-            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+            dynamic_range,
         };
+        let probe_result = crate::probe::run(
+            &crate::factory::NativeFactory,
+            description.identity.clone(),
+            config.clone(),
+        )
+        .unwrap();
+        assert_eq!(probe_result["usable"], true, "{probe_result}");
         let mut encoder = Encoder::open(&description.identity, &config)
             .unwrap_or_else(|error| panic!("{error}: {:?}", super::last_open_failure()));
         let mut packets = Vec::new();
         for sequence in 1..=FRAMES {
             let mut frame = buffer.frame(sequence);
             frame.fourcc = u32::from_le_bytes(*b"AR30");
-            frame.color = DMABUF_COLOR_BT2020_PQ;
+            frame.color = if hdr {
+                DMABUF_COLOR_BT2020_PQ
+            } else {
+                DMABUF_COLOR_SRGB
+            };
             // SAFETY: allocation and descriptors outlive this synchronous duplication.
             let owned = unsafe { crate::input::DmaBufInput::duplicate(&frame) }.unwrap();
             encoder
@@ -574,7 +641,7 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
         assert_eq!(packets.len() as u64, FRAMES);
         let path = stream_file(
             codec,
-            "hdr10",
+            if hdr { "hdr10" } else { "sdr10" },
             packets.into_iter().map(|packet| packet.bytes),
         );
         let info = probe(codec, &path);
@@ -584,9 +651,21 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
         if codec == Codec::Hevc {
             assert_eq!(stream["profile"], "Main 10", "{stream}");
         }
-        assert_eq!(stream["color_primaries"], "bt2020", "{stream}");
-        assert_eq!(stream["color_transfer"], "smpte2084", "{stream}");
-        assert_eq!(stream["color_space"], "bt2020nc", "{stream}");
+        assert_eq!(
+            stream["color_primaries"],
+            if hdr { "bt2020" } else { "bt709" },
+            "{stream}"
+        );
+        assert_eq!(
+            stream["color_transfer"],
+            if hdr { "smpte2084" } else { "bt709" },
+            "{stream}"
+        );
+        assert_eq!(
+            stream["color_space"],
+            if hdr { "bt2020nc" } else { "bt709" },
+            "{stream}"
+        );
         let decoded = Command::new("ffmpeg")
             .args(["-v", "error", "-threads", "2", "-f", demuxer(codec), "-i"])
             .arg(&path)
@@ -614,7 +693,11 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
             .map(|v| u16::from_le_bytes([v[0], v[1]]))
             .collect();
         assert_eq!(pixels.len(), (WIDTH * HEIGHT * 3 / 2) as usize);
-        let rows = super::color::hdr_conversion_rows();
+        let rows = if hdr {
+            super::color::hdr_conversion_rows()
+        } else {
+            super::color::sdr_ten_bit_conversion_rows(ColorMode::Bt709Limited)
+        };
         for (color, y) in [(top, HEIGHT / 4), (bottom, HEIGHT * 3 / 4)] {
             let rgb = [
                 ((color >> 20) & 1023) as f32 / 1023.0,
@@ -649,11 +732,19 @@ fn nvenc_cuda_gpu_hdr10_preserves_precision_and_signaling() {
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::copy(
                 &path,
-                directory.join(format!("hdr10-{}.bin", codec.token())),
+                directory.join(format!(
+                    "{}10-{}.bin",
+                    if hdr { "hdr" } else { "sdr" },
+                    codec.token()
+                )),
             )
             .unwrap();
             std::fs::write(
-                directory.join(format!("hdr10-{}.json", codec.token())),
+                directory.join(format!(
+                    "{}10-{}.json",
+                    if hdr { "hdr" } else { "sdr" },
+                    codec.token()
+                )),
                 serde_json::to_vec_pretty(&probe(codec, &path)).unwrap(),
             )
             .unwrap();

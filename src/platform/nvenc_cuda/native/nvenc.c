@@ -584,8 +584,11 @@ static int input_writable(const struct am_nvcuda_encoder *encoder) {
 
 int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_t *nv12,
                                  size_t length, struct am_nvcuda_status *status) {
-    size_t luma_bytes = encoder != NULL ? (size_t)encoder->width * encoder->height : 0;
-    if (!input_writable(encoder) || encoder->bit_depth != 8 || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
+    /* Internal planar upload: NV12 at eight bits, P010 at ten bits. Public
+     * CPU NV12 input remains rejected for ten-bit sessions by Rust validation. */
+    size_t row_bytes = encoder != NULL ? (size_t)encoder->width * (encoder->bit_depth == 10 ? 2u : 1u) : 0;
+    size_t luma_bytes = encoder != NULL ? row_bytes * encoder->height : 0;
+    if (!input_writable(encoder) || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
@@ -593,11 +596,11 @@ int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_
     memset(&copy, 0, sizeof(copy));
     copy.srcMemoryType = CU_MEMORYTYPE_HOST;
     copy.srcHost = nv12;
-    copy.srcPitch = encoder->width;
+    copy.srcPitch = row_bytes;
     copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
     copy.dstDevice = encoder->input;
     copy.dstPitch = encoder->input_pitch;
-    copy.WidthInBytes = encoder->width;
+    copy.WidthInBytes = row_bytes;
     /* The packed chroma rows directly follow the luma rows in both layouts. */
     copy.Height = (size_t)encoder->height + encoder->height / 2;
     CUresult cuda_status = encoder->driver->cuda.memcpy_2d(&copy);
@@ -610,7 +613,7 @@ int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_
 
 int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, const uint8_t *bgra,
                                  size_t length, struct am_nvcuda_status *status) {
-    if (!input_writable(encoder) || encoder->bit_depth != 8 || bgra == NULL ||
+    if (!input_writable(encoder) || bgra == NULL ||
         length != (size_t)encoder->width * encoder->height * 4u) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;

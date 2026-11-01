@@ -1,5 +1,5 @@
-//! Native NVIDIA NVENC on a CUDA context: H.264, HEVC and AV1, 8-bit SDR
-//! 4:2:0, with GPU RGB -> NV12 conversion and DMA-BUF import.
+//! Native NVIDIA NVENC on a CUDA context: H.264, HEVC and AV1 in 8-bit SDR,
+//! plus HEVC/AV1 in 10-bit SDR or HDR, with GPU conversion and DMA-BUF import.
 //!
 //! The C adapter in `native/` is compiled only by the `linux-nvenc-cuda`
 //! feature when its headers are found (cfg `amaterasu_nvenc_cuda`); every

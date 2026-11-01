@@ -105,6 +105,28 @@ pub fn conversion_rows(mode: ColorMode) -> ConversionRows {
     }
 }
 
+/// SDR keeps its selected matrix and transfer function at ten bits. Limited
+/// range scales the eight-bit legal endpoints by four; full-range chroma is
+/// centred at 512. Multiplying eight-bit normalized rows by 1023 would instead
+/// put limited-range black above code 64 and shift neutral chroma.
+pub fn sdr_ten_bit_conversion_rows(mode: ColorMode) -> ConversionRows {
+    let mut rows = conversion_rows(mode);
+    match mode {
+        ColorMode::Bt601Limited | ColorMode::Bt709Limited => {
+            for row in [&mut rows.luma, &mut rows.cb, &mut rows.cr] {
+                for value in row {
+                    *value *= 1020.0 / 1023.0;
+                }
+            }
+        }
+        ColorMode::Bt601Full | ColorMode::Bt709Full => {
+            rows.cb[3] = 512.0 / 1023.0;
+            rows.cr[3] = 512.0 / 1023.0;
+        }
+    }
+    rows
+}
+
 /// HDR10 RGB input is already PQ/BT.2020; conversion changes only the matrix
 /// and limited-range code values, never the transfer function or primaries.
 pub fn hdr_signal() -> ColorSignal {
@@ -154,6 +176,23 @@ mod tests {
         ColorMode::Bt709Limited,
         ColorMode::Bt709Full,
     ];
+
+    #[test]
+    fn ten_bit_sdr_has_legal_black_white_and_neutral_chroma() {
+        let code = |row: [f32; 4], rgb: [f32; 3]| {
+            ((row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + row[3]) * 1023.0).round() as u16
+        };
+        for mode in MODES {
+            let rows = sdr_ten_bit_conversion_rows(mode);
+            let full = matches!(mode, ColorMode::Bt601Full | ColorMode::Bt709Full);
+            assert_eq!(code(rows.luma, [0.0; 3]), if full { 0 } else { 64 });
+            assert_eq!(code(rows.luma, [1.0; 3]), if full { 1023 } else { 940 });
+            for gray in [0.0, 0.5, 1.0] {
+                assert_eq!(code(rows.cb, [gray; 3]), 512);
+                assert_eq!(code(rows.cr, [gray; 3]), 512);
+            }
+        }
+    }
 
     /// The shader's arithmetic: f32 dot product, clamp, round to unorm8.
     fn shade(row: [f32; 4], rgb: [f32; 3]) -> u8 {

@@ -59,6 +59,8 @@ pub fn native_settings(configuration: &Configuration, codec: Codec) -> NativeSet
     };
     let rows = if configuration.is_hdr() {
         super::color::hdr_conversion_rows()
+    } else if configuration.is_ten_bit() {
+        super::color::sdr_ten_bit_conversion_rows(configuration.color_mode)
     } else {
         conversion_rows(configuration.color_mode)
     };

@@ -1,4 +1,4 @@
-//! Transient codec validation uses owned synthetic NV12, never a capture provider.
+//! Transient codec validation uses owned synthetic NV12/P010, never a capture provider.
 use crate::worker::{ReceiveResult, SubmitResult};
 use crate::{
     bitstream::Normalizer,
@@ -53,12 +53,7 @@ fn validate_output(
     backend: &mut dyn Backend,
     configuration: &Configuration,
 ) -> Result<(), &'static str> {
-    let pixels = usize::try_from(configuration.width)
-        .ok()
-        .and_then(|width| width.checked_mul(configuration.height as usize))
-        .ok_or("invalid_configuration")?;
-    let mut frame = vec![128; pixels + pixels / 2];
-    frame[..pixels].fill(16);
+    let frame = probe_frame(configuration)?;
     if !matches!(
         backend.submit(frame, PROBE_TIMESTAMP, true)?,
         SubmitResult::Accepted
@@ -120,6 +115,37 @@ fn validate_output(
         found_idr |= idr;
     }
     Err("encoder_probe_output_limit")
+}
+
+/// The probe must exercise the selected input bit depth. An NV12 probe in a
+/// ten-bit session makes a working P010 encoder look unavailable.
+fn probe_frame(configuration: &Configuration) -> Result<Vec<u8>, &'static str> {
+    let pixels = usize::try_from(configuration.width)
+        .ok()
+        .and_then(|width| width.checked_mul(configuration.height as usize))
+        .ok_or("invalid_configuration")?;
+    if configuration.is_ten_bit() {
+        let luma = if matches!(
+            configuration.color_mode,
+            amaterasu_media::ColorMode::Bt601Full | amaterasu_media::ColorMode::Bt709Full
+        ) && !configuration.is_hdr()
+        {
+            0u16
+        } else {
+            64u16
+        };
+        let mut frame = Vec::with_capacity(pixels * 3);
+        for (samples, code) in [(pixels, luma), (pixels / 2, 512u16)] {
+            for _ in 0..samples {
+                frame.extend_from_slice(&(code << 6).to_le_bytes());
+            }
+        }
+        Ok(frame)
+    } else {
+        let mut frame = vec![128; pixels + pixels / 2];
+        frame[..pixels].fill(16);
+        Ok(frame)
+    }
 }
 
 #[cfg(test)]
