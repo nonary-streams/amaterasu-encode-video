@@ -412,6 +412,7 @@ impl Stream {
     }
 
     fn cleanup(&mut self, code: &'static str) {
+        eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage);
         if let Some(request) = self.pending.take() {
             self.unsettled = Some(request);
         }

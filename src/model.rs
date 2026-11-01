@@ -600,10 +600,7 @@ impl Configuration {
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux")
-                    && self.video_stream_format.bit_depth == 10
-                    && self.video_stream_format.dynamic_range
-                        == amaterasu_module_sdk::DynamicRange::Hdr))
+                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (1..=16384).contains(&self.width)
             && (1..=16384).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -624,10 +621,7 @@ impl Configuration {
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux")
-                    && self.video_stream_format.bit_depth == 10
-                    && self.video_stream_format.dynamic_range
-                        == amaterasu_module_sdk::DynamicRange::Hdr))
+                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -1038,7 +1032,7 @@ mod tests {
             assert_eq!(current.codec, media);
             assert!(current.validate());
             current.video_stream_format.bit_depth = 10;
-            assert!(!current.validate());
+            assert_eq!(current.validate(), cfg!(target_os = "linux"));
         }
         let mut conflicting: Configuration =
             serde_json::from_value(open_request()["configuration"].clone()).unwrap();
