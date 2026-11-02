@@ -90,6 +90,9 @@ impl ManagedModule for Video {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+            amaterasu_module_sdk::threading::ThreadPriority::High,
+        );
         let runtime = &self.runtime;
         self.pipeline.tick(&mut *self.plane, &mut |command| {
             runtime.send_ephemeral(command)
