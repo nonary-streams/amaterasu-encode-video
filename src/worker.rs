@@ -234,6 +234,9 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-h264".into())
             .spawn(move || {
+                amaterasu_module_sdk::threading::configure_worker_priority(
+                    amaterasu_module_sdk::threading::ThreadPriority::High,
+                );
                 let mut encoder = match open_backend() {
                     Ok(encoder) => encoder,
                     Err(error) => {
