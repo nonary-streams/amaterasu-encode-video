@@ -23,9 +23,17 @@ impl Drop for Subscription {
 #[derive(Default)]
 pub(super) struct Subscriptions {
     values: BTreeMap<u64, Subscription>,
+    work: Option<amaterasu_module_sdk::WorkNotifier>,
 }
 
 impl Subscriptions {
+    pub fn new(work: amaterasu_module_sdk::WorkNotifier) -> Self {
+        Self {
+            work: Some(work),
+            ..Self::default()
+        }
+    }
+
     pub fn notice(
         &mut self,
         video: u64,
@@ -42,7 +50,12 @@ impl Subscriptions {
             // SAFETY: version and table size cover the new optional tail.
             let api =
                 unsafe { binding.table::<CaptureApiV1_7>() }.map_err(|_| "capture_bind_failed")?;
-            let notifications = CaptureNotifications::new();
+            let notifications = self
+                .work
+                .as_ref()
+                .map_or_else(CaptureNotifications::new, |work| {
+                    CaptureNotifications::with_work_notifier(work.clone())
+                });
             // SAFETY: on success this reader stays in the subscription until the
             // provider's unsubscribe barrier. Failure must retain no callbacks.
             let result = unsafe {

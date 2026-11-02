@@ -282,3 +282,38 @@ fn slow_gpu_submission_does_not_charge_a_second_frame_interval() {
     assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
     assert_eq!(counters(&pipeline).0, 2);
 }
+
+#[test]
+fn capture_readiness_preserves_presentation_pacing_and_the_frame_rate_cap() {
+    use amaterasu_module_sdk::capture::CaptureNotice;
+    let (mut pipeline, mut runtime, mut plane) = presentation_stream();
+    plane.event_api = true;
+    plane.notices.push_back(CaptureNotice {
+        frame_ready: true,
+        ..CaptureNotice::default()
+    });
+    present(&mut plane, 1, 2_000_000);
+    assert!(
+        pump_once(&mut pipeline, &mut runtime, &mut plane).0,
+        "a ready presentation must bypass the distant timer slot"
+    );
+    assert_eq!(status(&pipeline)["pacing"], "presentation");
+    assert!(pipeline.streams[&1].capture_notifications);
+    hold_rate_cap(pipeline.streams.get_mut(&1).unwrap());
+    plane.notices.push_back(CaptureNotice {
+        frame_ready: true,
+        ..CaptureNotice::default()
+    });
+    present(&mut plane, 2, 2_008_333);
+    assert!(!pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    open_rate_cap(pipeline.streams.get_mut(&1).unwrap());
+    assert!(
+        pump_once(&mut pipeline, &mut runtime, &mut plane).0,
+        "the coalesced presentation remains ready after the notification is consumed"
+    );
+    open_rate_cap(pipeline.streams.get_mut(&1).unwrap());
+    assert!(
+        !pump_once(&mut pipeline, &mut runtime, &mut plane).0,
+        "no timer read or repeat is introduced without a new presentation"
+    );
+}

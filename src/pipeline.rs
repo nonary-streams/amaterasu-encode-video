@@ -1162,11 +1162,9 @@ enum CaptureTrigger {
 
 fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     let now = Instant::now();
-    let presentation_paced = match if stream.capture_notifications {
-        Ok(false)
-    } else {
-        stream.observe_presentation(plane)
-    } {
+    // Notifications wake the consumer; presentation metadata still owns frame
+    // cadence and source timestamps when the selected provider offers both.
+    let presentation_paced = match stream.observe_presentation(plane) {
         Ok(paced) => paced,
         Err(code) => {
             stream.cleanup(code);
