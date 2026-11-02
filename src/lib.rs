@@ -45,6 +45,7 @@ impl ManagedModule for EncodeModule {
         let shared = Arc::new(Mutex::new(sessions::Sessions::with_log_emitter(
             settings.enabled,
             log_emitter,
+            runtime.work_notifier(),
         )));
         let registration = Box::new(native::Registration::new(shared.clone()));
         runtime.require_success(Command::Register {

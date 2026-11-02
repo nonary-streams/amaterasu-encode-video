@@ -21,11 +21,12 @@ pub struct NativeFactory;
 
 pub struct LogForwardingFactory {
     emitter: LogEmitter,
+    notifier: amaterasu_module_sdk::WorkNotifier,
 }
 
 impl LogForwardingFactory {
-    pub fn new(emitter: LogEmitter) -> Self {
-        Self { emitter }
+    pub fn new(emitter: LogEmitter, notifier: amaterasu_module_sdk::WorkNotifier) -> Self {
+        Self { emitter, notifier }
     }
 }
 
@@ -53,7 +54,12 @@ impl Factory for LogForwardingFactory {
         encoder: EncoderIdentity,
         configuration: Configuration,
     ) -> Result<Box<dyn Backend>, &'static str> {
-        Worker::open_with_log_emitter(encoder, configuration, self.emitter.clone())
-            .map(|worker| Box::new(worker) as Box<dyn Backend>)
+        Worker::open_with_log_emitter(
+            encoder,
+            configuration,
+            self.emitter.clone(),
+            self.notifier.clone(),
+        )
+        .map(|worker| Box::new(worker) as Box<dyn Backend>)
     }
 }

@@ -206,15 +206,26 @@ impl Worker {
         identity: EncoderIdentity,
         config: Configuration,
         emitter: amaterasu_module_sdk::LogEmitter,
+        notifier: amaterasu_module_sdk::WorkNotifier,
     ) -> Result<Self, &'static str> {
-        Self::start(move || {
-            platform::Encoder::open_with_log_emitter(&identity, &config, Some(emitter))
-                .map(|encoder| Box::new(encoder) as Box<dyn WorkerBackend>)
-        })
+        Self::start_with_notifier(
+            move || {
+                platform::Encoder::open_with_log_emitter(&identity, &config, Some(emitter))
+                    .map(|encoder| Box::new(encoder) as Box<dyn WorkerBackend>)
+            },
+            Some(notifier),
+        )
     }
 
     fn start(
         open_backend: impl FnOnce() -> Result<Box<dyn WorkerBackend>, &'static str> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        Self::start_with_notifier(open_backend, None)
+    }
+
+    fn start_with_notifier(
+        open_backend: impl FnOnce() -> Result<Box<dyn WorkerBackend>, &'static str> + Send + 'static,
+        notifier: Option<amaterasu_module_sdk::WorkNotifier>,
     ) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel::<Request>(ASYNC_QUEUE_CAPACITY);
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -263,11 +274,14 @@ impl Worker {
                             Operation::Drain => encoder.drain().map(|()| Reply::Done),
                         }
                     };
+                    let work_ready = result.is_err()
+                        || matches!(&result, Ok(Reply::Packet(Some(_))))
+                        || matches!(request.kind, AsyncKind::Submit | AsyncKind::Drain);
                     if result.is_err() {
                         failed = true;
                     }
                     let operation_us = duration_micros(started_at.elapsed());
-                    if request
+                    let delivered = request
                         .reply
                         .send(Completed {
                             result,
@@ -275,8 +289,14 @@ impl Worker {
                             queue_wait_us,
                             operation_us,
                         })
-                        .is_err()
+                        .is_ok();
+                    if delivered
+                        && work_ready
+                        && let Some(notifier) = &notifier
                     {
+                        notifier.notify();
+                    }
+                    if !delivered {
                         // An abandoned asynchronous reply is expected during close.
                         if worker_cancel.is_cancelled() {
                             continue;
@@ -656,6 +676,116 @@ mod tests {
                 keyframe: call == 0,
             }))
         }
+    }
+
+    #[test]
+    fn readiness_wakes_for_packets_and_submits_but_not_empty_receive_polls() {
+        use amaterasu_module_sdk::{RuntimeClient, abi::*};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        unsafe extern "C" fn notify(
+            context: *mut std::ffi::c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: fixture and input are retained through this worker callback.
+            let count = unsafe { &*context.cast::<AtomicUsize>() };
+            let command: amaterasu_module_sdk::Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            assert!(matches!(
+                command,
+                amaterasu_module_sdk::Command::NotifyWorkReady {}
+            ));
+            count.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the SDK lends this sink until synchronous invoke returns.
+            unsafe { reply.send(br#"{"kind":"ok"}"#) };
+            STATUS_OK
+        }
+        struct Backend {
+            calls: Arc<AtomicUsize>,
+        }
+        impl WorkerBackend for Backend {
+            fn uses_background_encode(&self) -> bool {
+                true
+            }
+            fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn drain(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok((call == 1).then(|| Packet {
+                    bytes: vec![1],
+                    timestamp_100ns: 0,
+                    keyframe: true,
+                }))
+            }
+        }
+        let notifications = AtomicUsize::new(0);
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&notifications as *const AtomicUsize).cast_mut().cast(),
+            invoke: notify,
+        };
+        // SAFETY: notifications and endpoint live until worker is joined below.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let mut worker = Worker::start_with_notifier(
+            move || {
+                Ok(Box::new(Backend {
+                    calls: backend_calls,
+                }))
+            },
+            Some(runtime.work_notifier()),
+        )
+        .unwrap();
+        assert!(matches!(worker.receive().unwrap(), ReceiveResult::Pending));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            worker.poll_background().unwrap();
+            if worker.receive_result.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            0,
+            "empty receive created a polling wake loop"
+        );
+        assert!(matches!(
+            worker.receive().unwrap(),
+            ReceiveResult::Ready(None)
+        ));
+        while notifications.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        loop {
+            match worker.receive().unwrap() {
+                ReceiveResult::Ready(Some(packet)) => {
+                    assert_eq!(packet.bytes, [1]);
+                    break;
+                }
+                _ => {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(
+            worker.submit(vec![0], 1, false).unwrap(),
+            SubmitResult::Accepted
+        );
+        while notifications.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        drop(worker);
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
     }
 
     #[test]

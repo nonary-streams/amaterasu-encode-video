@@ -167,9 +167,13 @@ impl Sessions {
             values: BTreeMap::new(),
         }
     }
-    pub fn with_log_emitter(enabled: bool, emitter: amaterasu_module_sdk::LogEmitter) -> Self {
+    pub fn with_log_emitter(
+        enabled: bool,
+        emitter: amaterasu_module_sdk::LogEmitter,
+        notifier: amaterasu_module_sdk::WorkNotifier,
+    ) -> Self {
         let mut sessions = Self::new(enabled);
-        sessions.factory = Arc::new(LogForwardingFactory::new(emitter));
+        sessions.factory = Arc::new(LogForwardingFactory::new(emitter, notifier));
         sessions
     }
     #[cfg(test)]
