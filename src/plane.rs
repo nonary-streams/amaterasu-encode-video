@@ -149,6 +149,7 @@ pub struct FrameMetadata {
 pub trait Plane {
     fn hdr_metadata(
         &mut self,
+        _: u64,
         _: CaptureProvider,
         _: u64,
     ) -> Result<Option<HdrMetadata>, &'static str> {
@@ -832,9 +833,13 @@ impl Plane for NativePlane {
 
     fn hdr_metadata(
         &mut self,
+        video: u64,
         provider: CaptureProvider,
         stream: u64,
     ) -> Result<Option<HdrMetadata>, &'static str> {
+        if let Some(binding) = &self.gpu_processor {
+            return gpu_processor::hdr_metadata(binding, video);
+        }
         let Some(binding) = self.captures.get(&provider) else {
             return Ok(None);
         };
@@ -854,6 +859,15 @@ impl Plane for NativePlane {
     }
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
+        if let Some(binding) = &self.gpu_processor
+            && let Some(metadata) = gpu_processor::hdr_metadata(binding, input.video)?
+        {
+            let hdr = input.configuration.video_stream_format.dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr;
+            if (metadata.enabled == 1) != hdr {
+                return Err("processor_output_range_mismatch");
+            }
+        }
         if self.require_frame_lease && input.frame_path != FramePath::DmaBuf {
             return Err("capture_frame_lease_required");
         }

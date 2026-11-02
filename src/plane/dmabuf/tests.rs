@@ -693,6 +693,95 @@ fn gpu_processor_api(harness: &Harness) -> GpuProcessorApi {
     }
 }
 
+unsafe extern "C" fn processed_hdr_metadata(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut HdrMetadata,
+) -> Status {
+    // SAFETY: the fixture owns both the harness and writable metadata for this query.
+    let harness = unsafe { &*context.cast::<Harness>() };
+    assert_eq!(stream, 42, "query must identify video rather than capture");
+    let mut metadata = HdrMetadata {
+        enabled: 1,
+        ..Default::default()
+    };
+    metadata.fields[8] = 1200;
+    match harness.processor_mode.get() {
+        20 => return MEDIA_UNSUPPORTED,
+        21 => metadata.enabled = 2,
+        22 => return MEDIA_BACKEND_ERROR,
+        _ => {}
+    }
+    unsafe {
+        *output = metadata;
+    }
+    STATUS_OK
+}
+
+#[test]
+fn processor_metadata_tail_is_optional_and_rejects_invalid_stream_output() {
+    use crate::plane::{NativePlane, Plane};
+    use amaterasu_module_sdk::RuntimeClient;
+    use std::sync::{Arc, Mutex};
+    for mode in [0, 1, 2, 20, 21, 22] {
+        let harness = Harness::default();
+        harness.processor_mode.set(mode);
+        let capture = leased_capture_api(&harness);
+        let encoder = leased_encoder_api(&harness);
+        let mut processor = GpuProcessorApiV1_1 {
+            base: gpu_processor_api(&harness),
+            hdr_metadata: processed_hdr_metadata,
+        };
+        processor.base.base.header.minor = if mode == 0 { 0 } else { 1 };
+        processor.base.base.header.size = if mode == 1 {
+            GPU_PROCESSOR_API_V1_0_SIZE
+        } else {
+            GPU_PROCESSOR_API_V1_1_SIZE
+        };
+        let fixture = RuntimeFixture {
+            harness: &harness,
+            capture: std::ptr::from_ref(&capture) as usize,
+            encoder: std::ptr::from_ref(&encoder) as usize,
+            external_encoder: 0,
+            processor: std::ptr::from_ref(&processor) as usize,
+        };
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(&fixture).cast_mut().cast(),
+                invoke: invoke_lifecycle_runtime,
+            })
+        };
+        let mut plane = NativePlane::bind(
+            &runtime,
+            Arc::new(Mutex::new(crate::queue::Queues::default())),
+            &[CaptureProvider::Vkms].into(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            Some("fixture.gpu-processor/1"),
+        )
+        .unwrap();
+        let result = plane.hdr_metadata(42, CaptureProvider::Vkms, 999);
+        match mode {
+            0 | 1 | 20 => assert_eq!(result, Ok(None)),
+            2 => {
+                assert_eq!(result.unwrap().unwrap().fields[8], 1200);
+                let config = configuration();
+                let mut input = pump(&config, true, false);
+                input.video = 42;
+                assert!(matches!(
+                    plane.pump(input),
+                    Err("processor_output_range_mismatch")
+                ));
+                assert!(harness.submitted.borrow().is_empty());
+            }
+            _ => assert_eq!(result, Err("processor_hdr_metadata_unavailable")),
+        }
+    }
+}
+
 #[test]
 fn lease_and_encoder_tails_require_complete_advertised_prefixes() {
     let header = |size, minor| AbiHeader {

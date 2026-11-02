@@ -1054,7 +1054,7 @@ impl Pipeline {
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
                 if let Some(capture) = stream.capture {
-                    match plane.hdr_metadata(stream.provider, capture) {
+                    match plane.hdr_metadata(id, stream.provider, capture) {
                         Ok(metadata) => queues.set_hdr(id, metadata),
                         Err(code) => stream.cleanup(code),
                     }
