@@ -49,6 +49,17 @@ pub(super) struct PresentationPacing {
     fresh_pushes: u64,
     repeats: u64,
     coalesced: u64,
+    /// A newer presentation arrived between metadata query and actual read.
+    newer_during_read: u64,
+    /// Distinct increasing presentation values observed by the consumer.
+    observed_presentations: u64,
+    latest_observed_sequence: u64,
+    /// Queries that advanced by more than one sequence value. Sequence values
+    /// need not be consecutive, so this is not a count of lost frames.
+    sequence_jump_events: u64,
+    /// Distinct observed presentations held at least once by the rate cap.
+    cap_hold_events: u64,
+    last_cap_held_sequence: u64,
 }
 
 impl PresentationPacing {
@@ -60,6 +71,18 @@ impl PresentationPacing {
         let PresentationQuery::Latest(presentation) = query else {
             return self.active;
         };
+        if presentation.sequence > self.latest_observed_sequence {
+            if self.latest_observed_sequence != 0
+                && presentation
+                    .sequence
+                    .saturating_sub(self.latest_observed_sequence)
+                    > 1
+            {
+                self.sequence_jump_events = self.sequence_jump_events.saturating_add(1);
+            }
+            self.latest_observed_sequence = presentation.sequence;
+            self.observed_presentations = self.observed_presentations.saturating_add(1);
+        }
         let newest_known = self
             .pending
             .map_or(self.delivered_sequence, |pending| pending.sequence);
@@ -85,6 +108,17 @@ impl PresentationPacing {
     /// A newer presentation waits and the frame-rate cap admits it.
     pub(super) fn fresh_due(&self, now: Instant) -> bool {
         self.pending.is_some() && self.submit_allowed(now)
+    }
+
+    /// Records cap holds once per presentation, rather than once per host tick.
+    pub(super) fn record_cap_hold(&mut self, now: Instant) {
+        if let Some(pending) = self.pending
+            && pending.sequence > self.last_cap_held_sequence
+            && !self.submit_allowed(now)
+        {
+            self.last_cap_held_sequence = pending.sequence;
+            self.cap_hold_events = self.cap_hold_events.saturating_add(1);
+        }
     }
 
     /// The stream timestamp for submitting the pending presentation, mapped
@@ -150,6 +184,9 @@ impl PresentationPacing {
             } else {
                 0
             };
+            if delivery.submitted && requested != 0 && delivered > requested {
+                self.newer_during_read = self.newer_during_read.saturating_add(1);
+            }
             self.delivered_sequence = self.delivered_sequence.max(delivered).max(requested);
             if self
                 .pending
@@ -196,6 +233,11 @@ impl PresentationPacing {
             "fresh_pushes": self.fresh_pushes,
             "repeats": self.repeats,
             "coalesced": self.coalesced,
+            "newer_during_read": self.newer_during_read,
+            "observed_presentations": self.observed_presentations,
+            "latest_observed_sequence": self.latest_observed_sequence,
+            "sequence_jump_events": self.sequence_jump_events,
+            "cap_hold_events": self.cap_hold_events,
         });
     }
 }
@@ -274,6 +316,51 @@ mod tests {
         let resumed = late + INTERVAL * 3;
         pacing.record(resumed, INTERVAL, fresh_submit(4));
         assert_eq!(pacing.next_submit_at, Some(resumed + INTERVAL));
+    }
+
+    #[test]
+    fn source_observations_and_cap_holds_are_counted_once_per_presentation() {
+        let start = Instant::now();
+        let mut pacing = PresentationPacing::default();
+        pacing.observe(presented(100, 1_000));
+        pacing.record(start, INTERVAL, fresh_submit(100));
+        pacing.observe(presented(102, 2_000));
+        pacing.record_cap_hold(start + Duration::from_millis(1));
+        pacing.record_cap_hold(start + Duration::from_millis(2));
+        pacing.observe(presented(102, 2_000));
+        pacing.observe(presented(103, 3_000));
+        pacing.record_cap_hold(start + Duration::from_millis(3));
+
+        let mut status = json!({});
+        pacing.write_status(&mut status);
+        let counters = &status["presentation_pacing"];
+        assert_eq!(counters["observed_presentations"], 3);
+        assert_eq!(counters["latest_observed_sequence"], 103);
+        assert_eq!(counters["sequence_jump_events"], 1);
+        assert_eq!(counters["cap_hold_events"], 2);
+        assert_eq!(counters["coalesced"], 1);
+    }
+
+    #[test]
+    fn aligned_120hz_source_does_not_lose_frames_to_two_millisecond_ticks() {
+        let start = Instant::now();
+        let interval = frame_interval(120);
+        let mut pacing = PresentationPacing::default();
+        let mut submitted = 0_u64;
+        for tick in 0..5_000_u64 {
+            let elapsed = Duration::from_millis(tick * 2);
+            let sequence = (elapsed.as_nanos() / interval.as_nanos()) as u64 + 1;
+            pacing.observe(presented(sequence, elapsed.as_micros() as u64));
+            let now = start + elapsed;
+            pacing.record_cap_hold(now);
+            if pacing.fresh_due(now) {
+                pacing.record(now, interval, fresh_submit(sequence));
+                submitted += 1;
+            }
+        }
+        assert_eq!(submitted, 1_200);
+        assert_eq!(pacing.coalesced, 0);
+        assert_eq!(pacing.sequence_jump_events, 0);
     }
 
     #[test]

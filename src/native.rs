@@ -1,5 +1,7 @@
 use crate::queue::Queues;
-use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, VideoApiV1_2};
+use amaterasu_media::{
+    MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, TimedPacketSink, VideoApiV1_2, VideoApiV1_3,
+};
 use amaterasu_module_sdk::abi::*;
 use std::{
     ffi::c_void,
@@ -27,7 +29,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: VideoApiV1_2,
+    api: VideoApiV1_3,
     queues: Arc<Mutex<Queues>>,
     caller: String,
 }
@@ -49,8 +51,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 2
-            || query.min_size as usize > size_of::<VideoApiV1_2>()
+            || query.min_minor > 3
+            || query.min_size as usize > size_of::<VideoApiV1_3>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -64,25 +66,28 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: VideoApiV1_2 {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<VideoApiV1_2>() as u32,
-                        major: 1,
-                        minor: 2,
+            api: VideoApiV1_3 {
+                base: VideoApiV1_2 {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<VideoApiV1_3>() as u32,
+                            major: 1,
+                            minor: 3,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release),
+                    receive,
+                    geometry,
+                    hdr_metadata,
                 },
-                receive,
-                geometry,
-                hdr_metadata,
+                receive_timed,
             },
             queues: factory.queues.clone(),
             caller,
         });
-        binding.api.base.context = (&mut *binding as *mut Binding).cast();
-        let table = &binding.api.base as *const NativeInterface;
+        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
+        let table = &binding.api.base.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: transfers provider-owned table until exactly one release.
         unsafe {
@@ -114,6 +119,24 @@ unsafe extern "C" fn receive(context: *mut c_void, stream: u64, sink: PacketSink
             return MEDIA_BUSY;
         };
         unsafe { queues.receive(&binding.caller, stream, sink) }
+    })
+}
+
+unsafe extern "C" fn receive_timed(
+    context: *mut c_void,
+    stream: u64,
+    sink: TimedPacketSink,
+) -> Status {
+    guarded(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: binding and sink remain live for this synchronous call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        unsafe { queues.receive_timed(&binding.caller, stream, sink) }
     })
 }
 
@@ -181,9 +204,73 @@ unsafe extern "C" fn hdr_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amaterasu_media::{CODEC_H264, EncodedPacket, MEDIA_CLOSED, VideoApi};
+    use amaterasu_media::{CODEC_H264, EncodedPacket, MEDIA_CLOSED, TimedEncodedPacket, VideoApi};
     unsafe extern "C" fn accept(_: *mut c_void, _: *const EncodedPacket) -> Status {
         STATUS_OK
+    }
+    unsafe extern "C" fn accept_timed(_: *mut c_void, packet: *const TimedEncodedPacket) -> Status {
+        // SAFETY: the provider lends a valid timed packet for this callback.
+        let packet = unsafe { &*packet };
+        assert_eq!(packet.base.timestamp_us, 11);
+        assert_eq!(packet.processing_started_host_us, 42);
+        STATUS_OK
+    }
+
+    #[test]
+    fn timed_tail_negotiates_and_preserves_caller_owned_output() {
+        let queues = Arc::new(Mutex::new(Queues::default()));
+        queues.lock().unwrap().open(7, "alice", 10);
+        queues.lock().unwrap().start_processing(7, 1, 42);
+        let bytes = [1];
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: 0,
+            data: bytes.as_ptr(),
+            len: 1,
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        // SAFETY: the queue copies the live packet immediately.
+        assert_eq!(
+            unsafe { queues.lock().unwrap().push(7, &packet) },
+            STATUS_OK
+        );
+        let factory = Factory::new(queues);
+        let query = NativeInterfaceQuery {
+            header: AbiHeader::of::<NativeInterfaceQuery>(),
+            interface_major: 1,
+            min_minor: 3,
+            min_size: size_of::<VideoApiV1_3>() as u32,
+        };
+        let mut output = std::ptr::null();
+        // SAFETY: query and output are live for the bind.
+        assert_eq!(
+            unsafe {
+                bind(
+                    factory.api.context,
+                    BorrowedBytes::new(b"alice"),
+                    &query,
+                    &mut output,
+                )
+            },
+            STATUS_OK
+        );
+        // SAFETY: successful bind provides this complete v1.3 table until release.
+        let api = unsafe { &*output.cast::<VideoApiV1_3>() };
+        assert_eq!(
+            unsafe {
+                (api.receive_timed)(
+                    api.base.base.context,
+                    7,
+                    TimedPacketSink {
+                        context: std::ptr::null_mut(),
+                        write: accept_timed,
+                    },
+                )
+            },
+            STATUS_OK
+        );
+        unsafe { (api.base.base.release.unwrap())(api.base.base.context) };
     }
     #[test]
     fn factory_copies_principal_and_binds_packet_ownership() {

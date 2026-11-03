@@ -70,6 +70,133 @@ fn counters(pipeline: &Pipeline) -> (u64, u64, u64) {
 }
 
 #[test]
+fn presentation_advance_during_read_is_counted() {
+    let mut pacing = crate::pipeline::presentation::PresentationPacing::default();
+    assert!(pacing.observe(crate::plane::PresentationQuery::Latest(
+        PresentationStatus {
+            sequence: 4,
+            timestamp_us: 100
+        }
+    )));
+    pacing.record(
+        Instant::now(),
+        Duration::from_millis(8),
+        crate::pipeline::presentation::PresentationDelivery {
+            pushed: true,
+            repeat: false,
+            delivered: Some(5),
+            submitted: true,
+        },
+    );
+    let mut status = json!({});
+    pacing.write_status(&mut status);
+    assert_eq!(status["presentation_pacing"]["newer_during_read"], 1);
+    assert!(pacing.observe(crate::plane::PresentationQuery::Latest(
+        PresentationStatus {
+            sequence: 6,
+            timestamp_us: 200
+        }
+    )));
+    pacing.record(
+        Instant::now(),
+        Duration::from_millis(8),
+        crate::pipeline::presentation::PresentationDelivery {
+            pushed: true,
+            repeat: false,
+            delivered: Some(7),
+            submitted: false,
+        },
+    );
+    pacing.write_status(&mut status);
+    assert_eq!(status["presentation_pacing"]["newer_during_read"], 1);
+}
+
+#[test]
+fn capture_start_survives_same_pump_and_delayed_encoder_output() {
+    use amaterasu_media::{CODEC_H264, EncodedPacket, TimedEncodedPacket, TimedPacketSink};
+    use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+    use std::ffi::c_void;
+    unsafe extern "C" fn collect(
+        context: *mut c_void,
+        packet: *const TimedEncodedPacket,
+    ) -> Status {
+        // SAFETY: the callback is given a live vector and borrowed packet.
+        let output = unsafe { &mut *context.cast::<Vec<(u64, u64, u64)>>() };
+        let packet = unsafe { &*packet };
+        output.push((
+            packet.base.sequence,
+            packet.base.timestamp_us,
+            packet.processing_started_host_us,
+        ));
+        STATUS_OK
+    }
+    let (mut pipeline, mut runtime, mut plane) = presentation_stream();
+    plane.same_pump_output = Some(pipeline.queues.clone());
+    present(&mut plane, 1, 1_000_000);
+    let before = amaterasu_media::host_monotonic_micros();
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    let first = *plane.inputs.last().unwrap();
+    let mut output: Vec<(u64, u64, u64)> = Vec::new();
+    let sink = TimedPacketSink {
+        context: (&mut output as *mut Vec<(u64, u64, u64)>).cast(),
+        write: collect,
+    };
+    // SAFETY: output and queue-owned bytes outlive the callback.
+    assert_eq!(
+        unsafe {
+            pipeline
+                .queues
+                .lock()
+                .unwrap()
+                .receive_timed("alice", 1, sink)
+        },
+        STATUS_OK
+    );
+    assert_eq!(output[0].0, first.5);
+    assert_eq!(output[0].1, pipeline.streams[&1].clock_origin_us + first.6);
+    assert!(output[0].2 >= before && output[0].2 <= amaterasu_media::host_monotonic_micros());
+
+    // The next accepted capture returns its encoded packet on a later pump.
+    plane.same_pump_output = None;
+    open_rate_cap(pipeline.streams.get_mut(&1).unwrap());
+    present(&mut plane, 2, 1_016_667);
+    let before = amaterasu_media::host_monotonic_micros();
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    let delayed = *plane.inputs.last().unwrap();
+    let bytes = [1u8];
+    let packet = EncodedPacket {
+        codec: CODEC_H264,
+        flags: 0,
+        data: bytes.as_ptr(),
+        len: 1,
+        timestamp_us: delayed.6,
+        sequence: delayed.5,
+    };
+    // SAFETY: the live bytes are copied before push returns.
+    assert_eq!(
+        unsafe { pipeline.queues.lock().unwrap().push(1, &packet) },
+        STATUS_OK
+    );
+    // SAFETY: output and queue-owned bytes outlive the callback.
+    assert_eq!(
+        unsafe {
+            pipeline
+                .queues
+                .lock()
+                .unwrap()
+                .receive_timed("alice", 1, sink)
+        },
+        STATUS_OK
+    );
+    assert_eq!(output[1].0, delayed.5);
+    assert_eq!(
+        output[1].1,
+        pipeline.streams[&1].clock_origin_us + delayed.6
+    );
+    assert!(output[1].2 >= before && output[1].2 <= amaterasu_media::host_monotonic_micros());
+}
+
+#[test]
 fn fresh_presentation_is_pushed_on_the_next_tick_not_the_next_timer_slot() {
     let (mut pipeline, mut runtime, mut plane) = presentation_stream();
     assert_eq!(status(&pipeline)["pacing"], "presentation");
