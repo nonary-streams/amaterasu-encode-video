@@ -142,6 +142,7 @@ struct Stream {
     encoder_probe_attempt: u8,
     encoder_probe_reason: Option<String>,
     configuration: Configuration,
+    gpu_configured: bool,
     parent: Option<u64>,
     ending_parent: Option<u64>,
     pending: Option<u64>,
@@ -994,6 +995,7 @@ impl Pipeline {
                 encoder_index,
                 encoder_attempt: 0,
                 configuration,
+                gpu_configured: false,
                 parent: Some(request),
                 ending_parent: None,
                 pending: None,
@@ -1055,6 +1057,15 @@ impl Pipeline {
         let stream = self.streams.get_mut(&id).unwrap();
         plane.select_encoder(&stream.encoder_service);
         plane.set_stream_clock(id, stream.clock_origin_us, stream.clock_epoch);
+        if !stream.gpu_configured {
+            match plane.configure_gpu(id, stream.configuration.gpu_processing.as_ref()) {
+                Ok(()) => stream.gpu_configured = true,
+                Err(reason) => {
+                    stream.gpu_configured = true;
+                    stream.cleanup(reason);
+                }
+            }
+        }
         if let Some(parent) = stream.parent
             && !matches!(
                 send(Command::CheckRequest { request: parent }),
@@ -1596,7 +1607,7 @@ fn advance(
         return apply_result(stream, id, queues, plane, result, send);
     }
     if stream.stage == Stage::Capture {
-        owned_capture::select_capture_provider(stream, plane);
+        owned_capture::select_capture_provider(stream, id, plane);
         if stream.stage != Stage::Capture {
             return false;
         }
@@ -2060,7 +2071,7 @@ fn apply_result(
     }
     let next = match stream.stage {
         Stage::SelectEncoder => {
-            let prefer_dmabuf = stream.owned_capture.prefers_dmabuf(plane);
+            let prefer_dmabuf = stream.owned_capture.prefers_dmabuf(id, plane);
             let software_only = matches!(
                 stream.requested_encoder,
                 EncoderSelection::Backend(EncoderBackend::Software)

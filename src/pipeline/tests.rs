@@ -386,6 +386,8 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 struct FakePlane {
     same_pump_output: Option<Arc<Mutex<Queues>>>,
     selected_encoders: Vec<String>,
+    gpu_configurations: Vec<(u64, Option<serde_json::Value>)>,
+    gpu_configuration_failure: bool,
     source_starts: Vec<(u64, u64, u64)>,
     source_pumps: Vec<(u64, bool)>,
     source_drains: usize,
@@ -424,6 +426,21 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn configure_gpu(
+        &mut self,
+        stream: u64,
+        selection: Option<&crate::model::GpuProcessing>,
+    ) -> Result<(), &'static str> {
+        self.gpu_configurations.push((
+            stream,
+            selection.map(|value| serde_json::to_value(value).unwrap()),
+        ));
+        if self.gpu_configuration_failure {
+            Err("gpu_processor_settings_rejected")
+        } else {
+            Ok(())
+        }
+    }
     fn select_encoder(&mut self, service: &str) {
         self.selected_encoders.push(service.to_owned());
     }
@@ -492,7 +509,7 @@ impl Plane for FakePlane {
         Ok(self.owned_geometry)
     }
 
-    fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
+    fn dmabuf_unavailable(&self, _: u64, _: CaptureProvider) -> Option<&'static str> {
         (!self.dmabuf_ready).then_some("capture_dmabuf_interface_unavailable")
     }
 
@@ -767,6 +784,7 @@ fn open() -> Operation {
         encoder: EncoderSelection::Identity(encoder_identity()),
         encoder_provider: None,
         configuration: Box::new(Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             slices_per_frame: 1,
             qp: 28,
@@ -1758,6 +1776,59 @@ fn tick(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane, c
     for _ in 0..count {
         pipeline.tick(plane, &mut |command| runtime.send(command));
     }
+}
+
+#[test]
+fn gpu_settings_are_admitted_once_before_frames_and_failures_stop_open() {
+    let selected = json!({"service":"example.processor/1", "enabled":true,
+        "source_hdr_required":false, "settings":{"strength":7}});
+    let operation_with_processing = || {
+        let mut operation = open();
+        let Operation::Open { configuration, .. } = &mut operation else {
+            unreachable!()
+        };
+        configuration.gpu_processing = Some(serde_json::from_value(selected.clone()).unwrap());
+        operation
+    };
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, operation_with_processing(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(plane.gpu_configurations, vec![(1, Some(selected.clone()))]);
+    assert_eq!(
+        plane.calls, 0,
+        "settings must be admitted before frame processing"
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 6);
+    assert_eq!(
+        plane.gpu_configurations.len(),
+        1,
+        "stream configuration is immutable"
+    );
+    assert!(plane.calls > 0);
+
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    plane.gpu_configuration_failure = true;
+    pipeline.handle("alice", 99, operation_with_processing(), &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert_eq!(plane.gpu_configurations, vec![(1, Some(selected))]);
+    assert_eq!(
+        plane.calls, 0,
+        "rejected settings must never process a frame"
+    );
+    assert_eq!(
+        runtime.open_effects, 0,
+        "rejected settings must not open capture or encoder"
+    );
+    assert!(
+        runtime
+            .completed
+            .iter()
+            .any(|(_, reply)| reply["code"] == "gpu_processor_settings_rejected")
+    );
 }
 
 #[test]

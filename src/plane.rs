@@ -147,6 +147,18 @@ pub struct FrameMetadata {
     pub sequence: u64,
 }
 pub trait Plane {
+    /// Admit one immutable stream selection before any provider operation.
+    fn configure_gpu(
+        &mut self,
+        _: u64,
+        selection: Option<&crate::model::GpuProcessing>,
+    ) -> Result<(), &'static str> {
+        if selection.is_some() {
+            Err("gpu_processor_unavailable")
+        } else {
+            Ok(())
+        }
+    }
     fn hdr_metadata(
         &mut self,
         _: u64,
@@ -213,7 +225,7 @@ pub trait Plane {
     }
     /// Why `provider` cannot deliver DMA-BUF frames directly to the encoder
     /// binding, or `None` when both native tables carry the DMA-BUF tails.
-    fn dmabuf_unavailable(&self, _: CaptureProvider) -> Option<&'static str> {
+    fn dmabuf_unavailable(&self, _: u64, _: CaptureProvider) -> Option<&'static str> {
         Some("dmabuf_unsupported")
     }
     /// The newest completed presentation of a DMA-BUF capture stream. This
@@ -239,6 +251,10 @@ pub struct NativePlane {
     stream_clocks: BTreeMap<u64, (u64, [u8; 16])>,
     sources: BTreeMap<u64, (String, source::Source)>,
     gpu_processor: Option<NativeBinding>,
+    gpu_processor_service: Option<String>,
+    gpu_processor_opt_in: bool,
+    gpu_bypassed: std::collections::BTreeSet<u64>,
+    gpu_configured: std::collections::BTreeSet<u64>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     /// Optional providers whose startup binding failed, with the reason.
@@ -253,6 +269,10 @@ pub struct NativePlane {
 }
 
 impl NativePlane {
+    pub fn with_gpu_processor_opt_in(mut self, opt_in: bool) -> Self {
+        self.gpu_processor_opt_in = opt_in;
+        self
+    }
     pub fn with_required_frame_leases(mut self, required: bool) -> Self {
         self.require_frame_lease = required;
         self
@@ -355,6 +375,10 @@ impl NativePlane {
                         )
                     })
                     .transpose()?,
+                gpu_processor_service: gpu_processor_service.map(str::to_owned),
+                gpu_processor_opt_in: false,
+                gpu_bypassed: Default::default(),
+                gpu_configured: Default::default(),
                 gpu_processor: gpu_processor_service
                     .map(|service| {
                         runtime.bind_native_typed(
@@ -642,6 +666,37 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn configure_gpu(
+        &mut self,
+        stream: u64,
+        selection: Option<&crate::model::GpuProcessing>,
+    ) -> Result<(), &'static str> {
+        let Some(selection) = selection else {
+            if self.gpu_processor_opt_in {
+                self.gpu_bypassed.insert(stream);
+            }
+            return Ok(());
+        };
+        if self.gpu_processor_service.as_deref() != Some(selection.service.as_str()) {
+            return Err("gpu_processor_selection_mismatch");
+        }
+        let binding = self
+            .gpu_processor
+            .as_ref()
+            .ok_or("gpu_processor_unavailable")?;
+        if !selection.enabled {
+            self.gpu_bypassed.insert(stream);
+            return Ok(());
+        }
+        let json = serde_json::to_vec(&selection.settings)
+            .map_err(|_| "gpu_processor_settings_invalid")?;
+        let api = unsafe { gpu_processor::table(binding) }?;
+        unsafe { amaterasu_module_sdk::processing::configure_gpu_stream(api, stream, &json) }
+            .map_err(|_| "gpu_processor_settings_rejected")?;
+        self.gpu_configured.insert(stream);
+        Ok(())
+    }
+
     fn select_encoder(&mut self, service: &str) {
         debug_assert!(
             self.encoders.contains_key(service) || self.source_encoders.contains_key(service)
@@ -762,7 +817,7 @@ impl Plane for NativePlane {
         }
     }
 
-    fn dmabuf_unavailable(&self, provider: CaptureProvider) -> Option<&'static str> {
+    fn dmabuf_unavailable(&self, video: u64, provider: CaptureProvider) -> Option<&'static str> {
         if self.processor.is_some() {
             return Some("processor_requires_cpu");
         }
@@ -800,7 +855,7 @@ impl Plane for NativePlane {
                 if let Err(reason) = dmabuf::use_lease_path(
                     capture.base.header,
                     encoder.base.header,
-                    self.gpu_processor.is_some(),
+                    self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&video),
                 ) {
                     return Some(reason);
                 }
@@ -837,7 +892,9 @@ impl Plane for NativePlane {
         provider: CaptureProvider,
         stream: u64,
     ) -> Result<Option<HdrMetadata>, &'static str> {
-        if let Some(binding) = &self.gpu_processor {
+        if let Some(binding) = &self.gpu_processor
+            && !self.gpu_bypassed.contains(&video)
+        {
             return gpu_processor::hdr_metadata(binding, video);
         }
         let Some(binding) = self.captures.get(&provider) else {
@@ -860,6 +917,7 @@ impl Plane for NativePlane {
 
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         if let Some(binding) = &self.gpu_processor
+            && !self.gpu_bypassed.contains(&input.video)
             && let Some(metadata) = gpu_processor::hdr_metadata(binding, input.video)?
         {
             let hdr = input.configuration.video_stream_format.dynamic_range
@@ -870,6 +928,27 @@ impl Plane for NativePlane {
         }
         if self.require_frame_lease && input.frame_path != FramePath::DmaBuf {
             return Err("capture_frame_lease_required");
+        }
+        if input.configuration.gpu_processing.is_some() && input.frame_path != FramePath::DmaBuf {
+            // Explicit processing policy requires capture-owned color provenance;
+            // untagged CPU frames cannot prove the requested source range.
+            return Err("capture_range_verification_requires_dmabuf");
+        }
+        if input.configuration.gpu_processing.is_some() {
+            let capture = self
+                .captures
+                .get(&input.provider)
+                .ok_or("capture_provider_unavailable")?;
+            // SAFETY: the typed capture binding and stream remain live through
+            // this SDK query, which checks the additive table version and size.
+            let prefix =
+                unsafe { capture.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+            match unsafe { amaterasu_module_sdk::capture::color_provenance(prefix, input.capture) }
+            {
+                Ok(true) => {}
+                Err(MEDIA_PENDING | MEDIA_BUSY) => return Ok(Progress::default()),
+                _ => return Err("capture_color_provenance_unavailable"),
+            }
         }
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::Generic {
@@ -905,7 +984,7 @@ impl Plane for NativePlane {
                 .table::<EncoderApi>()
         }
         .map_err(|_| "encoder_interface")?;
-        if self.gpu_processor.is_some() {
+        if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
             return Err("gpu_processor_requires_dmabuf");
         }
         #[cfg(amaterasu_swscale)]
@@ -1020,7 +1099,16 @@ impl Plane for NativePlane {
         self.resource_selections.remove(&video);
         self.dmabuf_resource_selections.remove(&video);
         self.capture_events.remove(video);
-        self.leased_streams.finish(video);
+        let processor_retired = self.leased_streams.finish(video);
+        if self.gpu_configured.remove(&video)
+            && !processor_retired
+            && let Some(binding) = &self.gpu_processor
+            && let Ok(api) = unsafe { gpu_processor::table(binding) }
+        {
+            // SAFETY: the configured binding is live and downstream leases have retired.
+            unsafe { (api.cancel_dmabuf_leases)(api.base.context, video) };
+        }
+        self.gpu_bypassed.remove(&video);
     }
 
     fn release_stream(&mut self, video: u64) {
@@ -1072,7 +1160,9 @@ impl NativePlane {
         if !input.capture_due {
             return Ok(Progress::default());
         }
-        if self.processor.is_some() || self.gpu_processor.is_some() {
+        if self.processor.is_some()
+            || (self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video))
+        {
             return Err("generic_processor_unsupported");
         }
         let capture = self
@@ -1183,6 +1273,7 @@ impl NativePlane {
             let processor = self
                 .gpu_processor
                 .as_ref()
+                .filter(|_| !self.gpu_bypassed.contains(&input.video))
                 .map(|binding| unsafe { gpu_processor::table(binding) })
                 .transpose()?;
             // SAFETY: these bindings remain live until mandatory cancellation completes.
@@ -1224,13 +1315,14 @@ impl NativePlane {
         if dmabuf::use_lease_path(
             capture_prefix.base.header,
             encoder_prefix.base.header,
-            self.gpu_processor.is_some(),
+            self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video),
         )? {
             let leased_capture =
                 unsafe { binding.table::<CaptureApiV1_6>() }.map_err(|_| "capture_interface")?;
             let processor = self
                 .gpu_processor
                 .as_ref()
+                .filter(|_| !self.gpu_bypassed.contains(&input.video))
                 .map(|binding| unsafe { gpu_processor::table(binding) })
                 .transpose()?;
             let leased_encoder = unsafe {
@@ -1256,7 +1348,9 @@ impl NativePlane {
                 !input.capture_due,
             )?;
             if let Some(reason) = progress.dmabuf_fallback {
-                if self.gpu_processor.is_some() || self.require_frame_lease {
+                if (self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video))
+                    || self.require_frame_lease
+                {
                     return Err(reason);
                 }
                 if reason == "capture_dmabuf_lease_unsupported" {
@@ -1266,7 +1360,7 @@ impl NativePlane {
             Ok(progress)
         } else if self.require_frame_lease {
             Err("capture_frame_lease_required")
-        } else if self.gpu_processor.is_some() {
+        } else if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
             Err("gpu_processor_requires_frame_lease")
         } else {
             dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due)
@@ -1747,6 +1841,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -1828,6 +1923,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -1947,6 +2043,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2135,6 +2232,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2204,6 +2302,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            gpu_processing: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,

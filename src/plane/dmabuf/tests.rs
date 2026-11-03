@@ -669,6 +669,11 @@ unsafe extern "C" fn process_lease(
             unsafe { (sink.write)(sink.context, input, freshness) }
         }
         2 => STATUS_OK,
+        6 => {
+            let mut converted = unsafe { *input };
+            converted.frame.color = DMABUF_COLOR_BT2020_PQ;
+            unsafe { (sink.write)(sink.context, &converted, freshness) }
+        }
         3 => {
             unsafe { (sink.write)(sink.context, input, freshness) };
             unsafe { (sink.write)(sink.context, input, freshness) }
@@ -895,6 +900,124 @@ fn leased_delivery_releases_on_encoder_busy_failure_and_retain_refusal() {
 }
 
 #[test]
+fn selected_processing_checks_capture_color_before_processing_or_bypass() {
+    for (enabled, required_hdr, color, expected) in [
+        (true, false, DMABUF_COLOR_SRGB, true),
+        (true, false, DMABUF_COLOR_BT2020_PQ, false),
+        (true, false, 0, false),
+        (false, true, DMABUF_COLOR_BT2020_PQ, true),
+        (false, true, DMABUF_COLOR_SRGB, false),
+        (false, true, 0, false),
+    ] {
+        let harness = Harness::default();
+        harness.frame_color.set(color);
+        let mut config = configuration();
+        if required_hdr {
+            config.video_stream_format = serde_json::from_value(serde_json::json!({
+                "codec":"hevc", "bit_depth":10, "dynamic_range":"hdr"
+            }))
+            .unwrap();
+        }
+        config.gpu_processing = Some(
+            serde_json::from_value(serde_json::json!({
+                "service":"fixture.processor/1", "enabled":enabled,
+                "source_hdr_required":required_hdr, "settings":{}
+            }))
+            .unwrap(),
+        );
+        let processor = gpu_processor_api(&harness);
+        let result = deliver_leased(
+            &leased_capture_api(&harness),
+            &leased_encoder_api(&harness),
+            enabled.then_some(&processor),
+            &pump(&config, true, false),
+            false,
+        );
+        if expected {
+            assert!(result.unwrap().submitted);
+            finish_encoder(&harness);
+        } else {
+            assert_eq!(result.err(), Some("frame_rejected"));
+            assert!(harness.submitted.borrow().is_empty());
+            assert_eq!(harness.retained.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn selected_processor_output_must_match_negotiated_range() {
+    for (mode, accepted) in [(0, false), (6, true)] {
+        let harness = Harness::default();
+        harness.processor_mode.set(mode);
+        let mut config = configuration();
+        config.video_stream_format = serde_json::from_value(serde_json::json!({
+            "codec":"hevc", "bit_depth":10, "dynamic_range":"hdr"
+        }))
+        .unwrap();
+        config.gpu_processing = Some(
+            serde_json::from_value(serde_json::json!({
+                "service":"fixture.processor/1", "enabled":true,
+                "source_hdr_required":false, "settings":{}
+            }))
+            .unwrap(),
+        );
+        let processor = gpu_processor_api(&harness);
+        let result = deliver_leased(
+            &leased_capture_api(&harness),
+            &leased_encoder_api(&harness),
+            Some(&processor),
+            &pump(&config, true, false),
+            false,
+        );
+        if accepted {
+            assert!(result.unwrap().submitted);
+            finish_encoder(&harness);
+        } else {
+            assert_eq!(result.err(), Some("frame_rejected"));
+            assert!(harness.submitted.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn disabled_processing_cannot_claim_a_different_output_range() {
+    let mut config = configuration();
+    config.video_stream_format = serde_json::from_value(serde_json::json!({
+        "codec":"hevc", "bit_depth":10, "dynamic_range":"hdr"
+    }))
+    .unwrap();
+    config.gpu_processing = Some(
+        serde_json::from_value(serde_json::json!({
+            "service":"fixture.processor/1", "enabled":false,
+            "source_hdr_required":false, "settings":{}
+        }))
+        .unwrap(),
+    );
+    assert!(!config.validate());
+}
+
+#[test]
+fn borrowed_capture_also_checks_selected_source_color() {
+    let harness = Harness::default();
+    let mut config = configuration();
+    config.gpu_processing = Some(
+        serde_json::from_value(serde_json::json!({
+            "service":"fixture.processor/1", "enabled":false,
+            "source_hdr_required":true, "settings":{}
+        }))
+        .unwrap(),
+    );
+    let result = deliver(
+        &capture_api(&harness),
+        &encoder_api(&harness),
+        &pump(&config, true, false),
+        false,
+    );
+    assert_eq!(result.err(), Some("frame_rejected"));
+    assert!(harness.submitted.borrow().is_empty());
+}
+
+#[test]
 fn gpu_processor_preserves_ownership_and_rejects_invalid_output_protocols() {
     let harness = Harness::default();
     let config = configuration();
@@ -1084,6 +1207,119 @@ unsafe extern "C" fn invoke_lifecycle_runtime(
     // SAFETY: the synchronous runtime call keeps reply sink live through send.
     unsafe { sink.send(&serde_json::to_vec(&response).unwrap()) };
     STATUS_OK
+}
+
+unsafe extern "C" fn fixture_hdr_metadata(_: *mut c_void, _: u64, _: *mut HdrMetadata) -> Status {
+    MEDIA_PENDING
+}
+
+unsafe extern "C" fn fixture_color_provenance(
+    context: *mut c_void,
+    stream: u64,
+    out: *mut u32,
+) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    assert_eq!(stream, 3);
+    match harness.processor_mode.get() {
+        10 => MEDIA_PENDING,
+        16 => MEDIA_BUSY,
+        17 => {
+            unsafe { *out = CAPTURE_COLOR_PER_PRESENTATION_AUTHORITATIVE | 2 };
+            STATUS_OK
+        }
+        11 => {
+            unsafe { *out = 0 };
+            STATUS_OK
+        }
+        12 => {
+            unsafe { *out = CAPTURE_COLOR_PER_PRESENTATION_AUTHORITATIVE };
+            STATUS_OK
+        }
+        _ => MEDIA_UNSUPPORTED,
+    }
+}
+
+#[test]
+fn selected_processing_requires_capture_color_provenance_before_delivery() {
+    use crate::plane::{NativePlane, Plane};
+    use amaterasu_module_sdk::RuntimeClient;
+    use std::sync::{Arc, Mutex};
+    for mode in [10, 11, 12, 13, 14, 15, 16, 17] {
+        let harness = Harness::default();
+        harness.processor_mode.set(mode);
+        let mut base = leased_capture_api(&harness);
+        base.base.header = AbiHeader {
+            size: std::mem::size_of::<CaptureApiV1_10>() as u32,
+            major: INTERFACE_MAJOR,
+            minor: CAPTURE_COLOR_PROVENANCE_INTERFACE_MINOR,
+        };
+        if mode == 14 {
+            base.base.header.minor = 9;
+        } else if mode == 15 {
+            base.base.header.size = std::mem::size_of::<CaptureApiV1_9>() as u32;
+        }
+        let capture = CaptureApiV1_10 {
+            base: CaptureApiV1_9 {
+                base: CaptureApiV1_7 {
+                    base,
+                    subscribe_events: no_subscribe,
+                    unsubscribe_events: no_unsubscribe,
+                    resolve_swap: no_swap,
+                },
+                enumerate_resources: resource_enumerate,
+                select_resource: resource_select,
+                read_resource_frame: resource_read,
+                hdr_metadata: fixture_hdr_metadata,
+            },
+            color_provenance: fixture_color_provenance,
+        };
+        let encoder = leased_encoder_api(&harness);
+        let fixture = RuntimeFixture {
+            harness: &harness,
+            capture: std::ptr::from_ref(&capture) as usize,
+            encoder: std::ptr::from_ref(&encoder) as usize,
+            external_encoder: 0,
+            processor: 0,
+        };
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(&fixture).cast_mut().cast(),
+                invoke: invoke_lifecycle_runtime,
+            })
+        };
+        let mut plane = NativePlane::bind(
+            &runtime,
+            Arc::new(Mutex::new(crate::queue::Queues::default())),
+            &[CaptureProvider::Vkms].into(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut config = configuration();
+        config.gpu_processing = Some(
+            serde_json::from_value(serde_json::json!({
+                "service":"fixture.processor/1", "enabled":false,
+                "source_hdr_required":false, "settings":{}
+            }))
+            .unwrap(),
+        );
+        let result = plane.pump(pump(&config, true, false));
+        match mode {
+            10 | 16 => assert!(!result.unwrap().submitted),
+            12 => {
+                assert!(result.unwrap().submitted);
+                finish_encoder(&harness);
+            }
+            _ => assert_eq!(result.err(), Some("capture_color_provenance_unavailable")),
+        }
+        if mode != 12 {
+            assert!(harness.submitted.borrow().is_empty());
+        }
+    }
 }
 
 #[test]
@@ -1319,6 +1555,46 @@ unsafe extern "C" fn no_unsubscribe(_: *mut c_void, _: u64) {}
 unsafe extern "C" fn no_swap(_: *mut c_void, _: u64, _: u64, _: u32, _: BorrowedBytes) -> Status {
     MEDIA_UNSUPPORTED
 }
+#[test]
+fn negotiated_resource_checks_capture_color_before_encoder() {
+    let harness = Harness::default();
+    let mut base = leased_capture_api(&harness);
+    base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_8_SIZE,
+        major: INTERFACE_MAJOR,
+        minor: CAPTURE_RESOURCE_INTERFACE_MINOR,
+    };
+    let capture = CaptureApiV1_8 {
+        base: CaptureApiV1_7 {
+            base,
+            subscribe_events: no_subscribe,
+            unsubscribe_events: no_unsubscribe,
+            resolve_swap: no_swap,
+        },
+        enumerate_resources: resource_enumerate,
+        select_resource: resource_select,
+        read_resource_frame: resource_read,
+    };
+    let mut config = configuration();
+    config.gpu_processing = Some(
+        serde_json::from_value(serde_json::json!({
+            "service":"fixture.processor/1", "enabled":false,
+            "source_hdr_required":true, "settings":{}
+        }))
+        .unwrap(),
+    );
+    let result = deliver_resource(
+        &capture,
+        &leased_encoder_api(&harness),
+        None,
+        &pump(&config, true, true),
+        &mut std::collections::BTreeMap::new(),
+    );
+    assert_eq!(result.err(), Some("frame_rejected"));
+    assert!(harness.submitted.borrow().is_empty());
+    assert_eq!(harness.retained.get(), 0);
+}
+
 #[test]
 fn negotiated_resource_reaches_encoder_and_retains_until_completion() {
     let harness = Harness::default();

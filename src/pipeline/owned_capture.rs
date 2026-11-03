@@ -64,24 +64,24 @@ impl OwnedOutputCapture {
 
     /// Encoder selection ranks DMA-BUF-capable encoders first only when the
     /// capture side could actually deliver DMA-BUF frames to them.
-    pub(super) fn prefers_dmabuf(&self, plane: &dyn Plane) -> bool {
+    pub(super) fn prefers_dmabuf(&self, video: u64, plane: &dyn Plane) -> bool {
         self.candidate
             && self.vkms_allowed
             && self
                 .dmabuf_provider
-                .is_some_and(|provider| plane.dmabuf_unavailable(provider).is_none())
+                .is_some_and(|provider| plane.dmabuf_unavailable(video, provider).is_none())
     }
 
     pub(super) fn record_encoder_inputs(&mut self, accepts_dmabuf: bool) {
         self.encoder_accepts_dmabuf = Some(accepts_dmabuf);
     }
 
-    fn unavailable_reason(&self, plane: &dyn Plane) -> Option<&'static str> {
+    fn unavailable_reason(&self, video: u64, plane: &dyn Plane) -> Option<&'static str> {
         if !self.vkms_allowed {
             return Some("capture_vkms_not_configured");
         }
         if let Some(reason) =
-            plane.dmabuf_unavailable(self.dmabuf_provider.expect("candidate has provider"))
+            plane.dmabuf_unavailable(video, self.dmabuf_provider.expect("candidate has provider"))
         {
             return Some(reason);
         }
@@ -119,12 +119,12 @@ impl OwnedOutputCapture {
 /// binding carries capture v1.4, the encoder binding carries v1.1, and the
 /// selected encoder accepts DMA-BUF input. Otherwise the stream keeps PipeWire
 /// and records the reason; pinned vkms streams fail with that reason instead.
-pub(super) fn select_capture_provider(stream: &mut Stream, plane: &dyn Plane) {
+pub(super) fn select_capture_provider(stream: &mut Stream, video: u64, plane: &dyn Plane) {
     if stream.generic_input || !stream.owned_capture.selection_pending {
         return;
     }
     stream.owned_capture.selection_pending = false;
-    match stream.owned_capture.unavailable_reason(plane) {
+    match stream.owned_capture.unavailable_reason(video, plane) {
         None => {
             stream.provider = stream
                 .owned_capture

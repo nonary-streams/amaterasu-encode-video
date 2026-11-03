@@ -65,13 +65,15 @@ impl LeasedStreams {
         );
     }
 
-    pub fn finish(&mut self, video: u64) {
+    pub fn finish(&mut self, video: u64) -> bool {
         if let Some(stages) = self.values.remove(&video) {
             stages.encoder.finish();
             if let Some(processor) = stages.processor {
                 processor.finish();
+                return true;
             }
         }
+        false
     }
 
     pub fn finish_all(&mut self) {

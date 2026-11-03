@@ -274,6 +274,9 @@ pub struct Settings {
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
     pub gpu_processor_service: Option<String>,
+    /// Keep the selected processor inactive until a stream explicitly selects it.
+    #[serde(default)]
+    pub gpu_processor_opt_in: bool,
     /// Refuse borrowed/CPU fallbacks when this composition requires retained GPU frames.
     #[serde(default)]
     pub require_frame_lease: bool,
@@ -304,6 +307,7 @@ impl Default for Settings {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            gpu_processor_opt_in: false,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
         }
@@ -461,6 +465,9 @@ impl Settings {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    /// Lifecycle-authorized selection and opaque provider-specific settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_processing: Option<GpuProcessing>,
     /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
     #[serde(
         default = "default_video_stream_format",
@@ -508,6 +515,17 @@ pub struct Configuration {
     /// AMD AV1 latency policy. Current capture and H.264 MFT paths cannot apply it.
     #[serde(default, skip_serializing_if = "AmdAv1LatencyMode::is_auto")]
     pub amd_av1_latency_mode: AmdAv1LatencyMode,
+}
+
+/// Frozen processor selection supplied by the trusted stream owner.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GpuProcessing {
+    pub service: String,
+    pub enabled: bool,
+    /// Capture-owned source range required by the selected processing plan.
+    pub source_hdr_required: bool,
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_video_stream_format() -> amaterasu_module_sdk::VideoStreamFormat {
@@ -571,6 +589,19 @@ fn is_h264(codec: &VideoCodec) -> bool {
     *codec == VideoCodec::H264
 }
 
+impl GpuProcessing {
+    fn validate(&self) -> bool {
+        !self.service.is_empty()
+            && self.service.len() <= 128
+            && self.service.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-' | b'/')
+            })
+            && serde_json::to_vec(&self.settings).is_ok_and(|settings| settings.len() <= 16 * 1024)
+    }
+}
+
 impl Configuration {
     /// Accept either public codec representation, while refusing contradictory
     /// explicit non-default selections before allocating capture resources.
@@ -596,7 +627,10 @@ impl Configuration {
     }
 
     pub fn validate_source(&self) -> bool {
-        self.video_stream_format.validate().is_ok()
+        // Source encoders bypass capture frame inspection, so they cannot be
+        // used with an explicitly selected processing policy.
+        self.gpu_processing.is_none()
+            && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
@@ -617,7 +651,13 @@ impl Configuration {
     }
 
     pub fn validate(&self) -> bool {
-        self.video_stream_format.validate().is_ok()
+        self.gpu_processing.as_ref().is_none_or(|processing| {
+            processing.validate()
+                && (processing.enabled
+                    || processing.source_hdr_required
+                        == (self.video_stream_format.dynamic_range
+                            == amaterasu_module_sdk::DynamicRange::Hdr))
+        }) && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
@@ -1424,6 +1464,7 @@ mod tests {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            gpu_processor_opt_in: false,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1449,6 +1490,7 @@ mod tests {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            gpu_processor_opt_in: false,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };

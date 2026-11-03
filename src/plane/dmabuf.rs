@@ -107,12 +107,25 @@ enum Outcome {
     Rejected,
 }
 
+/// No source constraint preserves legacy operation. Explicit processing plans
+/// accept only a capture-provided, recognized sRGB or HDR10 color tag.
+fn source_color_matches(required_hdr: Option<bool>, color: u32) -> bool {
+    match required_hdr {
+        None => true,
+        Some(false) => color == DMABUF_COLOR_SRGB,
+        Some(true) => color == DMABUF_COLOR_BT2020_PQ,
+    }
+}
+
 struct Submission<'a> {
     api: &'a EncoderApiV1_1,
     encoder: u64,
     width: u32,
     height: u32,
     force_idr: bool,
+    /// Require a capture-supplied, recognized source color on each frame.
+    source_hdr_required: Option<bool>,
+    output_hdr_required: Option<bool>,
     timestamp_us: u64,
     sequence: u64,
     outcome: Outcome,
@@ -130,7 +143,10 @@ impl Submission<'_> {
     /// Every descriptor in `frame` must remain open until this call returns.
     unsafe fn forward(&mut self, frame: &DmaBufFrame) -> Outcome {
         self.presentation = Some(frame.sequence);
-        if frame.validate().is_err() {
+        if frame.validate().is_err()
+            || !source_color_matches(self.source_hdr_required, frame.color)
+            || !source_color_matches(self.output_hdr_required, frame.color)
+        {
             return Outcome::Rejected;
         }
         if frame.width != self.width || frame.height != self.height {
@@ -210,6 +226,15 @@ pub fn deliver(
         width: input.configuration.width,
         height: input.configuration.height,
         force_idr: input.force_idr,
+        source_hdr_required: input
+            .configuration
+            .gpu_processing
+            .as_ref()
+            .map(|selection| selection.source_hdr_required),
+        output_hdr_required: input.configuration.gpu_processing.as_ref().map(|_| {
+            input.configuration.video_stream_format.dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr
+        }),
         timestamp_us: input.timestamp_us,
         sequence: input.sequence,
         outcome: Outcome::NotDelivered,
@@ -270,7 +295,9 @@ impl LeasedSubmission<'_> {
     unsafe fn forward(&mut self, lease: &DmaBufFrameLease) -> Outcome {
         let frame = &lease.frame;
         self.common.presentation = Some(frame.sequence);
-        if lease.validate().is_err() {
+        if lease.validate().is_err()
+            || !source_color_matches(self.common.output_hdr_required, frame.color)
+        {
             return Outcome::Rejected;
         }
         if frame.width != self.common.width || frame.height != self.common.height {
@@ -329,6 +356,10 @@ unsafe extern "C" fn submit_leased_frame(
     }
     // SAFETY: capture lends this descriptor through the callback.
     let lease = unsafe { &*lease };
+    if !source_color_matches(submission.common.source_hdr_required, lease.frame.color) {
+        submission.common.outcome = Outcome::Rejected;
+        return STATUS_OK;
+    }
     submission.common.fresh = Some(freshness == CAPTURE_FRAME_FRESH);
     // SAFETY: capture and processor bindings outlive the synchronous pump; the
     // temporary retained reference is dropped before the callback returns.
@@ -400,6 +431,15 @@ pub fn deliver_leased(
             width: input.configuration.width,
             height: input.configuration.height,
             force_idr: input.force_idr,
+            source_hdr_required: input
+                .configuration
+                .gpu_processing
+                .as_ref()
+                .map(|selection| selection.source_hdr_required),
+            output_hdr_required: input.configuration.gpu_processing.as_ref().map(|_| {
+                input.configuration.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Hdr
+            }),
             timestamp_us: input.timestamp_us,
             sequence: input.sequence,
             outcome: Outcome::NotDelivered,

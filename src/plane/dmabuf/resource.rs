@@ -330,6 +330,15 @@ pub(in crate::plane) fn deliver(
                     width: input.configuration.width,
                     height: input.configuration.height,
                     force_idr: input.force_idr,
+                    source_hdr_required: input
+                        .configuration
+                        .gpu_processing
+                        .as_ref()
+                        .map(|selection| selection.source_hdr_required),
+                    output_hdr_required: input.configuration.gpu_processing.as_ref().map(|_| {
+                        input.configuration.video_stream_format.dynamic_range
+                            == amaterasu_module_sdk::DynamicRange::Hdr
+                    }),
                     timestamp_us: input.timestamp_us,
                     sequence: input.sequence,
                     outcome: Outcome::NotDelivered,
@@ -537,6 +546,8 @@ mod tests {
                     width: 1,
                     height: 1,
                     force_idr: false,
+                    source_hdr_required: None,
+                    output_hdr_required: None,
                     timestamp_us: 1,
                     sequence: 1,
                     outcome: Outcome::NotDelivered,
