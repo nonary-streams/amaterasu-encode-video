@@ -368,7 +368,7 @@ impl NativePlane {
                     .transpose()?,
                 queues,
                 leased_streams: lease_lifecycle::LeasedStreams::default(),
-                capture_events: capture_events::Subscriptions::default(),
+                capture_events: capture_events::Subscriptions::new(runtime.work_notifier()),
                 resource_selections: BTreeMap::new(),
                 dmabuf_resource_selections: BTreeMap::new(),
                 #[cfg(amaterasu_swscale)]

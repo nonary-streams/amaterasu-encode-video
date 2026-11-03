@@ -1,10 +1,14 @@
 //! Bounded encoded packet ownership shared with native consumer bindings.
 use amaterasu_media::{
     EncodedPacket, FLAG_END_OF_STREAM, MAX_PACKET_BYTES, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
-    PacketSink,
+    PacketSink, TimedEncodedPacket, TimedPacketSink,
 };
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 struct Packet {
     bytes: Vec<u8>,
@@ -12,6 +16,7 @@ struct Packet {
     flags: u32,
     timestamp_us: u64,
     sequence: u64,
+    processing_started_host_us: u64,
 }
 
 struct Stream {
@@ -27,14 +32,26 @@ struct Stream {
     bytes: usize,
     eos_queued: bool,
     eos_accepted: bool,
+    /// A bounded association for accepted frames still in the encoder. Older
+    /// entries may be evicted when a replacement provider delays output; their
+    /// processing time then becomes explicitly unavailable rather than guessed.
+    processing_starts: BTreeMap<u64, (u64, u64)>,
+    /// Freeze the first fragment's choice so later fragments remain consistent
+    /// even if a concurrent bookkeeping miss invalidates provisional starts.
+    frozen_processing_starts: BTreeMap<u64, u64>,
 }
 
 #[derive(Default)]
 pub struct Queues {
     streams: BTreeMap<u64, Stream>,
+    processing_generation: Arc<AtomicU64>,
 }
 
 impl Queues {
+    pub fn processing_generation(&self) -> Arc<AtomicU64> {
+        self.processing_generation.clone()
+    }
+
     pub fn clear(&mut self) {
         self.streams.clear();
     }
@@ -51,6 +68,8 @@ impl Queues {
                 bytes: 0,
                 eos_queued: false,
                 eos_accepted: false,
+                processing_starts: BTreeMap::new(),
+                frozen_processing_starts: BTreeMap::new(),
             },
         );
     }
@@ -105,6 +124,27 @@ impl Queues {
             .is_some_and(|stream| stream.eos_accepted)
     }
 
+    /// Record provisionally before a pump; output can arrive in the same pump.
+    pub fn start_processing(&mut self, id: u64, sequence: u64, started_host_us: u64) {
+        const MAX_PENDING_TIMESTAMPS: usize = 128;
+        if let Some(stream) = self.streams.get_mut(&id) {
+            let generation = self.processing_generation.load(Ordering::Relaxed);
+            stream
+                .processing_starts
+                .insert(sequence, (started_host_us, generation));
+            while stream.processing_starts.len() > MAX_PENDING_TIMESTAMPS {
+                stream.processing_starts.pop_first();
+            }
+        }
+    }
+
+    /// A rejected or deferred submission does not own this sequence.
+    pub fn cancel_processing(&mut self, id: u64, sequence: u64) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.processing_starts.remove(&sequence);
+        }
+    }
+
     /// # Safety
     /// Packet memory must be readable until this synchronous copy returns.
     pub unsafe fn push(&mut self, id: u64, packet: &EncodedPacket) -> Status {
@@ -134,12 +174,33 @@ impl Queues {
         };
         stream.eos_queued = packet.flags == FLAG_END_OF_STREAM;
         stream.bytes += bytes.len();
+        let processing_started_host_us =
+            if let Some(value) = stream.frozen_processing_starts.get(&packet.sequence) {
+                *value
+            } else {
+                let value = stream
+                    .processing_starts
+                    .get(&packet.sequence)
+                    .and_then(|&(started, generation)| {
+                        let current = self.processing_generation.load(Ordering::Relaxed);
+                        (current != u64::MAX && generation == current).then_some(started)
+                    })
+                    .unwrap_or(0);
+                stream
+                    .frozen_processing_starts
+                    .insert(packet.sequence, value);
+                while stream.frozen_processing_starts.len() > 128 {
+                    stream.frozen_processing_starts.pop_first();
+                }
+                value
+            };
         stream.packets.push_back(Packet {
             bytes,
             codec: packet.codec,
             flags: packet.flags,
             timestamp_us: packet.timestamp_us,
             sequence: packet.sequence,
+            processing_started_host_us,
         });
         STATUS_OK
     }
@@ -178,6 +239,44 @@ impl Queues {
         }
         status
     }
+
+    /// # Safety
+    /// Sink follows borrowed packet rules and must not reenter this queue.
+    pub unsafe fn receive_timed(&mut self, owner: &str, id: u64, sink: TimedPacketSink) -> Status {
+        let Some(stream) = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+        else {
+            return MEDIA_CLOSED;
+        };
+        let Some(packet) = stream.packets.front() else {
+            return if stream.eos_accepted {
+                MEDIA_CLOSED
+            } else {
+                MEDIA_PENDING
+            };
+        };
+        let borrowed = TimedEncodedPacket {
+            base: EncodedPacket {
+                codec: packet.codec,
+                flags: packet.flags,
+                data: packet.bytes.as_ptr(),
+                len: packet.bytes.len(),
+                timestamp_us: stream.clock_origin_us + packet.timestamp_us,
+                sequence: packet.sequence,
+            },
+            processing_started_host_us: packet.processing_started_host_us,
+        };
+        // SAFETY: queue owns packet bytes for the callback; rejection retains it.
+        let status = unsafe { sink.send(&borrowed) };
+        if status == STATUS_OK {
+            stream.eos_accepted = packet.flags == FLAG_END_OF_STREAM;
+            stream.bytes -= packet.bytes.len();
+            stream.packets.pop_front();
+        }
+        status
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +284,146 @@ mod tests {
     use super::*;
     use amaterasu_media::CODEC_H264;
     use std::ffi::c_void;
+
+    #[derive(Default)]
+    struct TimedReceipt {
+        values: Vec<(u64, u64, u64)>,
+        busy: bool,
+    }
+
+    unsafe extern "C" fn timed_receipt(
+        context: *mut c_void,
+        packet: *const TimedEncodedPacket,
+    ) -> Status {
+        // SAFETY: the test provides a live receipt and queue-borrowed packet.
+        let receipt = unsafe { &mut *context.cast::<TimedReceipt>() };
+        let packet = unsafe { &*packet };
+        receipt.values.push((
+            packet.base.sequence,
+            packet.base.timestamp_us,
+            packet.processing_started_host_us,
+        ));
+        if receipt.busy { MEDIA_BUSY } else { STATUS_OK }
+    }
+
+    #[test]
+    fn timed_delivery_preserves_independent_timestamp_across_fragments_and_retry() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 1000);
+        queues.start_processing(1, 7, 5000);
+        let data = [1u8];
+        let fragment = EncodedPacket {
+            codec: CODEC_H264,
+            flags: 0,
+            data: data.as_ptr(),
+            len: 1,
+            timestamp_us: 99,
+            sequence: 7,
+        };
+        // SAFETY: test data remains live until both copies complete.
+        assert_eq!(unsafe { queues.push(1, &fragment) }, STATUS_OK);
+        // A bookkeeping miss from another stream must not split metadata in
+        // the middle of this access unit.
+        queues
+            .processing_generation()
+            .fetch_add(1, Ordering::Relaxed);
+        assert_eq!(unsafe { queues.push(1, &fragment) }, STATUS_OK);
+        let mut receipt = TimedReceipt {
+            busy: true,
+            ..Default::default()
+        };
+        let sink = TimedPacketSink {
+            context: (&mut receipt as *mut TimedReceipt).cast(),
+            write: timed_receipt,
+        };
+        // SAFETY: receipt and packet remain alive during each synchronous callback.
+        assert_eq!(
+            unsafe { queues.receive_timed("alice", 1, sink) },
+            MEDIA_BUSY
+        );
+        receipt.busy = false;
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(receipt.values, vec![(7, 1099, 5000); 3]);
+    }
+
+    #[test]
+    fn absent_cancelled_and_evicted_timestamps_are_unknown_and_bounded() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 1000);
+        queues.start_processing(1, 1, 5000);
+        queues.cancel_processing(1, 1);
+        for sequence in 2..=130 {
+            queues.start_processing(1, sequence, sequence + 5000);
+        }
+        assert_eq!(queues.streams[&1].processing_starts.len(), 128);
+        let data = [1u8];
+        for sequence in [1, 2] {
+            let packet = EncodedPacket {
+                codec: CODEC_H264,
+                flags: 0,
+                data: data.as_ptr(),
+                len: 1,
+                timestamp_us: 99,
+                sequence,
+            };
+            // SAFETY: input remains live until copied.
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        }
+        let mut receipt = TimedReceipt::default();
+        let sink = TimedPacketSink {
+            context: (&mut receipt as *mut TimedReceipt).cast(),
+            write: timed_receipt,
+        };
+        // SAFETY: receipt and packet remain alive during each synchronous callback.
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(receipt.values, vec![(1, 1099, 0), (2, 1099, 0)]);
+    }
+
+    #[test]
+    fn invalidation_rejects_stale_associations_across_streams_and_saturation() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 0);
+        queues.open(2, "alice", 0);
+        queues.start_processing(1, 1, 100);
+        queues.start_processing(2, 1, 200);
+        let generation = queues.processing_generation();
+        generation.fetch_add(1, Ordering::Relaxed);
+        // A retry for stream 1 is a distinct submission and gets a fresh clock.
+        queues.start_processing(1, 1, 300);
+        let data = [1u8];
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: 0,
+            data: data.as_ptr(),
+            len: 1,
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        // SAFETY: packet bytes remain live until copied.
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        assert_eq!(unsafe { queues.push(2, &packet) }, STATUS_OK);
+        let mut receipt = TimedReceipt::default();
+        let sink = TimedPacketSink {
+            context: (&mut receipt as *mut TimedReceipt).cast(),
+            write: timed_receipt,
+        };
+        // SAFETY: sink and data remain live until callback returns.
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(unsafe { queues.receive_timed("alice", 2, sink) }, STATUS_OK);
+        assert_eq!(receipt.values, vec![(1, 1, 300), (1, 1, 0)]);
+        generation.store(u64::MAX, Ordering::Relaxed);
+        queues.start_processing(1, 2, 400);
+        let last = EncodedPacket {
+            sequence: 2,
+            ..packet
+        };
+        // SAFETY: packet bytes remain live until copied and callback returns.
+        assert_eq!(unsafe { queues.push(1, &last) }, STATUS_OK);
+        assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
+        assert_eq!(receipt.values.last(), Some(&(2, 1, 0)));
+    }
     unsafe extern "C" fn reject(_: *mut c_void, _: *const EncodedPacket) -> Status {
         MEDIA_BUSY
     }

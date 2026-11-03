@@ -43,6 +43,36 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
     assert_eq!(timings.transport_admission.total_us, 4);
 }
 
+#[test]
+fn diagnostic_windows_are_bounded_and_reset_stage_maxima_and_counts() {
+    let start = Instant::now();
+    let mut window = DiagnosticWindow::new(start);
+    window.record(&Progress {
+        submitted: true,
+        capture_callback_count: 1,
+        capture_frame_count: 1,
+        capture_callback_us: 900,
+        encoder_submit_us: 300,
+        ..Progress::default()
+    });
+    assert!(window.take_if_due(start + Duration::from_secs(9)).is_none());
+    let first = window.take_if_due(start + Duration::from_secs(10)).unwrap();
+    assert_eq!(first.submitted, 1);
+    assert_eq!(first.timings.capture_callback.max_us, 900);
+    assert_eq!(first.timings.encoder_submit.total_us, 300);
+    window.record(&Progress {
+        dropped: true,
+        capture_callback_count: 1,
+        capture_callback_us: 20,
+        ..Progress::default()
+    });
+    let second = window.take_if_due(start + Duration::from_secs(20)).unwrap();
+    assert_eq!(second.submitted, 0);
+    assert_eq!(second.dropped, 1);
+    assert_eq!(second.timings.capture_callback.max_us, 20);
+    assert_eq!(second.timings.capture_callback.calls, 1);
+}
+
 #[derive(Default)]
 struct Runtime {
     next: u64,
@@ -354,6 +384,7 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 
 #[derive(Default)]
 struct FakePlane {
+    same_pump_output: Option<Arc<Mutex<Queues>>>,
     selected_encoders: Vec<String>,
     source_starts: Vec<(u64, u64, u64)>,
     source_pumps: Vec<(u64, bool)>,
@@ -520,6 +551,24 @@ impl Plane for FakePlane {
                 && !self.dropped
                 && input.repeat_due
                 && (input.repeat_frame.is_some() || gpu);
+            if (capture_submitted || repeat_attempted)
+                && let Some(queues) = &self.same_pump_output
+            {
+                let bytes = [1_u8];
+                let packet = amaterasu_media::EncodedPacket {
+                    codec: amaterasu_media::CODEC_H264,
+                    flags: 0,
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                    timestamp_us: input.timestamp_us,
+                    sequence: input.sequence,
+                };
+                // SAFETY: the live bytes are copied synchronously by the queue.
+                assert_eq!(
+                    unsafe { queues.lock().unwrap().push(input.video, &packet) },
+                    amaterasu_module_sdk::abi::STATUS_OK
+                );
+            }
             Ok(Progress {
                 dropped: self.dropped,
                 submitted: capture_submitted || repeat_attempted,
@@ -1748,6 +1797,80 @@ fn open_delegates_with_parent_and_running_pumps_native_plane() {
     plane.dropped = true;
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     assert_eq!(pipeline.streams[&1].dropped, 1);
+}
+
+#[test]
+fn running_video_emits_one_interval_summary_and_keeps_stream_running() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    let mut window = DiagnosticWindow::new(Instant::now() - Duration::from_secs(11));
+    window.record(&Progress {
+        submitted: true,
+        capture_callback_count: 1,
+        capture_frame_count: 1,
+        capture_callback_us: 500,
+        encoder_submit_us: 100,
+        ..Progress::default()
+    });
+    pipeline.streams.get_mut(&1).unwrap().diagnostics = Some(window);
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    let events: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Log {
+                level,
+                target,
+                message,
+            } if target == "video.pipeline" => {
+                Some((*level, serde_json::from_str::<Value>(message).unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, LogLevel::Info as u8);
+    assert_eq!(events[0].1["event"], "video_stage_window");
+    assert_eq!(events[0].1["target_fps"], 60);
+    assert_eq!(events[0].1["pacing"], "timer");
+    assert_eq!(
+        events[0].1["presentation_pacing_cumulative"]["fresh_pushes"],
+        0
+    );
+    assert_eq!(events[0].1["presentation_pacing_cumulative"]["repeats"], 0);
+    assert_eq!(
+        events[0].1["presentation_pacing_cumulative"]["coalesced"],
+        0
+    );
+    assert_eq!(
+        events[0].1["encoder_session"],
+        pipeline.streams[&1].session.unwrap()
+    );
+    assert_eq!(
+        events[0].1["encoder_service"],
+        pipeline.streams[&1].encoder_service
+    );
+    assert_eq!(
+        events[0].1["stage_timing_us"]["capture_callback"]["max_us"],
+        500
+    );
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+}
+
+#[test]
+fn timing_bookkeeping_never_waits_for_a_busy_queue_or_wraps() {
+    let queues = Arc::new(Mutex::new(Queues::default()));
+    let generation = queues.lock().unwrap().processing_generation();
+    let guard = queues.lock().unwrap();
+    record_processing_start(&queues, &generation, 1, 7);
+    assert_eq!(generation.load(Ordering::Relaxed), 1);
+    cancel_processing_start(&queues, &generation, 1, 7);
+    assert_eq!(generation.load(Ordering::Relaxed), 2);
+    generation.store(u64::MAX, Ordering::Relaxed);
+    record_processing_start(&queues, &generation, 1, 7);
+    assert_eq!(generation.load(Ordering::Relaxed), u64::MAX);
+    drop(guard);
 }
 
 #[test]

@@ -21,12 +21,15 @@ use crate::{
     rpc::{self, Send},
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
-use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
+use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, LogLevel, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -170,11 +173,12 @@ struct Stream {
     dropped: u64,
     submitted: u64,
     timing: StageTimings,
+    diagnostics: Option<DiagnosticWindow>,
     last_frame: Option<FrameMetadata>,
     unresolved: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize)]
 struct TimingMetric {
     calls: u64,
     total_us: u64,
@@ -189,7 +193,7 @@ impl TimingMetric {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize)]
 struct StageTimings {
     capture_callback: TimingMetric,
     encoder_submit: TimingMetric,
@@ -198,6 +202,39 @@ struct StageTimings {
     encoder_poll: TimingMetric,
     transport_admission: TimingMetric,
     captured_frames: u64,
+}
+
+/// Interval statistics are independent of the cumulative status counters.
+/// Stage timings overlap: capture callback time can include encoder submission.
+struct DiagnosticWindow {
+    started: Instant,
+    timings: StageTimings,
+    submitted: u64,
+    dropped: u64,
+}
+
+impl DiagnosticWindow {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            timings: StageTimings::default(),
+            submitted: 0,
+            dropped: 0,
+        }
+    }
+
+    fn record(&mut self, progress: &Progress) {
+        self.timings.record(progress);
+        self.submitted = self.submitted.saturating_add(u64::from(progress.submitted));
+        self.dropped = self.dropped.saturating_add(u64::from(progress.dropped));
+    }
+
+    fn take_if_due(&mut self, now: Instant) -> Option<Self> {
+        if now.saturating_duration_since(self.started) < Duration::from_secs(10) {
+            return None;
+        }
+        Some(std::mem::replace(self, Self::new(now)))
+    }
 }
 
 impl StageTimings {
@@ -223,6 +260,45 @@ impl StageTimings {
                 .record(progress.transport_admission_us);
         }
     }
+}
+
+/// Emit one bounded summary per interval through the host log transport. These
+/// are local video pipeline observations, not client delivery or encode latency.
+fn log_diagnostics(stream: &mut Stream, id: u64, send: &mut Send<'_>) {
+    let now = Instant::now();
+    let Some(window) = stream
+        .diagnostics
+        .as_mut()
+        .and_then(|window| window.take_if_due(now))
+    else {
+        return;
+    };
+    let mut pacing = json!({});
+    stream.presentation.write_status(&mut pacing);
+    let summary = json!({
+        "event": "video_stage_window",
+        "stream": id,
+        "window_us": now.saturating_duration_since(window.started).as_micros().min(u64::MAX as u128) as u64,
+        "target_fps": stream.configuration.fps,
+        "capture_provider": stream.provider,
+        "encoder_provider": stream.encoder_provider,
+        "encoder_service": stream.encoder_service,
+        "encoder_session": stream.session,
+        "frame_path": stream.frame_path.name(),
+        "submitted_frames": window.submitted,
+        "dropped_frames": window.dropped,
+        "pacing": pacing["pacing"],
+        "presentation_pacing_cumulative": pacing["presentation_pacing"],
+        "stage_timing_us": window.timings,
+        "timing_scope": "overlapping_local_calls_not_encode_latency_or_delivery"
+    });
+    // Diagnostics are best-effort and must not interrupt the stream if the
+    // bounded host log queue is full or the logging transport is unavailable.
+    let _ = send(Command::Log {
+        level: LogLevel::Info as u8,
+        target: "video.pipeline".into(),
+        message: summary.to_string(),
+    });
 }
 
 impl Stream {
@@ -447,6 +523,7 @@ pub struct Pipeline {
     portal: portal::Control,
     observations: observation::Control,
     pub queues: Arc<Mutex<Queues>>,
+    processing_generation: Arc<AtomicU64>,
 }
 
 fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
@@ -463,6 +540,10 @@ fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage
 
 impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
+        let processing_generation = queues
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .processing_generation();
         Self {
             require_frame_lease: settings.require_frame_lease,
             enabled: settings.enabled,
@@ -484,6 +565,7 @@ impl Pipeline {
             portal: portal::Control::default(),
             observations: observation::Control::default(),
             queues,
+            processing_generation,
         }
     }
 
@@ -948,6 +1030,7 @@ impl Pipeline {
                 dropped: 0,
                 submitted: 0,
                 timing: StageTimings::default(),
+                diagnostics: None,
                 last_frame: None,
                 unresolved: false,
             }
@@ -1049,7 +1132,8 @@ impl Pipeline {
                     Err(code) => stream.cleanup(code),
                 }
             } else {
-                pump(plane, stream, id);
+                pump(plane, stream, id, &self.queues, &self.processing_generation);
+                log_diagnostics(stream, id, send);
             }
             if let Ok(mut queues) = self.queues.lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
@@ -1160,19 +1244,26 @@ enum CaptureTrigger {
     Presentation,
 }
 
-fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
+fn pump(
+    plane: &mut dyn Plane,
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+) {
     let now = Instant::now();
-    let presentation_paced = match if stream.capture_notifications {
-        Ok(false)
-    } else {
-        stream.observe_presentation(plane)
-    } {
+    // Notifications wake the consumer; presentation metadata still owns frame
+    // cadence and source timestamps when the selected provider offers both.
+    let presentation_paced = match stream.observe_presentation(plane) {
         Ok(paced) => paced,
         Err(code) => {
             stream.cleanup(code);
             return;
         }
     };
+    if presentation_paced {
+        stream.presentation.record_cap_hold(now);
+    }
     let mut trigger = if presentation_paced {
         stream.presentation_capture_due(now)
     } else if now >= stream.next_frame
@@ -1235,6 +1326,16 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
         stream.cleanup("frame_clock_exhausted");
         return;
     };
+    // Record before entering the capture callback: some encoders return output
+    // during this same pump. This clock is distinct from presentation pacing.
+    // Only the direct DMA-BUF path guarantees that capture and submission
+    // occur in this same pump. Deferred CPU preprocessing and source-owned
+    // providers need to supply their own timing rather than guessing here.
+    let capture_start_recorded =
+        stream.frame_path == FramePath::DmaBuf && (capture_due || repeat_due);
+    if capture_start_recorded {
+        record_processing_start(queues, generation, id, sequence);
+    }
     match plane.pump(Pump {
         video: id,
         provider: stream.provider,
@@ -1252,6 +1353,9 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
     }) {
         Ok(progress) => {
             let completed_at = Instant::now();
+            if capture_start_recorded && !progress.submitted {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
             if stream.capture_notifications
                 && capture_due
                 && !progress.submitted
@@ -1262,6 +1366,10 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 stream.capture_event_ready = true;
             }
             stream.timing.record(&progress);
+            stream
+                .diagnostics
+                .get_or_insert_with(|| DiagnosticWindow::new(now))
+                .record(&progress);
             stream.owned_capture.record_freshness(&progress);
             if let Some(reason) = progress.dmabuf_fallback {
                 if !owned_capture::begin_cpu_capture_fallback(stream, reason) {
@@ -1351,8 +1459,60 @@ fn pump(plane: &mut dyn Plane, stream: &mut Stream, id: u64) {
                 stream.force_idr = false;
             }
         }
-        Err(code) if begin_runtime_encoder_recovery(stream, code) => {}
-        Err(code) => stream.cleanup(code),
+        Err(code) if begin_runtime_encoder_recovery(stream, code) => {
+            if capture_start_recorded {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
+        }
+        Err(code) => {
+            if capture_start_recorded {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
+            stream.cleanup(code);
+        }
+    }
+}
+
+/// An unavailable queue must not turn a stale provisional timestamp into a
+/// falsely precise result. Invalidate all prior associations without waiting.
+fn invalidate_processing_generation(generation: &AtomicU64) {
+    let mut value = generation.load(Ordering::Relaxed);
+    while value != u64::MAX {
+        match generation.compare_exchange_weak(
+            value,
+            value + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => value = current,
+        }
+    }
+}
+
+fn record_processing_start(
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+    id: u64,
+    sequence: u64,
+) {
+    match queues.try_lock() {
+        Ok(mut queue) => {
+            queue.start_processing(id, sequence, amaterasu_media::host_monotonic_micros())
+        }
+        Err(_) => invalidate_processing_generation(generation),
+    }
+}
+
+fn cancel_processing_start(
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+    id: u64,
+    sequence: u64,
+) {
+    match queues.try_lock() {
+        Ok(mut queue) => queue.cancel_processing(id, sequence),
+        Err(_) => invalidate_processing_generation(generation),
     }
 }
 

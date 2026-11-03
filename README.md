@@ -134,7 +134,17 @@ Presentation pacing works as follows on every module tick:
   other query failure is a capture failure.
 
 Status reports `pacing` (`presentation` or `timer`, for every stream) and
-`presentation_pacing` with `fresh_pushes`, `repeats` and `coalesced` counters.
+`presentation_pacing` with `fresh_pushes`, `repeats`, `coalesced`, and
+`newer_during_read` counters. The last counter records accepted submissions
+whose captured presentation advanced after the latest-presentation query; it
+detects a possible queried-versus-delivered timestamp mismatch but does not
+rewrite presentation timestamps.
+It also reports `observed_presentations`, `latest_observed_sequence`,
+`sequence_jump_events`, and `cap_hold_events`. A sequence jump records that
+the latest observed sequence advanced by more than one; providers need not use
+consecutive sequence values, so it does not prove frame loss. Cap holds count
+distinct presentations held at least once, not the number of polling ticks or
+frames dropped.
 CPU (PipeWire, WGC, DXGI) streams never query presentations and keep their
 existing pacing.
 
@@ -419,6 +429,28 @@ queue admission. They contain no pixel data and update in status snapshots rathe
 than logging each frame. Encode status separately reports BGRA conversion and
 actual worker-side x264 submit duration, allowing queue delay and encoder work to
 be distinguished from video tick time.
+
+For managed capture, an Info-level `video.pipeline` record emits a
+`video_stage_window` summary approximately every ten seconds. It identifies the
+video stream and encoder session/service and reports the target rate, capture
+provider, frame path, accepted submissions, drops, and interval stage counts,
+totals, and maxima in microseconds. These calls overlap: for example, the DMA-BUF
+capture callback includes encoder submission. They are not end-to-end host
+processing latency, actual encoder worker duration, or client delivery. The
+summary is best effort and is skipped for externally driven source streams.
+The summary also includes pacing mode and cumulative presentation counters.
+
+The optional native video v1.3 `receive_timed` tail carries a separate host
+processing start with each encoded fragment. Direct DMA-BUF capture/repeat
+records this clock immediately before its capture pump; the presentation clock
+in the existing packet is unchanged. A bounded per-stream association maps the
+accepted sequence to its start, including same-pump and later encoder output.
+All fragments freeze the same value on first output. Missing, evicted, or
+invalidated associations use zero (unknown); source-owned and deferred/CPU
+capture paths currently report unknown rather than infer a start from delivery.
+Queue contention invalidates outstanding timing associations without blocking
+the video pump and does not affect packet delivery. v1.0–v1.2 consumers keep the
+existing packet interface and timestamps.
 
 ## Authority, cancellation and lifecycle
 
