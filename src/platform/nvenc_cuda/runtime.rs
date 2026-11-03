@@ -13,6 +13,7 @@ use super::{
 use crate::{
     input::{DmaBufImportSupport, DmaBufInput, GpuInput, InputSupport},
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
+    worker::NativeStageTimings,
 };
 use std::{
     collections::VecDeque,
@@ -185,6 +186,7 @@ pub(super) struct TestBuffer {
 }
 
 unsafe extern "C" {
+    fn amaterasu_nvcuda_get_timings(encoder: *mut c_void, timings: *mut NativeStageTimings);
     fn amaterasu_nvcuda_header_versions(versions: *mut StructVersions) -> i32;
     fn amaterasu_nvcuda_driver_api(packed_version: *mut u32, status: *mut NativeStatus) -> i32;
     fn amaterasu_nvcuda_enumerate(
@@ -240,6 +242,14 @@ unsafe extern "C" {
     fn amaterasu_nvcuda_release_output(encoder: *mut c_void, status: *mut NativeStatus) -> i32;
     fn amaterasu_nvcuda_drain(encoder: *mut c_void, status: *mut NativeStatus) -> i32;
     fn amaterasu_nvcuda_close(encoder: *mut c_void);
+    #[cfg(test)]
+    fn amaterasu_nvcuda_test_conversion_stream(asynchronous: i32, fail_copy: i32) -> i32;
+    #[cfg(test)]
+    fn amaterasu_nvcuda_test_stream_enabled(encoder: *const c_void) -> i32;
+    #[cfg(test)]
+    fn amaterasu_nvcuda_test_failed_retirement(mapping_unproven: i32) -> i32;
+    #[cfg(test)]
+    fn amaterasu_nvcuda_test_stream_setup(mode: i32) -> i32;
 }
 
 #[cfg(test)]
@@ -342,6 +352,17 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    #[cfg(test)]
+    pub(super) fn stream_ordering_enabled(&self) -> bool {
+        // SAFETY: encoder is live and accessed on its owning worker thread.
+        unsafe { amaterasu_nvcuda_test_stream_enabled(self.native.as_ptr()) != 0 }
+    }
+    pub fn native_stage_timings(&self) -> NativeStageTimings {
+        let mut timings = NativeStageTimings::default();
+        // SAFETY: the live encoder and output belong to this worker thread.
+        unsafe { amaterasu_nvcuda_get_timings(self.native.as_ptr(), &mut timings) };
+        timings
+    }
     pub fn open(
         identity: &EncoderIdentity,
         configuration: &Configuration,
@@ -588,6 +609,40 @@ mod tests {
     use super::*;
     use crate::input::DmaBufPlaneInput;
     use std::os::fd::OwnedFd;
+
+    #[test]
+    fn conversion_copy_uses_stream_or_synchronous_fallback_and_unmaps_on_failure() {
+        for asynchronous in [0, 1] {
+            for fail_copy in [0, 1, 2, 3] {
+                // SAFETY: isolated test driver with no GPU handles or shared callers.
+                assert_eq!(
+                    unsafe { amaterasu_nvcuda_test_conversion_stream(asynchronous, fail_copy) },
+                    1
+                );
+            }
+        }
+        // SAFETY: exercises synchronous fallback with a failed context wait.
+        assert_eq!(unsafe { amaterasu_nvcuda_test_conversion_stream(0, 4) }, 1);
+    }
+
+    #[test]
+    fn failed_cuda_retirement_does_not_free_in_flight_resources() {
+        // SAFETY: synthetic callbacks create no actual GPU resources.
+        for mapping_unproven in [0, 1, 2] {
+            assert_eq!(
+                unsafe { amaterasu_nvcuda_test_failed_retirement(mapping_unproven) },
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn nvenc_stream_setup_falls_back_when_stream_support_is_unavailable() {
+        for mode in [0, 1, 2] {
+            // SAFETY: test function uses only synthetic CUDA/NVENC callbacks.
+            assert_eq!(unsafe { amaterasu_nvcuda_test_stream_setup(mode) }, 1);
+        }
+    }
 
     /// A pipe's read end stands in for a DMA-BUF or sync_file descriptor;
     /// writing to the other end fails with EPIPE once every reader closed,

@@ -53,6 +53,11 @@ struct am_cuda_api {
     tcuMemAllocPitch_v2 *mem_alloc_pitch;
     tcuMemFree_v2 *mem_free;
     tcuMemcpy2D_v2 *memcpy_2d;
+    /* Optional stream support; absent drivers keep the synchronous path. */
+    tcuMemcpy2DAsync_v2 *memcpy_2d_async;
+    tcuStreamCreate *stream_create;
+    tcuStreamDestroy_v2 *stream_destroy;
+    tcuStreamSynchronize *stream_synchronize;
     tcuGraphicsGLRegisterImage *graphics_gl_register_image;
     tcuGraphicsUnregisterResource *graphics_unregister;
     tcuGraphicsMapResources *graphics_map;
@@ -195,6 +200,10 @@ struct am_converter {
     GLuint chroma_framebuffer;
     CUgraphicsResource luma_resource;
     CUgraphicsResource chroma_resource;
+    /* Set until CUDA confirms that unmapping was successfully submitted. */
+    int mapping_outstanding;
+    /* A failed context wait does not establish that private copies retired. */
+    int retirement_unproven;
     uint32_t width;
     uint32_t height;
     uint32_t bit_depth;
@@ -212,7 +221,7 @@ int am_converter_upload_bgra(struct am_converter *converter, const uint8_t *bgra
 int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_dmabuf *frame,
                                struct am_nvcuda_status *status);
 int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destination,
-                           size_t pitch, struct am_nvcuda_status *status);
+                           size_t pitch, CUstream stream, struct am_nvcuda_status *status);
 int am_converter_import_modifiers(const struct am_converter *converter, uint32_t fourcc,
                                   uint64_t *modifiers, uint32_t capacity,
                                   uint32_t *modifier_count, uint32_t *implicit);

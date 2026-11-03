@@ -49,6 +49,18 @@ struct am_nvcuda_status {
     int32_t native_code;
 };
 
+/* Last completed input's wall-clock durations, in microseconds. These include
+ * GPU waits and may overlap work queued by the driver; they are not GPU time. */
+struct am_nvcuda_timings {
+    uint64_t import_convert_us;
+    uint64_t interop_copy_us;
+    uint64_t map_input_us;
+    uint64_t submit_picture_us;
+    uint64_t lock_output_us;
+    /* 1 when input copies are ordered with NVENC on a CUDA stream. */
+    uint64_t stream_ordered;
+};
+
 /* One NVENC API version and the struct versions used with it. The Rust
  * negotiation policy produces these; the adapter only applies them. */
 struct am_nvcuda_struct_versions {
@@ -122,6 +134,8 @@ struct am_nvcuda_dmabuf {
 };
 
 struct am_nvcuda_encoder;
+void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder,
+                                  struct am_nvcuda_timings *timings);
 
 /* GPU-free: record sizes, so Rust tests can check their mirrored layouts. */
 struct am_nvcuda_abi_sizes {

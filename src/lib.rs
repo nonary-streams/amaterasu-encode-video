@@ -13,13 +13,15 @@ mod probe;
 mod sessions;
 mod worker;
 use amaterasu_module_sdk::{
-    Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+    Command, LogLevel, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
 };
 use model::Operation;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 const SERVICE: &str = "amaterasu.encode/1";
+const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -31,6 +33,7 @@ struct EncodeModule {
     runtime: RuntimeClient,
     shared: native::Shared,
     log_queue: LogQueue,
+    last_timing_log: Instant,
     _registration: Box<native::Registration>,
 }
 
@@ -64,11 +67,13 @@ impl ManagedModule for EncodeModule {
             runtime,
             shared,
             log_queue,
+            last_timing_log: Instant::now(),
             _registration: registration,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
+        self.log_worker_timings();
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -112,6 +117,24 @@ impl ManagedModule for EncodeModule {
 }
 
 impl EncodeModule {
+    fn log_worker_timings(&mut self) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_timing_log) < TIMING_LOG_INTERVAL {
+            return;
+        }
+        // Native clients share this lock. Skip a busy snapshot rather than
+        // adding a wait to the host tick; retry on the next tick.
+        let Ok(sessions) = self.shared.try_lock() else {
+            return;
+        };
+        let summaries = sessions.timing_summaries(now);
+        drop(sessions);
+        self.last_timing_log = now;
+        for summary in summaries {
+            let _ = self.runtime.log(LogLevel::Info, "encoder.timing", &summary);
+        }
+    }
+
     fn control(&self, caller: &str, payload: Value) -> Result<(Value, Option<u64>), &'static str> {
         let operation: Operation =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;

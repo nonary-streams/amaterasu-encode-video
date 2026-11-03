@@ -331,6 +331,22 @@ fn nvenc_cuda_gpu_publishes_codecs_with_cpu_input() {
 }
 
 #[test]
+#[ignore = "requires NVIDIA GPU with NVENC CUDA stream support"]
+fn nvenc_cuda_gpu_enables_ordered_conversion_stream() {
+    let description = published().into_iter().next().unwrap();
+    let codec = Codec::from_clsid(&description.identity.clsid).unwrap();
+    let encoder = Encoder::open(
+        &description.identity,
+        &configuration(codec, ColorMode::Bt709Limited),
+    )
+    .expect("NVENC open failed");
+    assert!(
+        encoder.stream_ordering_enabled(),
+        "driver did not accept the CUDA IO stream"
+    );
+}
+
+#[test]
 #[ignore = "requires an NVIDIA GPU with NVENC"]
 fn nvenc_cuda_gpu_encodes_synthetic_frames_that_ffmpeg_decodes() {
     let published = published();

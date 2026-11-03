@@ -70,6 +70,7 @@ struct Completed {
     kind: AsyncKind,
     queue_wait_us: u64,
     operation_us: u64,
+    native_stages: Option<NativeStageTimings>,
 }
 
 struct Request {
@@ -82,6 +83,46 @@ struct Request {
 struct Pending {
     kind: AsyncKind,
     response: Receiver<Completed>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[repr(C)]
+pub struct NativeStageTimings {
+    pub import_convert_us: u64,
+    pub interop_copy_us: u64,
+    pub map_input_us: u64,
+    pub submit_picture_us: u64,
+    pub lock_output_us: u64,
+    pub stream_ordered: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct NativeStageTotals {
+    pub samples: u64,
+    pub import_convert_us: u64,
+    pub interop_copy_us: u64,
+    pub map_input_us: u64,
+    pub submit_picture_us: u64,
+    pub lock_output_us: u64,
+    pub stream_ordered_samples: u64,
+}
+
+impl NativeStageTotals {
+    fn record(&mut self, sample: NativeStageTimings) {
+        self.samples = self.samples.saturating_add(1);
+        self.import_convert_us = self
+            .import_convert_us
+            .saturating_add(sample.import_convert_us);
+        self.interop_copy_us = self.interop_copy_us.saturating_add(sample.interop_copy_us);
+        self.map_input_us = self.map_input_us.saturating_add(sample.map_input_us);
+        self.submit_picture_us = self
+            .submit_picture_us
+            .saturating_add(sample.submit_picture_us);
+        self.lock_output_us = self.lock_output_us.saturating_add(sample.lock_output_us);
+        self.stream_ordered_samples = self
+            .stream_ordered_samples
+            .saturating_add(u64::from(sample.stream_ordered != 0));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -101,6 +142,7 @@ pub struct Metrics {
     pub drain_max_us: u64,
     pub busy_submissions: u64,
     pub pending_operations: u64,
+    pub native_stage_totals: Option<NativeStageTotals>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +164,9 @@ pub(crate) trait WorkerBackend {
     fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
     fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
     fn drain(&mut self) -> Result<(), &'static str>;
+    fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+        None
+    }
     /// Reported once, on the worker thread, right after the backend opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
@@ -143,6 +188,9 @@ pub(crate) trait WorkerBackend {
 }
 
 impl WorkerBackend for platform::Encoder {
+    fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+        platform::Encoder::native_stage_timings(self)
+    }
     fn uses_background_encode(&self) -> bool {
         platform::Encoder::uses_background_encode(self)
     }
@@ -259,6 +307,10 @@ impl Worker {
                 let mut failed = false;
                 while let Ok(request) = receiver.recv() {
                     let started_at = Instant::now();
+                    let is_dmabuf = matches!(
+                        &request.operation,
+                        Operation::SubmitGpu(GpuInput::DmaBuf(_), ..)
+                    );
                     let queue_wait_us =
                         duration_micros(started_at.saturating_duration_since(request.queued_at));
                     let result = if failed {
@@ -284,6 +336,11 @@ impl Worker {
                         failed = true;
                     }
                     let operation_us = duration_micros(started_at.elapsed());
+                    let native_stages = if result.is_ok() && is_dmabuf {
+                        encoder.native_stage_timings()
+                    } else {
+                        None
+                    };
                     let delivered = request
                         .reply
                         .send(Completed {
@@ -291,6 +348,7 @@ impl Worker {
                             kind: request.kind,
                             queue_wait_us,
                             operation_us,
+                            native_stages,
                         })
                         .is_ok();
                     if delivered
@@ -467,6 +525,12 @@ impl Worker {
     }
 
     fn record_completion(&mut self, completed: &Completed) {
+        if let Some(sample) = completed.native_stages {
+            self.metrics
+                .native_stage_totals
+                .get_or_insert_with(Default::default)
+                .record(sample);
+        }
         self.metrics.queue_wait_us_total = self
             .metrics
             .queue_wait_us_total
@@ -502,6 +566,12 @@ impl Worker {
     pub fn metrics(&mut self) -> Result<Metrics, &'static str> {
         self.poll_background()?;
         Ok(self.metrics)
+    }
+
+    /// Read only completions already observed by normal media operations.
+    /// Logging must not consume a worker error or change operation ordering.
+    pub fn observed_metrics(&self) -> Metrics {
+        self.metrics
     }
 
     pub fn submit(
@@ -657,6 +727,28 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_stage_totals_preserve_independent_measurements_and_saturate() {
+        let mut totals = super::NativeStageTotals::default();
+        totals.record(super::NativeStageTimings {
+            import_convert_us: 100,
+            interop_copy_us: 200,
+            map_input_us: 3,
+            submit_picture_us: 4,
+            lock_output_us: u64::MAX,
+            stream_ordered: 1,
+        });
+        totals.record(super::NativeStageTimings {
+            import_convert_us: 50,
+            lock_output_us: 1,
+            ..Default::default()
+        });
+        assert_eq!(totals.samples, 2);
+        assert_eq!(totals.import_convert_us, 150);
+        assert_eq!(totals.interop_copy_us, 200);
+        assert_eq!(totals.lock_output_us, u64::MAX);
+        assert_eq!(totals.stream_ordered_samples, 1);
+    }
     use super::*;
     use std::sync::{Condvar, Mutex};
 
@@ -789,6 +881,36 @@ mod tests {
         }
         drop(worker);
         assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn diagnostic_snapshot_does_not_consume_pending_worker_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let mut worker = Worker::start(move || Ok(Box::new(PacketBackend(backend_calls)))).unwrap();
+        assert!(matches!(worker.receive().unwrap(), ReceiveResult::Pending));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(worker.observed_metrics().completed_operations, 0);
+        assert_eq!(worker.pending.len(), 1);
+        assert!(worker.receive_result.is_none());
+        loop {
+            match worker.receive().unwrap() {
+                ReceiveResult::Ready(Some(packet)) => {
+                    assert_eq!(packet.bytes, [0]);
+                    break;
+                }
+                ReceiveResult::Pending => {}
+                _ => panic!("pending packet was lost"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(worker.observed_metrics().receive_operations, 1);
     }
 
     #[test]

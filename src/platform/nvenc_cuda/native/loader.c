@@ -27,6 +27,11 @@ static int load_symbol(void *library, const char *name, void *destination) {
 }
 
 static int load_cuda(struct am_cuda_api *cuda, void *library) {
+    /* Optional CUDA stream entry points are independent of baseline support. */
+    load_symbol(library, "cuMemcpy2DAsync_v2", &cuda->memcpy_2d_async);
+    load_symbol(library, "cuStreamCreate", &cuda->stream_create);
+    load_symbol(library, "cuStreamDestroy_v2", &cuda->stream_destroy);
+    load_symbol(library, "cuStreamSynchronize", &cuda->stream_synchronize);
     return load_symbol(library, "cuInit", &cuda->init) &&
            load_symbol(library, "cuDeviceGetCount", &cuda->device_get_count) &&
            load_symbol(library, "cuDeviceGet", &cuda->device_get) &&

@@ -127,7 +127,15 @@ call may already have accepted its sample before failing or timing out.
 Owner-scoped `status` reports numeric `timing` counters for BGRA-to-NV12 conversion
 and `encoder_timing` counters for worker queue wait, submit/receive/drain duration,
 busy submissions, and pending operations. Counters update when the caller polls
-status or the media API; no per-frame timing logs or frame content are emitted.
+status or the media API. While the module is running, it attempts an Info-level
+`encoder.timing` host log summary every ten seconds for each session with
+worker metrics. These are cumulative since session open; counts and totals can
+be differenced between records, while maxima cover the whole session. Worker
+counts include only completions already observed by normal media operations;
+logging does not consume pending worker results. Worker execution includes the
+backend call and does not by itself establish GPU time,
+host processing latency, network delivery, or display latency. Sampling skips a
+busy session lock and retries on a later host tick. No frame content is logged.
 
 Receive delivers at most one borrowed packet. A rejected sink retains the exact
 packet for retry. Samples are normalized to Annex B; IDR is determined from NAL
@@ -413,9 +421,11 @@ device whose `EGL_CUDA_DEVICE_NV` is the encoder's CUdevice, or, when that displ
 cannot import DMA-BUFs, GBM on the same EGL device's DRM render node. A desktop
 OpenGL 3.3 core, surfaceless context is current on the encoder worker. Two
 fragment passes draw the source into an R8 luma and an RG8 half-size chroma
-texture; both are registered with CUDA once (`cuGraphicsGLRegisterImage`). Each
-frame maps them (which orders the GL draws first), copies their arrays into the
-NVENC input buffer and synchronizes the context. Luma is the per-pixel matrix
+texture; both are registered with CUDA once (`cuGraphicsGLRegisterImage`). When
+the driver supports NVENC CUDA IO streams, mapping, asynchronous plane copies,
+unmapping and encoder input run in order on the same CUDA stream. Otherwise the
+backend uses synchronous copies and a context wait. Source DMA-BUF reads still
+complete before the producer's lease is released. Luma is the per-pixel matrix
 product and chroma the box average of each 2x2 block, like the CPU converter. The
 matrix rows are computed in `color.rs`; unit tests replay the shader's f32
 arithmetic and match exact arithmetic within one code value, and the CPU
@@ -599,6 +609,18 @@ validation. The real-shim test can write its limited-range access unit when
 `AMATERASU_X265_SMOKE_FULL_OUTPUT` is set; neither file is written by default.
 
 ## Scoped hardware policy during integration
+
+For native NVENC/CUDA DMA-BUF submissions, `encoder.timing` includes cumulative
+`native_stage_totals` and a sample count. Divide differences between two log
+snapshots by the difference in samples for per-frame interval averages. The
+wall-clock stages cover DMA-BUF import and GL conversion submission,
+CUDA/GL interop mapping, copies and synchronization, NVENC input mapping,
+picture submission, and blocking output locking. `stream_ordered_samples` counts
+frames using the NVENC CUDA IO stream instead of the synchronous fallback. GPU work may be deferred to a
+later wait, so these are CPU elapsed durations at API boundaries, not isolated
+GPU execution times. Only successful DMA-BUF submissions are sampled. Other
+encoder backends report null, and the records do not measure client delivery or
+display presentation.
 
 `nvenc_settings` retains the resolved host/app/client policy on the control boundary.
 Current encoder backends cannot apply those scoped controls, so a nondefault

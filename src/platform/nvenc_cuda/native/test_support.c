@@ -7,7 +7,7 @@
  * Production code never calls these functions. libgbm and libEGL are loaded
  * on first use.
  */
-#include "adapter.h"
+#include "internal.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -16,6 +16,71 @@
 #include <gbm.h>
 #include <string.h>
 #include <unistd.h>
+
+/* GPU-free test of the conversion handoff's stream selection and ordering. */
+static struct {
+    CUstream expected;
+    int map, unmap, copies, sync, failed, fail_copy;
+} am_test_copy;
+static CUresult CUDAAPI am_test_map(unsigned int count, CUgraphicsResource *resources, CUstream stream) {
+    (void)resources;
+    am_test_copy.map++;
+    if (count != 2 || stream != am_test_copy.expected) am_test_copy.failed = 1;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_unmap(unsigned int count, CUgraphicsResource *resources, CUstream stream) {
+    (void)resources;
+    am_test_copy.unmap++;
+    if (count != 2 || stream != am_test_copy.expected) am_test_copy.failed = 1;
+    return am_test_copy.fail_copy == 2 ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_array(CUarray *array, CUgraphicsResource resource, unsigned int index, unsigned int level) {
+    (void)resource; (void)index; (void)level;
+    *array = (CUarray)(uintptr_t)1;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_copy_sync(const CUDA_MEMCPY2D *copy) {
+    (void)copy;
+    am_test_copy.copies++;
+    if (am_test_copy.expected != NULL) am_test_copy.failed = 1;
+    return (am_test_copy.fail_copy == 1 ||
+            (am_test_copy.fail_copy == 3 && am_test_copy.copies == 2))
+        ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_copy_async(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    (void)copy;
+    am_test_copy.copies++;
+    if (stream != am_test_copy.expected || stream == NULL) am_test_copy.failed = 1;
+    return (am_test_copy.fail_copy == 1 ||
+            (am_test_copy.fail_copy == 3 && am_test_copy.copies == 2))
+        ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_context_sync(void) {
+    am_test_copy.sync++;
+    return am_test_copy.fail_copy == 4 ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+int amaterasu_nvcuda_test_conversion_stream(int asynchronous, int fail_copy) {
+    memset(&am_test_copy, 0, sizeof(am_test_copy));
+    am_test_copy.expected = asynchronous ? (CUstream)(uintptr_t)1 : NULL;
+    am_test_copy.fail_copy = fail_copy;
+    struct am_driver driver = {0};
+    driver.cuda.graphics_map = am_test_map;
+    driver.cuda.graphics_unmap = am_test_unmap;
+    driver.cuda.graphics_mapped_array = am_test_array;
+    driver.cuda.memcpy_2d = am_test_copy_sync;
+    driver.cuda.memcpy_2d_async = am_test_copy_async;
+    driver.cuda.ctx_synchronize = am_test_context_sync;
+    struct am_converter converter = {0};
+    converter.driver = &driver;
+    converter.width = 640; converter.height = 360; converter.bit_depth = 8;
+    struct am_nvcuda_status status = {0};
+    int result = am_converter_copy_nv12(&converter, 1, 640, am_test_copy.expected, &status);
+    if (am_test_copy.failed || am_test_copy.map != 1 || am_test_copy.unmap != 1 ||
+        am_test_copy.copies != (fail_copy == 1 ? 1 : 2) || am_test_copy.sync != (asynchronous ? 0 : 1) ||
+        converter.mapping_outstanding != (fail_copy == 2) ||
+        converter.retirement_unproven != (fail_copy == 4 && !asynchronous)) return 0;
+    return fail_copy ? result == AM_NVCUDA_NATIVE_FAILURE : result == AM_NVCUDA_OK;
+}
 
 struct am_test_gbm_api {
     struct gbm_device *(*create_device)(int fd);

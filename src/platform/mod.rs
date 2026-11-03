@@ -126,6 +126,13 @@ pub enum Encoder {
 }
 
 impl Encoder {
+    pub fn native_stage_timings(&self) -> Option<crate::worker::NativeStageTimings> {
+        match self {
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => Some(encoder.native_stage_timings()),
+            _ => None,
+        }
+    }
     pub fn open_with_log_emitter(
         identity: &EncoderIdentity,
         configuration: &Configuration,

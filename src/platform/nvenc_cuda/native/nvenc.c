@@ -13,9 +13,16 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <stdatomic.h>
+#include <stdio.h>
 
 #define AM_MAX_CODEC_GUIDS 64
 #define AM_MAX_INPUT_FORMATS 64
+
+/* A driver that cannot retire stream work must not admit more sessions. The
+ * bounded active session set can be quarantined until process teardown. */
+static atomic_int am_retirement_failed = 0;
 
 struct am_nvcuda_encoder {
     const struct am_driver *driver;
@@ -36,7 +43,34 @@ struct am_nvcuda_encoder {
     uint32_t width;
     uint32_t height;
     int draining;
+    /* Non-NULL only after NVENC accepts this stream for input and output. */
+    CUstream conversion_stream;
+    struct am_nvcuda_timings timings;
 };
+
+static uint64_t monotonic_us(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+}
+
+static uint64_t elapsed_us(uint64_t start) {
+    uint64_t end = monotonic_us();
+    return start != 0 && end >= start ? end - start : 0;
+}
+
+void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder,
+                                  struct am_nvcuda_timings *timings) {
+    if (encoder != NULL && timings != NULL) {
+        *timings = encoder->timings;
+        timings->stream_ordered = encoder->conversion_stream != NULL;
+    }
+}
+
+/* Test-only inspection; production operation is identical on either path. */
+int amaterasu_nvcuda_test_stream_enabled(const struct am_nvcuda_encoder *encoder) {
+    return encoder != NULL && encoder->conversion_stream != NULL;
+}
 
 void amaterasu_nvcuda_abi_sizes(struct am_nvcuda_abi_sizes *sizes) {
     sizes->status = (uint32_t)sizeof(struct am_nvcuda_status);
@@ -500,6 +534,119 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
     return AM_NVCUDA_OK;
 }
 
+/* Stream setup is optional: older drivers retain the synchronous path.
+ * The stream handle is stored in the encoder for the complete NVENC lifetime;
+ * NvEncSetIOCudaStreams takes pointers to the handle, not the handle itself. */
+static void configure_cuda_stream(struct am_nvcuda_encoder *encoder) {
+    const struct am_cuda_api *cuda = &encoder->driver->cuda;
+    if (cuda->stream_create == NULL || cuda->stream_destroy == NULL ||
+        cuda->stream_synchronize == NULL || cuda->memcpy_2d_async == NULL ||
+        encoder->functions.nvEncSetIOCudaStreams == NULL) {
+        return;
+    }
+    CUstream stream = NULL;
+    if (cuda->stream_create(&stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS || stream == NULL) {
+        return;
+    }
+    encoder->conversion_stream = stream;
+    NVENCSTATUS result = encoder->functions.nvEncSetIOCudaStreams(
+        encoder->session, &encoder->conversion_stream, &encoder->conversion_stream);
+    if (result != NV_ENC_SUCCESS) {
+        cuda->stream_destroy(stream);
+        encoder->conversion_stream = NULL;
+    }
+}
+
+/* GPU-free checks for stream setup success, rejected association, and older
+ * drivers that lack optional stream entry points. */
+static _Thread_local int am_test_stream_setup_mode;
+static _Thread_local int am_test_stream_destroyed;
+static CUresult CUDAAPI am_test_stream_create(CUstream *stream, unsigned int flags) {
+    if (flags != CU_STREAM_NON_BLOCKING) return CUDA_ERROR_INVALID_VALUE;
+    *stream = (CUstream)(uintptr_t)1;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_stream_destroy(CUstream stream) {
+    if (stream != (CUstream)(uintptr_t)1) return CUDA_ERROR_INVALID_VALUE;
+    ++am_test_stream_destroyed;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_stream_synchronize(CUstream stream) {
+    (void)stream;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI am_test_async_copy(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    (void)copy; (void)stream;
+    return CUDA_SUCCESS;
+}
+static NVENCSTATUS NVENCAPI am_test_set_io_streams(void *session, NV_ENC_CUSTREAM_PTR input,
+                                                   NV_ENC_CUSTREAM_PTR output) {
+    (void)session;
+    if (input != output || *(CUstream *)input != (CUstream)(uintptr_t)1)
+        return NV_ENC_ERR_INVALID_PARAM;
+    return am_test_stream_setup_mode == 1 ? NV_ENC_ERR_UNSUPPORTED_PARAM : NV_ENC_SUCCESS;
+}
+int amaterasu_nvcuda_test_stream_setup(int mode) {
+    am_test_stream_setup_mode = mode;
+    am_test_stream_destroyed = 0;
+    struct am_driver driver = {0};
+    driver.cuda.stream_create = am_test_stream_create;
+    driver.cuda.stream_destroy = am_test_stream_destroy;
+    driver.cuda.stream_synchronize = am_test_stream_synchronize;
+    driver.cuda.memcpy_2d_async = mode == 2 ? NULL : am_test_async_copy;
+    struct am_nvcuda_encoder encoder = {0};
+    encoder.driver = &driver;
+    encoder.functions.nvEncSetIOCudaStreams = am_test_set_io_streams;
+    configure_cuda_stream(&encoder);
+    if (mode == 0) return encoder.conversion_stream != NULL && am_test_stream_destroyed == 0;
+    return encoder.conversion_stream == NULL && am_test_stream_destroyed == (mode == 1);
+}
+
+/* A failed asynchronous map/copy/unmap can still leave CUDA work in flight.
+ * Do not release any backing allocations without first joining that work. */
+static int synchronize_conversion(struct am_nvcuda_encoder *encoder,
+                                  struct am_nvcuda_status *status) {
+    CUresult result = encoder->conversion_stream == NULL ? CUDA_SUCCESS :
+        encoder->driver->cuda.stream_synchronize(encoder->conversion_stream);
+    if (result != CUDA_SUCCESS || encoder->converter.mapping_outstanding ||
+        encoder->converter.retirement_unproven) {
+        if (atomic_exchange(&am_retirement_failed, 1) == 0) {
+            fprintf(stderr, "amaterasu nvenc: CUDA stream retirement failed; refusing new NVENC sessions until restart\n");
+        }
+        am_set_status(status, AM_STAGE_CUDA_INTEROP, (int32_t)result);
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+/* GPU-free regression test: a failed retirement must quarantine resources
+ * rather than proceeding to release an allocation still used by CUDA. */
+static int am_test_retirement_sync_failure;
+static CUresult CUDAAPI am_test_failed_stream_sync(CUstream stream) {
+    (void)stream;
+    return am_test_retirement_sync_failure ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+int amaterasu_nvcuda_test_failed_retirement(int mapping_unproven) {
+    int previous_failure = atomic_exchange(&am_retirement_failed, 0);
+    am_test_retirement_sync_failure = !mapping_unproven;
+    struct am_driver driver = {0};
+    driver.cuda.stream_synchronize = am_test_failed_stream_sync;
+    struct am_nvcuda_encoder *encoder = calloc(1, sizeof(*encoder));
+    if (encoder == NULL) return 0;
+    encoder->driver = &driver;
+    encoder->conversion_stream = (CUstream)(uintptr_t)1;
+    encoder->converter.mapping_outstanding = mapping_unproven == 1;
+    encoder->converter.retirement_unproven = mapping_unproven == 2;
+    /* Any progression past the retirement barrier would call NULL driver
+     * callbacks or free this object. On failure the caller retains it. */
+    amaterasu_nvcuda_close(encoder);
+    int retained = encoder->conversion_stream == (CUstream)(uintptr_t)1 &&
+                   atomic_load(&am_retirement_failed) == 1;
+    free(encoder);
+    atomic_store(&am_retirement_failed, previous_failure);
+    return retained;
+}
+
 static int open_encoder(struct am_nvcuda_encoder *encoder, const char *pci_bus_id,
                         const struct am_nvcuda_struct_versions *candidates,
                         uint32_t candidate_count, const struct am_nvcuda_settings *settings,
@@ -523,6 +670,9 @@ static int open_encoder(struct am_nvcuda_encoder *encoder, const char *pci_bus_i
         result = configure_encoder(encoder, settings, status);
     }
     if (result == AM_NVCUDA_OK) {
+        configure_cuda_stream(encoder);
+    }
+    if (result == AM_NVCUDA_OK) {
         result = create_buffers(encoder, status);
     }
     if (result == AM_NVCUDA_OK) {
@@ -537,6 +687,11 @@ struct am_nvcuda_encoder *amaterasu_nvcuda_open(
     uint32_t candidate_count, const struct am_nvcuda_settings *settings,
     struct am_nvcuda_status *status, int *result) {
     if (result == NULL) {
+        return NULL;
+    }
+    if (atomic_load(&am_retirement_failed)) {
+        am_set_status(status, AM_STAGE_CUDA_INTEROP, 0);
+        *result = AM_NVCUDA_NATIVE_FAILURE;
         return NULL;
     }
     if (pci_bus_id == NULL || candidates == NULL || candidate_count == 0 || settings == NULL ||
@@ -592,6 +747,7 @@ int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
+    memset(&encoder->timings, 0, sizeof(encoder->timings));
     CUDA_MEMCPY2D copy;
     memset(&copy, 0, sizeof(copy));
     copy.srcMemoryType = CU_MEMORYTYPE_HOST;
@@ -618,12 +774,20 @@ int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, const uint8_
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
+    memset(&encoder->timings, 0, sizeof(encoder->timings));
+    uint64_t started = monotonic_us();
     int result = am_converter_upload_bgra(&encoder->converter, bgra, status);
+    encoder->timings.import_convert_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK) {
         return result;
     }
-    return am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
-                                  status);
+    started = monotonic_us();
+    result = am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
+                                    encoder->conversion_stream, status);
+    encoder->timings.interop_copy_us = elapsed_us(started);
+    if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK)
+        return AM_NVCUDA_NATIVE_FAILURE;
+    return result;
 }
 
 int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder,
@@ -633,12 +797,20 @@ int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder,
         am_set_status(status, AM_STAGE_IMPORT, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
+    memset(&encoder->timings, 0, sizeof(encoder->timings));
+    uint64_t started = monotonic_us();
     int result = am_converter_import_dmabuf(&encoder->converter, frame, status);
+    encoder->timings.import_convert_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK) {
         return result;
     }
-    return am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
-                                  status);
+    started = monotonic_us();
+    result = am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
+                                    encoder->conversion_stream, status);
+    encoder->timings.interop_copy_us = elapsed_us(started);
+    if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK)
+        return AM_NVCUDA_NATIVE_FAILURE;
+    return result;
 }
 
 static void unmap_input(struct am_nvcuda_encoder *encoder) {
@@ -751,14 +923,23 @@ int amaterasu_nvcuda_encode(struct am_nvcuda_encoder *encoder, int64_t timestamp
     *data = NULL;
     *length = 0;
     NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+    uint64_t started = monotonic_us();
     int result = map_input(encoder, &format, status);
+    encoder->timings.map_input_us = elapsed_us(started);
     if (result == AM_NVCUDA_OK) {
+        started = monotonic_us();
         result = submit_picture(encoder, format, timestamp_100ns, force_idr, status);
+        encoder->timings.submit_picture_us = elapsed_us(started);
     }
     if (result == AM_NVCUDA_OK) {
+        started = monotonic_us();
         result = lock_output(encoder, timestamp_100ns, data, length, picture_type, status);
+        encoder->timings.lock_output_us = elapsed_us(started);
     }
     if (result != AM_NVCUDA_OK) {
+        if (synchronize_conversion(encoder, status) != AM_NVCUDA_OK) {
+            return AM_NVCUDA_NATIVE_FAILURE;
+        }
         amaterasu_nvcuda_release_output(encoder, NULL);
         *data = NULL;
         *length = 0;
@@ -792,6 +973,12 @@ void amaterasu_nvcuda_close(struct am_nvcuda_encoder *encoder) {
     if (encoder == NULL) {
         return;
     }
+    /* A failed or partially submitted frame can leave private GPU resources
+     * in use. Quarantine the entire encoder if the driver cannot prove stream
+     * retirement; freeing its CUDA/GL allocations would risk use-after-free. */
+    if (synchronize_conversion(encoder, NULL) != AM_NVCUDA_OK) {
+        return;
+    }
     if (encoder->session != NULL) {
         amaterasu_nvcuda_release_output(encoder, NULL);
     }
@@ -804,6 +991,9 @@ void amaterasu_nvcuda_close(struct am_nvcuda_encoder *encoder) {
     }
     if (encoder->session != NULL) {
         encoder->functions.nvEncDestroyEncoder(encoder->session);
+    }
+    if (encoder->conversion_stream != NULL) {
+        encoder->driver->cuda.stream_destroy(encoder->conversion_stream);
     }
     if (encoder->input != 0) {
         encoder->driver->cuda.mem_free(encoder->input);

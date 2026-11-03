@@ -30,6 +30,10 @@ pub trait Backend: Send {
     fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
         Ok(None)
     }
+    /// A side-effect-free diagnostic snapshot, if this backend supports it.
+    fn observed_metrics(&self) -> Option<WorkerMetrics> {
+        None
+    }
     /// Inputs accepted besides packed NV12; read once when the session opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
@@ -74,6 +78,9 @@ impl Backend for Worker {
     fn metrics(&mut self) -> Result<Option<WorkerMetrics>, &'static str> {
         self.metrics().map(Some)
     }
+    fn observed_metrics(&self) -> Option<WorkerMetrics> {
+        Some(self.observed_metrics())
+    }
     fn input_support(&self) -> InputSupport {
         Worker::input_support(self)
     }
@@ -117,6 +124,7 @@ pub struct Session {
     color_conversion_total_us: u64,
     color_conversion_max_us: u64,
     color_conversion_frames: u64,
+    opened_at: Instant,
 }
 
 /// Owned provider reference; callbacks stay on the module thread. Only duplicated
@@ -302,6 +310,7 @@ impl Sessions {
                 color_conversion_total_us: 0,
                 color_conversion_max_us: 0,
                 color_conversion_frames: 0,
+                opened_at: Instant::now(),
             },
         );
         Ok(response)
@@ -331,6 +340,25 @@ impl Sessions {
         Ok(
             json!({"ok":true,"session_id":id,"state":state,"configuration":session.config,"packet_boundaries":session.packet_boundaries,"supports_packet_boundaries":true,"timing":{"color_conversion_frames":session.color_conversion_frames,"color_conversion_total_us":session.color_conversion_total_us,"color_conversion_max_us":session.color_conversion_max_us},"encoder_timing":encoder_metrics}),
         )
+    }
+
+    /// A bounded, host-only snapshot; worker timings are cumulative since the
+    /// session opened and do not measure capture, packet delivery or display.
+    pub fn timing_summaries(&self, now: Instant) -> Vec<String> {
+        self.values
+            .iter()
+            .filter_map(|(id, session)| {
+                let metrics = session.backend.observed_metrics()?;
+                let elapsed_ms = now.saturating_duration_since(session.opened_at).as_millis();
+                Some(format!(
+                    "encoder_session={id} elapsed_ms={elapsed_ms} width={} height={} target_fps={} worker_metrics_cumulative={}",
+                    session.config.width,
+                    session.config.height,
+                    session.config.fps,
+                    serde_json::to_string(&metrics).ok()?
+                ))
+            })
+            .collect()
     }
     pub fn close(&mut self, owner: &str, id: u64) -> Result<Value, &'static str> {
         self.owned(owner, id)?;

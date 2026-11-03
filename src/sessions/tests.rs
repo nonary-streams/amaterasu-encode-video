@@ -130,6 +130,50 @@ impl Backend for Fake {
     }
 }
 
+struct TimingBackend;
+
+impl Backend for TimingBackend {
+    fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
+        Ok(SubmitResult::Accepted)
+    }
+    fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+        Ok(ReceiveResult::Ready(None))
+    }
+    fn drain(&mut self) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+    fn observed_metrics(&self) -> Option<WorkerMetrics> {
+        Some(WorkerMetrics {
+            completed_operations: 2,
+            queue_wait_us_total: 300,
+            submit_total_us: 700,
+            busy_submissions: 1,
+            ..WorkerMetrics::default()
+        })
+    }
+}
+
+#[test]
+fn timing_summary_reports_worker_counters_without_owner_data() {
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "private-owner",
+            configuration(),
+            Box::new(TimingBackend),
+            false,
+        )
+        .unwrap();
+    let summaries = sessions.timing_summaries(Instant::now());
+    assert_eq!(summaries.len(), 1);
+    let summary = &summaries[0];
+    assert!(summary.contains("encoder_session=1"));
+    assert!(summary.contains("\"queue_wait_us_total\":300"));
+    assert!(summary.contains("\"submit_total_us\":700"));
+    assert!(summary.contains("\"busy_submissions\":1"));
+    assert!(!summary.contains("private-owner"));
+}
+
 impl Drop for Fake {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::SeqCst);

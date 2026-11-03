@@ -552,7 +552,7 @@ int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_
 }
 
 static int copy_plane(const struct am_cuda_api *cuda, CUarray source, CUdeviceptr destination,
-                      size_t pitch, size_t width_bytes, size_t rows) {
+                      size_t pitch, size_t width_bytes, size_t rows, CUstream stream) {
     CUDA_MEMCPY2D copy;
     memset(&copy, 0, sizeof(copy));
     copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
@@ -562,16 +562,21 @@ static int copy_plane(const struct am_cuda_api *cuda, CUarray source, CUdevicept
     copy.dstPitch = pitch;
     copy.WidthInBytes = width_bytes;
     copy.Height = rows;
-    return cuda->memcpy_2d(&copy) == CUDA_SUCCESS;
+    return (stream != NULL ? cuda->memcpy_2d_async(&copy, stream) : cuda->memcpy_2d(&copy)) ==
+           CUDA_SUCCESS;
 }
 
-/* Mapping orders the GL draws before the CUDA copies; the context
- * synchronization completes the copies before NVENC or the caller proceed. */
+/* Mapping orders GL draws before CUDA copies. With a non-NULL stream, map,
+ * copies, and unmap are ordered there; NVENC consumes that same input stream.
+ * The caller must synchronize it on failure and before releasing resources. */
 int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destination,
-                           size_t pitch, struct am_nvcuda_status *status) {
+                           size_t pitch, CUstream stream, struct am_nvcuda_status *status) {
     const struct am_cuda_api *cuda = &converter->driver->cuda;
     CUgraphicsResource resources[] = {converter->luma_resource, converter->chroma_resource};
-    CUresult result = cuda->graphics_map(2, resources, NULL);
+    /* If map or unmap fails the driver has not proved that ownership returned
+     * to GL. The caller must quarantine the registration on that path. */
+    converter->mapping_outstanding = 1;
+    CUresult result = cuda->graphics_map(2, resources, stream);
     if (result != CUDA_SUCCESS) {
         am_set_status(status, AM_STAGE_CUDA_INTEROP, (int32_t)result);
         return AM_NVCUDA_NATIVE_FAILURE;
@@ -582,11 +587,13 @@ int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destinati
         cuda->graphics_mapped_array(&luma, converter->luma_resource, 0, 0) == CUDA_SUCCESS &&
         cuda->graphics_mapped_array(&chroma, converter->chroma_resource, 0, 0) ==
             CUDA_SUCCESS &&
-        copy_plane(cuda, luma, destination, pitch, converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height) &&
+        copy_plane(cuda, luma, destination, pitch, converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height, stream) &&
         copy_plane(cuda, chroma, destination + pitch * converter->height, pitch,
-                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height / 2);
-    CUresult unmapped = cuda->graphics_unmap(2, resources, NULL);
-    CUresult synchronized = cuda->ctx_synchronize();
+                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height / 2, stream);
+    CUresult unmapped = cuda->graphics_unmap(2, resources, stream);
+    if (unmapped == CUDA_SUCCESS) converter->mapping_outstanding = 0;
+    CUresult synchronized = stream == NULL ? cuda->ctx_synchronize() : CUDA_SUCCESS;
+    if (synchronized != CUDA_SUCCESS) converter->retirement_unproven = 1;
     if (!copied || unmapped != CUDA_SUCCESS || synchronized != CUDA_SUCCESS) {
         am_set_status(status, AM_STAGE_CUDA_INTEROP,
                       (int32_t)(unmapped != CUDA_SUCCESS ? unmapped : synchronized));
