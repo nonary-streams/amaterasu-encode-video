@@ -94,6 +94,7 @@ struct Runtime {
     omit_reference_metadata: bool,
     capture_geometry: Option<Value>,
     capture_touch_surface: Option<Value>,
+    capture_source_observation: Option<Value>,
     capture_open_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_admission_errors: BTreeMap<CaptureProvider, &'static str>,
     capture_outputs: BTreeMap<CaptureProvider, Vec<Value>>,
@@ -236,6 +237,9 @@ impl Runtime {
                             }
                             if let Some(touch_surface) = &self.capture_touch_surface {
                                 result["touch_surface"] = touch_surface.clone();
+                            }
+                            if let Some(observed) = &self.capture_source_observation {
+                                result["observed_capture"] = observed.clone();
                             }
                             result
                         }
@@ -5425,4 +5429,163 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         _ => unreachable!(),
     });
     assert_eq!(retired, [("cancel", 80), ("release", 80)]);
+}
+
+fn named_source_observation(width: u32, height: u32) -> Value {
+    json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"ab".repeat(32),
+        "registry_global":17,"output_name":"Virtual-12","width":width,"height":height,"refresh_millihz":60000})
+}
+
+fn scaled_pipewire_open(width: u32, height: u32) -> Operation {
+    let mut operation = open();
+    let Operation::Open {
+        capture_provider,
+        output,
+        configuration,
+        ..
+    } = &mut operation
+    else {
+        unreachable!()
+    };
+    *capture_provider = CaptureProvider::Pipewire;
+    *output = "kwin:Virtual-12".into();
+    configuration.width = width;
+    configuration.height = height;
+    operation
+}
+
+#[test]
+fn pipewire_source_geometry_is_independent_of_each_encoded_image_and_touch_fit() {
+    for (
+        source_width,
+        source_height,
+        logical_width,
+        logical_height,
+        width,
+        height,
+        left,
+        top,
+        content_width,
+        content_height,
+    ) in [
+        (2560, 1440, 2560, 1440, 1920, 1080, 0, 0, 1920, 1080),
+        (2560, 1440, 2560, 1440, 1920, 1200, 0, 60, 1920, 1080),
+        (1080, 1920, 1080, 1920, 1920, 1080, 656, 0, 607, 1080),
+        (2560, 1440, 1463, 823, 1920, 1200, 0, 60, 1920, 1080),
+    ] {
+        let (mut pipeline, mut runtime, mut plane) =
+            setup_with_providers([CaptureProvider::Pipewire].into());
+        let geometry = CaptureGeometry::new(
+            DesktopRect::new(0, 0, logical_width, logical_height).unwrap(),
+            DesktopRect::new(0, 0, logical_width, logical_height).unwrap(),
+        )
+        .unwrap();
+        runtime.capture_geometry = Some(json!(geometry));
+        runtime.capture_source_observation =
+            Some(named_source_observation(source_width, source_height));
+        plane.owned_geometry = Some(geometry);
+        pipeline.handle(
+            "alice",
+            99,
+            scaled_pipewire_open(width, height),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 4);
+        let opened = &runtime.completed[0].1;
+        assert_eq!(opened["state"], "running", "{opened}");
+        assert_eq!(opened["desktop_geometry"], json!(geometry));
+        assert_eq!(
+            opened["touch_port"],
+            json!({"width":width,"height":height,
+            "logical_width":logical_width,"logical_height":logical_height,"client_offset_x":left as f32,"client_offset_y":top as f32,
+            "content_width":content_width,"content_height":content_height})
+        );
+        let encoder_open = runtime
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == ENCODE && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(encoder_open["configuration"]["width"], width);
+        assert_eq!(encoder_open["configuration"]["height"], height);
+        let stream = pipeline.streams.get_mut(&1).unwrap();
+        assert_eq!(
+            stream.source_observation.as_ref().unwrap().width,
+            source_width
+        );
+        // Other providers retain their existing geometry/encoder-size contract.
+        stream.provider = CaptureProvider::Vkms;
+        assert_eq!(
+            verify_stream_geometry(&mut plane, stream),
+            Err("capture_geometry_changed")
+        );
+    }
+}
+
+#[test]
+fn pipewire_scaled_mapping_rejects_forged_source_and_changed_geometry() {
+    for mismatch in ["name", "extent", "zero", "touch"] {
+        let (mut pipeline, mut runtime, mut plane) =
+            setup_with_providers([CaptureProvider::Pipewire].into());
+        let geometry = CaptureGeometry::new(
+            DesktopRect::new(0, 0, 2560, 1440).unwrap(),
+            DesktopRect::new(0, 0, 2560, 1440).unwrap(),
+        )
+        .unwrap();
+        runtime.capture_geometry = Some(json!(geometry));
+        let mut observation = named_source_observation(2560, 1440);
+        match mismatch {
+            "name" => observation["output_name"] = json!("Virtual-13"),
+            "extent" => observation["height"] = json!(1600),
+            "zero" => observation["width"] = json!(0),
+            "touch" => {
+                runtime.capture_touch_surface = Some(
+                    json!({"width":1920,"height":1080,"logical_width":2560,"logical_height":1440}),
+                )
+            }
+            _ => unreachable!(),
+        }
+        runtime.capture_source_observation = Some(observation);
+        plane.owned_geometry = Some(geometry);
+        pipeline.handle(
+            "alice",
+            99,
+            scaled_pipewire_open(1920, 1080),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 8);
+        assert_ne!(runtime.completed[0].1["state"], "running");
+        assert!(!runtime.commands.iter().any(|command| matches!(command,Command::Request {service,payload,..} if service==ENCODE && payload["action"]=="open")));
+    }
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire].into());
+    let geometry = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 2560, 1440).unwrap(),
+        DesktopRect::new(0, 0, 2560, 1440).unwrap(),
+    )
+    .unwrap();
+    runtime.capture_geometry = Some(json!(geometry));
+    runtime.capture_source_observation = Some(named_source_observation(2560, 1440));
+    plane.owned_geometry = Some(geometry);
+    pipeline.handle(
+        "alice",
+        99,
+        scaled_pipewire_open(1920, 1080),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    assert_eq!(runtime.completed[0].1["state"], "running");
+    let changed = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 2560, 1600).unwrap(),
+        DesktopRect::new(0, 0, 2560, 1600).unwrap(),
+    )
+    .unwrap();
+    plane.owned_geometry = Some(changed);
+    pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].error, Some("capture_geometry_changed"));
 }

@@ -154,6 +154,7 @@ struct Stream {
     settlement_attempts: u8,
     capture: Option<u64>,
     desktop_geometry: Option<CaptureGeometry>,
+    source_observation: Option<ObservedCapture>,
     touch_port: Option<Value>,
     session: Option<u64>,
     operation: String,
@@ -1011,6 +1012,7 @@ impl Pipeline {
                 settlement_attempts: 0,
                 capture: None,
                 desktop_geometry: None,
+                source_observation: None,
                 touch_port: None,
                 session: None,
                 capture_operation: format!("{operation}-capture-0"),
@@ -1231,15 +1233,24 @@ fn verify_stream_geometry(
             return Ok(GeometryProgress::Busy);
         };
         actual.validate().map_err(|_| "invalid_capture_geometry")?;
-        // Geometry is in logical desktop units, so a scaled owned output is
-        // smaller than its pixels. A new peer can expand the desktop or move an
-        // output without invalidating its pixels; a resize that breaks the
-        // stream's aspect (one consistent scale on both axes) cannot.
+        // Geometry is in logical desktop units. For PipeWire, the selected
+        // source's native observation establishes its pixels independently of
+        // each client's resized encoder image. A desktop move is harmless;
+        // geometry that breaks the source's uniform DPI scale is not.
+        let (pixel_width, pixel_height) = if stream.provider == CaptureProvider::Pipewire {
+            stream
+                .source_observation
+                .as_ref()
+                .map(|observed| (observed.width, observed.height))
+                .unwrap_or((stream.configuration.width, stream.configuration.height))
+        } else {
+            (stream.configuration.width, stream.configuration.height)
+        };
         if !consistent_output_scale(
             actual.output.width,
             actual.output.height,
-            stream.configuration.width,
-            stream.configuration.height,
+            pixel_width,
+            pixel_height,
         ) {
             return Err("capture_geometry_changed");
         }
@@ -2160,8 +2171,21 @@ fn apply_result(
                 return false;
             };
             stream.capture = Some(capture);
-            if let Err(code) = observed_capture(&payload) {
-                stream.cleanup(code);
+            stream.source_observation = match observed_capture(&payload) {
+                Ok(observation) => observation,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
+            if stream.provider == CaptureProvider::Pipewire
+                && stream.capture_output.starts_with("kwin:")
+                && stream.source_observation.as_ref().is_some_and(|observed| {
+                    stream.capture_output.strip_prefix("kwin:")
+                        != Some(observed.output_name.as_str())
+                })
+            {
+                stream.cleanup("capture_source_identity_mismatch");
                 return false;
             }
             if stream.generic_input
@@ -2186,6 +2210,8 @@ fn apply_result(
                 &payload,
                 &stream.configuration,
                 stream.desktop_geometry,
+                stream.provider,
+                stream.source_observation.as_ref(),
             ) {
                 Ok(touch_port) => touch_port,
                 Err(code) => {
@@ -3284,7 +3310,14 @@ fn capture_touch_port(
     payload: &Value,
     configuration: &Configuration,
     desktop_geometry: Option<CaptureGeometry>,
+    provider: CaptureProvider,
+    source_observation: Option<&ObservedCapture>,
 ) -> Result<Option<Value>, &'static str> {
+    if provider == CaptureProvider::Pipewire
+        && let Some(source) = source_observation
+    {
+        return pipewire_touch_port(payload, configuration, desktop_geometry, source);
+    }
     let Some(value) = payload.get("touch_surface") else {
         return Ok(None);
     };
@@ -3310,6 +3343,56 @@ fn capture_touch_port(
         "client_offset_x": 0.0_f32,
         "client_offset_y": 0.0_f32,
     })))
+}
+
+fn pipewire_touch_port(
+    payload: &Value,
+    configuration: &Configuration,
+    geometry: Option<CaptureGeometry>,
+    source: &ObservedCapture,
+) -> Result<Option<Value>, &'static str> {
+    let Some(geometry) = geometry else {
+        return Ok(None);
+    };
+    if !consistent_output_scale(
+        geometry.output.width,
+        geometry.output.height,
+        source.width,
+        source.height,
+    ) {
+        return Err("capture_geometry_changed");
+    }
+    let surface = match payload.get("touch_surface") {
+        Some(surface) => serde_json::from_value::<TouchSurface>(surface.clone())
+            .map_err(|_| "invalid_capture_touch_surface")?,
+        // Two native facts from the same selected PipeWire source establish
+        // physical source pixels and compositor input units independently.
+        // Desktop geometry alone is never used to infer image dimensions.
+        None => TouchSurface {
+            width: source.width,
+            height: source.height,
+            logical_width: geometry.output.width,
+            logical_height: geometry.output.height,
+        },
+    };
+    if !surface.validate() || surface.width != source.width || surface.height != source.height {
+        return Err("invalid_capture_touch_surface");
+    }
+    let fit = crate::image_fit::ImageFit::new(
+        source.width,
+        source.height,
+        configuration.width,
+        configuration.height,
+    )
+    .ok_or("invalid_capture_touch_surface")?;
+    let mut port = json!({"width":configuration.width,"height":configuration.height,
+        "logical_width":surface.logical_width,"logical_height":surface.logical_height,
+        "client_offset_x":fit.left as f32,"client_offset_y":fit.top as f32});
+    if source.width != configuration.width || source.height != configuration.height {
+        port["content_width"] = json!(fit.width);
+        port["content_height"] = json!(fit.height);
+    }
+    Ok(Some(port))
 }
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {

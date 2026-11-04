@@ -1,4 +1,5 @@
 //! Managed capture-to-encode coordination with bounded native packet delivery.
+mod image_fit;
 mod model;
 mod native;
 mod pipeline;

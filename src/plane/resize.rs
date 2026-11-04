@@ -19,21 +19,9 @@ pub(super) fn fit_bgra(
     {
         return Err(STATUS_INVALID_ARGUMENT);
     }
-    let (fit_width, fit_height) = if u64::from(width) * u64::from(source.height)
-        <= u64::from(height) * u64::from(source.width)
-    {
-        (
-            width,
-            (u64::from(width) * u64::from(source.height) / u64::from(source.width)).max(1) as u32,
-        )
-    } else {
-        (
-            (u64::from(height) * u64::from(source.width) / u64::from(source.height)).max(1) as u32,
-            height,
-        )
-    };
-    let left = (width - fit_width) / 2;
-    let top = (height - fit_height) / 2;
+    let fit = crate::image_fit::ImageFit::new(source.width, source.height, width, height)
+        .ok_or(STATUS_INVALID_ARGUMENT)?;
+    let (fit_width, fit_height, left, top) = (fit.width, fit.height, fit.left, fit.top);
     let mut bytes = Vec::new();
     let length = width as usize * height as usize * 4;
     bytes
@@ -147,5 +135,42 @@ mod tests {
         }
         assert!(fit_bgra(&frame, &pixels[..4], 4, 4).is_err());
         assert!(fit_bgra(&frame, &pixels, 0, 4).is_err());
+    }
+
+    #[test]
+    fn odd_letterbox_pixels_match_the_inverse_mapping_rectangle() {
+        let pixels = vec![255; 4 * 5 * 4];
+        let frame = CpuFrame {
+            width: 4,
+            height: 5,
+            format: PIXEL_BGRA8,
+            stride: 16,
+            data: pixels.as_ptr(),
+            len: pixels.len(),
+            timestamp_us: 0,
+            sequence: 0,
+        };
+        let resized = fit_bgra(&frame, &pixels, 8, 4).unwrap();
+        assert_eq!(
+            crate::image_fit::ImageFit::new(4, 5, 8, 4),
+            Some(crate::image_fit::ImageFit {
+                left: 2,
+                top: 0,
+                width: 3,
+                height: 4,
+            })
+        );
+        for row in resized.bytes.as_chunks::<32>().0 {
+            for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
+                assert_eq!(
+                    pixel,
+                    if (2..5).contains(&x) {
+                        &[255; 4]
+                    } else {
+                        &[0, 0, 0, 255]
+                    }
+                );
+            }
+        }
     }
 }
