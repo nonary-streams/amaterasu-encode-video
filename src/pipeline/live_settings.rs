@@ -1,6 +1,9 @@
 //! Bounded asynchronous reads of the selected provider's live settings.
 use super::{Stage, Stream};
 use crate::{model::LiveProcessingSettings, plane::Plane, rpc::Send};
+use amaterasu_module_sdk::requests::{
+    RequestOptions, live_provider_settings_command, validate_live_provider_settings,
+};
 use amaterasu_module_sdk::{Command, LogLevel, Response};
 use serde_json::{Value, json};
 use std::{
@@ -121,26 +124,22 @@ impl Control {
             let Some(reference) = selection.live_settings.as_mut() else {
                 return;
             };
-            let revision = payload.get("revision").and_then(Value::as_str);
-            let settings = &payload["settings"];
-            if payload["status"] == "succeeded"
-                && payload["target"] == json!(reference.target)
-                && payload["provider"] == reference.provider
-                && revision.is_some_and(|value| !value.is_empty() && value.len() <= 128)
-                && settings.is_object()
-                && serde_json::to_vec(settings).is_ok_and(|bytes| bytes.len() <= 16 * 1024)
-                && revision != Some(reference.revision.as_str())
-            {
-                match plane.update_gpu(pending.stream, settings) {
+            if let Ok(Some(update)) = validate_live_provider_settings(
+                &payload,
+                &reference.target,
+                &reference.provider,
+                &reference.revision,
+            ) {
+                match plane.update_gpu(pending.stream, &update.settings) {
                     Ok(()) => {
-                        reference.revision = revision.unwrap().to_owned();
+                        reference.revision = update.revision;
                         stream.live_settings_rejected_revision = None;
                     }
                     Err("gpu_processor_update_internal") => {
                         stream.cleanup("gpu_processor_update_internal")
                     }
                     Err(reason) => {
-                        let revision = revision.unwrap();
+                        let revision = update.revision.as_str();
                         if stream.live_settings_rejected_revision.as_deref() != Some(revision) {
                             let _ = send(Command::Log {
                                 level: LogLevel::Warning as u8,
@@ -171,12 +170,18 @@ impl Control {
             return;
         };
         self.sequence = self.sequence.wrapping_add(1);
-        let command = Command::Request {
-            service: "amaterasu.session-lifecycle/1".into(),
-            payload: json!({"operation":"read_live_provider_settings", "target":reference.target, "provider":reference.provider}),
-            timeout_ms: 5000,
-            operation_id: format!("video-live-settings-{epoch}-{}", self.sequence),
-            parent: None,
+        let operation_id = format!("video-live-settings-{epoch}-{}", self.sequence);
+        let Ok(command) = live_provider_settings_command(
+            RequestOptions {
+                service: "amaterasu.session-lifecycle/1",
+                timeout_ms: 5000,
+                operation_id: &operation_id,
+                parent: None,
+            },
+            reference.target.clone(),
+            &reference.provider,
+        ) else {
+            return;
         };
         self.pending = Some(Pending {
             stream,
