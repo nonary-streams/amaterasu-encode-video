@@ -388,6 +388,9 @@ struct FakePlane {
     selected_encoders: Vec<String>,
     gpu_configurations: Vec<(u64, Option<serde_json::Value>)>,
     gpu_configuration_failure: bool,
+    gpu_updates: Vec<(u64, Value)>,
+    gpu_update_failure: bool,
+    gpu_update_internal: bool,
     source_starts: Vec<(u64, u64, u64)>,
     source_pumps: Vec<(u64, bool)>,
     source_drains: usize,
@@ -426,6 +429,16 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn update_gpu(&mut self, stream: u64, settings: &Value) -> Result<(), &'static str> {
+        self.gpu_updates.push((stream, settings.clone()));
+        if self.gpu_update_internal {
+            Err("gpu_processor_update_internal")
+        } else if self.gpu_update_failure {
+            Err("rejected")
+        } else {
+            Ok(())
+        }
+    }
     fn configure_gpu(
         &mut self,
         stream: u64,
@@ -5242,4 +5255,174 @@ fn repeated_observations_release_each_broker_result() {
     drop(send);
     assert_eq!(releases, 40);
     assert_eq!(successes, 40);
+}
+
+#[test]
+fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    configuration.gpu_processing = Some(
+        serde_json::from_value(json!({
+            "service":"example.processor/1", "enabled":true, "source_hdr_required":false,
+            "settings":{"strength":1}
+        }))
+        .unwrap(),
+    );
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .configuration
+        .gpu_processing
+        .as_mut()
+        .unwrap()
+        .live_settings = Some(
+        serde_json::from_value(
+            json!({"target":target,"provider":"example.processor","revision":"old"}),
+        )
+        .unwrap(),
+    );
+    let mut control = live_settings::Control::default();
+    let mut response = json!({"status":"succeeded","target":target,"provider":"example.processor","revision":"new","settings":{"strength":2}});
+    let mut send = |command| match command {
+        Command::Request { .. } => Ok(Response::Accepted { id: 77 }),
+        Command::TakeResult { .. } => Ok(Response::Result {
+            payload: response.clone(),
+        }),
+        Command::ReleaseResult { .. } => Ok(Response::Ok),
+        Command::Log { .. } => Ok(Response::Ok),
+        _ => unreachable!(),
+    };
+    // A failed provider update does not advance the accepted revision.
+    plane.gpu_update_failure = true;
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .live_settings_next_poll = Instant::now();
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    assert_eq!(
+        pipeline.streams[&1]
+            .configuration
+            .gpu_processing
+            .as_ref()
+            .unwrap()
+            .live_settings
+            .as_ref()
+            .unwrap()
+            .revision,
+        "old"
+    );
+    plane.gpu_update_failure = false;
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .live_settings_next_poll = Instant::now();
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    assert_eq!(
+        pipeline.streams[&1]
+            .configuration
+            .gpu_processing
+            .as_ref()
+            .unwrap()
+            .live_settings
+            .as_ref()
+            .unwrap()
+            .revision,
+        "new"
+    );
+    response["target"]["generation"] = json!(2);
+    response["revision"] = json!("newer");
+    let mut send = |command| match command {
+        Command::Request { .. } => Ok(Response::Accepted { id: 78 }),
+        Command::TakeResult { .. } => Ok(Response::Result {
+            payload: response.clone(),
+        }),
+        Command::ReleaseResult { .. } => Ok(Response::Ok),
+        _ => unreachable!(),
+    };
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .live_settings_next_poll = Instant::now();
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    assert_eq!(plane.gpu_updates.len(), 2);
+    assert_eq!(
+        pipeline.streams[&1]
+            .configuration
+            .gpu_processing
+            .as_ref()
+            .unwrap()
+            .live_settings
+            .as_ref()
+            .unwrap()
+            .revision,
+        "new"
+    );
+    response["target"]["generation"] = json!(1);
+    plane.gpu_update_internal = true;
+    let mut send = |command| match command {
+        Command::Request { .. } => Ok(Response::Accepted { id: 79 }),
+        Command::TakeResult { .. } => Ok(Response::Result {
+            payload: response.clone(),
+        }),
+        Command::ReleaseResult { .. } => Ok(Response::Ok),
+        _ => unreachable!(),
+    };
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .live_settings_next_poll = Instant::now();
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    assert_eq!(pipeline.streams[&1].stage, Stage::FindEncoder);
+    assert_eq!(
+        pipeline.streams[&1].error,
+        Some("gpu_processor_update_internal")
+    );
+
+    // A lost admission reply is reconciled using the same operation ID on shutdown.
+    pipeline.streams.get_mut(&1).unwrap().stage = Stage::Running;
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .live_settings_next_poll = Instant::now();
+    let mut first_operation = String::new();
+    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut |command| {
+        let Command::Request { operation_id, .. } = command else {
+            unreachable!()
+        };
+        first_operation = operation_id;
+        Err("lost admission".into())
+    });
+    let mut retired = Vec::new();
+    control.shutdown(&mut |command| match command {
+        Command::Request { operation_id, .. } => {
+            assert_eq!(operation_id, first_operation);
+            Ok(Response::Accepted { id: 80 })
+        }
+        Command::Cancel { request } => {
+            retired.push(("cancel", request));
+            Ok(Response::Ok)
+        }
+        Command::ReleaseResult { request } => {
+            retired.push(("release", request));
+            Ok(Response::Ok)
+        }
+        _ => unreachable!(),
+    });
+    assert_eq!(retired, [("cancel", 80), ("release", 80)]);
 }

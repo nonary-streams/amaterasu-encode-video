@@ -526,6 +526,17 @@ pub struct GpuProcessing {
     /// Capture-owned source range required by the selected processing plan.
     pub source_hdr_required: bool,
     pub settings: serde_json::Map<String, serde_json::Value>,
+    /// Trusted lifecycle authority for reading changes to this selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_settings: Option<LiveProcessingSettings>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiveProcessingSettings {
+    pub target: amaterasu_module_sdk::extension_api::LifecycleTarget,
+    pub provider: String,
+    pub revision: String,
 }
 
 fn default_video_stream_format() -> amaterasu_module_sdk::VideoStreamFormat {
@@ -599,6 +610,16 @@ impl GpuProcessing {
                     || matches!(byte, b'.' | b'_' | b'-' | b'/')
             })
             && serde_json::to_vec(&self.settings).is_ok_and(|settings| settings.len() <= 16 * 1024)
+            && self.live_settings.as_ref().is_none_or(|live| {
+                matches!(
+                    live.target,
+                    amaterasu_module_sdk::extension_api::LifecycleTarget::Stream { .. }
+                ) && !live.provider.is_empty()
+                    && live.provider.len() <= 128
+                    && !live.revision.is_empty()
+                    && live.revision.len() <= 128
+                    && serde_json::to_vec(&live.target).is_ok_and(|target| target.len() <= 1024)
+            })
     }
 }
 

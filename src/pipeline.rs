@@ -1,6 +1,7 @@
 mod capture_events;
 mod encoder;
 mod lifecycle;
+mod live_settings;
 mod observation;
 mod operations;
 mod output;
@@ -143,6 +144,8 @@ struct Stream {
     encoder_probe_reason: Option<String>,
     configuration: Configuration,
     gpu_configured: bool,
+    live_settings_next_poll: Instant,
+    live_settings_rejected_revision: Option<String>,
     parent: Option<u64>,
     ending_parent: Option<u64>,
     pending: Option<u64>,
@@ -523,6 +526,7 @@ pub struct Pipeline {
     operations: BTreeMap<(String, String), operations::Record>,
     portal: portal::Control,
     observations: observation::Control,
+    live_settings: live_settings::Control,
     pub queues: Arc<Mutex<Queues>>,
     processing_generation: Arc<AtomicU64>,
 }
@@ -565,6 +569,7 @@ impl Pipeline {
             operations: BTreeMap::new(),
             portal: portal::Control::default(),
             observations: observation::Control::default(),
+            live_settings: live_settings::Control::default(),
             queues,
             processing_generation,
         }
@@ -996,6 +1001,8 @@ impl Pipeline {
                 encoder_attempt: 0,
                 configuration,
                 gpu_configured: false,
+                live_settings_next_poll: Instant::now(),
+                live_settings_rejected_revision: None,
                 parent: Some(request),
                 ending_parent: None,
                 pending: None,
@@ -1048,6 +1055,8 @@ impl Pipeline {
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         self.portal.tick(send);
         self.observations.tick(&self.streams, send);
+        self.live_settings
+            .tick(&mut self.streams, &self.epoch, plane, send);
         if self.streams.is_empty() {
             return;
         }

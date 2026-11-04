@@ -159,6 +159,10 @@ pub trait Plane {
             Ok(())
         }
     }
+    /// Replace an active processor's opaque settings between frame operations.
+    fn update_gpu(&mut self, _: u64, _: &serde_json::Value) -> Result<(), &'static str> {
+        Err("gpu_processor_update_unavailable")
+    }
     fn hdr_metadata(
         &mut self,
         _: u64,
@@ -695,6 +699,35 @@ impl Plane for NativePlane {
             .map_err(|_| "gpu_processor_settings_rejected")?;
         self.gpu_configured.insert(stream);
         Ok(())
+    }
+
+    fn update_gpu(
+        &mut self,
+        stream: u64,
+        settings: &serde_json::Value,
+    ) -> Result<(), &'static str> {
+        if !self.gpu_configured.contains(&stream) || self.gpu_bypassed.contains(&stream) {
+            return Err("gpu_processor_update_unavailable");
+        }
+        let binding = self
+            .gpu_processor
+            .as_ref()
+            .ok_or("gpu_processor_unavailable")?;
+        let json = serde_json::to_vec(settings).map_err(|_| "gpu_processor_settings_invalid")?;
+        let api = unsafe { gpu_processor::table(binding) }?;
+        // SAFETY: the binding remains live, and the video tick serializes this
+        // call with frame processing and stream retirement.
+        unsafe { amaterasu_module_sdk::processing::update_gpu_stream(api, stream, &json) }.map_err(
+            |status| {
+                if status == amaterasu_module_sdk::abi::STATUS_INTERNAL_ERROR {
+                    "gpu_processor_update_internal"
+                } else if status == amaterasu_media::MEDIA_UNSUPPORTED {
+                    "gpu_processor_update_unsupported"
+                } else {
+                    "gpu_processor_settings_rejected"
+                }
+            },
+        )
     }
 
     fn select_encoder(&mut self, service: &str) {

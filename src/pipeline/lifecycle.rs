@@ -6,6 +6,7 @@ impl Pipeline {
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         self.enabled = false;
         self.observations.shutdown(send);
+        self.live_settings.shutdown(send);
         if let Ok(mut queues) = self.queues.lock() {
             queues.clear();
         }
