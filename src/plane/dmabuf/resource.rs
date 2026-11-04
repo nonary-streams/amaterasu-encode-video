@@ -14,7 +14,14 @@ pub(in crate::plane) struct CachedSelection {
     stream: u64,
     generation: u64,
     selection: Selection,
+    reconfigure_started: Option<Instant>,
 }
+const RECONFIGURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn reconfiguration_expired(started: Option<Instant>, now: Instant) -> bool {
+    started.is_some_and(|started| now.saturating_duration_since(started) >= RECONFIGURE_TIMEOUT)
+}
+
 struct Offers {
     ids: Vec<u64>,
     selection: Option<Selection>,
@@ -261,8 +268,21 @@ pub(in crate::plane) fn deliver(
     {
         cache.remove(&input.video);
     }
+    // A compositor transition may invalidate the selected allocation before
+    // a compatible replacement appears. Keep the stream and retry, but bound
+    // the wait so a permanently incompatible source still reports failure.
+    if reconfiguration_expired(
+        cache.get(&input.video).and_then(|s| s.reconfigure_started),
+        Instant::now(),
+    ) {
+        return Err("capture_resource_reconfiguration_timeout");
+    }
     for _ in 0..2 {
-        let selected = if let Some(s) = cache.get(&input.video).copied() {
+        let selected = if let Some(s) = cache
+            .get(&input.video)
+            .copied()
+            .filter(|s| s.generation != 0)
+        {
             s
         } else {
             let mut offers = Offers {
@@ -294,6 +314,12 @@ pub(in crate::plane) fn deliver(
                 return Err("capture_resource_enumeration_failed");
             }
             let Some(selection) = offers.selection else {
+                if cache.contains_key(&input.video) {
+                    return Ok(Progress {
+                        capture_deferred: true,
+                        ..Progress::default()
+                    });
+                }
                 return Ok(Progress {
                     dmabuf_fallback: Some("capture_resource_no_dmabuf_offer"),
                     ..Progress::default()
@@ -317,6 +343,7 @@ pub(in crate::plane) fn deliver(
                 stream: input.capture,
                 generation,
                 selection,
+                reconfigure_started: cache.get(&input.video).and_then(|s| s.reconfigure_started),
             };
             cache.insert(input.video, s);
             s
@@ -372,11 +399,19 @@ pub(in crate::plane) fn deliver(
             return Err("capture_resource_protocol");
         }
         if status == MEDIA_UNSUPPORTED {
-            cache.remove(&input.video);
+            if let Some(cached) = cache.get_mut(&input.video) {
+                cached.generation = 0;
+                cached.reconfigure_started.get_or_insert_with(Instant::now);
+            }
             continue;
         }
         if !matches!(status, STATUS_OK | MEDIA_BUSY | MEDIA_PENDING) {
             return Err("capture_failed");
+        }
+        if status == STATUS_OK
+            && let Some(cached) = cache.get_mut(&input.video)
+        {
+            cached.reconfigure_started = None;
         }
         let common = delivery.common.common;
         let fallback = match common.outcome {
@@ -400,13 +435,34 @@ pub(in crate::plane) fn deliver(
             ..Progress::default()
         });
     }
-    Err("capture_resource_stale")
+    if cache.contains_key(&input.video) {
+        Ok(Progress {
+            capture_deferred: true,
+            ..Progress::default()
+        })
+    } else {
+        Err("capture_resource_stale")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn reconfiguration_wait_has_a_fixed_deadline() {
+        let start = Instant::now();
+        assert!(!reconfiguration_expired(None, start + RECONFIGURE_TIMEOUT));
+        assert!(!reconfiguration_expired(
+            Some(start),
+            start + RECONFIGURE_TIMEOUT - std::time::Duration::from_nanos(1)
+        ));
+        assert!(reconfiguration_expired(
+            Some(start),
+            start + RECONFIGURE_TIMEOUT
+        ));
+    }
 
     struct Counts {
         retains: Cell<u32>,
@@ -567,6 +623,7 @@ mod tests {
                 stream: 1,
                 generation: 1,
                 selection: Selection { id: 1, caps },
+                reconfigure_started: None,
             },
             calls: 0,
             invalid: false,

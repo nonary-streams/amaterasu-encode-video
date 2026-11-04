@@ -1450,10 +1450,10 @@ unsafe extern "C" fn resource_enumerate(
         fourcc: source.fourcc,
         color: source.color,
         modifier: source.modifier,
-        min_width: 16,
-        max_width: 16,
-        min_height: 16,
-        max_height: 16,
+        min_width: source.width,
+        max_width: source.width,
+        min_height: source.height,
+        max_height: source.height,
         device_id: [0; 16],
     };
     let none = FrameDescriptor {
@@ -1751,4 +1751,98 @@ fn vkms_resource_color_metadata_reaches_the_encoder() {
         finish_encoder(&harness);
         assert_eq!(harness.retained.get(), 0);
     }
+}
+
+#[test]
+fn negotiated_resource_survives_temporary_incompatible_geometry() {
+    unsafe extern "C" fn transition_read(
+        context: *mut c_void,
+        stream: u64,
+        sink: CaptureResourceFrameSink,
+    ) -> Status {
+        // The old selection is invalidated when the compositor changes geometry.
+        let harness = unsafe { &*context.cast::<Harness>() };
+        if harness.frame_width.get() != 16 {
+            return MEDIA_UNSUPPORTED;
+        }
+        unsafe { resource_read(context, stream, sink) }
+    }
+    let harness = Harness::default();
+    let mut base = leased_capture_api(&harness);
+    base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_8_SIZE,
+        major: INTERFACE_MAJOR,
+        minor: CAPTURE_RESOURCE_INTERFACE_MINOR,
+    };
+    let capture = CaptureApiV1_8 {
+        base: CaptureApiV1_7 {
+            base,
+            subscribe_events: no_subscribe,
+            unsubscribe_events: no_unsubscribe,
+            resolve_swap: no_swap,
+        },
+        enumerate_resources: resource_enumerate,
+        select_resource: resource_select,
+        read_resource_frame: transition_read,
+    };
+    let encoder = leased_encoder_api(&harness);
+    let config = configuration();
+    let mut cache = std::collections::BTreeMap::new();
+    assert!(
+        deliver_resource(
+            &capture,
+            &encoder,
+            None,
+            &pump(&config, true, false),
+            &mut cache
+        )
+        .unwrap()
+        .submitted
+    );
+    finish_encoder(&harness);
+    harness.frame_width.set(32);
+    for _ in 0..3 {
+        let progress = deliver_resource(
+            &capture,
+            &encoder,
+            None,
+            &pump(&config, true, false),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(progress.capture_deferred);
+        assert!(progress.dmabuf_fallback.is_none());
+        assert!(!progress.submitted);
+    }
+    assert_eq!(harness.submitted.borrow().len(), 1);
+    assert_eq!(harness.retained.get(), 0);
+    harness.frame_width.set(16);
+    assert!(
+        deliver_resource(
+            &capture,
+            &encoder,
+            None,
+            &pump(&config, true, false),
+            &mut cache
+        )
+        .unwrap()
+        .submitted
+    );
+    finish_encoder(&harness);
+    assert_eq!(harness.submitted.borrow().len(), 2);
+    assert_eq!(harness.retained.get(), 0);
+    cache.clear();
+    harness.frame_width.set(32);
+    let initial = deliver_resource(
+        &capture,
+        &encoder,
+        None,
+        &pump(&config, true, false),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(
+        initial.dmabuf_fallback,
+        Some("capture_resource_no_dmabuf_offer")
+    );
 }
