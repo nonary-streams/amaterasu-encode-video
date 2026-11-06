@@ -899,7 +899,7 @@ fn selected_color_mode_is_forwarded_to_encoder_open() {
     };
     configuration.color_mode = amaterasu_media::ColorMode::Bt601Limited;
     pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
-    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
 
     let encoder_open = runtime
         .commands
@@ -4389,6 +4389,48 @@ fn explicit_encoder_selection_never_probes_or_substitutes_another_candidate() {
             })
             .collect();
         assert_eq!(attempts, [&json!(encoder_identity())]);
+    }
+}
+
+#[test]
+fn explicit_advanced_formats_are_probed_before_any_capture_effect() {
+    for dynamic_range in [
+        amaterasu_module_sdk::DynamicRange::Sdr,
+        amaterasu_module_sdk::DynamicRange::Hdr,
+    ] {
+        for usable in [false, true] {
+            let (mut pipeline, mut runtime, mut plane) = setup();
+            let mut operation = open();
+            let Operation::Open { configuration, .. } = &mut operation else {
+                unreachable!()
+            };
+            configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+                codec: amaterasu_module_sdk::VideoCodec::Hevc,
+                bit_depth: 10,
+                dynamic_range,
+            };
+            configuration.normalize_codec().unwrap();
+            let frozen = configuration.clone();
+            runtime.encoder_probe_replies.insert(
+                encoder_identity().clsid.clone(),
+                probe_reply(&json!(encoder_identity()), &json!(configuration), usable),
+            );
+            pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+            tick(&mut pipeline, &mut runtime, &mut plane, 20);
+            let probe = runtime.commands.iter().position(|command| matches!(command,
+                Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "probe" && payload["configuration"] == json!(frozen))).expect("exact selected configuration was probed");
+            let capture = runtime.commands.iter().position(|command| matches!(command,
+                Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "open"));
+            if usable {
+                assert!(probe < capture.expect("supported provider may open capture"));
+            } else {
+                assert!(capture.is_none(), "unsupported encoder cannot open capture");
+                assert_eq!(runtime.open_effects, 0);
+                assert!(pipeline.streams.is_empty());
+            }
+            assert_eq!(runtime.commands.iter().filter(|command| matches!(command,
+                Command::Request {service,payload,..} if service == ENCODE && payload["action"] == "probe")).count(), 1, "explicit selection never probes an alternative");
+        }
     }
 }
 

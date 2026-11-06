@@ -718,10 +718,6 @@ impl Configuration {
         // used with an explicitly selected processing policy.
         self.gpu_processing.is_none()
             && self.video_stream_format.validate().is_ok()
-            && ((self.video_stream_format.bit_depth == 8
-                && self.video_stream_format.dynamic_range
-                    == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (1..=16384).contains(&self.width)
             && (1..=16384).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -745,10 +741,6 @@ impl Configuration {
                         == (self.video_stream_format.dynamic_range
                             == amaterasu_module_sdk::DynamicRange::Hdr))
         }) && self.video_stream_format.validate().is_ok()
-            && ((self.video_stream_format.bit_depth == 8
-                && self.video_stream_format.dynamic_range
-                    == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -756,8 +748,6 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 16
-            && (cfg!(target_os = "linux") || self.codec == VideoCodec::H264)
-            && (!cfg!(windows) || self.color_mode.is_default())
             && self.slices_per_frame >= 1
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
             && self.nvenc_settings.validate().is_ok()
@@ -1159,7 +1149,7 @@ mod tests {
             assert_eq!(current.codec, media);
             assert!(current.validate());
             current.video_stream_format.bit_depth = 10;
-            assert_eq!(current.validate(), cfg!(target_os = "linux"));
+            assert!(current.validate());
         }
         let mut conflicting: Configuration =
             serde_json::from_value(open_request()["configuration"].clone()).unwrap();
@@ -1168,6 +1158,42 @@ mod tests {
         assert_eq!(
             conflicting.normalize_codec(),
             Err("conflicting_video_codec")
+        );
+    }
+
+    #[test]
+    fn selected_providers_can_accept_ten_bit_sdr_and_hdr_without_host_os_gates() {
+        for codec in [
+            amaterasu_module_sdk::VideoCodec::Hevc,
+            amaterasu_module_sdk::VideoCodec::Av1,
+        ] {
+            for dynamic_range in [
+                amaterasu_module_sdk::DynamicRange::Sdr,
+                amaterasu_module_sdk::DynamicRange::Hdr,
+            ] {
+                let mut configuration: Configuration =
+                    serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+                configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+                    codec,
+                    bit_depth: 10,
+                    dynamic_range,
+                };
+                configuration.normalize_codec().unwrap();
+                assert!(configuration.validate());
+                assert!(configuration.validate_source());
+            }
+        }
+        let mut configuration: Configuration =
+            serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert!(
+            configuration.validate(),
+            "the selected encoder decides color capability"
+        );
+        configuration.video_stream_format.bit_depth = 10;
+        assert!(
+            !configuration.validate(),
+            "invalid H.264 formats remain invalid on every platform"
         );
     }
 

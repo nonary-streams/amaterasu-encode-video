@@ -141,6 +141,7 @@ struct Stream {
     requested_encoder: EncoderSelection,
     encoder_candidates: VecDeque<EncoderChoice>,
     encoder_probe_attempt: u8,
+    encoder_configuration_probed: bool,
     encoder_probe_reason: Option<String>,
     configuration: Configuration,
     gpu_configured: bool,
@@ -991,6 +992,7 @@ impl Pipeline {
                 requested_encoder,
                 encoder_candidates: VecDeque::new(),
                 encoder_probe_attempt: 0,
+                encoder_configuration_probed: false,
                 encoder_probe_reason: None,
                 encoder,
                 fallback_encoder: None,
@@ -1627,6 +1629,18 @@ fn advance(
         return apply_result(stream, id, queues, plane, result, send);
     }
     if stream.stage == Stage::Capture {
+        if requires_encoder_configuration_probe(&stream.configuration)
+            && !stream.encoder_configuration_probed
+        {
+            if stream.encoder.is_none() {
+                stream.cleanup("encoder_configuration_unverified");
+                return false;
+            }
+            stream.no_resources = stream.capture.is_none() && stream.session.is_none();
+            stream.encoder_probe_attempt += 1;
+            stream.stage = Stage::ProbeEncoder;
+            return false;
+        }
         owned_capture::select_capture_provider(stream, id, plane);
         if stream.stage != Stage::Capture {
             return false;
@@ -2007,6 +2021,7 @@ fn apply_result(
         };
         match encoder::probe_result(identity, &stream.configuration, &payload) {
             Ok(None) => {
+                stream.encoder_configuration_probed = true;
                 // A software candidate selected by probing has already used
                 // the software fallback; never restart it as its own fallback.
                 if stream.encoder == stream.fallback_encoder {
@@ -2349,10 +2364,17 @@ fn begin_encoder_probe(stream: &mut Stream) -> bool {
         .owned_capture
         .record_encoder_inputs(choice.accepts_dmabuf);
     stream.encoder = Some(choice.identity);
+    stream.encoder_configuration_probed = false;
     stream.encoder_probe_attempt += 1;
     stream.stage = Stage::ProbeEncoder;
     stream.retries = 0;
     true
+}
+
+fn requires_encoder_configuration_probe(configuration: &Configuration) -> bool {
+    configuration.video_stream_format != amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+        || configuration.codec != amaterasu_media::VideoCodec::H264
+        || !configuration.color_mode.is_default()
 }
 
 #[derive(Clone, Debug, Deserialize)]
