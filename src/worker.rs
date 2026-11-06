@@ -307,10 +307,13 @@ impl Worker {
                 let mut failed = false;
                 while let Ok(request) = receiver.recv() {
                     let started_at = Instant::now();
+                    #[cfg(unix)]
                     let is_dmabuf = matches!(
                         &request.operation,
                         Operation::SubmitGpu(GpuInput::DmaBuf(_), ..)
                     );
+                    #[cfg(not(unix))]
+                    let is_dmabuf = false;
                     let queue_wait_us =
                         duration_micros(started_at.saturating_duration_since(request.queued_at));
                     let result = if failed {
