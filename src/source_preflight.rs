@@ -136,6 +136,7 @@ mod tests {
                 height: 1080,
                 refresh_millihz: 60_000,
                 hdr: false,
+                bit_depth: None,
             },
         }
     }
@@ -152,6 +153,8 @@ mod tests {
                 max_refresh_millihz: 240_000,
                 sdr: true,
                 hdr: true,
+                bit_depths: vec![8, 10],
+                format_open: false,
             }],
         )
     }
