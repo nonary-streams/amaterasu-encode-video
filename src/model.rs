@@ -257,6 +257,21 @@ pub struct SourceEncoderRegistration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SourcePreflightRoute {
+    pub provider: CaptureProvider,
+    #[serde(rename = "class")]
+    pub source_class: amaterasu_module_sdk::capture::SourceClass,
+}
+
+impl Clone for SourcePreflightRoute {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for SourcePreflightRoute {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
@@ -267,7 +282,9 @@ pub struct Settings {
     /// Trusted opaque route keys for nonmutating source queries. Requests
     /// cannot choose a native service or fall back to another provider.
     #[serde(default)]
-    pub source_preflight_routes: BTreeMap<String, CaptureProvider>,
+    pub source_preflight_routes: BTreeMap<String, SourcePreflightRoute>,
+    #[serde(default)]
+    pub preflight_only_principals: BTreeSet<String>,
     #[serde(default)]
     pub external_encoder_providers: BTreeMap<String, String>,
     #[serde(default)]
@@ -307,6 +324,7 @@ impl Default for Settings {
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
@@ -373,10 +391,19 @@ impl Settings {
                     || !self
                         .resolved_providers()
                         .iter()
-                        .any(|selected| selected.identity() == provider.identity())
+                        .any(|selected| selected.identity() == provider.provider.identity())
             })
         {
             return Err("invalid_source_preflight_routes");
+        }
+        if self.preflight_only_principals.len() > 32
+            || self.preflight_only_principals.iter().any(|principal| {
+                principal.is_empty()
+                    || principal.len() > 128
+                    || principal.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid_preflight_only_principals");
         }
         if (self.capture_providers.is_empty()
             && self.external_capture_providers.is_empty()
@@ -479,15 +506,23 @@ impl Settings {
             .collect()
     }
 
-    pub fn resolved_source_preflight_routes(&self) -> BTreeMap<String, CaptureProvider> {
+    pub fn resolved_source_preflight_routes(&self) -> BTreeMap<String, SourcePreflightRoute> {
         let providers = self.resolved_providers();
         self.source_preflight_routes
             .iter()
             .filter_map(|(key, route)| {
                 providers
                     .iter()
-                    .find(|provider| provider.identity() == route.identity())
-                    .map(|provider| (key.clone(), *provider))
+                    .find(|provider| provider.identity() == route.provider.identity())
+                    .map(|provider| {
+                        (
+                            key.clone(),
+                            SourcePreflightRoute {
+                                provider: *provider,
+                                source_class: route.source_class,
+                            },
+                        )
+                    })
             })
             .collect()
     }
@@ -1512,6 +1547,7 @@ mod tests {
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
@@ -1539,6 +1575,7 @@ mod tests {
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),

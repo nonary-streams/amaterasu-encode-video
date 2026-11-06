@@ -1,5 +1,5 @@
 //! Pure source admission against exactly the capture route selected at startup.
-use crate::model::{CaptureProvider, Settings, error};
+use crate::model::{CaptureProvider, Settings, SourcePreflightRoute, error};
 use amaterasu_media::{MEDIA_BUSY, MEDIA_PENDING, MEDIA_UNSUPPORTED};
 use amaterasu_module_sdk::{
     Command, RuntimeClient,
@@ -11,7 +11,7 @@ use amaterasu_module_sdk::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +30,8 @@ struct Query {
 
 pub(super) struct SourcePreflight {
     enabled: bool,
-    routes: BTreeMap<String, CaptureProvider>,
+    routes: BTreeMap<String, SourcePreflightRoute>,
+    preflight_only: BTreeSet<String>,
     bindings: BTreeMap<CaptureProvider, Option<SourcePreflightConnection>>,
 }
 impl SourcePreflight {
@@ -38,8 +39,12 @@ impl SourcePreflight {
         Self {
             enabled: settings.enabled,
             routes: settings.resolved_source_preflight_routes(),
+            preflight_only: settings.preflight_only_principals.clone(),
             bindings: BTreeMap::new(),
         }
+    }
+    pub fn operation_allowed(&self, caller: &str, payload: &Value) -> bool {
+        !self.preflight_only.contains(caller) || payload["action"] == "preflight_source"
     }
     pub fn handle(&mut self, runtime: &RuntimeClient, request_id: u64, payload: Value) -> Value {
         let (route_key, request) = match decode(payload) {
@@ -91,7 +96,7 @@ fn decode(payload: Value) -> Result<(String, SourcePreflightRequest), &'static s
 
 fn query_selected(
     enabled: bool,
-    selected: Option<CaptureProvider>,
+    selected: Option<SourcePreflightRoute>,
     request: &SourcePreflightRequest,
     query: &mut impl FnMut(
         CaptureProvider,
@@ -100,8 +105,11 @@ fn query_selected(
 ) -> Value {
     let response = if !enabled {
         SourcePreflightResponse::unavailable(request, "disabled")
-    } else if let Some(provider) = selected {
-        match query(provider, request) {
+    } else if let Some(route) = selected {
+        if route.source_class != request.source_class {
+            return json!({"ok":true,"preflight":SourcePreflightResponse::unsupported(request,"source_class_unselected")});
+        }
+        match query(route.provider, request) {
             Ok(response) => response,
             Err(MEDIA_UNSUPPORTED) => {
                 SourcePreflightResponse::unsupported(request, "source_preflight_unsupported")
@@ -163,20 +171,36 @@ mod tests {
         for provider in [CaptureProvider::Pipewire, CaptureProvider::Vkms] {
             let mut called = Vec::new();
             let request = request();
-            let reply = query_selected(true, Some(provider), &request, &mut |selected, request| {
-                called.push(selected);
-                Ok(ready(request))
-            });
+            let reply = query_selected(
+                true,
+                Some(SourcePreflightRoute {
+                    provider,
+                    source_class: request.source_class,
+                }),
+                &request,
+                &mut |selected, request| {
+                    called.push(selected);
+                    Ok(ready(request))
+                },
+            );
             assert!(
                 decode_video_source_preflight(&reply, &request)
                     .unwrap()
                     .is_ready()
             );
             assert_eq!(called, [provider]);
-            let unavailable = query_selected(true, Some(provider), &request, &mut |selected, _| {
-                called.push(selected);
-                Err(MEDIA_UNSUPPORTED)
-            });
+            let unavailable = query_selected(
+                true,
+                Some(SourcePreflightRoute {
+                    provider,
+                    source_class: request.source_class,
+                }),
+                &request,
+                &mut |selected, _| {
+                    called.push(selected);
+                    Err(MEDIA_UNSUPPORTED)
+                },
+            );
             assert!(
                 !decode_video_source_preflight(&unavailable, &request)
                     .unwrap()
@@ -192,11 +216,11 @@ mod tests {
     #[test]
     fn only_signed_route_keys_can_select_a_provider_and_no_native_query_runs_for_unselected_routes()
     {
-        let settings:Settings=serde_json::from_value(json!({"enabled":true,"capture_providers":["pipewire"],"source_preflight_routes":{"third-party.capture-route/2":"pipewire"}})).unwrap();
+        let settings:Settings=serde_json::from_value(json!({"enabled":true,"capture_providers":["pipewire"],"source_preflight_routes":{"third-party.capture-route/2":{"provider":"pipewire","class":"managed_output"}}})).unwrap();
         settings.validate().unwrap();
         let registry = SourcePreflight::new(&settings);
         assert_eq!(
-            registry.routes["third-party.capture-route/2"],
+            registry.routes["third-party.capture-route/2"].provider,
             CaptureProvider::Pipewire
         );
         let request = request();
@@ -215,12 +239,15 @@ mod tests {
     }
     #[test]
     fn unknown_selected_alias_and_mismatched_provider_echo_are_rejected() {
-        let settings:Settings=serde_json::from_value(json!({"enabled":true,"capture_providers":["pipewire"],"source_preflight_routes":{"managed_output":"unselected"}})).unwrap();
+        let settings:Settings=serde_json::from_value(json!({"enabled":true,"capture_providers":["pipewire"],"source_preflight_routes":{"managed_output":{"provider":"unselected","class":"managed_output"}}})).unwrap();
         assert_eq!(settings.validate(), Err("invalid_source_preflight_routes"));
         let request = request();
         let reply = query_selected(
             true,
-            Some(CaptureProvider::Pipewire),
+            Some(SourcePreflightRoute {
+                provider: CaptureProvider::Pipewire,
+                source_class: request.source_class,
+            }),
             &request,
             &mut |_, request| {
                 let mut changed = request.clone();
@@ -229,5 +256,50 @@ mod tests {
             },
         );
         assert!(decode_video_source_preflight(&reply, &request).is_err());
+    }
+
+    #[test]
+    fn preflight_observers_cannot_invoke_any_raw_video_operation_or_change_the_signed_class() {
+        let settings:Settings=serde_json::from_value(json!({"enabled":true,"capture_providers":["pipewire"],"source_preflight_routes":{"managed_output":{"provider":"pipewire","class":"managed_output"}},"preflight_only_principals":["remote-policy"]})).unwrap();
+        settings.validate().unwrap();
+        let registry = SourcePreflight::new(&settings);
+        assert!(registry.operation_allowed("remote-policy", &json!({"action":"preflight_source"})));
+        for action in [
+            "open",
+            "close",
+            "open_source",
+            "open_with_options",
+            "status",
+            "lookup",
+            "observe_capture",
+            "force_idr",
+            "drain",
+            "select_portal_source",
+            "poll_portal_selection",
+            "cancel_portal_selection",
+            "unknown",
+        ] {
+            assert!(
+                !registry.operation_allowed("remote-policy", &json!({"action":action})),
+                "observer action {action} reached raw Video handler"
+            );
+            assert!(
+                registry.operation_allowed("ordinary-video-consumer", &json!({"action":action}))
+            );
+        }
+        assert!(!registry.operation_allowed("remote-policy", &json!({"method":"open"})));
+        let mut request = request();
+        request.source_class = SourceClass::DesktopOutput;
+        let response = query_selected(
+            true,
+            registry.routes.get("managed_output").copied(),
+            &request,
+            &mut |_, _| panic!("caller changed the signed source class"),
+        );
+        assert!(
+            !decode_video_source_preflight(&response, &request)
+                .unwrap()
+                .is_ready()
+        );
     }
 }

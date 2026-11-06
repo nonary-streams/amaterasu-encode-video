@@ -118,6 +118,10 @@ impl ManagedModule for Video {
                     return Ok(());
                 }
                 let mut send = |command| runtime.send_ephemeral(command);
+                if !self.source_preflight.operation_allowed(&caller, &payload) {
+                    rpc::complete(&mut send, id, error("source_preflight_only"));
+                    return Ok(());
+                }
                 if payload["action"] == "preflight_source" {
                     let response = self.source_preflight.handle(runtime, id, payload);
                     rpc::complete(&mut send, id, response);
