@@ -66,6 +66,7 @@ impl ManagedModule for Video {
                     settings.cpu_processor_service.as_deref(),
                     settings.gpu_processor_service.as_deref(),
                 )?
+                .with_resource_processor(&runtime, settings.resource_processor_service.as_deref())?
                 .with_source_preflight_routes(
                     &runtime,
                     &settings.resolved_source_preflight_routes(),

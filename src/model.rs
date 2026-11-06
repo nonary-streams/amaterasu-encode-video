@@ -295,6 +295,9 @@ pub struct Settings {
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
     pub gpu_processor_service: Option<String>,
+    /// Explicit generic resource processor; v1.0 uses signed startup settings.
+    #[serde(default)]
+    pub resource_processor_service: Option<String>,
     /// Keep the selected processor inactive until a stream explicitly selects it.
     #[serde(default)]
     pub gpu_processor_opt_in: bool,
@@ -330,6 +333,7 @@ impl Default for Settings {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            resource_processor_service: None,
             gpu_processor_opt_in: false,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
@@ -358,6 +362,7 @@ impl Settings {
         for service in [
             self.cpu_processor_service.as_deref(),
             self.gpu_processor_service.as_deref(),
+            self.resource_processor_service.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -421,7 +426,19 @@ impl Settings {
                 .gpu_processor_service
                 .as_ref()
                 .is_some_and(|service| !valid_external_service(service))
-            || (self.cpu_processor_service.is_some() && self.gpu_processor_service.is_some())
+            || self
+                .resource_processor_service
+                .as_ref()
+                .is_some_and(|service| !valid_external_service(service))
+            || [
+                self.cpu_processor_service.is_some(),
+                self.gpu_processor_service.is_some(),
+                self.resource_processor_service.is_some(),
+            ]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+                > 1
             || self.external_encoder_consumers.len() > 16
             || self
                 .external_encoder_consumers
@@ -1586,6 +1603,7 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1614,6 +1632,7 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1712,6 +1731,23 @@ mod tests {
                 serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
             assert_eq!(settings.validate(), Err("invalid_video_settings"));
         }
+        let resource: Settings =
+            serde_json::from_value(json!({"resource_processor_service":"third-party.effects/1"}))
+                .unwrap();
+        assert!(resource.validate().is_ok());
+        for other in ["gpu_processor_service", "cpu_processor_service"] {
+            let mut settings = json!({"resource_processor_service":"third-party.effects/1"});
+            settings[other] = json!("other.effects/1");
+            assert_eq!(
+                serde_json::from_value::<Settings>(settings)
+                    .unwrap()
+                    .validate(),
+                Err("invalid_video_settings")
+            );
+        }
+        let invalid: Settings =
+            serde_json::from_value(json!({"resource_processor_service":"no-version"})).unwrap();
+        assert_eq!(invalid.validate(), Err("invalid_video_settings"));
     }
     #[test]
     fn external_encoder_settings_reject_untrusted_or_duplicate_services() {
