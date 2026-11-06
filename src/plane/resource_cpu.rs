@@ -14,6 +14,7 @@ struct Offers {
     selected: Option<Selection>,
     width: u32,
     height: u32,
+    bit_depth: u8,
     invalid: bool,
 }
 
@@ -71,8 +72,7 @@ unsafe extern "C" fn offer(context: *mut c_void, offer: *const CaptureResourceOf
     }
     state.ids.push(offer.id);
     let resource = &offer.resource;
-    if state.selected.is_some()
-        || offer.accessibility & FRAME_ACCESS_CPU == 0
+    if offer.accessibility & FRAME_ACCESS_CPU == 0
         || offer.accessibility & !(FRAME_ACCESS_CPU | FRAME_ACCESS_GPU) != 0
         || !matches!(
             offer.ownership,
@@ -96,7 +96,17 @@ unsafe extern "C" fn offer(context: *mut c_void, offer: *const CaptureResourceOf
             .cast::<CpuResourceCapabilities>()
             .read_unaligned()
     };
-    if matches!(caps.format, PIXEL_BGRA8 | PIXEL_NV12)
+    let matching_depth = match caps.format {
+        PIXEL_BGRA8 => true,
+        PIXEL_NV12 => state.bit_depth == 8,
+        PIXEL_P010 => state.bit_depth == 10,
+        _ => false,
+    };
+    let preferred_planar = state.bit_depth == 10 && caps.format == PIXEL_P010;
+    let selected_planar = state
+        .selected
+        .is_some_and(|selected| selected.caps.format == PIXEL_P010);
+    if matching_depth
         && caps.min_width > 0
         && caps.min_height > 0
         && caps.min_width <= state.width
@@ -107,13 +117,14 @@ unsafe extern "C" fn offer(context: *mut c_void, offer: *const CaptureResourceOf
             state.width,
             state.height,
             caps.format,
-            if caps.format == PIXEL_BGRA8 {
-                state.width.saturating_mul(4)
-            } else {
-                state.width
+            match caps.format {
+                PIXEL_BGRA8 => state.width.saturating_mul(4),
+                PIXEL_P010 => state.width.saturating_mul(2),
+                _ => state.width,
             },
         )
         .is_ok()
+        && (state.selected.is_none() || (preferred_planar && !selected_planar))
     {
         state.selected = Some(Selection { id: offer.id, caps });
     }
@@ -231,6 +242,7 @@ fn negotiate(
         selected: None,
         width: submission.configuration.width,
         height: submission.configuration.height,
+        bit_depth: submission.configuration.video_stream_format.bit_depth,
         invalid: false,
     };
     let mut generation = 0;
@@ -363,6 +375,7 @@ mod tests {
             selected: None,
             width: 64,
             height: 48,
+            bit_depth: 8,
             invalid: false,
         }
     }
@@ -516,6 +529,85 @@ mod tests {
         assert!(!valid_clock(&clock));
         clock.version = 0;
         assert!(!valid_clock(&clock));
+    }
+
+    #[test]
+    fn p010_cpu_offer_is_a_distinct_standard_format_with_bounded_even_geometry() {
+        let caps = CpuResourceCapabilities {
+            format: PIXEL_P010,
+            min_width: 64,
+            max_width: 64,
+            min_height: 48,
+            max_height: 48,
+        };
+        let offered = cpu_offer(&caps);
+        let mut collected = offers();
+        collected.bit_depth = 10;
+        // SAFETY: local offer and mutable sink context live through enumeration.
+        assert_eq!(
+            unsafe { offer((&mut collected as *mut Offers).cast(), &offered) },
+            STATUS_OK
+        );
+        assert_eq!(collected.selected.unwrap().caps.format, PIXEL_P010);
+        let mut invalid = offers();
+        invalid.bit_depth = 10;
+        invalid.width = 63;
+        assert_eq!(
+            unsafe { offer((&mut invalid as *mut Offers).cast(), &offered) },
+            STATUS_OK
+        );
+        assert!(invalid.selected.is_none());
+    }
+
+    #[test]
+    fn cpu_negotiation_matches_actual_encoded_bit_depth_when_nv12_is_offered_first() {
+        for (bit_depth, expected) in [(8, PIXEL_NV12), (10, PIXEL_P010)] {
+            let mut collected = offers();
+            collected.bit_depth = bit_depth;
+            for (id, format) in [(1, PIXEL_NV12), (2, PIXEL_P010)] {
+                let caps = CpuResourceCapabilities {
+                    format,
+                    min_width: 64,
+                    max_width: 64,
+                    min_height: 48,
+                    max_height: 48,
+                };
+                let offered = CaptureResourceOffer {
+                    id,
+                    ..cpu_offer(&caps)
+                };
+                // SAFETY: offer and mutable collector live through the callback.
+                assert_eq!(
+                    unsafe { offer((&mut collected as *mut Offers).cast(), &offered) },
+                    STATUS_OK
+                );
+            }
+            assert_eq!(collected.selected.unwrap().caps.format, expected);
+            assert_eq!(
+                collected.selected.unwrap().id,
+                if bit_depth == 10 { 2 } else { 1 }
+            );
+            let caps = CpuResourceCapabilities {
+                format: expected,
+                min_width: 64,
+                max_width: 64,
+                min_height: 48,
+                max_height: 48,
+            };
+            let equally_good = CaptureResourceOffer {
+                id: 3,
+                ..cpu_offer(&caps)
+            };
+            assert_eq!(
+                unsafe { offer((&mut collected as *mut Offers).cast(), &equally_good) },
+                STATUS_OK
+            );
+            assert_eq!(
+                collected.selected.unwrap().id,
+                if bit_depth == 10 { 2 } else { 1 },
+                "first equally compatible offer retains provider priority"
+            );
+        }
     }
 
     #[test]
