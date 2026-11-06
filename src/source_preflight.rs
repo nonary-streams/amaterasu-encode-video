@@ -1,13 +1,11 @@
 //! Pure source admission against exactly the capture route selected at startup.
 use crate::model::{CaptureProvider, Settings, SourcePreflightRoute, error};
+use crate::plane::Plane;
 use amaterasu_media::{MEDIA_BUSY, MEDIA_PENDING, MEDIA_UNSUPPORTED};
 use amaterasu_module_sdk::{
     Command, RuntimeClient,
     abi::*,
-    capture::{
-        SourceClass, SourceMode, SourcePreflightConnection, SourcePreflightRequest,
-        SourcePreflightResponse,
-    },
+    capture::{SourceClass, SourceMode, SourcePreflightRequest, SourcePreflightResponse},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,7 +30,6 @@ pub(super) struct SourcePreflight {
     enabled: bool,
     routes: BTreeMap<String, SourcePreflightRoute>,
     preflight_only: BTreeSet<String>,
-    bindings: BTreeMap<CaptureProvider, Option<SourcePreflightConnection>>,
 }
 impl SourcePreflight {
     pub fn new(settings: &Settings) -> Self {
@@ -40,13 +37,18 @@ impl SourcePreflight {
             enabled: settings.enabled,
             routes: settings.resolved_source_preflight_routes(),
             preflight_only: settings.preflight_only_principals.clone(),
-            bindings: BTreeMap::new(),
         }
     }
     pub fn operation_allowed(&self, caller: &str, payload: &Value) -> bool {
         !self.preflight_only.contains(caller) || payload["action"] == "preflight_source"
     }
-    pub fn handle(&mut self, runtime: &RuntimeClient, request_id: u64, payload: Value) -> Value {
+    pub fn handle(
+        &self,
+        runtime: &RuntimeClient,
+        plane: &mut dyn Plane,
+        request_id: u64,
+        payload: Value,
+    ) -> Value {
         let (route_key, request) = match decode(payload) {
             Ok(query) => query,
             Err(code) => return error(code),
@@ -61,12 +63,7 @@ impl SourcePreflight {
             {
                 return Err(MEDIA_UNSUPPORTED);
             }
-            let binding = self.bindings.entry(provider).or_insert_with(|| {
-                // SAFETY: signed startup settings resolve this exact selected
-                // capture service; binding and runtime outlive every query.
-                unsafe { SourcePreflightConnection::bind(runtime, provider.service()) }.ok()
-            });
-            binding.as_ref().ok_or(MEDIA_UNSUPPORTED)?.query(query)
+            plane.source_preflight(provider, query)
         })
     }
 }

@@ -66,6 +66,10 @@ impl ManagedModule for Video {
                     settings.cpu_processor_service.as_deref(),
                     settings.gpu_processor_service.as_deref(),
                 )?
+                .with_source_preflight_routes(
+                    &runtime,
+                    &settings.resolved_source_preflight_routes(),
+                )
                 .with_required_frame_leases(settings.require_frame_lease)
                 .with_gpu_processor_opt_in(settings.gpu_processor_opt_in),
             )
@@ -123,7 +127,9 @@ impl ManagedModule for Video {
                     return Ok(());
                 }
                 if payload["action"] == "preflight_source" {
-                    let response = self.source_preflight.handle(runtime, id, payload);
+                    let response =
+                        self.source_preflight
+                            .handle(runtime, self.plane.as_mut(), id, payload);
                     rpc::complete(&mut send, id, response);
                     return Ok(());
                 }

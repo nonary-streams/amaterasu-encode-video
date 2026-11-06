@@ -5,6 +5,8 @@ mod dmabuf;
 mod freshness_tests;
 mod gpu_processor;
 mod lease_lifecycle;
+#[cfg(test)]
+mod preflight_tests;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
 mod processor;
@@ -269,6 +271,8 @@ pub struct NativePlane {
     gpu_configured: std::collections::BTreeSet<u64>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
+    capture_preflights:
+        BTreeMap<CaptureProvider, amaterasu_module_sdk::capture::SourcePreflightConnection>,
     /// Optional providers whose startup binding failed, with the reason.
     unbound: BTreeMap<CaptureProvider, &'static str>,
     leased_streams: lease_lifecycle::LeasedStreams,
@@ -281,6 +285,32 @@ pub struct NativePlane {
 }
 
 impl NativePlane {
+    /// Bind the optional query tail only for signed logical routes. Ordinary
+    /// capture selections retain their original bindings and table headers.
+    pub fn with_source_preflight_routes(
+        mut self,
+        runtime: &RuntimeClient,
+        routes: &BTreeMap<String, crate::model::SourcePreflightRoute>,
+    ) -> Self {
+        for route in routes.values() {
+            let provider = route.provider;
+            if self.captures.contains_key(&provider)
+                && !self.capture_preflights.contains_key(&provider)
+            {
+                // SAFETY: this service is already selected through the exact
+                // typed Capture family; bindings retain the runtime/provider.
+                if let Ok(binding) = unsafe {
+                    amaterasu_module_sdk::capture::SourcePreflightConnection::bind(
+                        runtime,
+                        provider.service(),
+                    )
+                } {
+                    self.capture_preflights.insert(provider, binding);
+                }
+            }
+        }
+        self
+    }
     pub fn with_gpu_processor_opt_in(mut self, opt_in: bool) -> Self {
         self.gpu_processor_opt_in = opt_in;
         self
@@ -373,6 +403,7 @@ impl NativePlane {
                 source_encoders,
                 sources: BTreeMap::new(),
                 captures,
+                capture_preflights: BTreeMap::new(),
                 unbound,
                 encoders,
                 active_encoder: ENCODE.to_owned(),
@@ -683,11 +714,10 @@ impl Plane for NativePlane {
         provider: CaptureProvider,
         request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
     ) -> Result<amaterasu_module_sdk::capture::SourcePreflightResponse, Status> {
-        let binding = self.captures.get(&provider).ok_or(MEDIA_UNSUPPORTED)?;
-        // SAFETY: the exact typed capture binding remains alive during this
-        // synchronous call. The SDK checks the optional v1.11 tail before use.
-        let api = unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| MEDIA_UNSUPPORTED)?;
-        unsafe { amaterasu_module_sdk::capture::source_preflight(api, request) }
+        self.capture_preflights
+            .get(&provider)
+            .ok_or(MEDIA_UNSUPPORTED)?
+            .query(request)
     }
     fn configure_gpu(
         &mut self,
