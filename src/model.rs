@@ -765,6 +765,7 @@ fn valid_software_option(value: &Option<String>, maximum: usize) -> bool {
 
 #[derive(Clone, PartialEq)]
 pub struct OpenSpec {
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     pub packet_boundaries: bool,
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
@@ -873,6 +874,8 @@ enum OperationInput {
         source_id: Option<u64>,
         #[serde(default)]
         encoder_options: Option<serde_json::Value>,
+        #[serde(default)]
+        source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
         encoder: EncoderSelection,
         #[serde(default)]
         encoder_provider: Option<String>,
@@ -979,6 +982,7 @@ impl<'de> Deserialize<'de> for Operation {
                 output,
                 source_id,
                 encoder_options,
+                source_capture_context,
                 encoder,
                 encoder_provider,
                 configuration,
@@ -990,6 +994,7 @@ impl<'de> Deserialize<'de> for Operation {
                     if capture_provider.0.is_some()
                         || capture.0.is_some()
                         || constant_rate.0.is_some()
+                        || source_capture_context.is_some()
                         || !output.is_empty()
                     {
                         return Err(serde::de::Error::custom(
@@ -1018,7 +1023,7 @@ impl<'de> Deserialize<'de> for Operation {
                         constant_rate.0.unwrap_or(false),
                     )
                 };
-                if let Some(options) = encoder_options {
+                if encoder_options.is_some() || source_capture_context.is_some() {
                     return Ok(Self::OpenWithOptions {
                         specification: Box::new(OpenSpec {
                             packet_boundaries,
@@ -1032,7 +1037,8 @@ impl<'de> Deserialize<'de> for Operation {
                             encoder,
                             encoder_provider,
                             source_id: None,
-                            encoder_options: Some(options),
+                            encoder_options,
+                            source_capture_context,
                             configuration: *configuration,
                         }),
                     });

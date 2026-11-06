@@ -29,6 +29,15 @@ pub(super) struct OwnedOutputCapture {
 }
 
 impl OwnedOutputCapture {
+    pub(super) fn pin_provider(&mut self, provider: CaptureProvider) {
+        self.cpu_provider = None;
+        if self.dmabuf_provider != Some(provider) {
+            self.candidate = false;
+            self.selection_pending = false;
+            self.dmabuf_provider = None;
+        }
+    }
+
     pub(super) fn require_lease(&mut self) {
         self.require_lease = true;
         self.cpu_provider = None;

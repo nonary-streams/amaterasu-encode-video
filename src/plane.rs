@@ -147,6 +147,14 @@ pub struct FrameMetadata {
     pub sequence: u64,
 }
 pub trait Plane {
+    /// Query the selected capture provider without allocating a capture source.
+    fn source_preflight(
+        &mut self,
+        _: CaptureProvider,
+        _: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<amaterasu_module_sdk::capture::SourcePreflightResponse, Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
     /// Admit one immutable stream selection before any provider operation.
     fn configure_gpu(
         &mut self,
@@ -670,6 +678,17 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn source_preflight(
+        &mut self,
+        provider: CaptureProvider,
+        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<amaterasu_module_sdk::capture::SourcePreflightResponse, Status> {
+        let binding = self.captures.get(&provider).ok_or(MEDIA_UNSUPPORTED)?;
+        // SAFETY: the exact typed capture binding remains alive during this
+        // synchronous call. The SDK checks the optional v1.11 tail before use.
+        let api = unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| MEDIA_UNSUPPORTED)?;
+        unsafe { amaterasu_module_sdk::capture::source_preflight(api, request) }
+    }
     fn configure_gpu(
         &mut self,
         stream: u64,

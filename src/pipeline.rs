@@ -1,4 +1,5 @@
 mod capture_events;
+mod capture_open;
 mod encoder;
 mod lifecycle;
 mod live_settings;
@@ -106,6 +107,8 @@ struct Stream {
     encoder_provider: Option<String>,
     encoder_service: String,
     source_id: Option<u64>,
+    capture_selection: Option<capture_open::Selection>,
+    capture_source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
     encoder_options: Option<Value>,
     source_started: bool,
     generic_input: bool,
@@ -470,6 +473,9 @@ impl Stream {
             },
             "error": self.error,
         });
+        if let Some(selection) = &self.capture_selection {
+            response["source_capture_context"] = json!(selection.context);
+        }
         self.owned_capture.write_status(&mut response);
         self.presentation.write_status(&mut response);
         if let Some(encoder) = &self.encoder {
@@ -516,6 +522,7 @@ pub struct Pipeline {
     require_frame_lease: bool,
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
+    source_preflight_routes: BTreeMap<String, crate::model::SourcePreflightRoute>,
     encoder_providers: BTreeMap<String, String>,
     source_encoders: BTreeMap<String, crate::model::SourceEncoderRegistration>,
     encoder_consumers: BTreeSet<String>,
@@ -555,6 +562,7 @@ impl Pipeline {
             require_frame_lease: settings.require_frame_lease,
             enabled: settings.enabled,
             providers: settings.resolved_providers(),
+            source_preflight_routes: settings.resolved_source_preflight_routes(),
             encoder_providers: settings.external_encoder_providers,
             source_encoders: settings.source_encoder_providers,
             encoder_consumers: settings
@@ -638,6 +646,7 @@ impl Pipeline {
                     encoder_provider,
                     source_id: None,
                     encoder_options: None,
+                    source_capture_context: None,
                     configuration: *configuration,
                 },
                 send,
@@ -669,6 +678,7 @@ impl Pipeline {
                     encoder_provider: Some(encoder_provider),
                     source_id: Some(source_id),
                     encoder_options,
+                    source_capture_context: None,
                     configuration: *configuration,
                 },
                 send,
@@ -850,6 +860,18 @@ impl Pipeline {
             rpc::complete(send, request, error("invalid_encoder_options"));
             return;
         }
+        let capture_selection = match capture_open::select(
+            specification.source_capture_context.as_ref(),
+            specification.provider,
+            &specification.output,
+            &self.source_preflight_routes,
+        ) {
+            Ok(selection) => selection,
+            Err(code) => {
+                rpc::complete(send, request, error(code));
+                return;
+            }
+        };
         if !self.admit_operation(caller, request, &specification, send) {
             return;
         }
@@ -872,6 +894,7 @@ impl Pipeline {
             encoder_provider,
             source_id,
             encoder_options,
+            source_capture_context: _,
             configuration,
         } = specification;
         let failure = if source_id.is_none() && !self.providers.contains(&provider) {
@@ -941,6 +964,9 @@ impl Pipeline {
                 &output,
                 self.providers.contains(&CaptureProvider::Vkms),
             );
+            if capture_selection.is_some() {
+                owned_capture.pin_provider(provider);
+            }
             if self.require_frame_lease
                 || configuration.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Hdr
@@ -953,7 +979,11 @@ impl Pipeline {
             {
                 stage = Stage::InspectEncoder;
             }
-            let fallback_provider = if auto_capture && !constant_rate && !self.require_frame_lease {
+            let fallback_provider = if capture_selection.is_none()
+                && auto_capture
+                && !constant_rate
+                && !self.require_frame_lease
+            {
                 alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
             } else {
                 None
@@ -965,6 +995,8 @@ impl Pipeline {
                 encoder_provider,
                 encoder_service,
                 source_id,
+                capture_selection,
+                capture_source_format: None,
                 encoder_options,
                 source_started: false,
                 generic_input,
@@ -1645,6 +1677,19 @@ fn advance(
         if stream.stage != Stage::Capture {
             return false;
         }
+        match capture_open::format(
+            stream.capture_selection.as_ref(),
+            stream.provider,
+            &stream.capture_output,
+            &stream.configuration,
+            plane,
+        ) {
+            Ok(format) => stream.capture_source_format = format,
+            Err(code) => {
+                stream.cleanup(code);
+                return false;
+            }
+        }
     }
     if stream.stage == Stage::Encoder && stream.source_id.is_none() {
         match verify_stream_geometry(plane, stream) {
@@ -1775,6 +1820,9 @@ fn request(stream: &Stream) -> (&str, Value) {
                 "output":stream.capture_output,
                 "operation_id":stream.capture_operation,
             });
+            if let Some(format) = stream.capture_source_format {
+                request["source_format"] = json!(format);
+            }
             if stream.generic_input {
                 request["resource_capture_clock"] = resource_capture_clock(stream);
                 request["resource_callback_contract"] = json!("cross_service_safe");

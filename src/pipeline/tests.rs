@@ -388,6 +388,12 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 
 #[derive(Default)]
 struct FakePlane {
+    source_format_open: bool,
+    source_response_mutation: Option<&'static str>,
+    source_queries: Vec<(
+        CaptureProvider,
+        amaterasu_module_sdk::capture::SourcePreflightRequest,
+    )>,
     same_pump_output: Option<Arc<Mutex<Queues>>>,
     selected_encoders: Vec<String>,
     gpu_configurations: Vec<(u64, Option<serde_json::Value>)>,
@@ -433,6 +439,46 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn source_preflight(
+        &mut self,
+        provider: CaptureProvider,
+        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<
+        amaterasu_module_sdk::capture::SourcePreflightResponse,
+        amaterasu_module_sdk::abi::Status,
+    > {
+        use amaterasu_module_sdk::capture::{SourceModeCapabilities, SourcePreflightResponse};
+        self.source_queries.push((provider, request.clone()));
+        let mut response = SourcePreflightResponse::ready(
+            request,
+            vec![SourceModeCapabilities {
+                source_class: request.source_class,
+                min_width: 1,
+                max_width: 8192,
+                min_height: 1,
+                max_height: 8192,
+                min_refresh_millihz: 1000,
+                max_refresh_millihz: 1_000_000,
+                sdr: true,
+                hdr: true,
+                bit_depths: vec![8, 10],
+                format_open: self.source_format_open,
+            }],
+        );
+        match self.source_response_mutation {
+            Some("echo") => response.request.route = Some("another-output".into()),
+            Some("legacy") => {
+                response.capabilities[0].bit_depths.clear();
+                response.capabilities[0].format_open = false;
+            }
+            Some("unavailable") => {
+                response = SourcePreflightResponse::unavailable(request, "source_not_ready")
+            }
+            Some("unsupported") => return Err(amaterasu_media::MEDIA_UNSUPPORTED),
+            _ => {}
+        }
+        Ok(response)
+    }
     fn update_gpu(&mut self, stream: u64, settings: &Value) -> Result<(), &'static str> {
         self.gpu_updates.push((stream, settings.clone()));
         if self.gpu_update_internal {
@@ -4415,6 +4461,20 @@ fn explicit_advanced_formats_are_probed_before_any_capture_effect() {
                 encoder_identity().clsid.clone(),
                 probe_reply(&json!(encoder_identity()), &json!(configuration), usable),
             );
+            pipeline.source_preflight_routes.insert(
+                "desktop".into(),
+                crate::model::SourcePreflightRoute {
+                    provider: CaptureProvider::Dxgi,
+                    source_class: amaterasu_module_sdk::capture::SourceClass::DesktopOutput,
+                },
+            );
+            plane.source_format_open = true;
+            let operation: Operation = serde_json::from_value(json!({
+                "action":"open", "output":"display-1", "capture_provider":"dxgi",
+                "encoder":encoder_identity(), "configuration":frozen,
+                "source_capture_context":{"route_key":"desktop"},
+            }))
+            .unwrap();
             pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
             tick(&mut pipeline, &mut runtime, &mut plane, 20);
             let probe = runtime.commands.iter().position(|command| matches!(command,
@@ -4422,7 +4482,16 @@ fn explicit_advanced_formats_are_probed_before_any_capture_effect() {
             let capture = runtime.commands.iter().position(|command| matches!(command,
                 Command::Request {service,payload,..} if service == CAPTURE && payload["action"] == "open"));
             if usable {
-                assert!(probe < capture.expect("supported provider may open capture"));
+                let capture = capture.expect("supported provider may open capture");
+                assert!(probe < capture);
+                let Command::Request { payload, .. } = &runtime.commands[capture] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    payload["source_format"],
+                    json!({"bit_depth":10,"dynamic_range":dynamic_range})
+                );
+                assert_eq!(plane.source_queries.len(), 1);
             } else {
                 assert!(capture.is_none(), "unsupported encoder cannot open capture");
                 assert_eq!(runtime.open_effects, 0);
@@ -4967,6 +5036,7 @@ fn external_options_require_explicit_alias_and_preserve_replay_identity() {
         .encoder_providers
         .insert("vendor".into(), "example.encode/1".into());
     let specification = |alias: Option<&str>, quality| OpenSpec {
+        source_capture_context: None,
         packet_boundaries: false,
         operation_id: Some("external-options".into()),
         provider: CaptureProvider::Dxgi,
@@ -5694,4 +5764,312 @@ fn pipewire_scaled_mapping_rejects_forged_source_and_changed_geometry() {
     pipeline.streams.get_mut(&1).unwrap().next_frame = Instant::now();
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     assert_eq!(pipeline.streams[&1].error, Some("capture_geometry_changed"));
+}
+
+#[test]
+fn capture_source_context_binds_signed_route_and_preserves_legacy_open_schema() {
+    use amaterasu_module_sdk::capture::{SourceCaptureContext, SourceClass};
+    let context = SourceCaptureContext {
+        route_key: "approved.desktop".into(),
+        source_mode: None,
+    };
+    let routes = [(
+        context.route_key.clone(),
+        crate::model::SourcePreflightRoute {
+            provider: CaptureProvider::Dxgi,
+            source_class: SourceClass::DesktopOutput,
+        },
+    )]
+    .into();
+    assert!(matches!(
+        capture_open::select(Some(&context), CaptureProvider::Wgc, "display-1", &routes),
+        Err("source_route_provider_mismatch")
+    ));
+    assert!(matches!(
+        capture_open::select(
+            Some(&context),
+            CaptureProvider::Dxgi,
+            "display-1",
+            &BTreeMap::new()
+        ),
+        Err("source_route_unselected")
+    ));
+    let mut plane = FakePlane::default();
+    let legacy = open_configuration();
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Dxgi,
+            "display-1",
+            &legacy,
+            &mut plane
+        ),
+        Ok(None)
+    );
+    assert!(plane.source_queries.is_empty());
+    let selection =
+        capture_open::select(Some(&context), CaptureProvider::Dxgi, "display-1", &routes).unwrap();
+    assert_eq!(
+        capture_open::format(
+            selection.as_ref(),
+            CaptureProvider::Dxgi,
+            "display-1",
+            &legacy,
+            &mut plane
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        plane.source_queries[0].1.source_class,
+        SourceClass::DesktopOutput
+    );
+    assert_eq!(
+        plane.source_queries[0].1.route.as_deref(),
+        Some("display-1")
+    );
+    assert!(matches!(
+        capture_open::format(
+            selection.as_ref(),
+            CaptureProvider::Wgc,
+            "display-1",
+            &legacy,
+            &mut plane
+        ),
+        Err("source_route_provider_mismatch")
+    ));
+}
+
+#[test]
+fn capture_source_preflight_rejects_unknown_ten_bit_or_retargeted_and_unready_sources() {
+    use amaterasu_module_sdk::capture::{SourceCaptureContext, SourceClass};
+    let context = SourceCaptureContext {
+        route_key: "desktop".into(),
+        source_mode: None,
+    };
+    let routes = [(
+        context.route_key.clone(),
+        crate::model::SourcePreflightRoute {
+            provider: CaptureProvider::Dxgi,
+            source_class: SourceClass::DesktopOutput,
+        },
+    )]
+    .into();
+    let selection =
+        capture_open::select(Some(&context), CaptureProvider::Dxgi, "display-1", &routes).unwrap();
+    let mut config = open_configuration();
+    config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
+    };
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Dxgi,
+            "display-1",
+            &config,
+            &mut FakePlane::default()
+        ),
+        Err("capture_source_route_required")
+    );
+    for (mutation, expected) in [
+        ("echo", "invalid_capture_source_preflight"),
+        ("legacy", "invalid_capture_source_preflight"),
+        ("unavailable", "capture_source_not_ready"),
+        ("unsupported", "capture_source_preflight_unavailable"),
+    ] {
+        let mut plane = FakePlane {
+            source_response_mutation: Some(mutation),
+            ..FakePlane::default()
+        };
+        assert_eq!(
+            capture_open::format(
+                selection.as_ref(),
+                CaptureProvider::Dxgi,
+                "display-1",
+                &config,
+                &mut plane
+            ),
+            Err(expected)
+        );
+        assert_eq!(plane.source_queries.len(), 1);
+    }
+    // An opaque selector can declare its actual format without accepting a new
+    // Open field (for example a synthetic P010 descriptor).
+    assert_eq!(
+        capture_open::format(
+            selection.as_ref(),
+            CaptureProvider::Dxgi,
+            "display-1",
+            &config,
+            &mut FakePlane::default()
+        ),
+        Ok(None)
+    );
+}
+
+#[test]
+fn capture_source_format_uses_processing_input_range_and_frozen_native_mode() {
+    use amaterasu_module_sdk::{
+        DynamicRange,
+        capture::{SourceCaptureContext, SourceClass, SourceFormat, SourceMode},
+    };
+    let context = SourceCaptureContext {
+        route_key: "desktop".into(),
+        source_mode: Some(SourceMode {
+            width: 2560,
+            height: 1440,
+            refresh_millihz: 120_000,
+            hdr: true,
+            bit_depth: None,
+        }),
+    };
+    let routes = [(
+        context.route_key.clone(),
+        crate::model::SourcePreflightRoute {
+            provider: CaptureProvider::Dxgi,
+            source_class: SourceClass::DesktopOutput,
+        },
+    )]
+    .into();
+    let selection =
+        capture_open::select(Some(&context), CaptureProvider::Dxgi, "display-1", &routes).unwrap();
+    let mut config = open_configuration(); // H264 8-bit SDR output
+    config.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "example.processing/1".into(),
+        enabled: true,
+        source_hdr_required: true,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    let mut plane = FakePlane {
+        source_format_open: true,
+        ..FakePlane::default()
+    };
+    assert_eq!(
+        capture_open::format(
+            selection.as_ref(),
+            CaptureProvider::Dxgi,
+            "display-1",
+            &config,
+            &mut plane
+        ),
+        Ok(Some(SourceFormat {
+            bit_depth: 10,
+            dynamic_range: DynamicRange::Hdr
+        }))
+    );
+    assert_eq!(
+        plane.source_queries[0].1.mode,
+        SourceMode {
+            bit_depth: Some(10),
+            ..context.source_mode.unwrap()
+        }
+    );
+    config.gpu_processing = None;
+    assert_eq!(
+        capture_open::format(
+            selection.as_ref(),
+            CaptureProvider::Dxgi,
+            "display-1",
+            &config,
+            &mut plane
+        ),
+        Err("capture_source_format_mismatch")
+    );
+    assert_eq!(plane.source_queries.len(), 1);
+}
+
+#[test]
+fn selected_capture_context_failure_prevents_open_and_cannot_be_replayed_with_another_route() {
+    use amaterasu_module_sdk::capture::SourceClass;
+    for mutation in ["echo", "unsupported", "unavailable"] {
+        let (mut pipeline, mut runtime, mut plane) = setup();
+        pipeline.source_preflight_routes.insert(
+            "desktop".into(),
+            crate::model::SourcePreflightRoute {
+                provider: CaptureProvider::Dxgi,
+                source_class: SourceClass::DesktopOutput,
+            },
+        );
+        plane.source_response_mutation = Some(mutation);
+        let request = json!({"action":"open","operation_id":"bound-source","output":"display-1","capture_provider":"dxgi","encoder":encoder_identity(),"configuration":open_configuration(),"source_capture_context":{"route_key":"desktop"}});
+        pipeline.handle(
+            "alice",
+            99,
+            serde_json::from_value(request.clone()).unwrap(),
+            &mut |command| runtime.send(command),
+        );
+        tick(&mut pipeline, &mut runtime, &mut plane, 20);
+        assert_eq!(runtime.open_effects, 0);
+        assert_eq!(plane.source_queries.len(), 1);
+        assert!(pipeline.streams.is_empty());
+        let mut changed = request;
+        changed["source_capture_context"]["route_key"] = json!("other");
+        pipeline.source_preflight_routes.insert(
+            "other".into(),
+            crate::model::SourcePreflightRoute {
+                provider: CaptureProvider::Dxgi,
+                source_class: SourceClass::DesktopOutput,
+            },
+        );
+        pipeline.handle(
+            "alice",
+            100,
+            serde_json::from_value(changed).unwrap(),
+            &mut |command| runtime.send(command),
+        );
+        assert_eq!(
+            runtime.completed.last().unwrap().1["code"],
+            "operation_conflict"
+        );
+    }
+}
+
+#[test]
+fn the_same_source_format_consumer_accepts_independently_selected_replacement_providers() {
+    use amaterasu_module_sdk::capture::{SourceCaptureContext, SourceClass};
+    let context = SourceCaptureContext {
+        route_key: "replacement".into(),
+        source_mode: None,
+    };
+    for alias in ["acme", "other"] {
+        let provider: CaptureProvider = serde_json::from_value(json!(alias)).unwrap();
+        let routes = [(
+            context.route_key.clone(),
+            crate::model::SourcePreflightRoute {
+                provider,
+                source_class: SourceClass::DesktopOutput,
+            },
+        )]
+        .into();
+        let selection =
+            capture_open::select(Some(&context), provider, "exact-output", &routes).unwrap();
+        let mut plane = FakePlane {
+            source_format_open: true,
+            ..FakePlane::default()
+        };
+        let format = capture_open::format(
+            selection.as_ref(),
+            provider,
+            "exact-output",
+            &open_configuration(),
+            &mut plane,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(format.bit_depth, 8);
+        assert_eq!(plane.source_queries[0].0, provider);
+        assert_eq!(
+            capture_open::format(
+                selection.as_ref(),
+                provider,
+                "other-output",
+                &open_configuration(),
+                &mut plane
+            ),
+            Err("capture_source_selector_changed")
+        );
+        assert_eq!(plane.source_queries.len(), 1);
+    }
 }
