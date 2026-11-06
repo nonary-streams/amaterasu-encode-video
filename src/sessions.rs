@@ -19,6 +19,8 @@ pub trait Backend: Send {
         drop(self);
         Ok(())
     }
+    /// Tightly packed NV12 for eight-bit sessions or P010 for ten-bit sessions.
+    /// Code values already match the negotiated output color; this is no conversion request.
     fn submit(
         &mut self,
         bytes: Vec<u8>,
@@ -437,11 +439,11 @@ impl Sessions {
                 .backend
                 .submit_gpu(GpuInput::Bgra(packed), timestamp, force != 0)
         } else {
-            let nv12 = match session.cpu_nv12(frame, bytes) {
-                Ok(nv12) => nv12,
+            let planar = match session.packed_cpu_input(frame, bytes) {
+                Ok(planar) => planar,
                 Err(status) => return status,
             };
-            session.backend.submit(nv12, timestamp, force != 0)
+            session.backend.submit(planar, timestamp, force != 0)
         };
         session.record_submission(result, timestamp, frame.sequence, force != 0, started_at)
     }
@@ -664,9 +666,23 @@ impl Session {
         Ok(timestamp)
     }
 
-    /// CPU conversion for backends without GPU conversion, and NV12 copies.
-    fn cpu_nv12(&mut self, frame: &CpuFrame, bytes: &[u8]) -> Result<Vec<u8>, Status> {
+    /// Preserve explicitly selected planar bit depth. Backends already receive
+    /// NV12 for eight-bit configurations and packed P010 for ten-bit probes.
+    fn packed_cpu_input(&mut self, frame: &CpuFrame, bytes: &[u8]) -> Result<Vec<u8>, Status> {
         if self.config.is_ten_bit() {
+            return if frame.format == PIXEL_P010 {
+                layout::p010(
+                    bytes,
+                    frame.width as usize,
+                    frame.height as usize,
+                    frame.stride as usize,
+                )
+                .map_err(|_| STATUS_INVALID_ARGUMENT)
+            } else {
+                Err(MEDIA_UNSUPPORTED)
+            };
+        }
+        if frame.format == PIXEL_P010 {
             return Err(MEDIA_UNSUPPORTED);
         }
         let conversion_started = Instant::now();

@@ -1,5 +1,36 @@
 //! Packed CPU frames are converted to the configured SDR Y'CbCr mode; alpha is ignored.
-use amaterasu_media::{ColorMode, PIXEL_NV12};
+use amaterasu_media::{ColorMode, PIXEL_NV12, PIXEL_P010};
+
+/// Removes row padding from high-bit-aligned little-endian P010 without
+/// converting its code values or interpreting its color primaries/transfer.
+pub fn p010(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let row_bytes = width.checked_mul(2).ok_or("invalid_frame")?;
+    let rows = height.checked_add(height / 2).ok_or("invalid_frame")?;
+    validate(data, width, height, stride, row_bytes, rows)?;
+    if !stride.is_multiple_of(2) {
+        return Err("invalid_frame");
+    }
+    let capacity = row_bytes.checked_mul(rows).ok_or("invalid_frame")?;
+    let mut packed = Vec::with_capacity(capacity);
+    for row in data.chunks_exact(stride) {
+        let pixels = &row[..row_bytes];
+        if pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|sample| u16::from_le_bytes([sample[0], sample[1]]) & 0x3f != 0)
+        {
+            return Err("invalid_frame");
+        }
+        packed.extend_from_slice(pixels);
+    }
+    Ok(packed)
+}
 
 pub fn nv12(
     data: &[u8],
@@ -270,7 +301,7 @@ fn truncate_power_of_two(numerator: i64, shift: u32) -> i64 {
 }
 
 pub(crate) fn input_color_supported(format: u32, mode: ColorMode) -> bool {
-    format != PIXEL_NV12 || mode.is_default()
+    !matches!(format, PIXEL_NV12 | PIXEL_P010) || mode.is_default()
 }
 
 fn validate(
@@ -302,6 +333,36 @@ fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p010_preserves_ten_bit_samples_and_removes_only_row_padding() {
+        let codes = [64u16, 65, 66, 67, 511, 512];
+        let mut bytes = vec![0xee; 6 * 3];
+        for row in 0..3 {
+            for column in 0..2 {
+                bytes[row * 6 + column * 2..row * 6 + column * 2 + 2]
+                    .copy_from_slice(&(codes[row * 2 + column] << 6).to_le_bytes());
+            }
+        }
+        let expected: Vec<_> = codes
+            .iter()
+            .flat_map(|code| (code << 6).to_le_bytes())
+            .collect();
+        assert_eq!(p010(&bytes, 2, 2, 6).unwrap(), expected);
+        let mut invalid = bytes.clone();
+        invalid[0] |= 1;
+        assert!(
+            p010(&invalid, 2, 2, 6).is_err(),
+            "low six bits must be zero"
+        );
+        assert!(p010(&bytes[..17], 2, 2, 6).is_err());
+        assert!(p010(&bytes, 2, 2, 5).is_err());
+        assert!(p010(&bytes, 3, 2, 6).is_err());
+        assert!(p010(&bytes, 2, 3, 6).is_err());
+        assert!(p010(&bytes, usize::MAX, 2, 6).is_err());
+        assert!(p010(&bytes, 2, usize::MAX, 6).is_err());
+        assert!(!input_color_supported(PIXEL_P010, ColorMode::Bt709Full));
+    }
 
     #[test]
     fn packed_bgra_removes_padding_without_touching_pixels() {

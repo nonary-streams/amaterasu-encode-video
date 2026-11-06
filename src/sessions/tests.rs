@@ -391,6 +391,136 @@ fn configuration() -> Configuration {
     }
 }
 
+#[test]
+fn p010_cpu_frames_preserve_codes_for_ten_bit_sdr_and_hdr_and_reject_bit_depth_mismatch() {
+    struct PlanarBackend(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl Backend for PlanarBackend {
+        fn submit(
+            &mut self,
+            bytes: Vec<u8>,
+            _: i64,
+            _: bool,
+        ) -> Result<SubmitResult, &'static str> {
+            self.0.lock().unwrap().push(bytes);
+            Ok(SubmitResult::Accepted)
+        }
+        fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+            Ok(ReceiveResult::Ready(None))
+        }
+        fn drain(&mut self) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+    }
+    for dynamic_range in [
+        amaterasu_module_sdk::DynamicRange::Sdr,
+        amaterasu_module_sdk::DynamicRange::Hdr,
+    ] {
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let mut sessions = Sessions::new(true);
+        let mut config = configuration();
+        config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: amaterasu_module_sdk::VideoCodec::Hevc,
+            bit_depth: 10,
+            dynamic_range,
+        };
+        config.codec = VideoCodec::Hevc;
+        sessions
+            .insert(
+                "owner",
+                config,
+                Box::new(PlanarBackend(accepted.clone())),
+                false,
+            )
+            .unwrap();
+        let mut bytes = vec![0xee; 36 * 24];
+        let mut expected = Vec::new();
+        for row in 0..24 {
+            for column in 0..16 {
+                let code = if row < 16 {
+                    64u16 + ((row + column) % 32) as u16
+                } else {
+                    512u16
+                };
+                let sample = (code << 6).to_le_bytes();
+                bytes[row * 36 + column * 2..row * 36 + column * 2 + 2].copy_from_slice(&sample);
+                expected.extend_from_slice(&sample);
+            }
+        }
+        let frame = CpuFrame {
+            width: 16,
+            height: 16,
+            format: PIXEL_P010,
+            stride: 36,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 1,
+            sequence: 1,
+        };
+        // SAFETY: complete initialized pixels stay immutable throughout submit.
+        assert_eq!(
+            unsafe { sessions.submit("foreign", 1, &frame, 0) },
+            MEDIA_CLOSED
+        );
+        assert_eq!(unsafe { sessions.submit("owner", 1, &frame, 0) }, STATUS_OK);
+        assert_eq!(accepted.lock().unwrap().as_slice(), &[expected]);
+        let nv12 = vec![128u8; 16 * 24];
+        let wrong = CpuFrame {
+            format: PIXEL_NV12,
+            stride: 16,
+            data: nv12.as_ptr(),
+            len: nv12.len(),
+            timestamp_us: 2,
+            sequence: 2,
+            ..frame
+        };
+        assert_eq!(
+            unsafe { sessions.submit("owner", 1, &wrong, 0) },
+            MEDIA_UNSUPPORTED
+        );
+        assert_eq!(accepted.lock().unwrap().len(), 1);
+        let mut bad = bytes.clone();
+        bad[0] |= 1;
+        let malformed = CpuFrame {
+            data: bad.as_ptr(),
+            timestamp_us: 2,
+            sequence: 2,
+            ..frame
+        };
+        assert_eq!(
+            unsafe { sessions.submit("owner", 1, &malformed, 0) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(accepted.lock().unwrap().len(), 1);
+    }
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "owner",
+            configuration(),
+            Box::new(PlanarBackend(accepted.clone())),
+            false,
+        )
+        .unwrap();
+    let bytes = vec![0; 16 * 16 * 3];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_P010,
+        stride: 32,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    // SAFETY: complete initialized pixels stay live for this synchronous call.
+    assert_eq!(
+        unsafe { sessions.submit("owner", 1, &frame, 0) },
+        MEDIA_UNSUPPORTED
+    );
+    assert!(accepted.lock().unwrap().is_empty());
+}
+
 #[cfg(amaterasu_x264)]
 #[test]
 #[ignore = "requires matching system x264 runtime"]

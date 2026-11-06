@@ -661,6 +661,144 @@ fn nvenc_cuda_gpu_encodes_ten_bit_sdr_cpu_input() {
 }
 
 #[test]
+#[ignore = "requires idle NVIDIA NVENC plus ffmpeg/ffprobe; encodes isolated P010 black through public CPU submission"]
+fn nvenc_cuda_gpu_p010_cpu_black_preserves_sdr_and_hdr_signal() {
+    for codec in [Codec::Hevc, Codec::Av1] {
+        for dynamic_range in [
+            amaterasu_module_sdk::DynamicRange::Sdr,
+            amaterasu_module_sdk::DynamicRange::Hdr,
+        ] {
+            let hdr = dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
+            let description = published()
+                .into_iter()
+                .find(|entry| entry.codec == codec.token())
+                .unwrap();
+            let mut configuration = configuration(codec, ColorMode::Bt709Limited);
+            configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+                codec: match codec {
+                    Codec::Hevc => amaterasu_module_sdk::VideoCodec::Hevc,
+                    Codec::Av1 => amaterasu_module_sdk::VideoCodec::Av1,
+                    Codec::H264 => unreachable!(),
+                },
+                bit_depth: 10,
+                dynamic_range,
+            };
+            let mut sessions = Sessions::new(true);
+            let opened = sessions
+                .open(
+                    "p010-black",
+                    description.identity,
+                    configuration,
+                    None,
+                    true,
+                )
+                .unwrap();
+            let id = opened["session_id"].as_u64().unwrap();
+            let pixels = (WIDTH * HEIGHT) as usize;
+            let bytes: Vec<u8> = [(pixels, 64u16), (pixels / 2, 512u16)]
+                .into_iter()
+                .flat_map(|(samples, code)| {
+                    std::iter::repeat_n((code << 6).to_le_bytes(), samples).flatten()
+                })
+                .collect();
+            for sequence in 1..=3 {
+                let frame = CpuFrame {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    format: PIXEL_P010,
+                    stride: WIDTH * 2,
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                    timestamp_us: sequence * 33_333,
+                    sequence,
+                };
+                // SAFETY: complete initialized P010 pixels remain immutable throughout submission.
+                assert_eq!(
+                    unsafe { sessions.submit("p010-black", id, &frame, u32::from(sequence == 1)) },
+                    STATUS_OK
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while sessions.drain("p010-black", id) == MEDIA_BUSY {
+                assert!(Instant::now() < deadline, "P010 drain timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut packets = Vec::<(u32, Vec<u8>)>::new();
+            let sink = PacketSink {
+                context: (&mut packets as *mut Vec<(u32, Vec<u8>)>).cast(),
+                write: collect_packet,
+            };
+            loop {
+                // SAFETY: packet storage and the synchronous sink remain live.
+                let status = unsafe { sessions.receive("p010-black", id, sink) };
+                assert!(
+                    matches!(status, STATUS_OK | MEDIA_PENDING | MEDIA_BUSY),
+                    "P010 receive {status}"
+                );
+                if packets
+                    .last()
+                    .is_some_and(|(flags, _)| flags & FLAG_END_OF_STREAM != 0)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "P010 output timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            sessions.close("p010-black", id).unwrap();
+            let path = stream_file(
+                codec,
+                if hdr { "cpu-p010-hdr" } else { "cpu-p010-sdr" },
+                packets
+                    .into_iter()
+                    .filter(|(_, bytes)| !bytes.is_empty())
+                    .map(|(_, bytes)| bytes),
+            );
+            let stream = probe(codec, &path);
+            assert_eq!(stream["pix_fmt"], "yuv420p10le", "{stream}");
+            assert_eq!(
+                stream["color_primaries"],
+                if hdr { "bt2020" } else { "bt709" },
+                "{stream}"
+            );
+            assert_eq!(
+                stream["color_transfer"],
+                if hdr { "smpte2084" } else { "bt709" },
+                "{stream}"
+            );
+            let decoded = Command::new("ffmpeg")
+                .args(["-v", "error", "-f", demuxer(codec), "-i"])
+                .arg(&path)
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert_eq!(decoded.stdout.len(), pixels * 3);
+            assert!(
+                decoded.stdout[..pixels * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|sample| (62..=66).contains(&u16::from_le_bytes([sample[0], sample[1]])))
+            );
+            assert!(decoded.stdout[pixels*2..].as_chunks::<2>().0.iter().all(|sample|(510..=514).contains(&u16::from_le_bytes([sample[0],sample[1]]))));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
 fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
     let top = (719 << 20) | (321 << 10) | 183;
