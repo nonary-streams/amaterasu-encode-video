@@ -1,6 +1,7 @@
 use crate::queue::Queues;
 use amaterasu_media::{
-    MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, TimedPacketSink, VideoApiV1_2, VideoApiV1_3,
+    EncodeTimingSnapshotV1, MEDIA_BUSY, MEDIA_UNSUPPORTED, PacketSink, TimedPacketSink,
+    VideoApiV1_2, VideoApiV1_3, VideoApiV1_4,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{
@@ -29,7 +30,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: VideoApiV1_3,
+    api: VideoApiV1_4,
     queues: Arc<Mutex<Queues>>,
     caller: String,
 }
@@ -51,8 +52,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 3
-            || query.min_size as usize > size_of::<VideoApiV1_3>()
+            || query.min_minor > 4
+            || query.min_size as usize > size_of::<VideoApiV1_4>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -66,28 +67,31 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: VideoApiV1_3 {
-                base: VideoApiV1_2 {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: size_of::<VideoApiV1_3>() as u32,
-                            major: 1,
-                            minor: 3,
+            api: VideoApiV1_4 {
+                base: VideoApiV1_3 {
+                    base: VideoApiV1_2 {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<VideoApiV1_4>() as u32,
+                                major: 1,
+                                minor: 4,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release),
+                        receive,
+                        geometry,
+                        hdr_metadata,
                     },
-                    receive,
-                    geometry,
-                    hdr_metadata,
+                    receive_timed,
                 },
-                receive_timed,
+                encode_timing,
             },
             queues: factory.queues.clone(),
             caller,
         });
-        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
-        let table = &binding.api.base.base as *const NativeInterface;
+        binding.api.base.base.base.context = (&mut *binding as *mut Binding).cast();
+        let table = &binding.api.base.base.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: transfers provider-owned table until exactly one release.
         unsafe {
@@ -137,6 +141,32 @@ unsafe extern "C" fn receive_timed(
             return MEDIA_BUSY;
         };
         unsafe { queues.receive_timed(&binding.caller, stream, sink) }
+    })
+}
+
+unsafe extern "C" fn encode_timing(
+    context: *mut c_void,
+    stream: u64,
+    output: *mut EncodeTimingSnapshotV1,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || output.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains this binding; the consumer lends writable v1
+        // output. Reading optional counters performs no provider work.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        match queues.encode_timing(&binding.caller, stream) {
+            Ok(Some(snapshot)) => {
+                unsafe { output.write(snapshot) };
+                STATUS_OK
+            }
+            Ok(None) => MEDIA_UNSUPPORTED,
+            Err(status) => status,
+        }
     })
 }
 

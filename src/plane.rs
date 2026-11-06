@@ -789,7 +789,15 @@ impl Plane for NativePlane {
         let api =
             unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
         let mut queues = self.queues.lock().map_err(|_| "queue_failed")?;
-        unsafe { source.pump(api, &mut queues, force_idr) }
+        let result = unsafe { source.pump(api, &mut queues, force_idr) };
+        // SAFETY: the same authenticated typed binding and source session are
+        // live. Optional telemetry failure cannot stop or consume media output.
+        let timing =
+            unsafe { amaterasu_module_sdk::media::provider_encode_timing(api, source.session()) }
+                .ok()
+                .flatten();
+        queues.observe_encode_timing(video, service, source.session(), timing);
+        result
     }
     fn drain_source(&mut self, video: u64) -> Result<bool, &'static str> {
         let (service, source) = self
@@ -1412,6 +1420,15 @@ impl NativePlane {
         progress.encoder_poll_us = encoder_poll_us;
         progress.transport_admission_us = transport_admission_us;
         progress.transport_admission_count = destination_count;
+        // SAFETY: receive uses this same live typed encoder/session. Old tables
+        // explicitly provide no timing; no default encoder is consulted.
+        let timing =
+            unsafe { amaterasu_module_sdk::media::encoder_timing(encoder_api, input.encoder) }
+                .ok()
+                .flatten();
+        if let Ok(mut queues) = self.queues.lock() {
+            queues.observe_encode_timing(input.video, &self.active_encoder, input.encoder, timing);
+        }
         Ok(progress)
     }
 }

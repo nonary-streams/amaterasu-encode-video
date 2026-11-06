@@ -20,6 +20,10 @@ struct Packet {
 }
 
 struct Stream {
+    timing_source: Option<(String, u64, u64)>,
+    timing_epoch: u64,
+    encode_timing: Option<amaterasu_media::EncodeTimingSnapshotV1>,
+    timing_available: bool,
     owner: String,
     /// Host-clock microseconds at the stream's timestamp origin. Packets
     /// leave the queue stamped on the shared host clock (see
@@ -60,6 +64,10 @@ impl Queues {
         self.streams.insert(
             id,
             Stream {
+                timing_source: None,
+                timing_epoch: 0,
+                encode_timing: None,
+                timing_available: false,
                 owner: owner.into(),
                 clock_origin_us,
                 geometry: None,
@@ -78,6 +86,53 @@ impl Queues {
         if let Some(stream) = self.streams.get_mut(&id) {
             stream.geometry = geometry;
         }
+    }
+
+    /// Preserve the selected provider's measurements and translate its epoch to
+    /// this video's lifetime. A replacement never joins two unrelated counters.
+    pub fn observe_encode_timing(
+        &mut self,
+        id: u64,
+        provider: &str,
+        session: u64,
+        snapshot: Option<amaterasu_media::EncodeTimingSnapshotV1>,
+    ) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        stream.timing_available = false;
+        let Some(mut snapshot) = snapshot.filter(|snapshot| snapshot.validate().is_ok()) else {
+            return;
+        };
+        let source = (provider.to_owned(), session, snapshot.epoch);
+        if stream.timing_source.as_ref() != Some(&source) {
+            let Some(epoch) = stream.timing_epoch.checked_add(1) else {
+                return;
+            };
+            stream.timing_epoch = epoch;
+            stream.timing_source = Some(source);
+            stream.encode_timing = None;
+        }
+        snapshot.epoch = stream.timing_epoch;
+        if stream.encode_timing.is_some_and(|previous| {
+            !amaterasu_module_sdk::media::timing_follows(snapshot, previous)
+        }) {
+            return;
+        }
+        stream.encode_timing = Some(snapshot);
+        stream.timing_available = true;
+    }
+
+    pub fn encode_timing(
+        &self,
+        owner: &str,
+        id: u64,
+    ) -> Result<Option<amaterasu_media::EncodeTimingSnapshotV1>, Status> {
+        self.streams
+            .get(&id)
+            .filter(|stream| stream.owner == owner)
+            .map(|stream| stream.encode_timing.filter(|_| stream.timing_available))
+            .ok_or(MEDIA_CLOSED)
     }
 
     pub fn geometry(
@@ -567,6 +622,33 @@ mod tests {
 mod geometry_tests {
     use super::*;
     use amaterasu_media::{CaptureGeometry, DesktopRect};
+    #[test]
+    fn timing_tracks_only_the_selected_provider_and_rebases_replacements() {
+        use amaterasu_media::EncodeTimingSnapshotV1;
+        let mut queues = Queues::default();
+        queues.open(1, "owner", 0);
+        let mut first = EncodeTimingSnapshotV1::empty(1);
+        first.record(2000);
+        queues.observe_encode_timing(1, "provider-a", 1, Some(first));
+        let initial = queues.encode_timing("owner", 1).unwrap().unwrap();
+        assert_eq!(initial.completed_frames, 1);
+        assert_eq!(queues.encode_timing("another-owner", 1), Err(MEDIA_CLOSED));
+        queues.observe_encode_timing(1, "provider-a", 1, Some(EncodeTimingSnapshotV1::empty(1)));
+        assert_eq!(
+            queues.encode_timing("owner", 1).unwrap(),
+            None,
+            "backwards counters must not become a measurement"
+        );
+        queues.observe_encode_timing(1, "provider-a", 1, None);
+        assert_eq!(queues.encode_timing("owner", 1).unwrap(), None);
+        let mut replacement = EncodeTimingSnapshotV1::empty(1);
+        replacement.record(5000);
+        queues.observe_encode_timing(1, "provider-b", 1, Some(replacement));
+        let replaced = queues.encode_timing("owner", 1).unwrap().unwrap();
+        assert_ne!(initial.epoch, replaced.epoch);
+        assert_eq!(replaced.mean_ms_since(initial), None);
+        assert_eq!(replaced.total_us, 5000);
+    }
     #[test]
     fn geometry_tracks_the_owned_stream_and_peer_topology_without_crossing_callers() {
         let mut queues = Queues::default();

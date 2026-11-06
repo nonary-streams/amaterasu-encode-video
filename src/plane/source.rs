@@ -65,6 +65,9 @@ pub(super) struct Source {
     pending_idr: Option<u64>,
 }
 impl Source {
+    pub(super) fn session(&self) -> u64 {
+        self.session
+    }
     /// # Safety
     /// The authenticated provider binding and control session must outlive this object.
     pub(super) unsafe fn open(
