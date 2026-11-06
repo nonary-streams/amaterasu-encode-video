@@ -294,6 +294,7 @@ impl Backend for ControlledBackend {
     ) -> Result<SubmitResult, &'static str> {
         assert!(force);
         self.packet = Some(Packet {
+            ready_at: None,
             bytes: vec![
                 0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 1, 0, 0, 0, 1, 0x65, 1,
             ],

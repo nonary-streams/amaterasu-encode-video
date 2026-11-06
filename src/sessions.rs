@@ -101,6 +101,8 @@ impl Backend for Worker {
 }
 
 struct Metadata {
+    started_at: Instant,
+    timing_recorded: bool,
     timestamp: i64,
     sequence: u64,
     force_keyframe: bool,
@@ -125,6 +127,7 @@ pub struct Session {
     color_conversion_max_us: u64,
     color_conversion_frames: u64,
     opened_at: Instant,
+    encode_timing: EncodeTimingSnapshotV1,
 }
 
 /// Owned provider reference; callbacks stay on the module thread. Only duplicated
@@ -311,6 +314,7 @@ impl Sessions {
                 color_conversion_max_us: 0,
                 color_conversion_frames: 0,
                 opened_at: Instant::now(),
+                encode_timing: EncodeTimingSnapshotV1::empty(1),
             },
         );
         Ok(response)
@@ -320,6 +324,15 @@ impl Sessions {
             .get_mut(&id)
             .filter(|session| session.owner == owner)
             .ok_or("session_not_found")
+    }
+    pub fn encode_timing(
+        &mut self,
+        owner: &str,
+        id: u64,
+    ) -> Result<EncodeTimingSnapshotV1, Status> {
+        self.owned(owner, id)
+            .map(|session| session.encode_timing)
+            .map_err(|_| MEDIA_CLOSED)
     }
     pub fn status(&mut self, owner: &str, id: u64) -> Result<Value, &'static str> {
         let session = self.owned(owner, id)?;
@@ -338,7 +351,7 @@ impl Sessions {
             "open"
         };
         Ok(
-            json!({"ok":true,"session_id":id,"state":state,"configuration":session.config,"packet_boundaries":session.packet_boundaries,"supports_packet_boundaries":true,"timing":{"color_conversion_frames":session.color_conversion_frames,"color_conversion_total_us":session.color_conversion_total_us,"color_conversion_max_us":session.color_conversion_max_us},"encoder_timing":encoder_metrics}),
+            json!({"ok":true,"session_id":id,"state":state,"configuration":session.config,"packet_boundaries":session.packet_boundaries,"supports_packet_boundaries":true,"timing":{"color_conversion_frames":session.color_conversion_frames,"color_conversion_total_us":session.color_conversion_total_us,"color_conversion_max_us":session.color_conversion_max_us},"encode_latency":session.encode_timing,"encoder_timing":encoder_metrics}),
         )
     }
 
@@ -410,6 +423,7 @@ impl Sessions {
         if !layout::input_color_supported(frame.format, session.config.color_mode) {
             return STATUS_INVALID_ARGUMENT;
         }
+        let started_at = Instant::now();
         let result = if frame.format == PIXEL_BGRA8 && session.input_support.gpu_bgra_conversion {
             let Ok(packed) = layout::packed_bgra(
                 bytes,
@@ -429,7 +443,7 @@ impl Sessions {
             };
             session.backend.submit(nv12, timestamp, force != 0)
         };
-        session.record_submission(result, timestamp, frame.sequence, force != 0)
+        session.record_submission(result, timestamp, frame.sequence, force != 0, started_at)
     }
     /// # Safety
     /// Every descriptor in `frame` is open for the duration of this call.
@@ -553,7 +567,7 @@ impl Sessions {
         };
         let Some(metadata) = session
             .metadata
-            .iter()
+            .iter_mut()
             .find(|metadata| metadata.timestamp == packet.timestamp_100ns)
         else {
             session.failed = true;
@@ -562,6 +576,16 @@ impl Sessions {
         if metadata.force_keyframe && !packet.keyframe {
             session.failed = true;
             return MEDIA_BACKEND_ERROR;
+        }
+        if !metadata.timing_recorded {
+            if let Some(elapsed) = packet
+                .ready_at
+                .and_then(|ready| ready.checked_duration_since(metadata.started_at))
+                && let Ok(micros) = u64::try_from(elapsed.as_micros())
+            {
+                session.encode_timing.record(micros);
+            }
+            metadata.timing_recorded = true;
         }
         session.retained_frames.remove(&packet.timestamp_100ns);
         let encoded = EncodedPacket {
@@ -742,10 +766,12 @@ impl Session {
         } else {
             None
         };
+        let started_at = Instant::now();
         let result = self
             .backend
             .submit_gpu(GpuInput::DmaBuf(input), timestamp, force != 0);
-        let status = self.record_submission(result, timestamp, frame.sequence, force != 0);
+        let status =
+            self.record_submission(result, timestamp, frame.sequence, force != 0, started_at);
         if status == STATUS_OK
             && let Some(retained) = retained
         {
@@ -760,6 +786,7 @@ impl Session {
         timestamp: i64,
         sequence: u64,
         force_keyframe: bool,
+        started_at: Instant,
     ) -> Status {
         match result {
             Ok(SubmitResult::Accepted) => {}
@@ -770,6 +797,8 @@ impl Session {
             }
         }
         self.metadata.push_back(Metadata {
+            started_at,
+            timing_recorded: false,
             timestamp,
             sequence,
             force_keyframe,

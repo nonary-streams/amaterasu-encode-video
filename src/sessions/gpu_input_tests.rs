@@ -381,8 +381,11 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
     // SAFETY: a successful bind returns a live v1.1 table until release.
     unsafe {
         let api = &*output.cast::<EncoderApiV1_1>();
-        assert_eq!(api.base.header.minor, ENCODER_LEASE_INTERFACE_MINOR);
-        assert_eq!(api.base.header.size, ENCODER_API_V1_2_SIZE);
+        assert_eq!(api.base.header.minor, ENCODER_TIMING_INTERFACE_MINOR);
+        assert_eq!(
+            api.base.header.size,
+            std::mem::size_of::<EncoderApiV1_3>() as u32
+        );
         let (plane, _writer) = stand_in();
         let borrowed = frame(&plane, None, 1);
         assert_eq!(
@@ -407,7 +410,10 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
     // SAFETY: the successful v1.2 query returns the complete additive table.
     unsafe {
         let api = &*output.cast::<EncoderApiV1_2>();
-        assert_eq!(api.base.header.size, ENCODER_API_V1_2_SIZE);
+        assert_eq!(
+            api.base.header.size,
+            std::mem::size_of::<EncoderApiV1_3>() as u32
+        );
         assert_eq!(
             (api.submit_dmabuf_leased)(api.base.context, 99, std::ptr::null(), 0),
             STATUS_INVALID_ARGUMENT
@@ -419,10 +425,13 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
         ENCODER_API_V1_1_SIZE as usize
     );
     assert_eq!(
-        bind(ENCODER_LEASE_INTERFACE_MINOR + 1, ENCODER_API_V1_2_SIZE).0,
+        bind(ENCODER_TIMING_INTERFACE_MINOR + 1, ENCODER_API_V1_2_SIZE).0,
         MEDIA_UNSUPPORTED
     );
-    assert_eq!(bind(0, ENCODER_API_V1_2_SIZE + 8).0, MEDIA_UNSUPPORTED);
+    assert_eq!(
+        bind(0, std::mem::size_of::<EncoderApiV1_3>() as u32 + 8).0,
+        MEDIA_UNSUPPORTED
+    );
 }
 
 /// Holds every GPU input it receives, blocking the first until released.
@@ -843,6 +852,7 @@ impl Backend for ImmediateGpuPacket {
     ) -> Result<SubmitResult, &'static str> {
         drop(input);
         self.0 = Some(Packet {
+            ready_at: None,
             bytes: vec![1, 2, 3],
             timestamp_100ns: timestamp,
             keyframe: false,

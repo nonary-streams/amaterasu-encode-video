@@ -552,6 +552,7 @@ impl Encoder {
             return Err("nvenc_cuda_forced_idr_missing");
         }
         self.packets.push_back(Packet {
+            ready_at: Some(std::time::Instant::now()),
             bytes,
             timestamp_100ns,
             keyframe,

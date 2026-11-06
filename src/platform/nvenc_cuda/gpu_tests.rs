@@ -38,6 +38,99 @@ const SECOND_IDR: u64 = 15;
 const TOP_XRGB: u32 = 0x00c0_4020;
 const BOTTOM_XRGB: u32 = 0x0020_80e0;
 
+#[test]
+#[ignore = "requires NVIDIA NVENC; measures an isolated synthetic frame, not a live stream"]
+fn nvenc_cuda_gpu_reports_measured_session_timing_through_sdk() {
+    use amaterasu_abi::{AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery};
+    use std::sync::{Arc, Mutex};
+    let description = published().into_iter().next().unwrap();
+    let codec = Codec::from_clsid(&description.identity.clsid).unwrap();
+    let mut sessions = Sessions::new(true);
+    let opened = sessions
+        .open(
+            "timing-test",
+            description.identity,
+            configuration(codec, ColorMode::Bt709Limited),
+            None,
+            true,
+        )
+        .unwrap();
+    let id = opened["session_id"].as_u64().unwrap();
+    let shared = Arc::new(Mutex::new(sessions));
+    let registration = crate::native::Registration::new(shared.clone());
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: ENCODER_TIMING_INTERFACE_MINOR,
+        min_size: std::mem::size_of::<EncoderApiV1_3>() as u32,
+    };
+    let mut pointer: *const NativeInterface = std::ptr::null();
+    // SAFETY: this factory implements the encoder contract; descriptor, pixels,
+    // and sink storage remain live through each synchronous call until release.
+    unsafe {
+        assert_eq!(
+            registration.factory.bind.unwrap()(
+                registration.factory.context,
+                BorrowedBytes::new(b"timing-test"),
+                &query,
+                &mut pointer
+            ),
+            STATUS_OK
+        );
+        let api = &*pointer.cast::<EncoderApi>();
+        assert_eq!(
+            amaterasu_module_sdk::media::encoder_timing(api, id)
+                .unwrap()
+                .unwrap()
+                .completed_frames,
+            0
+        );
+        let mut bytes = vec![16u8; (WIDTH * HEIGHT) as usize];
+        bytes.resize((WIDTH * HEIGHT * 3 / 2) as usize, 128);
+        let frame = CpuFrame {
+            width: WIDTH,
+            height: HEIGHT,
+            format: PIXEL_NV12,
+            stride: WIDTH,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 1000,
+            sequence: 1,
+        };
+        assert_eq!((api.submit)(api.base.context, id, &frame, 1), STATUS_OK);
+        let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
+        let sink = PacketSink {
+            context: (&mut packets as *mut Vec<(u32, Vec<u8>)>).cast(),
+            write: collect_packet,
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = (api.receive)(api.base.context, id, sink);
+            if status == STATUS_OK {
+                break;
+            }
+            assert!(
+                matches!(status, MEDIA_PENDING | MEDIA_BUSY),
+                "receive {status}"
+            );
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let timing = amaterasu_module_sdk::media::encoder_timing(api, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(timing.completed_frames, 1);
+        timing.validate().unwrap();
+        assert!(!packets[0].1.is_empty());
+        eprintln!(
+            "real NVENC timing: {}",
+            serde_json::to_string(&timing).unwrap()
+        );
+        api.base.release.unwrap()(api.base.context);
+    }
+    shared.lock().unwrap().close("timing-test", id).unwrap();
+}
+
 fn published() -> Vec<EncoderDescription> {
     let published = super::descriptions();
     assert!(!published.is_empty(), "no NVENC/CUDA encoder was published");

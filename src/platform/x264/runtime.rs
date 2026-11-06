@@ -287,6 +287,7 @@ impl Encoder {
         let borrowed = unsafe { std::slice::from_raw_parts(output.data, output.len) };
         let (bytes, keyframe) = self.normalizer.sample(borrowed)?;
         self.packets.push_back(Packet {
+            ready_at: Some(std::time::Instant::now()),
             bytes,
             timestamp_100ns: output.timestamp,
             keyframe,

@@ -206,6 +206,18 @@ fn exercise_native_winner(module: &EncodeModule, config: &crate::model::Configur
         assert_eq!(receive_ready(), STATUS_OK);
         assert_eq!(receive_ready(), STATUS_OK);
         assert_eq!((api.receive)(api.base.context, 1, sink), MEDIA_PENDING);
+        let timing = amaterasu_module_sdk::media::encoder_timing(api, 1)
+            .unwrap()
+            .unwrap();
+        timing.validate().unwrap();
+        assert_eq!(
+            timing.completed_frames, 1,
+            "real x264 output carries a provider readiness measurement; EOS adds no sample"
+        );
+        eprintln!(
+            "real x264 timing: {}",
+            serde_json::to_string(&timing).unwrap()
+        );
         api.base.release.unwrap()(api.base.context);
         assert_eq!(packets.len(), 2);
         assert!(!packets[0].0.is_empty());

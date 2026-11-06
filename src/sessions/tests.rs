@@ -12,6 +12,108 @@ use std::{
 
 use crate::worker::{Worker, WorkerBackend};
 
+#[test]
+fn measured_readiness_excludes_later_polling_and_sink_retries_and_preserves_ownership() {
+    struct ReadyBackend {
+        packet: Option<Packet>,
+        ready: Instant,
+    }
+    impl Backend for ReadyBackend {
+        fn submit(
+            &mut self,
+            _: Vec<u8>,
+            timestamp: i64,
+            _: bool,
+        ) -> Result<SubmitResult, &'static str> {
+            self.packet = Some(Packet {
+                ready_at: Some(self.ready),
+                bytes: vec![0, 0, 1, 0x41],
+                timestamp_100ns: timestamp,
+                keyframe: false,
+            });
+            Ok(SubmitResult::Accepted)
+        }
+        fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+            Ok(ReceiveResult::Ready(self.packet.take()))
+        }
+        fn drain(&mut self) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+    }
+    unsafe extern "C" fn reject(_: *mut c_void, _: *const EncodedPacket) -> Status {
+        MEDIA_BUSY
+    }
+    unsafe extern "C" fn accept(_: *mut c_void, _: *const EncodedPacket) -> Status {
+        STATUS_OK
+    }
+    let started = Instant::now() - Duration::from_secs(10);
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "reader",
+            configuration(),
+            Box::new(ReadyBackend {
+                packet: None,
+                ready: started + Duration::from_micros(4_000),
+            }),
+            true,
+        )
+        .unwrap();
+    let bytes = vec![0u8; 16 * 16 * 3 / 2];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    // SAFETY: initialized pixels and all synchronous sink callbacks are live.
+    assert_eq!(
+        unsafe { sessions.submit("reader", 1, &frame, 0) },
+        STATUS_OK
+    );
+    sessions.values.get_mut(&1).unwrap().metadata[0].started_at = started;
+    assert_eq!(
+        sessions
+            .encode_timing("reader", 1)
+            .unwrap()
+            .completed_frames,
+        0
+    );
+    let sink = PacketSink {
+        context: std::ptr::null_mut(),
+        write: reject,
+    };
+    assert_eq!(unsafe { sessions.receive("reader", 1, sink) }, MEDIA_BUSY);
+    let measured = sessions.encode_timing("reader", 1).unwrap();
+    assert_eq!(measured.completed_frames, 1);
+    assert_eq!(
+        measured.total_us, 4_000,
+        "ten seconds of delayed observation must not be counted"
+    );
+    assert_eq!(unsafe { sessions.receive("reader", 1, sink) }, MEDIA_BUSY);
+    assert_eq!(
+        unsafe {
+            sessions.receive(
+                "reader",
+                1,
+                PacketSink {
+                    write: accept,
+                    ..sink
+                },
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(sessions.encode_timing("reader", 1).unwrap(), measured);
+    assert_eq!(sessions.encode_timing("other-reader", 1), Err(MEDIA_CLOSED));
+    sessions.close("reader", 1).unwrap();
+    assert_eq!(sessions.encode_timing("reader", 1), Err(MEDIA_CLOSED));
+}
+
 #[derive(Default)]
 struct SlowGateState {
     first_submit_entered: bool,
@@ -86,6 +188,7 @@ impl WorkerBackend for SlowWorkerBackend {
             }
         }
         state.packets.push_back(Packet {
+            ready_at: None,
             bytes: vec![0, 0, 1, 0x41],
             timestamp_100ns: timestamp,
             keyframe: false,
@@ -239,6 +342,7 @@ impl Backend for StreamingFake {
     ) -> Result<SubmitResult, &'static str> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         self.packets.push_back(Packet {
+            ready_at: None,
             bytes: vec![
                 0,
                 0,
@@ -767,6 +871,7 @@ fn exercise_packet_flags(packet_boundaries: bool, codec: VideoCodec) {
             config,
             Box::new(Fake {
                 packets: VecDeque::from([Packet {
+                    ready_at: None,
                     bytes: vec![0, 0, 1, 0x41, 1],
                     timestamp_100ns: 10,
                     keyframe: false,

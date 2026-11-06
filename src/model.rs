@@ -342,6 +342,8 @@ pub struct DescriptionCapabilities {
 /// temporal unit. Backends must establish their output boundary before
 /// handing this owned packet to the native session queue.
 pub struct Packet {
+    /// Provider readiness observation, before output waits in a consumer queue.
+    pub ready_at: Option<std::time::Instant>,
     pub bytes: Vec<u8>,
     pub timestamp_100ns: i64,
     pub keyframe: bool,

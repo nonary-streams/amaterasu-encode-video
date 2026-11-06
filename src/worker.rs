@@ -766,6 +766,7 @@ mod tests {
         fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
             let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(Packet {
+                ready_at: None,
                 bytes: vec![call as u8],
                 timestamp_100ns: call as i64,
                 keyframe: call == 0,
@@ -811,6 +812,7 @@ mod tests {
             fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok((call == 1).then(|| Packet {
+                    ready_at: None,
                     bytes: vec![1],
                     timestamp_100ns: 0,
                     keyframe: true,

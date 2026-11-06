@@ -28,10 +28,10 @@ impl Registration {
     }
 }
 
-/// The v1.2 table preserves both earlier prefixes. Provider references remain
+/// The v1.3 table preserves both earlier prefixes. Provider references remain
 /// on the module thread until encoded output or joined encoder shutdown.
 struct Binding {
-    api: EncoderApiV1_2,
+    api: EncoderApiV1_3,
     owner: String,
     shared: Shared,
 }
@@ -52,8 +52,8 @@ unsafe extern "C" fn bind(
             let query = &*query;
             if !query.header.supports::<NativeInterfaceQuery>()
                 || query.interface_major != INTERFACE_MAJOR
-                || query.min_minor > ENCODER_LEASE_INTERFACE_MINOR
-                || query.min_size > ENCODER_API_V1_2_SIZE
+                || query.min_minor > ENCODER_TIMING_INTERFACE_MINOR
+                || query.min_size > size_of::<EncoderApiV1_3>() as u32
             {
                 return MEDIA_UNSUPPORTED;
             }
@@ -67,29 +67,32 @@ unsafe extern "C" fn bind(
             };
             let shared = (&*context.cast::<Shared>()).clone();
             let mut binding = Box::new(Binding {
-                api: EncoderApiV1_2 {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: ENCODER_API_V1_2_SIZE,
-                            major: INTERFACE_MAJOR,
-                            minor: ENCODER_LEASE_INTERFACE_MINOR,
+                api: EncoderApiV1_3 {
+                    base: EncoderApiV1_2 {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<EncoderApiV1_3>() as u32,
+                                major: INTERFACE_MAJOR,
+                                minor: ENCODER_TIMING_INTERFACE_MINOR,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release),
+                        submit,
+                        receive,
+                        drain,
+                        submit_dmabuf,
+                        submit_dmabuf_leased,
+                        cancel_dmabuf_leases,
                     },
-                    submit,
-                    receive,
-                    drain,
-                    submit_dmabuf,
-                    submit_dmabuf_leased,
-                    cancel_dmabuf_leases,
+                    encode_timing,
                 },
                 owner,
                 shared,
             });
-            binding.api.base.context = (&mut *binding as *mut Binding).cast();
+            binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
             let pointer = Box::into_raw(binding);
-            *output = &(*pointer).api.base;
+            *output = &(*pointer).api.base.base;
         }
         STATUS_OK
     })
@@ -200,6 +203,30 @@ unsafe extern "C" fn receive(context: *mut c_void, id: u64, sink: PacketSink) ->
             return MEDIA_BUSY;
         };
         unsafe { sessions.receive(&binding.owner, id, sink) }
+    })
+}
+
+unsafe extern "C" fn encode_timing(
+    context: *mut c_void,
+    id: u64,
+    output: *mut EncodeTimingSnapshotV1,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || output.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: binding and caller-owned writable output outlive this call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        match sessions.encode_timing(&binding.owner, id) {
+            Ok(snapshot) => {
+                unsafe { output.write(snapshot) };
+                STATUS_OK
+            }
+            Err(status) => status,
+        }
     })
 }
 

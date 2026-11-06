@@ -85,6 +85,7 @@ fn configuration() -> Configuration {
 
 fn idr() -> Packet {
     Packet {
+        ready_at: None,
         bytes: vec![
             0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 1, 0, 0, 0, 1, 0x65, 1,
         ],
@@ -127,6 +128,7 @@ fn flag_only_avcc_wrong_timestamp_empty_and_failed_drain_are_unusable_after_clos
     let mut flag_only = idr();
     flag_only.bytes = vec![0, 0, 0, 1, 0x41, 1];
     let avcc = Packet {
+        ready_at: None,
         bytes: vec![0, 0, 0, 2, 0x65, 1],
         ..idr()
     };
@@ -178,6 +180,7 @@ fn negotiated_hevc_and_av1_probes_validate_their_own_bitstreams() {
         .unwrap();
         let factory = factory(
             Some(Packet {
+                ready_at: None,
                 bytes,
                 timestamp_100ns: PROBE_TIMESTAMP,
                 keyframe: true,

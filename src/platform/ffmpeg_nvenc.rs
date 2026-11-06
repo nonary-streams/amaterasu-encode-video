@@ -716,6 +716,7 @@ impl Encoder {
                     return Err("nvenc_keyframe_mismatch");
                 }
                 Ok(NativeReceive::Packet(Packet {
+                    ready_at: Some(std::time::Instant::now()),
                     bytes,
                     timestamp_100ns,
                     keyframe,

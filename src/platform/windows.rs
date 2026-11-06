@@ -640,6 +640,7 @@ impl Encoder {
                     windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
                 })?;
                 self.packets.push_back(Packet {
+                    ready_at: Some(std::time::Instant::now()),
                     bytes,
                     timestamp_100ns: sample.GetSampleTime()?,
                     keyframe,
