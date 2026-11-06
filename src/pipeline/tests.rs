@@ -5262,6 +5262,70 @@ fn repeated_observations_release_each_broker_result() {
 }
 
 #[test]
+fn live_effect_toggle_keeps_the_same_running_stream_and_processing_path() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    configuration.gpu_processing = Some(
+        serde_json::from_value(json!({
+            "service":"example.processor/1", "enabled":true,"source_hdr_required":false,
+            "settings":{"effect_enabled":false}
+        }))
+        .unwrap(),
+    );
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    pipeline
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .configuration
+        .gpu_processing
+        .as_mut()
+        .unwrap()
+        .live_settings = Some(
+        serde_json::from_value(
+            json!({"target":target,"provider":"example.processor","revision":"initial"}),
+        )
+        .unwrap(),
+    );
+    let mut control = live_settings::Control::default();
+    for (index, enabled) in [true, false, true].into_iter().enumerate() {
+        let revision = format!("toggle-{index}");
+        let response = json!({"status":"succeeded","target":target,"provider":"example.processor",
+            "revision":revision,"settings":{"effect_enabled":enabled}});
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 77 }),
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: response.clone(),
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            _ => unreachable!(),
+        };
+        pipeline
+            .streams
+            .get_mut(&1)
+            .unwrap()
+            .live_settings_next_poll = Instant::now();
+        control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+        control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+        assert_eq!(pipeline.streams.len(), 1);
+        let stream = &pipeline.streams[&1];
+        assert_eq!(stream.stage, Stage::Running);
+        let selection = stream.configuration.gpu_processing.as_ref().unwrap();
+        assert!(selection.enabled, "the processing path stays admitted");
+        assert_eq!(selection.live_settings.as_ref().unwrap().revision, revision);
+        assert_eq!(
+            plane.gpu_updates.last(),
+            Some(&(1, json!({"effect_enabled":enabled})))
+        );
+    }
+}
+
+#[test]
 fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     let mut operation = open();
