@@ -264,6 +264,10 @@ pub struct Settings {
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default)]
     pub external_capture_providers: BTreeMap<String, ExternalProviderRegistration>,
+    /// Trusted opaque route keys for nonmutating source queries. Requests
+    /// cannot choose a native service or fall back to another provider.
+    #[serde(default)]
+    pub source_preflight_routes: BTreeMap<String, CaptureProvider>,
     #[serde(default)]
     pub external_encoder_providers: BTreeMap<String, String>,
     #[serde(default)]
@@ -302,6 +306,7 @@ impl Default for Settings {
             enabled: false,
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
@@ -360,6 +365,19 @@ impl Settings {
         })
     }
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source_preflight_routes.len() > 32
+            || self.source_preflight_routes.iter().any(|(key, provider)| {
+                key.is_empty()
+                    || key.len() > 128
+                    || key.chars().any(char::is_control)
+                    || !self
+                        .resolved_providers()
+                        .iter()
+                        .any(|selected| selected.identity() == provider.identity())
+            })
+        {
+            return Err("invalid_source_preflight_routes");
+        }
         if (self.capture_providers.is_empty()
             && self.external_capture_providers.is_empty()
             && self.source_encoder_providers.is_empty())
@@ -458,6 +476,19 @@ impl Settings {
                         .map(CaptureProvider::External)
                     }),
             )
+            .collect()
+    }
+
+    pub fn resolved_source_preflight_routes(&self) -> BTreeMap<String, CaptureProvider> {
+        let providers = self.resolved_providers();
+        self.source_preflight_routes
+            .iter()
+            .filter_map(|(key, route)| {
+                providers
+                    .iter()
+                    .find(|provider| provider.identity() == route.identity())
+                    .map(|provider| (key.clone(), *provider))
+            })
             .collect()
     }
 }
@@ -1480,6 +1511,7 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
@@ -1506,6 +1538,7 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
