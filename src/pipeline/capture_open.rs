@@ -4,6 +4,7 @@ use crate::{
     model::{CaptureProvider, Configuration, SourcePreflightRoute},
     plane::Plane,
 };
+use amaterasu_media::{MEDIA_BUSY, MEDIA_PENDING};
 use amaterasu_module_sdk::{
     DynamicRange,
     capture::{SourceCaptureContext, SourceFormat, SourceMode, SourcePreflightRequest},
@@ -14,6 +15,12 @@ pub(super) struct Selection {
     pub(super) context: SourceCaptureContext,
     route: SourcePreflightRoute,
     output: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FormatProgress {
+    Pending,
+    Ready(Option<SourceFormat>),
 }
 
 pub(super) fn select(
@@ -66,14 +73,14 @@ pub(super) fn format(
     output: &str,
     configuration: &Configuration,
     plane: &mut dyn Plane,
-) -> Result<Option<SourceFormat>, &'static str> {
+) -> Result<FormatProgress, &'static str> {
     let format = required_format(configuration);
     format
         .validate()
         .map_err(|_| "invalid_capture_source_format")?;
     let Some(selection) = selection else {
         return if format.bit_depth == 8 && format.dynamic_range == DynamicRange::Sdr {
-            Ok(None)
+            Ok(FormatProgress::Ready(None))
         } else {
             Err("capture_source_route_required")
         };
@@ -108,9 +115,11 @@ pub(super) fn format(
     request
         .validate()
         .map_err(|_| "invalid_capture_source_mode")?;
-    let response = plane
-        .source_preflight(provider, &request)
-        .map_err(|_| "capture_source_preflight_unavailable")?;
+    let response = match plane.source_preflight(provider, &request) {
+        Ok(response) => response,
+        Err(MEDIA_BUSY | MEDIA_PENDING) => return Ok(FormatProgress::Pending),
+        Err(_) => return Err("capture_source_preflight_unavailable"),
+    };
     response
         .validate(&request)
         .map_err(|_| "invalid_capture_source_preflight")?;
@@ -119,9 +128,11 @@ pub(super) fn format(
     }
     // A provider without format_open retains its original strict Open schema.
     // Its positive depth/range capability attests its opaque selector's format.
-    Ok(response
-        .capabilities
-        .iter()
-        .any(|capability| capability.supports(&request) && capability.format_open)
-        .then_some(format))
+    Ok(FormatProgress::Ready(
+        response
+            .capabilities
+            .iter()
+            .any(|capability| capability.supports(&request) && capability.format_open)
+            .then_some(format),
+    ))
 }

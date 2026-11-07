@@ -109,6 +109,7 @@ struct Stream {
     source_id: Option<u64>,
     capture_selection: Option<capture_open::Selection>,
     capture_source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
+    capture_preflight_started: Option<Instant>,
     encoder_options: Option<Value>,
     source_started: bool,
     generic_input: bool,
@@ -1017,6 +1018,7 @@ impl Pipeline {
                 source_id,
                 capture_selection,
                 capture_source_format: None,
+                capture_preflight_started: None,
                 encoder_options,
                 source_started: false,
                 generic_input,
@@ -1748,14 +1750,36 @@ fn advance(
         if stream.stage != Stage::Capture {
             return false;
         }
-        match capture_open::format(
+        if stream.capture_selection.is_some() {
+            stream
+                .capture_preflight_started
+                .get_or_insert_with(Instant::now);
+        }
+        if capture_preflight_expired(stream) {
+            stream.cleanup("capture_source_preflight_timeout");
+            return false;
+        }
+        let preflight = capture_open::format(
             stream.capture_selection.as_ref(),
             stream.provider,
             &stream.capture_output,
             &stream.configuration,
             plane,
-        ) {
-            Ok(format) => stream.capture_source_format = format,
+        );
+        // A provider's synchronous callback may have returned after the
+        // admission deadline. Do not create a capture from an expired result.
+        if capture_preflight_expired(stream) {
+            stream.cleanup("capture_source_preflight_timeout");
+            return false;
+        }
+        match preflight {
+            Ok(capture_open::FormatProgress::Ready(format)) => {
+                stream.capture_preflight_started = None;
+                stream.capture_source_format = format;
+            }
+            Ok(capture_open::FormatProgress::Pending) => {
+                return false;
+            }
             Err(code) => {
                 stream.cleanup(code);
                 return false;
@@ -1868,6 +1892,12 @@ fn advance(
         }
     }
     false
+}
+
+fn capture_preflight_expired(stream: &Stream) -> bool {
+    stream
+        .capture_preflight_started
+        .is_some_and(|started| started.elapsed() >= Duration::from_secs(5))
 }
 
 fn request(stream: &Stream) -> (&str, Value) {

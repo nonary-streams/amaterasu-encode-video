@@ -5,6 +5,8 @@ use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_module_sdk::EncoderIdentity;
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 
+mod capture_preflight_retry;
+mod preflight_sdk;
 mod request_retirement;
 
 #[test]
@@ -392,6 +394,8 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 struct FakePlane {
     source_format_open: bool,
     source_response_mutation: Option<&'static str>,
+    source_preflight_statuses: VecDeque<amaterasu_module_sdk::abi::Status>,
+    source_preflight_delay: Duration,
     source_queries: Vec<(
         CaptureProvider,
         amaterasu_module_sdk::capture::SourcePreflightRequest,
@@ -452,6 +456,12 @@ impl Plane for FakePlane {
     > {
         use amaterasu_module_sdk::capture::{SourceModeCapabilities, SourcePreflightResponse};
         self.source_queries.push((provider, request.clone()));
+        if !self.source_preflight_delay.is_zero() {
+            std::thread::sleep(self.source_preflight_delay);
+        }
+        if let Some(status) = self.source_preflight_statuses.pop_front() {
+            return Err(status);
+        }
         let mut response = SourcePreflightResponse::ready(
             request,
             vec![SourceModeCapabilities {
@@ -5811,7 +5821,7 @@ fn capture_source_context_binds_signed_route_and_preserves_legacy_open_schema() 
             &legacy,
             &mut plane
         ),
-        Ok(None)
+        Ok(capture_open::FormatProgress::Ready(None))
     );
     assert!(plane.source_queries.is_empty());
     let selection =
@@ -5824,7 +5834,7 @@ fn capture_source_context_binds_signed_route_and_preserves_legacy_open_schema() 
             &legacy,
             &mut plane
         ),
-        Ok(None)
+        Ok(capture_open::FormatProgress::Ready(None))
     );
     assert_eq!(
         plane.source_queries[0].1.source_class,
@@ -5911,7 +5921,7 @@ fn capture_source_preflight_rejects_unknown_ten_bit_or_retargeted_and_unready_so
             &config,
             &mut FakePlane::default()
         ),
-        Ok(None)
+        Ok(capture_open::FormatProgress::Ready(None))
     );
 }
 
@@ -5961,10 +5971,10 @@ fn capture_source_format_uses_processing_input_range_and_frozen_native_mode() {
             &config,
             &mut plane
         ),
-        Ok(Some(SourceFormat {
+        Ok(capture_open::FormatProgress::Ready(Some(SourceFormat {
             bit_depth: 10,
             dynamic_range: DynamicRange::Hdr
-        }))
+        })))
     );
     assert_eq!(
         plane.source_queries[0].1.mode,
@@ -6063,8 +6073,10 @@ fn the_same_source_format_consumer_accepts_independently_selected_replacement_pr
             &open_configuration(),
             &mut plane,
         )
-        .unwrap()
         .unwrap();
+        let capture_open::FormatProgress::Ready(Some(format)) = format else {
+            panic!("replacement provider must be ready");
+        };
         assert_eq!(format.bit_depth, 8);
         assert_eq!(plane.source_queries[0].0, provider);
         assert_eq!(
