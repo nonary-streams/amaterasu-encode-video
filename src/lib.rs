@@ -1,5 +1,6 @@
 //! Video encoding control and the native CPU-frame and DMA-BUF interface.
 mod bitstream;
+mod closing;
 mod factory;
 #[cfg_attr(not(any(test, amaterasu_x265_hevc)), allow(dead_code))]
 mod hevc;
@@ -34,6 +35,8 @@ struct EncodeModule {
     shared: native::Shared,
     log_queue: LogQueue,
     last_timing_log: Instant,
+    shutting_down: bool,
+    closing: closing::Closing,
     _registration: Box<native::Registration>,
 }
 
@@ -68,12 +71,15 @@ impl ManagedModule for EncodeModule {
             shared,
             log_queue,
             last_timing_log: Instant::now(),
+            shutting_down: false,
+            closing: closing::Closing::default(),
             _registration: registration,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
         self.log_worker_timings();
+        self.closing.advance(&self.runtime, &self.shared)?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -90,7 +96,16 @@ impl ManagedModule for EncodeModule {
                     return Ok(());
                 }
                 let result = if service == SERVICE {
-                    self.control(&caller, payload)
+                    if let Ok(Operation::Close { session_id }) =
+                        serde_json::from_value(payload.clone())
+                    {
+                        match self.closing.admit(id, &caller, session_id) {
+                            Ok(()) => return self.closing.advance(&self.runtime, &self.shared),
+                            Err(code) => Err(code),
+                        }
+                    } else {
+                        self.control(&caller, payload)
+                    }
                 } else {
                     Err("invalid_service")
                 };
@@ -104,14 +119,39 @@ impl ManagedModule for EncodeModule {
                     Ok(Response::Ok)
                 ) && let Some(session) = created
                 {
-                    let _ = self
-                        .shared
-                        .lock()
-                        .map(|mut state| state.close(&caller, session));
+                    self.closing.rollback_open(&caller, session);
+                    self.closing.advance(&self.runtime, &self.shared)?;
                 }
                 Ok(())
             }
             _ => Err("encoder poll failed".into()),
+        }
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutting_down = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutting_down = true;
+        {
+            match self.shared.try_lock() {
+                Ok(mut sessions) => sessions.begin_shutdown(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("encoder state failed".into());
+                }
+            }
+        }
+        self.closing.advance(&self.runtime, &self.shared)?;
+        match self.shared.try_lock() {
+            Ok(sessions) => sessions
+                .shutdown_status()
+                .map(|ready| ready && self.closing.is_empty())
+                .map_err(str::to_owned),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err("encoder state failed".into()),
         }
     }
 }
@@ -138,6 +178,14 @@ impl EncodeModule {
     fn control(&self, caller: &str, payload: Value) -> Result<(Value, Option<u64>), &'static str> {
         let operation: Operation =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
+        if self.shutting_down
+            && matches!(&operation, Operation::Open { .. } | Operation::Probe { .. })
+        {
+            return Err("encoder_shutting_down");
+        }
+        if matches!(&operation, Operation::Close { .. }) {
+            return Err("encoder_close_requires_request");
+        }
         if let Operation::Probe {
             encoder,
             configuration,
@@ -180,7 +228,7 @@ impl EncodeModule {
                 packet_boundaries,
             ),
             Operation::Lookup { operation_id } => sessions.lookup(caller, &operation_id),
-            Operation::Close { session_id } => sessions.close(caller, session_id),
+            Operation::Close { .. } => unreachable!("close retains its broker request"),
             Operation::Status { session_id } => sessions.status(caller, session_id),
             Operation::Probe { .. } => unreachable!("probe runs outside the session lock"),
         }?;
@@ -192,7 +240,7 @@ impl EncodeModule {
 impl Drop for EncodeModule {
     fn drop(&mut self) {
         if let Ok(mut sessions) = self.shared.lock() {
-            sessions.clear();
+            let _ = sessions.clear();
         }
         self.log_queue.flush(&self.runtime);
     }

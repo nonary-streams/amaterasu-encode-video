@@ -15,6 +15,17 @@ use std::time::Instant;
 use crate::worker::{Metrics as WorkerMetrics, ReceiveResult, SubmitResult};
 
 pub trait Backend: Send {
+    /// Begin idempotent cancellation without waiting for native work. The session remains
+    /// owned until `ready_to_close` permits the mandatory close barrier.
+    fn begin_close(&mut self) {}
+    /// True only when closing will not wait for outstanding backend activity.
+    /// Backends with asynchronous workers must override both close hooks.
+    fn ready_to_close(&self) -> bool {
+        true
+    }
+    /// Retire all native execution and source pixel reads before returning,
+    /// including on error. An error preserves failed-cleanup evidence; it must
+    /// never transfer detached work that could outlive this backend or module.
     fn close(self: Box<Self>) -> Result<(), &'static str> {
         drop(self);
         Ok(())
@@ -60,6 +71,12 @@ pub trait Backend: Send {
 }
 
 impl Backend for Worker {
+    fn begin_close(&mut self) {
+        self.begin_shutdown();
+    }
+    fn ready_to_close(&self) -> bool {
+        Worker::ready_to_close(self)
+    }
     fn close(self: Box<Self>) -> Result<(), &'static str> {
         (*self).shutdown()
     }
@@ -123,6 +140,7 @@ pub struct Session {
     last_input: Option<(i64, u64)>,
     pending: Option<Packet>,
     draining: bool,
+    closing: bool,
     eos_sent: bool,
     failed: bool,
     color_conversion_total_us: u64,
@@ -162,12 +180,20 @@ struct OpenRecord {
     configuration: Configuration,
 }
 
+struct CloseFailure {
+    owner: String,
+    code: &'static str,
+}
+
 pub struct Sessions {
     pub enabled: bool,
     factory: Arc<dyn Factory>,
     next_id: u64,
     operations: BTreeMap<(String, String), OpenRecord>,
     values: BTreeMap<u64, Session>,
+    close_failures: BTreeMap<u64, CloseFailure>,
+    closed: BTreeMap<u64, String>,
+    accepting_new_sessions: bool,
 }
 
 impl Sessions {
@@ -178,6 +204,9 @@ impl Sessions {
             next_id: 0,
             operations: BTreeMap::new(),
             values: BTreeMap::new(),
+            close_failures: BTreeMap::new(),
+            closed: BTreeMap::new(),
+            accepting_new_sessions: true,
         }
     }
     pub fn with_log_emitter(
@@ -238,8 +267,13 @@ impl Sessions {
                 {
                     return Err("operation_conflict");
                 }
-                if !self.values.contains_key(&record.id) {
-                    return Err("session_closed");
+                if let Some(failure) = self.close_failures.get(&record.id) {
+                    return Err(failure.code);
+                }
+                match self.values.get(&record.id) {
+                    Some(session) if session.closing => return Err("session_closing"),
+                    Some(_) => (),
+                    None => return Err("session_closed"),
                 }
                 return Ok(open_reply(record.id, &configuration, packet_boundaries));
             }
@@ -272,14 +306,27 @@ impl Sessions {
         if !self.enabled {
             return Err("disabled");
         }
+        if !self.accepting_new_sessions {
+            return Err("encoder_shutting_down");
+        }
         config.validate()?;
         encoder.validate()?;
-        if self.values.len() >= 8
+        if self.values.len() + self.close_failures.len() + self.closed.len() >= 8
             || self
                 .values
                 .values()
                 .filter(|session| session.owner == owner)
                 .count()
+                + self
+                    .close_failures
+                    .values()
+                    .filter(|failure| failure.owner == owner)
+                    .count()
+                + self
+                    .closed
+                    .values()
+                    .filter(|closed_owner| *closed_owner == owner)
+                    .count()
                 >= 2
         {
             return Err("session_limit");
@@ -310,6 +357,7 @@ impl Sessions {
                 last_input: None,
                 pending: None,
                 draining: false,
+                closing: false,
                 eos_sent: false,
                 failed: false,
                 color_conversion_total_us: 0,
@@ -322,6 +370,11 @@ impl Sessions {
         Ok(response)
     }
     fn owned(&mut self, owner: &str, id: u64) -> Result<&mut Session, &'static str> {
+        if let Some(failure) = self.close_failures.get(&id)
+            && failure.owner == owner
+        {
+            return Err(failure.code);
+        }
         self.values
             .get_mut(&id)
             .filter(|session| session.owner == owner)
@@ -345,7 +398,9 @@ impl Sessions {
                 None
             }
         };
-        let state = if session.failed {
+        let state = if session.closing {
+            "closing"
+        } else if session.failed {
             "failed"
         } else if session.draining {
             "draining"
@@ -375,10 +430,71 @@ impl Sessions {
             })
             .collect()
     }
+    /// Synchronous lifetime barrier for native cancellation and final teardown.
+    /// Broker Close uses begin_close/poll_closing and keeps its request pending
+    /// until the worker is ready, rather than waiting inside the host tick.
     pub fn close(&mut self, owner: &str, id: u64) -> Result<Value, &'static str> {
+        if self
+            .closed
+            .get(&id)
+            .is_some_and(|closed_owner| closed_owner == owner)
+        {
+            return Ok(close_reply(id));
+        }
         self.owned(owner, id)?;
-        self.values.remove(&id);
-        Ok(json!({"ok":true,"session_id":id,"state":"closed"}))
+        let session = self.values.remove(&id).expect("validated owned session");
+        if let Err(code) = session.close() {
+            self.close_failures.insert(
+                id,
+                CloseFailure {
+                    owner: owner.to_owned(),
+                    code,
+                },
+            );
+            return Err(code);
+        }
+        self.closed.insert(id, owner.into());
+        Ok(close_reply(id))
+    }
+
+    pub fn begin_close(&mut self, owner: &str, id: u64) -> Result<(), &'static str> {
+        if self
+            .closed
+            .get(&id)
+            .is_some_and(|closed_owner| closed_owner == owner)
+        {
+            return Ok(());
+        }
+        self.owned(owner, id)?.begin_close();
+        Ok(())
+    }
+
+    pub fn close_result(&self, owner: &str, id: u64) -> Option<Result<Value, &'static str>> {
+        if self
+            .closed
+            .get(&id)
+            .is_some_and(|closed_owner| closed_owner == owner)
+        {
+            return Some(Ok(close_reply(id)));
+        }
+        if let Some(failure) = self.close_failures.get(&id)
+            && failure.owner == owner
+        {
+            return Some(Err(failure.code));
+        }
+        if self
+            .values
+            .get(&id)
+            .is_some_and(|session| session.owner == owner)
+        {
+            None
+        } else {
+            Some(Err("session_not_found"))
+        }
+    }
+
+    pub fn release_close_receipts(&mut self) {
+        self.closed.clear();
     }
     pub fn lookup(&self, owner: &str, operation: &str) -> Result<Value, &'static str> {
         validate_operation(operation)?;
@@ -386,6 +502,9 @@ impl Sessions {
             .operations
             .get(&(owner.into(), operation.into()))
             .ok_or("session_not_found")?;
+        if let Some(failure) = self.close_failures.get(&record.id) {
+            return Err(failure.code);
+        }
         if !self.values.contains_key(&record.id) {
             return Err("session_not_found");
         }
@@ -398,8 +517,56 @@ impl Sessions {
     pub fn latest_id(&self) -> u64 {
         self.next_id
     }
-    pub fn clear(&mut self) {
-        self.values.clear();
+    pub fn stop_admitting_sessions(&mut self) {
+        self.accepting_new_sessions = false;
+    }
+
+    pub fn begin_shutdown(&mut self) {
+        self.stop_admitting_sessions();
+        for session in self.values.values_mut() {
+            session.begin_close();
+        }
+    }
+
+    pub fn poll_closing(&mut self) {
+        let ready: Vec<_> = self
+            .values
+            .iter()
+            .filter(|(_, session)| session.closing && session.backend.ready_to_close())
+            .map(|(id, session)| (*id, session.owner.clone()))
+            .collect();
+        for (id, owner) in ready {
+            let _ = self.close(&owner, id);
+        }
+    }
+
+    pub fn shutdown_status(&self) -> Result<bool, &'static str> {
+        if !self.values.is_empty() {
+            return Ok(false);
+        }
+        match self.close_failures.values().next() {
+            Some(failure) => Err(failure.code),
+            None => Ok(true),
+        }
+    }
+
+    pub fn clear(&mut self) -> Result<(), &'static str> {
+        self.stop_admitting_sessions();
+        for session in self.values.values_mut() {
+            session.begin_close();
+        }
+        let sessions: Vec<_> = self
+            .values
+            .iter()
+            .map(|(id, session)| (*id, session.owner.clone()))
+            .collect();
+        for (id, owner) in sessions {
+            let _ = self.close(&owner, id);
+        }
+        match self.close_failures.values().next() {
+            Some(failure) => Err(failure.code),
+            None => Ok(()),
+        }
     }
     /// # Safety
     /// Frame allocation is borrowed for this call and contains its declared bytes.
@@ -510,6 +677,9 @@ impl Sessions {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
         };
+        if session.closing {
+            return MEDIA_CLOSED;
+        }
         if session.failed {
             return MEDIA_BACKEND_ERROR;
         }
@@ -532,6 +702,9 @@ impl Sessions {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
         };
+        if session.closing {
+            return MEDIA_CLOSED;
+        }
         if session.failed {
             return MEDIA_BACKEND_ERROR;
         }
@@ -623,8 +796,35 @@ impl Sessions {
     }
 }
 
+fn close_reply(id: u64) -> Value {
+    json!({"ok":true,"session_id":id,"state":"closed"})
+}
+
 impl Session {
+    fn begin_close(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            self.backend.begin_close();
+        }
+    }
+
+    fn close(self) -> Result<(), &'static str> {
+        let Self {
+            backend,
+            retained_frames,
+            ..
+        } = self;
+        // Backend::close is the source-read barrier on both success and error.
+        // Provider callbacks must remain pinned until that barrier completes.
+        let result = backend.close();
+        drop(retained_frames);
+        result
+    }
+
     fn check_accepting(&self) -> Result<(), Status> {
+        if self.closing {
+            return Err(MEDIA_CLOSED);
+        }
         if self.failed {
             return Err(MEDIA_BACKEND_ERROR);
         }
@@ -841,6 +1041,9 @@ fn open_reply(id: u64, config: &Configuration, packet_boundaries: bool) -> Value
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shutdown_tests;
 
 #[cfg(all(test, unix))]
 mod gpu_input_tests;

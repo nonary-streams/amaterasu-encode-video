@@ -691,9 +691,20 @@ impl Worker {
 }
 
 impl Worker {
-    pub fn shutdown(mut self) -> Result<(), &'static str> {
+    /// Stop queue admission and skip queued operations after the current native
+    /// call returns. The worker and its module code remain owned until joined.
+    pub fn begin_shutdown(&mut self) {
         self.cancel.cancel();
         self.sender.take();
+    }
+
+    /// A finished thread can be joined without blocking the module's host tick.
+    pub fn ready_to_close(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub fn shutdown(mut self) -> Result<(), &'static str> {
+        self.begin_shutdown();
         if let Some(thread) = self.thread.take() {
             thread.join().map_err(|_| "encoder_shutdown_failed")?;
         }

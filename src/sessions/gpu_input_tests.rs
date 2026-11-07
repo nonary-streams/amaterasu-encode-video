@@ -731,6 +731,117 @@ fn leased_submission_does_not_block_and_shutdown_retires_the_reference() {
     }
 }
 
+#[test]
+fn cooperative_shutdown_keeps_leases_until_the_native_worker_has_retired() {
+    use amaterasu_module_sdk::ManagedModule;
+    use std::sync::{atomic::Ordering, mpsc};
+    use std::time::{Duration, Instant};
+
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (entered, entry) = mpsc::channel();
+    let worker = Worker::with_backend(CompletionBackend {
+        entered,
+        gate: gate.clone(),
+        fail: false,
+    });
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert("alice", configuration(), Box::new(worker), false)
+        .unwrap();
+    let id = sessions.latest_id();
+    let (plane, mut writer) = stand_in();
+    let callbacks = LeaseCallbacks::default();
+    let lease = leased_frame(frame(&plane, None, 1), &callbacks);
+    // SAFETY: callback state and immutable source storage remain live until
+    // cooperative shutdown joins the worker and releases the retained lease.
+    assert_eq!(
+        unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) },
+        STATUS_OK
+    );
+    let mut module = super::shutdown_tests::module(sessions);
+    let release = ReleaseCompletionGate(gate);
+    let entered = entry.recv_timeout(Duration::from_secs(3));
+    drop(plane);
+    let ready = module.quiesce();
+    let released_while_running = callbacks.released.load(Ordering::Relaxed);
+    let descriptors_retained = !reader_closed(&mut writer);
+    drop(release);
+    assert!(entered.is_ok());
+    assert_eq!(ready, Ok(false));
+    assert_eq!(released_while_running, 0);
+    assert!(descriptors_retained);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !module.quiesce().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+    assert!(reader_closed(&mut writer));
+}
+
+#[test]
+fn broker_close_waits_for_gpu_leases_and_observes_native_cancel_retirement() {
+    use amaterasu_module_sdk::ManagedModule;
+    use std::sync::{atomic::Ordering, mpsc};
+    use std::time::Duration;
+
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (entered, entry) = mpsc::channel();
+    let worker = Worker::with_backend(CompletionBackend {
+        entered,
+        gate: gate.clone(),
+        fail: false,
+    });
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert("alice", configuration(), Box::new(worker), false)
+        .unwrap();
+    let id = sessions.latest_id();
+    let (plane, mut writer) = stand_in();
+    let callbacks = LeaseCallbacks::default();
+    let lease = leased_frame(frame(&plane, None, 1), &callbacks);
+    // SAFETY: callback state and the source plane outlive the retained reference.
+    assert_eq!(
+        unsafe { sessions.submit_dmabuf_leased("alice", id, &lease, 0) },
+        STATUS_OK
+    );
+    let mut module = super::shutdown_tests::module(sessions);
+    let release = ReleaseCompletionGate(gate);
+    let broker = super::shutdown_tests::Broker::attach(&mut module);
+    let entered = entry.recv_timeout(Duration::from_secs(3));
+    broker.request(61, "alice", json!({"action":"close","session_id":id}));
+    let first = module.tick();
+    let completed_early = broker.completed();
+    let released_early = callbacks.released.load(Ordering::Relaxed);
+    drop(plane);
+    let descriptors_retained = !reader_closed(&mut writer);
+    broker.cancel(61);
+    broker.request(73, "alice", json!({"action":"close","session_id":id}));
+    let retried = module.tick();
+    drop(release);
+    assert!(entered.is_ok());
+    assert!(first.is_ok());
+    assert!(retried.is_ok());
+    assert!(completed_early.is_empty());
+    assert_eq!(released_early, 0);
+    assert!(descriptors_retained);
+    let binding = bind_lease_encoder(&module._registration, "alice");
+    // SAFETY: this fixture owns the live binding and invokes cancellation on
+    // the lease's owning thread. It remains a synchronous source-read barrier.
+    unsafe {
+        let api = &*binding;
+        (api.cancel_dmabuf_leases)(api.base.context, id);
+        api.base.release.unwrap()(api.base.context);
+    }
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+    assert!(reader_closed(&mut writer));
+    module.tick().unwrap();
+    assert_eq!(
+        broker.completed(),
+        vec![(73, json!({"ok":true,"session_id":id,"state":"closed"}))]
+    );
+}
+
 fn bind_lease_encoder(registration: &Registration, owner: &str) -> *const EncoderApiV1_2 {
     let query = NativeInterfaceQuery {
         header: AbiHeader::of::<NativeInterfaceQuery>(),

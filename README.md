@@ -93,14 +93,14 @@ session state; concurrent or reentrant calls return `MEDIA_BUSY`.
 The additive `EncoderApiV1_2` table adds `submit_dmabuf_leased` and the mandatory
 `cancel_dmabuf_leases` lifetime barrier. Cancellation closes the caller-owned
 encoder session and joins its worker before returning, while capture and
-processor bindings remain live. Immutable
-presentation leases remain borrowed for the native call; this encoder completes
-all source GPU reads on its worker before returning, including failure paths.
-It does not retain capture or processor callbacks after return. Native NVENC
+processor bindings remain live. Leased submission retains immutable source
+storage on the module thread before queueing work and returns without waiting
+for the encoder worker. The provider reference stays pinned until encoded
+output proves completion or cancellation joins the worker. Only duplicated
+descriptors cross the worker boundary; provider callbacks run on the module
+thread. Native NVENC
 finishes GL reads before retiring the source image and synchronizes CUDA copies
-before using its private encode input. This initial safe-completion path can
-block the caller while native driver work runs; it does not apply the ordinary
-three-second asynchronous request timeout, because expiring the borrow while a
+before using its private encode input. Expiring the retained reference while a
 worker still reads its pixels would violate ownership. The queue remains bounded.
 Backends without an explicit completion guarantee return `MEDIA_UNSUPPORTED`.
 The older v1.0/v1.1 table prefixes remain compatible; duplicating a DMA-BUF fd
@@ -121,6 +121,21 @@ three outstanding operations (one running and two queued); `MEDIA_BUSY` accepts
 nothing, and dropped input retains neither sequence nor timestamp. Close cancels
 queued operations after the current native call returns, then joins the worker so
 module-owned code cannot be unloaded while native code is running.
+The broker Close request remains pending while its worker retires; it reports
+`state:closed` only after the joined shutdown barrier. Cancellation removes the
+request waiter, while its accepted cleanup target remains owned and progresses
+on later ticks. Duplicate Close requests share that retirement and retain their
+exact request IDs. The provider bounds both waiters and unvalidated close targets
+to 128 entries. A failed Open reply delivery uses the same background cleanup
+path. Native `cancel_dmabuf_leases` remains a synchronous lifetime barrier.
+Host shutdown first rejects new Open and Probe requests while serving existing
+consumers. Once consumers have drained, cooperative quiescence cancels all
+workers and polls their completion without blocking the host tick. Readiness
+requires every worker to be joined and its retained source leases released.
+An explicit backend close error remains owner scoped and repeatable through
+Close, Status, Lookup, and original Open retries. These unresolved records count
+against the same global and per-owner session limits; they never authorize a
+replacement session by silently disappearing.
 `MEDIA_BACKEND_ERROR` makes the session terminal until close, since a hardware
 call may already have accepted its sample before failing or timing out.
 
