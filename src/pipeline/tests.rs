@@ -436,6 +436,7 @@ struct FakePlane {
     swap_decisions: Vec<(u64, u64, amaterasu_module_sdk::capture::SwapDecision)>,
     swap_reply_error: bool,
     retired_events: Vec<u64>,
+    finished_streams: Vec<u64>,
 }
 
 impl Plane for FakePlane {
@@ -551,6 +552,9 @@ impl Plane for FakePlane {
     }
     fn release_stream(&mut self, video: u64) {
         self.retired_events.push(video);
+    }
+    fn finish_stream(&mut self, video: u64) {
+        self.finished_streams.push(video);
     }
     fn verify_geometry(
         &mut self,
@@ -4187,6 +4191,7 @@ mod capture_events;
 mod operations;
 mod owned_capture;
 mod presentation;
+mod quiescence;
 
 #[test]
 fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {

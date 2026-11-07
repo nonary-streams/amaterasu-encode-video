@@ -6,6 +6,15 @@ stream and H.264 encoder session asynchronously, then moves borrowed
 CPU frames directly into the encoder's copying submit API. Encoded packets reach
 consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 
+Host shutdown announcement fences new opens, selections and preflights while
+existing streams keep serving their consumers. After those consumers drain,
+video retires its native frame borrows and follows the same owner-scoped
+capture/encoder cleanup used by Close. It reports ready only after streams,
+packet queues and retained broker requests settle. Failed cleanup remains
+visible and the original host deadline never renews on another poll. Native
+callbacks must return and consumers must release their bindings before unload;
+quiescence does not preempt arbitrary foreign callback code.
+
 Linux settings default to:
 
 ```json

@@ -100,6 +100,18 @@ impl ManagedModule for Video {
         })
     }
 
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        self.pipeline.prepare_shutdown(remaining_ms);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let runtime = &self.runtime;
+        self.pipeline.quiesce(&mut *self.plane, &mut |command| {
+            runtime.send_ephemeral(command)
+        })
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::High,
@@ -128,6 +140,10 @@ impl ManagedModule for Video {
                     return Ok(());
                 }
                 if payload["action"] == "preflight_source" {
+                    if self.pipeline.admission_closed() {
+                        rpc::complete(&mut send, id, error("shutting_down"));
+                        return Ok(());
+                    }
                     let response =
                         self.source_preflight
                             .handle(runtime, self.plane.as_mut(), id, payload);
@@ -157,3 +173,6 @@ impl Drop for Video {
 }
 
 amaterasu_module_sdk::export_module!(Video);
+
+#[cfg(test)]
+mod lifecycle_tests;

@@ -759,6 +759,31 @@ fn begin_explicit_encoder_inspection() -> (Pipeline, Runtime, FakePlane) {
 }
 
 #[test]
+fn close_during_explicit_encoder_inspection_prevents_late_capture_allocation() {
+    let (mut pipeline, mut runtime, mut plane) = begin_explicit_encoder_inspection();
+    let pending = pipeline.streams[&1].pending.unwrap();
+    pipeline.handle(
+        "alice",
+        78,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(pipeline.streams[&1].stage, Stage::FindEncoder);
+    runtime.hold_encoder_enumeration = false;
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert!(pipeline.streams.is_empty());
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { request } if *request == pending))
+    );
+    assert_eq!(runtime.open_effects, 0);
+    assert!(capture_opens(&runtime).is_empty());
+    assert!(runtime.ended.contains(&77));
+}
+
+#[test]
 fn timed_out_explicit_encoder_inspection_settles_before_pipewire_open() {
     let (mut pipeline, mut runtime, mut plane) = begin_explicit_encoder_inspection();
     let pending = pipeline.streams[&1].pending.unwrap();

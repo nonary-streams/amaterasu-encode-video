@@ -35,6 +35,35 @@ pub(super) struct Control {
 }
 
 impl Control {
+    pub(super) fn quiesce(&mut self, send: &mut Send<'_>) -> bool {
+        self.pending.retain(|_, pending| {
+            // A failed transport check is not evidence that this delivered
+            // parent ended. Keep its ownership until completion is confirmed.
+            if !rpc::end_parent(send, pending.parent, error("video_shutdown")) {
+                return true;
+            }
+            if pending.child.is_none() {
+                match send(pending.command.clone()) {
+                    Ok(Response::Accepted { id }) => pending.child = Some(id),
+                    Ok(Response::Error { code, .. })
+                        if matches!(
+                            code.as_str(),
+                            "permission_denied"
+                                | "invalid_request"
+                                | "unavailable"
+                                | "capacity_exhausted"
+                        ) =>
+                    {
+                        return false;
+                    }
+                    _ => return true,
+                }
+            }
+            !rpc::cancel(send, pending.child.expect("recovered observation child"))
+        });
+        self.pending.is_empty()
+    }
+
     pub(super) fn begin(
         &mut self,
         owner: &str,

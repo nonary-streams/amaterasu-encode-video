@@ -73,7 +73,19 @@ pub(super) fn tick(
     queues: &Arc<Mutex<Queues>>,
     plane: &mut dyn Plane,
 ) {
-    let eos = queues.lock().is_ok_and(|queues| queues.eos_accepted(id));
+    let Ok(queue) = queues.try_lock() else {
+        if stream
+            .grace
+            .as_ref()
+            .is_some_and(|grace| Instant::now() >= grace.deadline)
+        {
+            stream.cleanup("drain_timeout");
+        }
+        return;
+    };
+    let eos = queue.eos_accepted(id);
+    let eos_queued = queue.eos_queued(id);
+    drop(queue);
     if eos {
         stream.cleanup("drained");
         return;
@@ -91,7 +103,7 @@ pub(super) fn tick(
     }
     // Once the encoder's EOS is buffered, only consumer acceptance or timeout can
     // advance output. Do not require further calls into an already drained provider.
-    if queues.lock().is_ok_and(|queues| queues.eos_queued(id)) {
+    if eos_queued {
         return;
     }
     if !grace.drain_sent {

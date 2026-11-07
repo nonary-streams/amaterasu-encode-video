@@ -185,6 +185,7 @@ struct Stream {
     diagnostics: Option<DiagnosticWindow>,
     last_frame: Option<FrameMetadata>,
     unresolved: bool,
+    cleanup_complete: bool,
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -521,6 +522,9 @@ impl Stream {
 pub struct Pipeline {
     require_frame_lease: bool,
     enabled: bool,
+    shutdown_deadline: Option<Instant>,
+    quiescing: bool,
+    pending_queue_closes: BTreeSet<u64>,
     providers: BTreeSet<CaptureProvider>,
     source_preflight_routes: BTreeMap<String, crate::model::SourcePreflightRoute>,
     encoder_providers: BTreeMap<String, String>,
@@ -561,6 +565,9 @@ impl Pipeline {
         Self {
             require_frame_lease: settings.require_frame_lease,
             enabled: settings.enabled,
+            shutdown_deadline: None,
+            quiescing: false,
+            pending_queue_closes: BTreeSet::new(),
             providers: settings.resolved_providers(),
             source_preflight_routes: settings.resolved_source_preflight_routes(),
             encoder_providers: settings.external_encoder_providers,
@@ -592,6 +599,18 @@ impl Pipeline {
         operation: Operation,
         send: &mut Send<'_>,
     ) {
+        let shutdown_allowed = match operation {
+            Operation::Status { .. }
+            | Operation::Lookup { .. }
+            | Operation::Close { .. }
+            | Operation::Drain { .. } => true,
+            Operation::CancelPortalSelection { .. } => !self.quiescing,
+            _ => false,
+        };
+        if self.admission_closed() && !shutdown_allowed {
+            rpc::complete(send, request, error("shutting_down"));
+            return;
+        }
         match operation {
             Operation::SelectPortalSource {
                 source_type,
@@ -730,6 +749,7 @@ impl Pipeline {
                 if matches!(
                     value.stage,
                     Stage::SelectEncoder
+                        | Stage::InspectEncoder
                         | Stage::X11Enumerate
                         | Stage::KmsEnumerate
                         | Stage::ProbeEncoder
@@ -746,9 +766,7 @@ impl Pipeline {
                 ) {
                     value.cleanup("closed_by_caller");
                 }
-                if let Ok(mut queues) = self.queues.lock() {
-                    queues.close(stream);
-                }
+                close_queue(&self.queues, &mut self.pending_queue_closes, stream);
                 rpc::complete(send, request, value.response(stream));
             }
         }
@@ -1078,6 +1096,7 @@ impl Pipeline {
                 diagnostics: None,
                 last_frame: None,
                 unresolved: false,
+                cleanup_complete: false,
             }
         });
     }
@@ -1089,10 +1108,23 @@ impl Pipeline {
     }
 
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
-        self.portal.tick(send);
-        self.observations.tick(&self.streams, send);
-        self.live_settings
-            .tick(&mut self.streams, &self.epoch, plane, send);
+        if !self.pending_queue_closes.is_empty()
+            && let Ok(mut queues) = self.queues.try_lock()
+        {
+            for id in std::mem::take(&mut self.pending_queue_closes) {
+                queues.close(id);
+            }
+        }
+        if self.quiescing {
+            self.portal.quiesce(send);
+            self.observations.quiesce(send);
+            self.live_settings.quiesce(send);
+        } else {
+            self.portal.tick(send);
+            self.observations.tick(&self.streams, send);
+            self.live_settings
+                .tick(&mut self.streams, &self.epoch, plane, send);
+        }
         if self.streams.is_empty() {
             return;
         }
@@ -1100,9 +1132,18 @@ impl Pipeline {
         let id = *self.streams.keys().nth(self.cursor).unwrap();
         self.cursor += 1;
         let stream = self.streams.get_mut(&id).unwrap();
+        if stream.cleanup_complete {
+            close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            if !self.pending_queue_closes.contains(&id)
+                && let Some(stream) = self.streams.remove(&id)
+            {
+                self.remember_failure(id, &stream);
+            }
+            return;
+        }
         plane.select_encoder(&stream.encoder_service);
         plane.set_stream_clock(id, stream.clock_origin_us, stream.clock_epoch);
-        if !stream.gpu_configured {
+        if !stream.gpu_configured && !self.quiescing {
             match plane.configure_gpu(id, stream.configuration.gpu_processing.as_ref()) {
                 Ok(()) => stream.gpu_configured = true,
                 Err(reason) => {
@@ -1147,15 +1188,14 @@ impl Pipeline {
         if stream.stage != Stage::Running
             && !((stream.source_id.is_some() || stream.generic_input)
                 && stream.stage == Stage::Draining)
+            && !(stream.source_started && stream.stage == Stage::Activating)
         {
             plane.release_stream(id);
         }
         if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
             output::tick(stream, id, &self.queues, plane);
-            if !matches!(stream.stage, Stage::StopCapture | Stage::Draining)
-                && let Ok(mut queues) = self.queues.lock()
-            {
-                queues.close(id);
+            if !matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
+                close_queue(&self.queues, &mut self.pending_queue_closes, id);
             }
             if stream.stage == Stage::Draining {
                 return;
@@ -1191,7 +1231,7 @@ impl Pipeline {
                 pump(plane, stream, id, &self.queues, &self.processing_generation);
                 log_diagnostics(stream, id, send);
             }
-            if let Ok(mut queues) = self.queues.lock() {
+            if let Ok(mut queues) = self.queues.try_lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
                 if let Some(capture) = stream.capture {
                     match plane.hdr_metadata(id, stream.provider, capture) {
@@ -1203,14 +1243,18 @@ impl Pipeline {
             if !matches!(
                 stream.stage,
                 Stage::Running | Stage::RestartCloseEncoder | Stage::ReplaceCapture
-            ) && let Ok(mut queues) = self.queues.lock()
-            {
-                queues.close(id);
+            ) {
+                close_queue(&self.queues, &mut self.pending_queue_closes, id);
             }
             return;
         }
         if stream.stage == Stage::Activating {
-            match verify_stream_geometry(plane, stream) {
+            let geometry = if stream.source_id.is_some() {
+                Ok(GeometryProgress::Ready)
+            } else {
+                verify_stream_geometry(plane, stream)
+            };
+            match geometry {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, &self.queues, send),
                 Ok(GeometryProgress::Busy) => return,
                 Err(code) => stream.cleanup(code),
@@ -1222,13 +1266,26 @@ impl Pipeline {
         }
         if advance(stream, id, &self.queues, plane, send) {
             plane.finish_stream(id);
+            stream.cleanup_complete = true;
+            close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            // A consumer may still borrow an owned packet. Keep this bounded
+            // stream slot until that queue closes, without replaying native close.
+            if self.pending_queue_closes.contains(&id) {
+                return;
+            }
             if let Some(stream) = self.streams.remove(&id) {
                 self.remember_failure(id, &stream);
             }
-            if let Ok(mut queues) = self.queues.lock() {
-                queues.close(id);
-            }
         }
+    }
+}
+
+fn close_queue(queues: &Arc<Mutex<Queues>>, pending: &mut BTreeSet<u64>, id: u64) {
+    if let Ok(mut queues) = queues.try_lock() {
+        queues.close(id);
+        pending.remove(&id);
+    } else {
+        pending.insert(id);
     }
 }
 
@@ -3507,9 +3564,16 @@ fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
 }
 
 fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mut Send<'_>) {
-    let Ok(mut guard) = queues.lock() else {
-        stream.cleanup("queue_failed");
-        return;
+    let mut guard = match queues.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            stream.stage = Stage::Activating;
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            stream.cleanup("queue_failed");
+            return;
+        }
     };
     guard.open(id, &stream.owner, stream.clock_origin_us);
     guard.set_geometry(id, stream.desktop_geometry);
@@ -3520,7 +3584,7 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
     {
         stream.ending_parent = Some(parent);
         stream.cleanup("completion_lost");
-        if let Ok(mut queues) = queues.lock() {
+        if let Ok(mut queues) = queues.try_lock() {
             queues.close(id);
         }
     }

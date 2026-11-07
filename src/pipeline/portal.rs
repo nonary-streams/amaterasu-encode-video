@@ -25,6 +25,12 @@ struct Pending {
     owner: String,
     operation_id: String,
     action: Action,
+    result: Option<Result<Value, &'static str>>,
+}
+
+struct Admission {
+    pending: Pending,
+    command: Command,
 }
 
 #[derive(Clone, Copy)]
@@ -39,9 +45,19 @@ pub(super) struct Control {
     selections: BTreeMap<(String, String), Selection>,
     current: Option<(String, String)>,
     pending: BTreeMap<u64, Pending>,
+    admissions: BTreeMap<u64, Admission>,
 }
 
 impl Control {
+    pub(super) fn quiesce(&mut self, send: &mut Send<'_>) -> bool {
+        self.reconcile_admissions(true, send);
+        self.pending.retain(|child, pending| {
+            !rpc::end_parent(send, pending.parent, error("video_shutdown"))
+                || !rpc::cancel(send, *child)
+        });
+        self.pending.is_empty() && self.admissions.is_empty()
+    }
+
     pub(super) fn select(
         &mut self,
         owner: &str,
@@ -164,6 +180,7 @@ impl Control {
     }
 
     pub(super) fn tick(&mut self, send: &mut Send<'_>) {
+        self.reconcile_admissions(false, send);
         let Some(child) = self.pending.keys().next().copied() else {
             return;
         };
@@ -176,29 +193,78 @@ impl Control {
             }),
             Ok(Response::Ok)
         ) {
-            let pending = self
-                .pending
-                .remove(&child)
-                .expect("pending portal request exists");
-            let _ = rpc::cancel(send, child);
-            if matches!(pending.action, Action::Select) {
-                self.selections
-                    .remove(&(pending.owner, pending.operation_id));
+            if rpc::cancel(send, child) {
+                let pending = self
+                    .pending
+                    .remove(&child)
+                    .expect("pending portal request exists");
+                if matches!(pending.action, Action::Select) {
+                    self.selections
+                        .remove(&(pending.owner, pending.operation_id));
+                }
             }
             return;
         }
-        let Some(result) = rpc::result(send, child) else {
-            return;
-        };
+        if pending.result.is_none() {
+            let Some(result) = rpc::result(send, child) else {
+                return;
+            };
+            self.pending
+                .get_mut(&child)
+                .expect("pending portal request exists")
+                .result = Some(result);
+        }
+        match send(Command::ReleaseResult { request: child }) {
+            Ok(Response::Ok) => {}
+            Ok(Response::Error { code, .. }) if code == "not_found" => {}
+            _ => return,
+        }
         let pending = self
             .pending
             .remove(&child)
             .expect("pending portal request exists");
-        let payload = match result {
-            Ok(payload) => self.record_result(&pending, payload),
+        let payload = match pending.result.as_ref().expect("provider result retained") {
+            Ok(payload) => self.record_result(&pending, payload.clone()),
             Err(_) => error("portal_provider_failed"),
         };
         rpc::complete(send, pending.parent, payload);
+    }
+
+    fn reconcile_admissions(&mut self, ending: bool, send: &mut Send<'_>) {
+        let parents: Vec<_> = self.admissions.keys().copied().collect();
+        for parent in parents {
+            let admission = self
+                .admissions
+                .get(&parent)
+                .expect("retained portal admission");
+            if ending && !rpc::end_parent(send, parent, error("video_shutdown")) {
+                continue;
+            }
+            match send(admission.command.clone()) {
+                Ok(Response::Accepted { id }) => {
+                    let admission = self
+                        .admissions
+                        .remove(&parent)
+                        .expect("retained portal admission");
+                    self.pending.insert(id, admission.pending);
+                }
+                Ok(Response::Error { code, .. })
+                    if matches!(
+                        code.as_str(),
+                        "permission_denied"
+                            | "invalid_request"
+                            | "unavailable"
+                            | "capacity_exhausted"
+                    ) =>
+                {
+                    if !ending && !rpc::end_parent(send, parent, error("portal_provider_failed")) {
+                        continue;
+                    }
+                    self.admissions.remove(&parent);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn dispatch(
@@ -209,7 +275,7 @@ impl Control {
         action: Action,
         send: &mut Send<'_>,
     ) {
-        if self.pending.len() >= MAX_PENDING {
+        if self.pending.len() + self.admissions.len() >= MAX_PENDING {
             rpc::complete(send, request, error("portal_request_limit"));
             return;
         }
@@ -233,29 +299,30 @@ impl Control {
             payload["source_type"] = json!(selection.source_type);
         }
         let runtime_operation = format!("video-portal-{request}-{action_name}");
-        match send(Command::Request {
+        let command = Command::Request {
             service: PIPEWIRE.into(),
             payload,
             timeout_ms: 5000,
             operation_id: runtime_operation,
             parent: Some(request),
-        }) {
+        };
+        let pending = Pending {
+            parent: request,
+            owner: owner.to_owned(),
+            operation_id: operation_id.to_owned(),
+            action,
+            result: None,
+        };
+        match send(command.clone()) {
             Ok(Response::Accepted { id }) => {
-                self.pending.insert(
-                    id,
-                    Pending {
-                        parent: request,
-                        owner: owner.to_owned(),
-                        operation_id: operation_id.to_owned(),
-                        action,
-                    },
-                );
+                self.pending.insert(id, pending);
             }
             Ok(Response::Error { code, .. }) => {
                 rpc::complete(send, request, error(&code));
             }
             _ => {
-                rpc::complete(send, request, error("portal_provider_failed"));
+                self.admissions
+                    .insert(request, Admission { pending, command });
             }
         }
     }

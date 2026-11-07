@@ -1,8 +1,70 @@
-//! Synchronous teardown cannot wait for other modules to tick. Stop delivery and
-//! queue only exact known closes; provider destruction owns final crash recovery.
+//! Cooperative retirement retains exact cleanup ownership while providers tick.
+//! Synchronous destruction only queues known closes as a final containment path.
 use super::*;
 
 impl Pipeline {
+    pub fn admission_closed(&self) -> bool {
+        self.shutdown_deadline.is_some() || self.quiescing
+    }
+
+    pub fn prepare_shutdown(&mut self, remaining_ms: u64) {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_millis(remaining_ms))
+            .unwrap_or(now);
+        self.shutdown_deadline = Some(
+            self.shutdown_deadline
+                .map_or(deadline, |previous| previous.min(deadline)),
+        );
+    }
+
+    /// Retire native borrows before queuing exact control cleanup. Providers
+    /// remain tickable until each retained request and resource has settled.
+    pub fn quiesce(
+        &mut self,
+        plane: &mut dyn Plane,
+        send: &mut Send<'_>,
+    ) -> amaterasu_module_sdk::ModuleResult<bool> {
+        if !self.quiescing {
+            self.quiescing = true;
+            if self.shutdown_deadline.is_none() {
+                self.prepare_shutdown(20_000);
+            }
+            for (&id, stream) in &mut self.streams {
+                plane.finish_stream(id);
+                if !matches!(
+                    stream.stage,
+                    Stage::FindEncoder
+                        | Stage::CloseEncoder
+                        | Stage::FindCapture
+                        | Stage::CloseCapture
+                        | Stage::Failed
+                ) {
+                    stream.cleanup("video_shutdown");
+                }
+            }
+        }
+        let queues_closed = self.queues.try_lock().is_ok_and(|mut queues| {
+            queues.clear();
+            true
+        });
+        if queues_closed {
+            self.pending_queue_closes.clear();
+        }
+        let controls_closed = self.portal.quiesce(send)
+            & self.observations.quiesce(send)
+            & self.live_settings.quiesce(send);
+        let ready = queues_closed && controls_closed && self.streams.is_empty();
+        if !ready
+            && self
+                .shutdown_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err("video shutdown deadline elapsed with cleanup pending".into());
+        }
+        Ok(ready)
+    }
+
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         self.enabled = false;
         self.observations.shutdown(send);

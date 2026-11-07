@@ -29,6 +29,28 @@ pub(super) struct Control {
 }
 
 impl Control {
+    pub(super) fn quiesce(&mut self, send: &mut Send<'_>) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return true;
+        };
+        if pending.request.is_none() {
+            match send(pending.command.clone()) {
+                Ok(Response::Accepted { id }) => pending.request = Some(id),
+                Ok(Response::Error { .. }) => {
+                    self.pending = None;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        let request = pending.request.expect("recovered live settings request");
+        if !crate::rpc::cancel(send, request) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
     pub(super) fn shutdown(&mut self, send: &mut Send<'_>) {
         let Some(pending) = self.pending.take() else {
             return;
