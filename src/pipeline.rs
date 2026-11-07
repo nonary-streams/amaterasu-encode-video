@@ -153,6 +153,7 @@ struct Stream {
     parent: Option<u64>,
     ending_parent: Option<u64>,
     pending: Option<u64>,
+    completed_payload: Option<Value>,
     unsettled: Option<u64>,
     uncertain: Option<Command>,
     settlement_attempts: u8,
@@ -505,6 +506,7 @@ impl Stream {
         if let Some(request) = self.pending.take() {
             self.unsettled = Some(request);
         }
+        self.completed_payload = None;
         if let Some(parent) = self.parent.take() {
             self.ending_parent = Some(parent);
         }
@@ -1059,6 +1061,7 @@ impl Pipeline {
                 parent: Some(request),
                 ending_parent: None,
                 pending: None,
+                completed_payload: None,
                 unsettled: None,
                 uncertain: None,
                 settlement_attempts: 0,
@@ -1697,8 +1700,13 @@ fn advance(
         return finish_cleanup(stream);
     }
     if let Some(request) = stream.pending {
-        let Some(result) = rpc::result(send, request) else {
-            return false;
+        let result = if let Some(payload) = stream.completed_payload.take() {
+            Ok(payload)
+        } else {
+            let Some(result) = rpc::result(send, request) else {
+                return false;
+            };
+            result
         };
         if result.is_err()
             || matches!(
@@ -1713,6 +1721,12 @@ fn advance(
             // Selection children retain no codec session. Their result must be
             // released before another probe, capture allocation or failure.
             stream.unsettled = Some(request);
+        } else if !rpc::release(send, request) {
+            // TakeResult retains the broker's payload and operation record.
+            // Keep both the exact request and its observed result until release
+            // is confirmed; only ledger settlement may retry, never the effect.
+            stream.completed_payload = result.ok();
+            return false;
         }
         stream.pending = None;
         return apply_result(stream, id, queues, plane, result, send);
@@ -2408,6 +2422,10 @@ fn apply_result(
             if missing && stream.source_id.is_some() {
                 return finish_cleanup(stream);
             } else if missing {
+                if !stream.generic_input {
+                    // The exact owner-scoped lookup proves no encoder remains.
+                    plane.finish_stream(id);
+                }
                 Stage::FindCapture
             } else {
                 let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
@@ -2419,7 +2437,15 @@ fn apply_result(
             }
         }
         Stage::CloseEncoder if stream.source_id.is_some() => return finish_cleanup(stream),
-        Stage::CloseEncoder => Stage::FindCapture,
+        Stage::CloseEncoder => {
+            if !stream.generic_input {
+                // Broker Close acknowledged worker retirement. Entering the
+                // mandatory lease barrier earlier could block the host before
+                // it dispatched that asynchronous cleanup. Capture stays live.
+                plane.finish_stream(id);
+            }
+            Stage::FindCapture
+        }
         Stage::RestartCloseEncoder => {
             stream.session = None;
             let Some(fallback) = stream.fallback_encoder.take() else {

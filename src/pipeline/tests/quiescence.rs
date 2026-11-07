@@ -1,6 +1,83 @@
 use super::*;
 
 #[test]
+fn legacy_quiesce_waits_for_encoder_close_before_entering_native_retirement() {
+    use std::{cell::Cell, rc::Rc};
+    struct RetirementPlane {
+        encoder_closed: Rc<Cell<bool>>,
+        native_retired: Rc<Cell<bool>>,
+    }
+    impl Plane for RetirementPlane {
+        fn verify_geometry(
+            &mut self,
+            _: CaptureProvider,
+            _: u64,
+            _: Option<CaptureGeometry>,
+        ) -> Result<GeometryProgress, &'static str> {
+            Ok(GeometryProgress::Ready)
+        }
+        fn pump(&mut self, _: Pump<'_>) -> Result<Progress, &'static str> {
+            Ok(Progress::default())
+        }
+        fn drain(&mut self, _: u64) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+        fn finish_stream(&mut self, _: u64) {
+            assert!(
+                self.encoder_closed.get(),
+                "a synchronous native barrier cannot precede asynchronous encoder Close"
+            );
+            self.native_retired.set(true);
+        }
+    }
+    let (mut pipeline, mut runtime, _) = setup();
+    let encoder_closed = Rc::new(Cell::new(false));
+    let native_retired = Rc::new(Cell::new(false));
+    let mut plane = RetirementPlane {
+        encoder_closed: encoder_closed.clone(),
+        native_retired: native_retired.clone(),
+    };
+    let mut encoder_close = None;
+    let mut send = |command: Command| {
+        if matches!(&command, Command::Request { service, payload, .. }
+            if service == CAPTURE && payload["action"] == "close")
+        {
+            assert!(
+                native_retired.get(),
+                "capture ownership must survive native lease retirement"
+            );
+        }
+        let close_request = matches!(&command, Command::Request { service, payload, .. }
+            if service == ENCODE && payload["action"] == "close");
+        let close_result =
+            matches!(&command, Command::TakeResult { request } if Some(*request) == encoder_close);
+        let response = runtime.send(command)?;
+        if close_request && let Response::Accepted { id } = &response {
+            encoder_close = Some(*id);
+        }
+        if close_result
+            && let Response::Result { payload } = &response
+            && payload["ok"] == true
+        {
+            encoder_closed.set(true);
+        }
+        Ok(response)
+    };
+    pipeline.handle("alice", 91, open(), &mut send);
+    for _ in 0..4 {
+        pipeline.tick(&mut plane, &mut send);
+    }
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert!(!pipeline.quiesce(&mut plane, &mut send).unwrap());
+    assert!(!native_retired.get());
+    for _ in 0..20 {
+        pipeline.tick(&mut plane, &mut send);
+    }
+    assert!(pipeline.quiesce(&mut plane, &mut send).unwrap());
+    assert!(native_retired.get());
+}
+
+#[test]
 fn source_activation_keeps_its_native_connection_while_packet_queue_is_borrowed() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline.source_encoders.insert(
@@ -186,7 +263,7 @@ fn announcement_keeps_active_frames_until_quiesce_retires_each_owned_stream() {
             .quiesce(&mut plane, &mut |command| runtime.send(command))
             .unwrap()
     );
-    assert_eq!(plane.finished_streams, [1, 2]);
+    assert!(plane.finished_streams.is_empty());
     tick(&mut pipeline, &mut runtime, &mut plane, 24);
     assert!(
         pipeline
@@ -194,6 +271,8 @@ fn announcement_keeps_active_frames_until_quiesce_retires_each_owned_stream() {
             .unwrap()
     );
     assert!(pipeline.streams.is_empty());
+    assert!(plane.finished_streams.contains(&1));
+    assert!(plane.finished_streams.contains(&2));
     assert_eq!(
         runtime
             .commands

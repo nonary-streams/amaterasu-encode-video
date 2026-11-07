@@ -15,6 +15,8 @@ mod resize;
 mod resource_cpu;
 mod resource_generic;
 mod resource_processor;
+#[cfg(test)]
+mod shutdown_poll_tests;
 mod source;
 use crate::{
     model::{CaptureProvider, Configuration},
@@ -861,7 +863,14 @@ impl Plane for NativePlane {
         // SAFETY: this is the same live binding that configured the source.
         let api =
             unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
-        let mut queues = self.queues.lock().map_err(|_| "queue_failed")?;
+        let mut queues = match self.queues.try_lock() {
+            Ok(queues) => queues,
+            // A downstream packet borrower owns this queue temporarily. Do not
+            // admit an IDR control or consume source output until delivery can
+            // proceed; the caller retains the same source and retry intent.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err("queue_failed"),
+        };
         let result = unsafe { source.pump(api, &mut queues, force_idr) };
         // SAFETY: the same authenticated typed binding and source session are
         // live. Optional telemetry failure cannot stop or consume media output.
@@ -1537,7 +1546,9 @@ impl NativePlane {
             unsafe { amaterasu_module_sdk::media::encoder_timing(encoder_api, input.encoder) }
                 .ok()
                 .flatten();
-        if let Ok(mut queues) = self.queues.lock() {
+        // Telemetry is optional. A downstream packet callback must not turn its
+        // snapshot into a wait after native capture/encoding already progressed.
+        if let Ok(mut queues) = self.queues.try_lock() {
             queues.observe_encode_timing(input.video, &self.active_encoder, input.encoder, timing);
         }
         Ok(progress)

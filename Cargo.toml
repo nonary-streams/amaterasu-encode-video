@@ -16,5 +16,7 @@ getrandom.workspace = true
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
+[dev-dependencies]
+amaterasu-runtime = { path = "../../crates/runtime" }
 [lints]
 workspace = true

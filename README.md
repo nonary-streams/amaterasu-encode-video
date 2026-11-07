@@ -8,12 +8,17 @@ consumers through the native `VideoApi`; frame/packet bytes never enter JSON.
 
 Host shutdown announcement fences new opens, selections and preflights while
 existing streams keep serving their consumers. After those consumers drain,
-video retires its native frame borrows and follows the same owner-scoped
-capture/encoder cleanup used by Close. It reports ready only after streams,
+video follows the same owner-scoped capture/encoder cleanup used by Close.
+Legacy encoders first acknowledge worker retirement through asynchronous Close;
+video then retires native frame borrows while capture is still alive. It reports ready only after streams,
 packet queues and retained broker requests settle. Failed cleanup remains
 visible and the original host deadline never renews on another poll. Native
 callbacks must return and consumers must release their bindings before unload;
 quiescence does not preempt arbitrary foreign callback code.
+External resource consumers and source encoders keep their required synchronous
+cancel/destroy barriers before control Close. Those interfaces provide no general
+asynchronous retirement query, so their native waits cannot be bounded by moving
+control Close ahead of destruction or unloading a live provider.
 
 Linux settings default to:
 

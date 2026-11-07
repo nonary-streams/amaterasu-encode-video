@@ -5,6 +5,8 @@ use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_module_sdk::EncoderIdentity;
 const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 
+mod request_retirement;
+
 #[test]
 fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admission() {
     let mut timings = StageTimings::default();

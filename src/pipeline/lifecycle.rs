@@ -18,8 +18,8 @@ impl Pipeline {
         );
     }
 
-    /// Retire native borrows before queuing exact control cleanup. Providers
-    /// remain tickable until each retained request and resource has settled.
+    /// Keep legacy capture borrows while asynchronous encoder Close retires its
+    /// worker. Source/resource APIs retain their mandatory pre-close barriers.
     pub fn quiesce(
         &mut self,
         plane: &mut dyn Plane,
@@ -31,7 +31,9 @@ impl Pipeline {
                 self.prepare_shutdown(20_000);
             }
             for (&id, stream) in &mut self.streams {
-                plane.finish_stream(id);
+                if stream.source_id.is_some() || stream.generic_input {
+                    plane.finish_stream(id);
+                }
                 if !matches!(
                     stream.stage,
                     Stage::FindEncoder

@@ -29,6 +29,15 @@ pub fn result(send: &mut Send<'_>, request: u64) -> Option<Result<Value, &'stati
     }
 }
 
+pub fn release(send: &mut Send<'_>, request: u64) -> bool {
+    match send(Command::ReleaseResult { request }) {
+        Ok(Response::Ok) => true,
+        // The previous release may have committed before its reply was lost.
+        Ok(Response::Error { code, .. }) if code == "not_found" => true,
+        _ => false,
+    }
+}
+
 pub fn cancel(send: &mut Send<'_>, request: u64) -> bool {
     for command in [
         Command::Cancel { request },
