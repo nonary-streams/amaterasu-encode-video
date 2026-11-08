@@ -108,6 +108,7 @@ pub struct NativeStageTotals {
     pub map_input_us: u64,
     pub submit_picture_us: u64,
     pub lock_output_us: u64,
+    pub lock_output_max_us: u64,
     pub stream_ordered_samples: u64,
     /// GPU-clock stages, summed over `gpu_timed_samples` with their maxima.
     pub gpu_timed_samples: u64,
@@ -136,6 +137,7 @@ impl NativeStageTotals {
             .submit_picture_us
             .saturating_add(sample.submit_picture_us);
         self.lock_output_us = self.lock_output_us.saturating_add(sample.lock_output_us);
+        self.lock_output_max_us = self.lock_output_max_us.max(sample.lock_output_us);
         self.stream_ordered_samples = self
             .stream_ordered_samples
             .saturating_add(u64::from(sample.stream_ordered != 0));
@@ -350,13 +352,6 @@ impl Worker {
                 let mut failed = false;
                 while let Ok(request) = receiver.recv() {
                     let started_at = Instant::now();
-                    #[cfg(unix)]
-                    let is_dmabuf = matches!(
-                        &request.operation,
-                        Operation::SubmitGpu(GpuInput::DmaBuf(_), ..)
-                    );
-                    #[cfg(not(unix))]
-                    let is_dmabuf = false;
                     let queue_wait_us =
                         duration_micros(started_at.saturating_duration_since(request.queued_at));
                     let result = if failed {
@@ -382,7 +377,9 @@ impl Worker {
                         failed = true;
                     }
                     let operation_us = duration_micros(started_at.elapsed());
-                    let native_stages = if result.is_ok() && is_dmabuf {
+                    // Completed GPU samples can first become available on Receive,
+                    // including CUDA-resource inputs with no DMA-BUF submission.
+                    let native_stages = if result.is_ok() {
                         encoder.native_stage_timings()
                     } else {
                         None
@@ -965,6 +962,49 @@ mod tests {
         }
         drop(worker);
         assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn receive_collects_completed_cuda_timings_once_and_preserves_output_wait_tail() {
+        struct CompletedTimingBackend {
+            completed: bool,
+            timing: std::cell::Cell<Option<NativeStageTimings>>,
+        }
+        impl WorkerBackend for CompletedTimingBackend {
+            fn uses_background_encode(&self) -> bool {
+                false
+            }
+            fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn drain(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+                if !self.completed {
+                    self.completed = true;
+                    self.timing.set(Some(NativeStageTimings {
+                        lock_output_us: 25_000,
+                        ..Default::default()
+                    }));
+                }
+                Ok(None)
+            }
+            fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+                self.timing.take()
+            }
+        }
+        let mut worker = Worker::with_backend(CompletedTimingBackend {
+            completed: false,
+            timing: std::cell::Cell::new(None),
+        });
+        worker.request(Operation::Receive).unwrap();
+        let totals = worker.observed_metrics().native_stage_totals.unwrap();
+        assert_eq!(totals.samples, 1);
+        assert_eq!(totals.lock_output_us, 25_000);
+        assert_eq!(totals.lock_output_max_us, 25_000);
+        worker.request(Operation::Receive).unwrap();
+        assert_eq!(worker.observed_metrics().native_stage_totals, Some(totals));
     }
 
     #[test]
