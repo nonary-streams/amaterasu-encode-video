@@ -133,6 +133,14 @@ impl Encoder {
             _ => None,
         }
     }
+    /// Finished output that can be read without visiting the encoder worker.
+    pub(crate) fn packet_tap(&self) -> Option<std::sync::Arc<dyn crate::worker::PacketTap>> {
+        match self {
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => Some(encoder.packet_tap()),
+            _ => None,
+        }
+    }
     /// Encoders that finish output on their own thread wake the module there.
     pub fn set_output_notifier(&mut self, notifier: amaterasu_module_sdk::WorkNotifier) {
         match self {

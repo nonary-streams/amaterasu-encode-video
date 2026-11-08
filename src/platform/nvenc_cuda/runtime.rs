@@ -454,6 +454,16 @@ impl Pipeline {
     }
 }
 
+impl crate::worker::PacketTap for Pipeline {
+    fn take_packet(&self) -> Result<Option<Packet>, &'static str> {
+        let mut state = self.lock();
+        match state.packets.pop_front() {
+            Some(packet) => Ok(Some(packet)),
+            None => state.failure.map_or(Ok(None), Err),
+        }
+    }
+}
+
 pub struct Encoder {
     native: NonNull<c_void>,
     pipeline: Arc<Pipeline>,
@@ -587,6 +597,12 @@ impl Encoder {
             }
         }
         (!support.is_empty()).then(|| Arc::new(support))
+    }
+
+    /// Packets the output thread finished, readable from any thread. GPU timing
+    /// and slot reuse stay on the worker, which reads them on the next submit.
+    pub(crate) fn packet_tap(&self) -> Arc<dyn crate::worker::PacketTap> {
+        Arc::clone(&self.pipeline) as Arc<dyn crate::worker::PacketTap>
     }
 
     /// Wakes the module as soon as the output thread finishes a packet.

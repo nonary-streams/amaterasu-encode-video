@@ -164,7 +164,7 @@ impl EncodeModule {
         }
         // Native clients share this lock. Skip a busy snapshot rather than
         // adding a wait to the host tick; retry on the next tick.
-        let Ok(sessions) = self.shared.try_lock() else {
+        let Ok(mut sessions) = self.shared.try_lock() else {
             return;
         };
         let summaries = sessions.timing_summaries(now);

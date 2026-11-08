@@ -160,6 +160,60 @@ impl NativeStageTotals {
     }
 }
 
+/// Stages of the slowest frame in one timing report, so a stall names its cause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WorstFrame {
+    /// Wall time from starting conversion until the bitstream was available.
+    pub total_us: u64,
+    pub import_convert_us: u64,
+    pub interop_copy_us: u64,
+    pub map_input_us: u64,
+    pub submit_picture_us: u64,
+    pub lock_output_us: u64,
+    pub gpu_queue_us: u64,
+    pub gpu_convert_us: u64,
+    pub gpu_encode_us: u64,
+}
+
+/// Frame statistics since the last timing report. Cumulative maxima hide when a
+/// stall happened; this window is reset every time it is reported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FrameWindow {
+    pub frames: u64,
+    pub over_6ms: u64,
+    pub over_10ms: u64,
+    pub over_16ms: u64,
+    pub worst: WorstFrame,
+}
+
+impl FrameWindow {
+    fn record(&mut self, sample: NativeStageTimings) {
+        let total_us = sample
+            .import_convert_us
+            .saturating_add(sample.interop_copy_us)
+            .saturating_add(sample.map_input_us)
+            .saturating_add(sample.submit_picture_us)
+            .saturating_add(sample.lock_output_us);
+        self.frames = self.frames.saturating_add(1);
+        self.over_6ms = self.over_6ms.saturating_add(u64::from(total_us > 6_000));
+        self.over_10ms = self.over_10ms.saturating_add(u64::from(total_us > 10_000));
+        self.over_16ms = self.over_16ms.saturating_add(u64::from(total_us > 16_000));
+        if total_us > self.worst.total_us {
+            self.worst = WorstFrame {
+                total_us,
+                import_convert_us: sample.import_convert_us,
+                interop_copy_us: sample.interop_copy_us,
+                map_input_us: sample.map_input_us,
+                submit_picture_us: sample.submit_picture_us,
+                lock_output_us: sample.lock_output_us,
+                gpu_queue_us: sample.gpu_queue_us,
+                gpu_convert_us: sample.gpu_convert_us,
+                gpu_encode_us: sample.gpu_encode_us,
+            };
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Metrics {
     pub queue_wait_us_total: u64,
@@ -178,6 +232,7 @@ pub struct Metrics {
     pub busy_submissions: u64,
     pub pending_operations: u64,
     pub native_stage_totals: Option<NativeStageTotals>,
+    pub frame_window: FrameWindow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +244,16 @@ pub enum SubmitResult {
 pub enum ReceiveResult {
     Ready(Option<Packet>),
     Pending,
+}
+
+/// Output a backend finished on its own thread, readable without the worker.
+///
+/// Asking the worker for a packet costs a host pass and a thread round trip
+/// after the packet already exists, on every frame.
+pub(crate) trait PacketTap: Send + Sync {
+    /// The oldest finished packet. A failure is reported only after every
+    /// packet completed before it, matching `WorkerBackend::receive`.
+    fn take_packet(&self) -> Result<Option<Packet>, &'static str>;
 }
 
 /// Encoder state is created, used, and dropped inside the worker thread. The
@@ -204,6 +269,10 @@ pub(crate) trait WorkerBackend {
     }
     /// A backend producing output on its own thread notifies through this.
     fn set_output_notifier(&mut self, _notifier: amaterasu_module_sdk::WorkNotifier) {}
+    /// Backends whose packets can be read from any thread offer them here.
+    fn packet_tap(&self) -> Option<Arc<dyn PacketTap>> {
+        None
+    }
     /// Reported once, on the worker thread, right after the backend opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
@@ -231,6 +300,9 @@ impl WorkerBackend for platform::Encoder {
     }
     fn set_output_notifier(&mut self, notifier: amaterasu_module_sdk::WorkNotifier) {
         platform::Encoder::set_output_notifier(self, notifier);
+    }
+    fn packet_tap(&self) -> Option<Arc<dyn PacketTap>> {
+        platform::Encoder::packet_tap(self)
     }
     fn uses_background_encode(&self) -> bool {
         platform::Encoder::uses_background_encode(self)
@@ -275,6 +347,7 @@ pub struct Worker {
     background_encode: bool,
     input_support: InputSupport,
     gpu_completion: bool,
+    packet_tap: Option<Arc<dyn PacketTap>>,
     pending: VecDeque<Pending>,
     receive_result: Option<Option<Packet>>,
     receive_pending: bool,
@@ -344,6 +417,7 @@ impl Worker {
                         background_encode,
                         encoder.input_support(),
                         gpu_completion,
+                        encoder.packet_tap(),
                     )))
                     .is_err()
                 {
@@ -416,13 +490,14 @@ impl Worker {
             .map_err(|_| "encoder_worker_failed")
             .and_then(|value| value)
         {
-            Ok((background_encode, input_support, gpu_completion)) => Ok(Self {
+            Ok((background_encode, input_support, gpu_completion, packet_tap)) => Ok(Self {
                 sender: Some(sender),
                 thread: Some(thread),
                 cancel,
                 background_encode,
                 input_support,
                 gpu_completion,
+                packet_tap,
                 pending: VecDeque::new(),
                 receive_result: None,
                 receive_pending: false,
@@ -573,6 +648,7 @@ impl Worker {
                 .native_stage_totals
                 .get_or_insert_with(Default::default)
                 .record(sample);
+            self.metrics.frame_window.record(sample);
         }
         self.metrics.queue_wait_us_total = self
             .metrics
@@ -615,6 +691,11 @@ impl Worker {
     /// Logging must not consume a worker error or change operation ordering.
     pub fn observed_metrics(&self) -> Metrics {
         self.metrics
+    }
+
+    /// Starts a new report window after the current one has been logged.
+    pub fn reset_frame_window(&mut self) {
+        self.metrics.frame_window = FrameWindow::default();
     }
 
     pub fn submit(
@@ -690,6 +771,9 @@ impl Worker {
                 _ => Err("encoder_worker_failed"),
             };
         }
+        if let Some(tap) = self.packet_tap.clone() {
+            return self.receive_from_tap(tap.as_ref());
+        }
         self.poll_background()?;
         if let Some(packet) = self.receive_result.take() {
             if packet.is_none() && self.drain_enqueued && !self.drain_complete {
@@ -710,6 +794,17 @@ impl Worker {
             self.receive_pending = true;
         }
         Ok(ReceiveResult::Pending)
+    }
+
+    /// Completions are polled first: once a drain is known complete every
+    /// remaining packet is already visible, so an empty tap means end of output.
+    fn receive_from_tap(&mut self, tap: &dyn PacketTap) -> Result<ReceiveResult, &'static str> {
+        self.poll_background()?;
+        let packet = tap.take_packet().inspect_err(|_| self.failed = true)?;
+        if packet.is_none() && self.drain_enqueued && !self.drain_complete {
+            return Ok(ReceiveResult::Pending);
+        }
+        Ok(ReceiveResult::Ready(packet))
     }
 
     pub fn drain(&mut self) -> Result<bool, &'static str> {
@@ -830,6 +925,180 @@ mod tests {
     }
     use super::*;
     use std::sync::{Condvar, Mutex};
+
+    #[derive(Default)]
+    struct TestTap {
+        packets: Mutex<VecDeque<Packet>>,
+        failure: Mutex<Option<&'static str>>,
+    }
+
+    impl TestTap {
+        fn push(&self, timestamp: i64) {
+            self.packets.lock().unwrap().push_back(Packet {
+                ready_at: None,
+                bytes: vec![timestamp as u8],
+                timestamp_100ns: timestamp,
+                keyframe: false,
+            });
+        }
+    }
+
+    impl PacketTap for TestTap {
+        fn take_packet(&self) -> Result<Option<Packet>, &'static str> {
+            match self.packets.lock().unwrap().pop_front() {
+                Some(packet) => Ok(Some(packet)),
+                None => self.failure.lock().unwrap().map_or(Ok(None), Err),
+            }
+        }
+    }
+
+    struct TapBackend {
+        tap: Arc<TestTap>,
+        worker_receives: Arc<std::sync::atomic::AtomicUsize>,
+        drain_gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl WorkerBackend for TapBackend {
+        fn uses_background_encode(&self) -> bool {
+            true
+        }
+        fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn drain(&mut self) -> Result<(), &'static str> {
+            let (open, changed) = &*self.drain_gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+            self.worker_receives
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        fn packet_tap(&self) -> Option<Arc<dyn PacketTap>> {
+            Some(self.tap.clone())
+        }
+    }
+
+    struct TapFixture {
+        worker: Worker,
+        tap: Arc<TestTap>,
+        worker_receives: Arc<std::sync::atomic::AtomicUsize>,
+        drain_gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    fn tap_fixture() -> TapFixture {
+        let tap = Arc::new(TestTap::default());
+        let worker_receives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = Worker::with_backend(TapBackend {
+            tap: tap.clone(),
+            worker_receives: worker_receives.clone(),
+            drain_gate: drain_gate.clone(),
+        });
+        TapFixture {
+            worker,
+            tap,
+            worker_receives,
+            drain_gate,
+        }
+    }
+
+    #[test]
+    fn a_finished_packet_is_delivered_on_the_first_receive_without_visiting_the_worker() {
+        let mut fixture = tap_fixture();
+        fixture.tap.push(7);
+
+        let received = fixture.worker.receive().unwrap();
+
+        assert!(
+            matches!(received, ReceiveResult::Ready(Some(packet)) if packet.timestamp_100ns == 7)
+        );
+        assert_eq!(
+            fixture
+                .worker_receives
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(fixture.worker.observed_metrics().receive_operations, 0);
+    }
+
+    #[test]
+    fn an_empty_tap_reports_no_packet_and_queues_no_worker_operation() {
+        let mut fixture = tap_fixture();
+
+        assert!(matches!(
+            fixture.worker.receive().unwrap(),
+            ReceiveResult::Ready(None)
+        ));
+        assert_eq!(fixture.worker.observed_metrics().pending_operations, 0);
+    }
+
+    #[test]
+    fn a_tap_failure_follows_the_packets_completed_before_it() {
+        let mut fixture = tap_fixture();
+        fixture.tap.push(1);
+        *fixture.tap.failure.lock().unwrap() = Some("encoder_failed");
+
+        assert!(matches!(
+            fixture.worker.receive().unwrap(),
+            ReceiveResult::Ready(Some(_))
+        ));
+        assert_eq!(fixture.worker.receive().err(), Some("encoder_failed"));
+    }
+
+    #[test]
+    fn end_of_output_waits_for_the_drain_to_finish() {
+        let mut fixture = tap_fixture();
+        assert!(fixture.worker.drain().unwrap());
+
+        assert!(matches!(
+            fixture.worker.receive().unwrap(),
+            ReceiveResult::Pending
+        ));
+
+        {
+            let (open, changed) = &*fixture.drain_gate;
+            *open.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fixture.worker.receive().unwrap() {
+                ReceiveResult::Ready(None) => break,
+                ReceiveResult::Ready(Some(_)) => panic!("no packet was produced"),
+                ReceiveResult::Pending => {
+                    assert!(Instant::now() < deadline, "drain never completed");
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_frame_window_keeps_the_stages_of_its_slowest_frame() {
+        let mut window = FrameWindow::default();
+        window.record(NativeStageTimings {
+            import_convert_us: 400,
+            lock_output_us: 2_000,
+            ..Default::default()
+        });
+        window.record(NativeStageTimings {
+            import_convert_us: 500,
+            lock_output_us: 18_000,
+            gpu_queue_us: 15_000,
+            ..Default::default()
+        });
+
+        assert_eq!(window.frames, 2);
+        assert_eq!(window.over_6ms, 1);
+        assert_eq!(window.over_16ms, 1);
+        assert_eq!(window.worst.total_us, 18_500);
+        assert_eq!(window.worst.gpu_queue_us, 15_000);
+    }
 
     struct PacketBackend(Arc<std::sync::atomic::AtomicUsize>);
     impl WorkerBackend for PacketBackend {

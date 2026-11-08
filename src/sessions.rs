@@ -47,6 +47,8 @@ pub trait Backend: Send {
     fn observed_metrics(&self) -> Option<WorkerMetrics> {
         None
     }
+    /// Starts a new frame report window after the current one was logged.
+    fn reset_frame_window(&mut self) {}
     /// Inputs accepted besides packed NV12; read once when the session opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
@@ -100,6 +102,9 @@ impl Backend for Worker {
     fn observed_metrics(&self) -> Option<WorkerMetrics> {
         Some(self.observed_metrics())
     }
+    fn reset_frame_window(&mut self) {
+        Worker::reset_frame_window(self);
+    }
     fn input_support(&self) -> InputSupport {
         Worker::input_support(self)
     }
@@ -116,6 +121,24 @@ impl Backend for Worker {
         force: bool,
     ) -> Result<SubmitResult, &'static str> {
         Worker::submit_gpu(self, input, timestamp, force)
+    }
+}
+
+/// Time finished packets spent waiting for the module to deliver them. Only the
+/// host's tick loop stands between these two points, so a long wait here means
+/// another module held that thread.
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct DeliveryWait {
+    packets: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
+impl DeliveryWait {
+    fn record(&mut self, waited_us: u64) {
+        self.packets = self.packets.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(waited_us);
+        self.max_us = self.max_us.max(waited_us);
     }
 }
 
@@ -148,6 +171,7 @@ pub struct Session {
     color_conversion_frames: u64,
     opened_at: Instant,
     encode_timing: EncodeTimingSnapshotV1,
+    delivery_wait: DeliveryWait,
     /// Producer offer configured for resource frames (generation, offer).
     resource_producer: Option<(u64, u64)>,
 }
@@ -393,6 +417,7 @@ impl Sessions {
                 color_conversion_frames: 0,
                 opened_at: Instant::now(),
                 encode_timing: EncodeTimingSnapshotV1::empty(1),
+                delivery_wait: DeliveryWait::default(),
                 resource_producer: None,
             },
         );
@@ -443,17 +468,20 @@ impl Sessions {
 
     /// A bounded, host-only snapshot; worker timings are cumulative since the
     /// session opened and do not measure capture, packet delivery or display.
-    pub fn timing_summaries(&self, now: Instant) -> Vec<String> {
+    pub fn timing_summaries(&mut self, now: Instant) -> Vec<String> {
         self.values
-            .iter()
+            .iter_mut()
             .filter_map(|(id, session)| {
                 let metrics = session.backend.observed_metrics()?;
                 let elapsed_ms = now.saturating_duration_since(session.opened_at).as_millis();
+                let delivery_wait = std::mem::take(&mut session.delivery_wait);
+                session.backend.reset_frame_window();
                 Some(format!(
-                    "encoder_session={id} elapsed_ms={elapsed_ms} width={} height={} target_fps={} worker_metrics_cumulative={}",
+                    "encoder_session={id} elapsed_ms={elapsed_ms} width={} height={} target_fps={} delivery_wait={} worker_metrics_cumulative={}",
                     session.config.width,
                     session.config.height,
                     session.config.fps,
+                    serde_json::to_string(&delivery_wait).ok()?,
                     serde_json::to_string(&metrics).ok()?
                 ))
             })
@@ -904,6 +932,12 @@ impl Sessions {
                 && let Ok(micros) = u64::try_from(elapsed.as_micros())
             {
                 session.encode_timing.record(micros);
+            }
+            if let Some(waited) = packet
+                .ready_at
+                .map(|ready| ready.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+            {
+                session.delivery_wait.record(waited);
             }
             metadata.timing_recorded = true;
         }
