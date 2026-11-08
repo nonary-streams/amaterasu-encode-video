@@ -944,15 +944,19 @@ fn selected_processing_checks_capture_color_before_processing_or_bypass() {
             }))
             .unwrap(),
         );
-        let processor = gpu_processor_api(&harness);
-        let result = deliver_leased(
-            &leased_capture_api(&harness),
-            &leased_encoder_api(&harness),
-            enabled.then_some(&processor),
-            None,
-            &pump(&config, true, false),
-            false,
-        );
+        let input = pump(&config, true, false);
+        let result = if enabled {
+            deliver_processed(&harness, &input, false)
+        } else {
+            deliver_leased(
+                &leased_capture_api(&harness),
+                &leased_encoder_api(&harness),
+                None,
+                None,
+                &input,
+                false,
+            )
+        };
         if expected {
             assert!(result.unwrap().submitted);
             finish_encoder(&harness);
@@ -981,15 +985,7 @@ fn selected_processor_output_must_match_negotiated_range() {
             }))
             .unwrap(),
         );
-        let processor = gpu_processor_api(&harness);
-        let result = deliver_leased(
-            &leased_capture_api(&harness),
-            &leased_encoder_api(&harness),
-            Some(&processor),
-            None,
-            &pump(&config, true, false),
-            false,
-        );
+        let result = deliver_processed(&harness, &pump(&config, true, false), false);
         if accepted {
             assert!(result.unwrap().submitted);
             finish_encoder(&harness);
@@ -1042,38 +1038,21 @@ fn borrowed_capture_also_checks_selected_source_color() {
 fn gpu_processor_preserves_ownership_and_rejects_invalid_output_protocols() {
     let harness = Harness::default();
     let config = configuration();
-    let processor = gpu_processor_api(&harness);
-    let result = deliver_leased(
-        &leased_capture_api(&harness),
-        &leased_encoder_api(&harness),
-        Some(&processor),
-        None,
-        &pump(&config, true, false),
-        false,
-    )
-    .unwrap();
+    let result = deliver_processed(&harness, &pump(&config, true, false), false).unwrap();
     assert!(result.submitted);
     assert!(result.gpu_processor_us.is_some());
     assert_eq!(harness.retained.get(), 1);
     assert_eq!(
         harness.released.get(),
-        2,
-        "input and processor output temporary refs released"
+        1,
+        "temporary input reference released; resource goes straight to encoder"
     );
     finish_encoder(&harness);
     assert_eq!(harness.retained.get(), 0);
     for mode in [1, 2, 3, 4] {
         let harness = Harness::default();
         harness.processor_mode.set(mode);
-        let processor = gpu_processor_api(&harness);
-        let result = deliver_leased(
-            &leased_capture_api(&harness),
-            &leased_encoder_api(&harness),
-            Some(&processor),
-            None,
-            &pump(&config, true, false),
-            false,
-        );
+        let result = deliver_processed(&harness, &pump(&config, true, false), false);
         if mode == 1 {
             let progress = result.unwrap();
             assert!(progress.dropped);
@@ -1155,16 +1134,7 @@ fn gpu_processor_receives_cached_reuse_freshness_without_reclassifying_it() {
         .deliver_freshness
         .set(Some(CAPTURE_FRAME_CACHED_REUSE));
     let config = configuration();
-    let processor = gpu_processor_api(&harness);
-    let result = deliver_leased(
-        &leased_capture_api(&harness),
-        &leased_encoder_api(&harness),
-        Some(&processor),
-        None,
-        &pump(&config, false, false),
-        true,
-    )
-    .unwrap();
+    let result = deliver_processed(&harness, &pump(&config, false, false), true).unwrap();
     assert!(result.submitted);
     assert!(result.capture_reused);
     assert_eq!(result.dmabuf_fresh, Some(false));
@@ -1366,8 +1336,8 @@ fn native_plane_drop_retires_encoder_and_processor_before_releasing_source_bindi
         harness.processor_mode.set(5);
         harness.encoder_status.set(encoder_status);
         let capture = leased_capture_api(&harness);
-        let encoder = leased_encoder_api(&harness);
-        let processor = gpu_processor_api(&harness);
+        let encoder = resource_encoder_api(&harness);
+        let processor = resource_processor_api(&harness);
         let fixture = RuntimeFixture {
             harness: &harness,
             capture: std::ptr::from_ref(&capture) as usize,
@@ -1447,9 +1417,18 @@ fn busy_encoder_defers_gpu_processing_but_keeps_polling_and_recovers() {
     use amaterasu_module_sdk::RuntimeClient;
     use std::sync::{Arc, Mutex};
 
-    // Exercise a new provider and two old/short-table providers against the
-    // same unchanged video consumer. Old providers keep the submission path.
-    for version in ["ready", "alternate", "legacy", "short", "unsupported"] {
+    // Independent current providers share one consumer. Incomplete resource
+    // tables fail before capture or processing instead of selecting a lease path.
+    for version in [
+        "ready",
+        "alternate",
+        "legacy",
+        "short",
+        "old_processor",
+        "short_processor",
+        "pending",
+        "unsupported",
+    ] {
         let harness = Harness::default();
         harness.gpu_readiness.set(if version == "unsupported" {
             MEDIA_UNSUPPORTED
@@ -1458,29 +1437,28 @@ fn busy_encoder_defers_gpu_processing_but_keeps_polling_and_recovers() {
         });
         let capture = leased_capture_api(&harness);
         let old_encoder = leased_encoder_api(&harness);
-        let mut new_encoder = EncoderApiV1_4 {
-            base: EncoderApiV1_3 {
-                base: leased_encoder_api(&harness),
-                encode_timing: fixture_encoder_timing,
-            },
-            gpu_input_ready: if version == "alternate" {
-                alternate_encoder_ready
-            } else {
-                fixture_encoder_ready
-            },
-        };
-        new_encoder.base.base.base.header.minor = ENCODER_GPU_READINESS_INTERFACE_MINOR;
-        new_encoder.base.base.base.header.size = if version == "short" {
-            std::mem::size_of::<EncoderApiV1_3>() as u32
+        let mut new_encoder = resource_encoder_api(&harness);
+        new_encoder.base.gpu_input_ready = if version == "alternate" {
+            alternate_encoder_ready
         } else {
-            ENCODER_API_V1_4_SIZE
+            fixture_encoder_ready
         };
+        if version == "short" {
+            new_encoder.base.base.base.base.header.size = ENCODER_API_V1_4_SIZE;
+        }
         let encoder = if version == "legacy" {
             std::ptr::from_ref(&old_encoder) as usize
         } else {
             std::ptr::from_ref(&new_encoder) as usize
         };
-        let processor = gpu_processor_api(&harness);
+        let mut processor = resource_processor_api(&harness);
+        if version == "old_processor" {
+            processor.base.base.base.base.base.header.minor = 3;
+        } else if version == "short_processor" {
+            processor.base.base.base.base.base.header.size = GPU_PROCESSOR_API_V1_3_SIZE;
+        } else if version == "pending" {
+            harness.processor_mode.set(30);
+        }
         let fixture = RuntimeFixture {
             harness: &harness,
             capture: std::ptr::from_ref(&capture) as usize,
@@ -1509,6 +1487,28 @@ fn busy_encoder_defers_gpu_processing_but_keeps_polling_and_recovers() {
         .unwrap();
         let config = configuration();
         let calls = || (harness.capture_reads.get(), harness.processor_calls.get());
+        if matches!(
+            version,
+            "legacy" | "short" | "old_processor" | "short_processor"
+        ) {
+            assert_eq!(
+                plane.pump(pump(&config, true, false)).err(),
+                Some("gpu_processor_resource_handoff_failed")
+            );
+            assert_eq!(calls(), (0, 0));
+            assert!(harness.submitted.borrow().is_empty());
+            continue;
+        }
+        if version == "pending" {
+            let deferred = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(deferred.capture_deferred && !deferred.submitted);
+            assert_eq!(calls(), (0, 0));
+            harness.processor_mode.set(0);
+            harness.gpu_readiness.set(STATUS_OK);
+            assert!(plane.pump(pump(&config, true, false)).unwrap().submitted);
+            finish_encoder(&harness);
+            continue;
+        }
         if matches!(version, "ready" | "alternate") {
             // Processing only queues GPU work, so readiness is checked before
             // every conversion. A busy encoder defers the frame before any
@@ -1578,8 +1578,8 @@ fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
     let harness = Harness::default();
     harness.processor_mode.set(5);
     let capture = leased_capture_api(&harness);
-    let encoder = leased_encoder_api(&harness);
-    let processor = gpu_processor_api(&harness);
+    let encoder = resource_encoder_api(&harness);
+    let processor = resource_processor_api(&harness);
     let fixture = RuntimeFixture {
         harness: &harness,
         capture: std::ptr::from_ref(&capture) as usize,
@@ -2256,4 +2256,189 @@ fn a_negotiated_handoff_routes_processor_output_to_resource_submission() {
         0,
         "the lease process is unused"
     );
+}
+
+// Current API fixtures use a DMA-BUF resource schema to keep the ownership
+// assertions independent of CUDA, GL and any particular vendor implementation.
+fn resource_processor_api(harness: &Harness) -> GpuProcessorApiV1_4 {
+    let mut base = gpu_processor_api(harness);
+    base.base.header.size = GPU_PROCESSOR_API_V1_4_SIZE;
+    base.base.header.minor = GPU_PROCESSOR_RESOURCE_OUTPUT_INTERFACE_MINOR;
+    GpuProcessorApiV1_4 {
+        base: GpuProcessorApiV1_3 {
+            base: GpuProcessorApiV1_2 {
+                base: GpuProcessorApiV1_1 {
+                    base,
+                    hdr_metadata: no_metadata,
+                },
+                configure_stream: no_json,
+            },
+            update_stream: no_json,
+        },
+        enumerate_outputs: fixture_output_offers,
+        select_output: resource_select,
+        process_to_resource: fixture_process_resource,
+    }
+}
+
+struct FixtureResourceSink(CaptureResourceFrameSink);
+unsafe extern "C" fn fixture_deliver_resource(
+    context: *mut c_void,
+    lease: *const DmaBufFrameLease,
+    freshness: u32,
+) -> Status {
+    // SAFETY: process_lease lends both the sink and its frame for this callback.
+    let (sink, lease) = unsafe { (&*context.cast::<FixtureResourceSink>(), &*lease) };
+    let frame = CaptureResourceFrame {
+        offer_generation: 2,
+        offer_id: 7,
+        timestamp_us: lease.frame.timestamp_us,
+        capture_pacing_timestamp_us: 0,
+        sequence: lease.frame.sequence,
+        width: lease.frame.width,
+        height: lease.frame.height,
+        freshness,
+        reserved: 0,
+        color: FrameColorMetadata {
+            transfer: if lease.frame.color == DMABUF_COLOR_BT2020_PQ {
+                FRAME_TRANSFER_PQ
+            } else {
+                FRAME_TRANSFER_SRGB
+            },
+            ..FrameColorMetadata::default()
+        },
+        clock: FrameClockMetadata::default(),
+        pacing_clock: FrameClockMetadata::default(),
+        resource: FrameDescriptor {
+            kind: FRAME_RESOURCE_DMABUF,
+            version: 1,
+            size: std::mem::size_of::<DmaBufFrame>() as u32,
+            data: std::ptr::from_ref(&lease.frame).cast(),
+            ..HANDOFF_NONE
+        },
+        acquire_sync: HANDOFF_NONE,
+        context: lease.context,
+        retain: resource_retain,
+        release: resource_release,
+    };
+    // SAFETY: all descriptors and callbacks remain borrowed through delivery.
+    unsafe { (sink.0.write)(sink.0.context, &frame) }
+}
+unsafe extern "C" fn fixture_process_resource(
+    context: *mut c_void,
+    stream: u64,
+    input: *const DmaBufFrameLease,
+    freshness: u32,
+    sink: CaptureResourceFrameSink,
+) -> Status {
+    let mut output = FixtureResourceSink(sink);
+    // SAFETY: this fixture borrows the adapter only through synchronous delivery.
+    unsafe {
+        process_lease(
+            context,
+            stream,
+            input,
+            freshness,
+            DmaBufLeaseSink {
+                context: std::ptr::from_mut(&mut output).cast(),
+                write: fixture_deliver_resource,
+            },
+        )
+    }
+}
+unsafe extern "C" fn fixture_configure_resource(
+    _: *mut c_void,
+    _: u64,
+    generation: u64,
+    id: u64,
+    producer_generation: u64,
+    offer: *const CaptureResourceOffer,
+) -> Status {
+    // SAFETY: negotiation lends the producer offer for this configure call.
+    let offer = unsafe { &*offer };
+    if generation == 2
+        && producer_generation == 2
+        && id == 7
+        && offer.id == 7
+        && offer.resource.kind == FRAME_RESOURCE_DMABUF
+    {
+        STATUS_OK
+    } else {
+        MEDIA_UNSUPPORTED
+    }
+}
+unsafe extern "C" fn fixture_submit_resource(
+    context: *mut c_void,
+    stream: u64,
+    frame: *const CaptureResourceFrame,
+    flags: u32,
+) -> Status {
+    // SAFETY: our processor fixture lends the exact DMA-BUF schema above.
+    let frame = unsafe { &*frame };
+    assert_eq!(frame.resource.kind, FRAME_RESOURCE_DMABUF);
+    let mut pixels = unsafe { *frame.resource.data.cast::<DmaBufFrame>() };
+    pixels.timestamp_us = frame.timestamp_us;
+    pixels.sequence = frame.sequence;
+    let lease = DmaBufFrameLease {
+        frame: pixels,
+        context: frame.context,
+        retain: Some(retain_lease),
+        release: Some(release_lease),
+    };
+    // SAFETY: submit_lease retains its own input reference before accepting it.
+    unsafe { submit_lease(context, stream, &lease, flags) }
+}
+fn resource_encoder_api(harness: &Harness) -> EncoderApiV1_5 {
+    let mut base = leased_encoder_api(harness);
+    base.base.header.size = ENCODER_API_V1_5_SIZE;
+    base.base.header.minor = ENCODER_RESOURCE_INTERFACE_MINOR;
+    EncoderApiV1_5 {
+        base: EncoderApiV1_4 {
+            base: EncoderApiV1_3 {
+                base,
+                encode_timing: fixture_encoder_timing,
+            },
+            gpu_input_ready: always_ready,
+        },
+        enumerate_resources: resource_enumerate,
+        configure_resource: fixture_configure_resource,
+        submit_resource: fixture_submit_resource,
+    }
+}
+
+fn deliver_processed(
+    harness: &Harness,
+    input: &Pump<'_>,
+    keepalive: bool,
+) -> Result<Progress, &'static str> {
+    let processor = resource_processor_api(harness);
+    let encoder = resource_encoder_api(harness);
+    deliver_leased(
+        &leased_capture_api(harness),
+        &encoder.base.base.base,
+        Some(&processor.base.base.base.base),
+        Some(ResourceTarget {
+            encoder: &encoder,
+            handoff: amaterasu_module_sdk::processing::ResourceHandoff {
+                generation: 2,
+                offer: 7,
+            },
+        }),
+        input,
+        keepalive,
+    )
+}
+
+unsafe extern "C" fn fixture_output_offers(
+    context: *mut c_void,
+    stream: u64,
+    sink: CaptureResourceOfferSink,
+    generation: *mut u64,
+) -> Status {
+    // SAFETY: negotiation borrows this fixture harness and output pointer.
+    let harness = unsafe { &*context.cast::<Harness>() };
+    if harness.processor_mode.get() == 30 {
+        return MEDIA_BUSY;
+    }
+    unsafe { resource_enumerate(context, stream, sink, generation) }
 }

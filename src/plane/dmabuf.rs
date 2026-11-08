@@ -414,10 +414,12 @@ impl LeasedSubmission<'_> {
         if frame.width != self.common.width || frame.height != self.common.height {
             return Outcome::Unsupported("resource_size_mismatch");
         }
-        if self.common.output_hdr_required == Some(true)
-            && frame.color.transfer != FRAME_TRANSFER_PQ
+        if self
+            .common
+            .output_hdr_required
+            .is_some_and(|hdr| (frame.color.transfer == FRAME_TRANSFER_PQ) != hdr)
         {
-            return Outcome::Unsupported("resource_color_mismatch");
+            return Rejection::of("resource_color_mismatch", STATUS_OK, source);
         }
         let mut forwarded = *frame;
         forwarded.timestamp_us = self.common.timestamp_us;
@@ -506,38 +508,27 @@ unsafe extern "C" fn submit_leased_frame(
             Outcome::Unsupported(_) => MEDIA_UNSUPPORTED,
             _ => STATUS_INVALID_ARGUMENT,
         };
-        let dispatched = if let Some(target) = submission.resource {
-            let source = lease.frame;
-            // SAFETY: as below; the encoder retains the resource output itself.
-            unsafe {
-                super::gpu_processor::dispatch_to_resource(
-                    processor,
-                    submission.video,
-                    target.handoff,
-                    retained.descriptor(),
-                    freshness,
-                    |output| {
-                        let outcome = submission.forward_resource(target, output, &source);
-                        submission.common.outcome = outcome;
-                        status_of(outcome)
-                    },
-                )
-            }
-        } else {
-            // SAFETY: as below.
-            unsafe {
-                super::gpu_processor::dispatch(
-                    processor,
-                    submission.video,
-                    retained.descriptor(),
-                    freshness,
-                    |output| {
-                        let outcome = submission.forward(output);
-                        submission.common.outcome = outcome;
-                        status_of(outcome)
-                    },
-                )
-            }
+        let Some(target) = submission.resource else {
+            submission.common.outcome =
+                Outcome::Unsupported("gpu_processor_resource_handoff_required");
+            return STATUS_OK;
+        };
+        let source = lease.frame;
+        // SAFETY: the encoder retains the negotiated output itself; all input
+        // and provider bindings remain live through synchronous dispatch.
+        let dispatched = unsafe {
+            super::gpu_processor::dispatch_to_resource(
+                processor,
+                submission.video,
+                target.handoff,
+                retained.descriptor(),
+                freshness,
+                |output| {
+                    let outcome = submission.forward_resource(target, output, &source);
+                    submission.common.outcome = outcome;
+                    status_of(outcome)
+                },
+            )
         };
         let outcome = match dispatched {
             super::processor::Outcome::Accepted => Outcome::Accepted,

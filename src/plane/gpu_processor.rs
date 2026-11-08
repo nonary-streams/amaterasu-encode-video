@@ -45,10 +45,11 @@ pub unsafe fn table(binding: &NativeBinding) -> Result<&GpuProcessorApi, &'stati
     Ok(api)
 }
 
-/// Like `dispatch`, but delivers the processor's negotiated resource output.
+/// Delivers the processor's negotiated resource output through the public SDK.
 ///
 /// # Safety
-/// As for `dispatch`; `handoff` must be the stream's current selection.
+/// Input and provider bindings must remain live for the call; `handoff` must
+/// be the stream's current selection.
 pub unsafe fn dispatch_to_resource<F>(
     api: &GpuProcessorApi,
     stream: u64,
@@ -63,27 +64,6 @@ where
     use amaterasu_module_sdk::processing::{ProcessingOutcome, process_gpu_to_resource};
     // SAFETY: caller supplies live input and provider bindings for this call.
     match unsafe { process_gpu_to_resource(api, stream, handoff, lease, freshness, submit) } {
-        ProcessingOutcome::Accepted => super::processor::Outcome::Accepted,
-        ProcessingOutcome::Busy => super::processor::Outcome::Busy,
-        ProcessingOutcome::Failed(status) => super::processor::Outcome::Failed(status),
-        ProcessingOutcome::ProtocolViolation => super::processor::Outcome::ProtocolViolation,
-    }
-}
-
-/// Built-in video uses the same dispatch adapter available to external consumers.
-pub unsafe fn dispatch<F>(
-    api: &GpuProcessorApi,
-    stream: u64,
-    lease: &DmaBufFrameLease,
-    freshness: u32,
-    submit: F,
-) -> super::processor::Outcome
-where
-    F: FnMut(&DmaBufFrameLease) -> Status,
-{
-    use amaterasu_module_sdk::processing::{ProcessingOutcome, process_gpu};
-    // SAFETY: caller supplies live input and provider bindings for this call.
-    match unsafe { process_gpu(api, stream, lease, freshness, submit) } {
         ProcessingOutcome::Accepted => super::processor::Outcome::Accepted,
         ProcessingOutcome::Busy => super::processor::Outcome::Busy,
         ProcessingOutcome::Failed(status) => super::processor::Outcome::Failed(status),
