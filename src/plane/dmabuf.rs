@@ -77,22 +77,8 @@ pub fn path_unavailable(capture: AbiHeader, encoder: AbiHeader) -> Option<&'stat
     }
 }
 
-/// Selects the additive ownership path without changing the legacy ABI route.
-/// A configured GPU processor is mandatory, so it cannot silently be skipped.
-pub fn use_lease_path(
-    capture: AbiHeader,
-    encoder: AbiHeader,
-    processor: bool,
-) -> Result<bool, &'static str> {
-    let capture_lease = lease_tail_available(capture);
-    let encoder_lease = encoder_lease_tail_available(encoder);
-    if processor && !capture_lease {
-        return Err("gpu_processor_requires_frame_lease");
-    }
-    if processor && !encoder_lease {
-        return Err("gpu_processor_requires_encoder_lease");
-    }
-    Ok(capture_lease && encoder_lease)
+pub fn use_lease_path(capture: AbiHeader, encoder: AbiHeader) -> bool {
+    lease_tail_available(capture) && encoder_lease_tail_available(encoder)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,22 +316,10 @@ pub fn deliver(
     })
 }
 
-/// A negotiated processor-to-encoder resource handoff for this stream.
-#[derive(Clone, Copy)]
-pub(super) struct ResourceTarget<'a> {
-    pub encoder: &'a EncoderApiV1_5,
-    pub handoff: amaterasu_module_sdk::processing::ResourceHandoff,
-}
-
 struct LeasedSubmission<'a> {
     common: Submission<'a>,
     encoder: &'a EncoderApiV1_2,
-    processor: Option<&'a GpuProcessorApi>,
-    /// When set, the processor output reaches the encoder as a resource.
-    resource: Option<ResourceTarget<'a>>,
-    gpu_processor_us: Option<u64>,
     encoder_busy: bool,
-    video: u64,
     calls: usize,
     invalid: bool,
 }
@@ -401,65 +375,6 @@ impl LeasedSubmission<'_> {
     }
 }
 
-impl LeasedSubmission<'_> {
-    /// Hands a processor's resource output to the encoder, which retains it
-    /// for asynchronous work. `source` names the capture frame in diagnostics.
-    unsafe fn forward_resource(
-        &mut self,
-        target: ResourceTarget<'_>,
-        frame: &CaptureResourceFrame,
-        source: &DmaBufFrame,
-    ) -> Outcome {
-        self.common.presentation = Some(source.sequence);
-        if frame.width != self.common.width || frame.height != self.common.height {
-            return Outcome::Unsupported("resource_size_mismatch");
-        }
-        if self
-            .common
-            .output_hdr_required
-            .is_some_and(|hdr| (frame.color.transfer == FRAME_TRANSFER_PQ) != hdr)
-        {
-            return Rejection::of("resource_color_mismatch", STATUS_OK, source);
-        }
-        let mut forwarded = *frame;
-        forwarded.timestamp_us = self.common.timestamp_us;
-        forwarded.sequence = self.common.sequence;
-        let flags = if self.common.force_idr {
-            FRAME_RESOURCE_SUBMIT_FORCE_IDR
-        } else {
-            0
-        };
-        let started = Instant::now();
-        // SAFETY: the processor keeps the output referenced during this call
-        // and the encoder retains its own reference before accepting.
-        let status = unsafe {
-            (target.encoder.submit_resource)(
-                target.encoder.base.base.base.base.context,
-                self.common.encoder,
-                &forwarded,
-                flags,
-            )
-        };
-        self.common.encoder_submit_us = elapsed_micros(started);
-        self.encoder_busy = status == MEDIA_BUSY;
-        match status {
-            STATUS_OK => {
-                self.common.frame = Some(FrameMetadata {
-                    width: frame.width,
-                    height: frame.height,
-                    stride: frame.width * 4,
-                    timestamp_us: self.common.timestamp_us,
-                    sequence: self.common.sequence,
-                });
-                Outcome::Accepted
-            }
-            MEDIA_BUSY => Outcome::Busy,
-            MEDIA_UNSUPPORTED => Outcome::Unsupported("encoder_resource_unsupported"),
-            status => Rejection::of("encoder_resource_submit_failed", status, source),
-        }
-    }
-}
-
 unsafe extern "C" fn submit_leased_frame(
     context: *mut c_void,
     lease: *const DmaBufFrameLease,
@@ -485,93 +400,16 @@ unsafe extern "C" fn submit_leased_frame(
         return STATUS_OK;
     }
     submission.common.fresh = Some(freshness == CAPTURE_FRAME_FRESH);
-    // SAFETY: capture and processor bindings outlive the synchronous pump; the
-    // temporary retained reference is dropped before the callback returns.
-    let retained = match unsafe { super::gpu_processor::ScopedLease::retain(lease) } {
-        Ok(retained) => retained,
-        Err(status) => {
-            submission.common.outcome = if status == MEDIA_BUSY {
-                Outcome::Busy
-            } else {
-                Rejection::of("capture_lease_retain_failed", status, &lease.frame)
-            };
-            return STATUS_OK;
-        }
-    };
-    submission.common.outcome = if let Some(processor) = submission.processor {
-        let started = Instant::now();
-        // SAFETY: retained frame and processor table stay alive throughout the
-        // synchronous processing callback and encoder submission.
-        let status_of = |outcome: Outcome| match outcome {
-            Outcome::Accepted => STATUS_OK,
-            Outcome::Busy => MEDIA_BUSY,
-            Outcome::Unsupported(_) => MEDIA_UNSUPPORTED,
-            _ => STATUS_INVALID_ARGUMENT,
-        };
-        let Some(target) = submission.resource else {
-            submission.common.outcome =
-                Outcome::Unsupported("gpu_processor_resource_handoff_required");
-            return STATUS_OK;
-        };
-        let source = lease.frame;
-        // SAFETY: the encoder retains the negotiated output itself; all input
-        // and provider bindings remain live through synchronous dispatch.
-        let dispatched = unsafe {
-            super::gpu_processor::dispatch_to_resource(
-                processor,
-                submission.video,
-                target.handoff,
-                retained.descriptor(),
-                freshness,
-                |output| {
-                    let outcome = submission.forward_resource(target, output, &source);
-                    submission.common.outcome = outcome;
-                    status_of(outcome)
-                },
-            )
-        };
-        let outcome = match dispatched {
-            super::processor::Outcome::Accepted => Outcome::Accepted,
-            super::processor::Outcome::Busy => Outcome::Busy,
-            super::processor::Outcome::Failed(MEDIA_UNSUPPORTED) => {
-                if matches!(submission.common.outcome, Outcome::Unsupported(_)) {
-                    submission.common.outcome
-                } else {
-                    Outcome::Unsupported("gpu_processor_unsupported")
-                }
-            }
-            // An output refused by this stage keeps its more specific reason.
-            _ if matches!(submission.common.outcome, Outcome::Rejected(_)) => {
-                submission.common.outcome
-            }
-            super::processor::Outcome::Failed(status) => {
-                Rejection::of("gpu_processor_failed", status, &lease.frame)
-            }
-            super::processor::Outcome::ProtocolViolation => Rejection::of(
-                "gpu_processor_protocol_violation",
-                MEDIA_BACKEND_ERROR,
-                &lease.frame,
-            ),
-        };
-        // Dispatch includes the downstream submit callback, which is timed
-        // separately and must not be attributed to GPU processing.
-        submission.gpu_processor_us =
-            Some(elapsed_micros(started).saturating_sub(submission.common.encoder_submit_us));
-        outcome
-    } else {
-        // SAFETY: this retained frame outlives synchronous submission.
-        unsafe { submission.forward(retained.descriptor()) }
-    };
+    // SAFETY: the capture callback pins this immutable lease through submit.
+    // An asynchronous encoder acquires its own reference before returning OK.
+    submission.common.outcome = unsafe { submission.forward(lease) };
     STATUS_OK
 }
 
-/// Exchanges immutable GPU ownership with capture, an optional processor, and
-/// a lease-aware encoder. No video-owned reference survives this call.
+/// Exchanges immutable GPU ownership with capture and a lease-aware encoder. No video-owned reference survives this call.
 pub fn deliver_leased(
     capture: &CaptureApiV1_6,
     encoder: &EncoderApiV1_2,
-    processor: Option<&GpuProcessorApi>,
-    resource: Option<ResourceTarget<'_>>,
     input: &Pump<'_>,
     repeat: bool,
 ) -> Result<Progress, &'static str> {
@@ -602,11 +440,7 @@ pub fn deliver_leased(
             encoder_submit_us: 0,
         },
         encoder,
-        processor,
-        resource,
-        gpu_processor_us: None,
         encoder_busy: false,
-        video: input.video,
         calls: 0,
         invalid: false,
     };
@@ -649,7 +483,6 @@ pub fn deliver_leased(
         capture_callback_count: 1,
         capture_frame_count: u64::from(submission.calls == 1),
         encoder_submit_us: common.encoder_submit_us,
-        gpu_processor_us: submission.gpu_processor_us,
         gpu_encoder_busy: submission.encoder_busy,
         ..Progress::default()
     })

@@ -1,9 +1,9 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
 mod capture_events;
 mod dmabuf;
+mod frame_processor;
 #[cfg(test)]
 mod freshness_tests;
-mod gpu_processor;
 mod lease_lifecycle;
 #[cfg(test)]
 mod preflight_tests;
@@ -263,13 +263,6 @@ pub trait Plane {
     }
 }
 
-/// One stream's negotiated processor-to-encoder handoff.
-struct ResourceNegotiation {
-    encoder_service: String,
-    encoder_session: u64,
-    handoff: amaterasu_module_sdk::processing::ResourceHandoff,
-}
-
 pub struct NativePlane {
     require_frame_lease: bool,
     resource_processor: Option<resource_processor::Processor>,
@@ -287,10 +280,7 @@ pub struct NativePlane {
     gpu_processor_opt_in: bool,
     gpu_bypassed: std::collections::BTreeSet<u64>,
     gpu_configured: std::collections::BTreeSet<u64>,
-    gpu_encoder_backpressure: BTreeMap<u64, (String, u64)>,
-    /// Per video stream: the processor-to-encoder resource handoff negotiated
-    /// for one encoder session. Failed negotiation never selects another path.
-    resource_handoffs: BTreeMap<u64, ResourceNegotiation>,
+    processing_sessions: BTreeMap<u64, frame_processor::Session>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     capture_preflights:
@@ -455,16 +445,15 @@ impl NativePlane {
                 gpu_processor_opt_in: false,
                 gpu_bypassed: Default::default(),
                 gpu_configured: Default::default(),
-                gpu_encoder_backpressure: BTreeMap::new(),
-                resource_handoffs: BTreeMap::new(),
+                processing_sessions: BTreeMap::new(),
                 gpu_processor: gpu_processor_service
                     .map(|service| {
                         runtime.bind_native_typed(
                             service,
-                            native_contracts::GPU_PROCESSOR,
-                            GPU_PROCESSOR_INTERFACE_MAJOR,
-                            GPU_PROCESSOR_INTERFACE_MINOR,
-                            GPU_PROCESSOR_API_V1_0_SIZE,
+                            native_contracts::FRAME_PROCESSOR,
+                            FRAME_PROCESSOR_INTERFACE_MAJOR,
+                            FRAME_PROCESSOR_INTERFACE_MINOR,
+                            FRAME_PROCESSOR_API_SIZE,
                         )
                     })
                     .transpose()?,
@@ -501,6 +490,15 @@ impl Drop for NativePlane {
             {
                 // SAFETY: source session is retired before its retained binding.
                 unsafe { source.finish(api) };
+            }
+        }
+        let processed: BTreeSet<_> = self.processing_sessions.keys().copied().collect();
+        self.processing_sessions.clear();
+        if let Some(binding) = &self.gpu_processor
+            && let Ok(api) = unsafe { frame_processor::table(binding) }
+        {
+            for stream in self.gpu_configured.difference(&processed) {
+                unsafe { (api.base.base.cancel)(api.base.base.base.context, *stream) };
             }
         }
         self.capture_events.clear();
@@ -786,9 +784,11 @@ impl Plane for NativePlane {
         }
         let json = serde_json::to_vec(&selection.settings)
             .map_err(|_| "gpu_processor_settings_invalid")?;
-        let api = unsafe { gpu_processor::table(binding) }?;
-        unsafe { amaterasu_module_sdk::processing::configure_gpu_stream(api, stream, &json) }
-            .map_err(|_| "gpu_processor_settings_rejected")?;
+        let api = unsafe { frame_processor::table(binding) }?;
+        unsafe {
+            amaterasu_module_sdk::frame_processing::configure_frame_stream(api, stream, &json)
+        }
+        .map_err(|_| "gpu_processor_settings_rejected")?;
         self.gpu_configured.insert(stream);
         Ok(())
     }
@@ -809,11 +809,11 @@ impl Plane for NativePlane {
             .as_ref()
             .ok_or("gpu_processor_unavailable")?;
         let json = serde_json::to_vec(settings).map_err(|_| "gpu_processor_settings_invalid")?;
-        let api = unsafe { gpu_processor::table(binding) }?;
+        let api = unsafe { frame_processor::table(binding) }?;
         // SAFETY: the binding remains live, and the video tick serializes this
         // call with frame processing and stream retirement.
-        unsafe { amaterasu_module_sdk::processing::update_gpu_stream(api, stream, &json) }.map_err(
-            |status| {
+        unsafe { amaterasu_module_sdk::frame_processing::update_frame_stream(api, stream, &json) }
+            .map_err(|status| {
                 if status == amaterasu_module_sdk::abi::STATUS_INTERNAL_ERROR {
                     "gpu_processor_update_internal"
                 } else if status == amaterasu_media::MEDIA_UNSUPPORTED {
@@ -821,8 +821,7 @@ impl Plane for NativePlane {
                 } else {
                     "gpu_processor_settings_rejected"
                 }
-            },
-        )
+            })
     }
 
     fn select_encoder(&mut self, service: &str) {
@@ -982,6 +981,18 @@ impl Plane for NativePlane {
         };
         match (capture, encoder) {
             (Ok(capture), Ok(encoder)) => {
+                if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&video) {
+                    return if !capture_resources_available(capture.base.header) {
+                        Some("capture_resources_unavailable")
+                    } else if encoder.base.header.minor < ENCODER_RESOURCE_INTERFACE_MINOR
+                        || encoder.base.header.size < ENCODER_API_V1_5_SIZE
+                    {
+                        Some("encoder_resource_interface_required")
+                    } else {
+                        None
+                    };
+                }
+
                 if self.require_frame_lease
                     && let Err(reason) =
                         dmabuf::require_lease_path(capture.base.header, encoder.base.header)
@@ -994,13 +1005,6 @@ impl Plane for NativePlane {
                     } else {
                         Some("encoder_dmabuf_lease_interface_unavailable")
                     };
-                }
-                if let Err(reason) = dmabuf::use_lease_path(
-                    capture.base.header,
-                    encoder.base.header,
-                    self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&video),
-                ) {
-                    return Some(reason);
                 }
                 dmabuf::path_unavailable(capture.base.header, encoder.base.header)
             }
@@ -1043,7 +1047,7 @@ impl Plane for NativePlane {
         if let Some(binding) = &self.gpu_processor
             && !self.gpu_bypassed.contains(&video)
         {
-            return gpu_processor::hdr_metadata(binding, video);
+            return frame_processor::hdr_metadata(binding, video);
         }
         let Some(binding) = self.captures.get(&provider) else {
             return Ok(None);
@@ -1066,7 +1070,7 @@ impl Plane for NativePlane {
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str> {
         if let Some(binding) = &self.gpu_processor
             && !self.gpu_bypassed.contains(&input.video)
-            && let Some(metadata) = gpu_processor::hdr_metadata(binding, input.video)?
+            && let Some(metadata) = frame_processor::hdr_metadata(binding, input.video)?
         {
             let hdr = input.configuration.video_stream_format.dynamic_range
                 == amaterasu_module_sdk::DynamicRange::Hdr;
@@ -1074,18 +1078,20 @@ impl Plane for NativePlane {
                 return Err("processor_output_range_mismatch");
             }
         }
-        if self.require_frame_lease && input.frame_path != FramePath::DmaBuf {
+        let processing = self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video);
+        if self.require_frame_lease && input.frame_path != FramePath::DmaBuf && !processing {
             return Err("capture_frame_lease_required");
         }
         if input.configuration.gpu_processing.is_some()
             && input.frame_path != FramePath::DmaBuf
             && self.resource_processor.is_none()
+            && !processing
         {
             // Explicit processing policy requires capture-owned color provenance;
             // untagged CPU frames cannot prove the requested source range.
             return Err("capture_range_verification_requires_dmabuf");
         }
-        if input.configuration.gpu_processing.is_some() {
+        if input.configuration.gpu_processing.is_some() && !processing {
             let capture = self
                 .captures
                 .get(&input.provider)
@@ -1100,6 +1106,17 @@ impl Plane for NativePlane {
                 Err(MEDIA_PENDING | MEDIA_BUSY) => return Ok(Progress::default()),
                 _ => return Err("capture_color_provenance_unavailable"),
             }
+        }
+        if processing {
+            let progress = self.deliver_processed(&input)?;
+            let encoder = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .ok_or("encoder_interface")?
+                    .table::<EncoderApi>()
+            }
+            .map_err(|_| "encoder_interface")?;
+            return self.receive_packets(encoder, &input, progress);
         }
         if let Some(processor) = self.resource_processor.as_mut()
             && processor.is_active(input.video)
@@ -1162,9 +1179,6 @@ impl Plane for NativePlane {
                 .table::<EncoderApi>()
         }
         .map_err(|_| "encoder_interface")?;
-        if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
-            return Err("gpu_processor_requires_dmabuf");
-        }
         #[cfg(amaterasu_swscale)]
         let processed = if self.processor.is_none()
             && input.provider == CaptureProvider::Pipewire
@@ -1275,23 +1289,22 @@ impl Plane for NativePlane {
         if let Some(processor) = self.resource_processor.as_mut() {
             processor.finish(video);
         }
+        let processed = self.processing_sessions.remove(&video).is_some();
         self.release_stream(video);
         self.stream_clocks.remove(&video);
         self.resource_selections.remove(&video);
         self.dmabuf_resource_selections.remove(&video);
         self.capture_events.remove(video);
-        let processor_retired = self.leased_streams.finish(video);
+        self.leased_streams.finish(video);
         if self.gpu_configured.remove(&video)
-            && !processor_retired
+            && !processed
             && let Some(binding) = &self.gpu_processor
-            && let Ok(api) = unsafe { gpu_processor::table(binding) }
+            && let Ok(api) = unsafe { frame_processor::table(binding) }
         {
             // SAFETY: the configured binding is live and downstream leases have retired.
-            unsafe { (api.cancel_dmabuf_leases)(api.base.context, video) };
+            unsafe { (api.base.base.cancel)(api.base.base.base.context, video) };
         }
         self.gpu_bypassed.remove(&video);
-        self.gpu_encoder_backpressure.remove(&video);
-        self.resource_handoffs.remove(&video);
     }
 
     fn release_stream(&mut self, video: u64) {
@@ -1416,33 +1429,25 @@ impl NativePlane {
         }
     }
 
-    /// Reads one DMA-BUF presentation for a due capture, or re-reads the latest
-    /// one as a keepalive repeat when only a repeat is due.
-    /// Negotiates, once per encoder session, whether the GPU processor's
-    /// output reaches the encoder as a negotiated resource (for example CUDA
-    /// device memory). A selected processor must agree with the encoder on
-    /// the current resource contract; no compatibility path is substituted.
-    fn resource_handoff(
-        &mut self,
-        input: &Pump<'_>,
-    ) -> Result<Option<amaterasu_module_sdk::processing::ResourceHandoff>, &'static str> {
-        if self.gpu_processor.is_none() || self.gpu_bypassed.contains(&input.video) {
-            self.resource_handoffs.remove(&input.video);
-            return Ok(None);
+    fn deliver_processed(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+        let capture_binding = self
+            .captures
+            .get(&input.provider)
+            .ok_or("capture_provider_unavailable")?;
+        let prefix = unsafe { capture_binding.table::<CaptureApiPrefix>() }
+            .map_err(|_| "capture_interface")?;
+        if !capture_resources_available(prefix.base.header) {
+            return Err("capture_resources_unavailable");
         }
-        if let Some(existing) = self.resource_handoffs.get(&input.video)
-            && existing.encoder_service == self.active_encoder
-            && existing.encoder_session == input.encoder
-        {
-            return Ok(Some(existing.handoff));
-        }
-        let binding = self
-            .gpu_processor
-            .as_ref()
-            .ok_or("gpu_processor_unavailable")?;
-        // SAFETY: the typed binding remains live through negotiation.
-        let processor = unsafe { gpu_processor::table(binding) }?;
-        // SAFETY: the active encoder binding is a typed encoder table.
+        let capture = unsafe { capture_binding.table::<CaptureApiV1_8>() }
+            .map_err(|_| "capture_interface")?;
+        let processor = unsafe {
+            frame_processor::table(
+                self.gpu_processor
+                    .as_ref()
+                    .ok_or("frame_processor_unavailable")?,
+            )
+        }?;
         let encoder = unsafe {
             self.encoders
                 .get(&self.active_encoder)
@@ -1450,110 +1455,62 @@ impl NativePlane {
                 .table::<EncoderApi>()
         }
         .map_err(|_| "encoder_interface")?;
-        // SAFETY: both typed bindings and streams are live on this thread.
-        let negotiated = unsafe {
-            amaterasu_module_sdk::processing::negotiate_resource_handoff(
-                processor,
-                input.video,
-                encoder,
-                input.encoder,
-            )
-        };
-        let handoff = negotiated.map_err(|status| {
-            if matches!(status, MEDIA_BUSY | MEDIA_PENDING) {
-                return "gpu_processor_resource_handoff_pending";
+        if !self.processing_sessions.contains_key(&input.video) {
+            let session = unsafe {
+                frame_processor::Session::new(
+                    capture,
+                    processor,
+                    encoder,
+                    &self.active_encoder,
+                    input,
+                )
+            }?;
+            self.processing_sessions.insert(input.video, session);
+        }
+        let session = self
+            .processing_sessions
+            .get_mut(&input.video)
+            .expect("created session");
+        if !session.source_matches(input) {
+            return Err("frame_processor_source_changed");
+        }
+        unsafe { session.select_encoder(encoder, &self.active_encoder, input.encoder) }?;
+        match unsafe {
+            amaterasu_module_sdk::media::encoder_gpu_input_ready(encoder, input.encoder)
+        } {
+            Ok(Some(false)) => {
+                return Ok(Progress {
+                    capture_deferred: true,
+                    gpu_input_deferred: true,
+                    ..Progress::default()
+                });
             }
-            eprintln!(
-                "amaterasu video processor handoff stream={} failed status={status}",
-                input.video
-            );
-            "gpu_processor_resource_handoff_failed"
-        })?;
-        eprintln!(
-            "amaterasu video processor handoff stream={} selected=resource",
-            input.video
-        );
-        self.resource_handoffs.insert(
-            input.video,
-            ResourceNegotiation {
-                encoder_service: self.active_encoder.clone(),
-                encoder_session: input.encoder,
-                handoff,
-            },
-        );
-        Ok(Some(handoff))
+            Ok(_) => {}
+            Err(_) => return Err("encoder_gpu_readiness_failed"),
+        }
+        session.pump(input)
     }
 
-    /// Borrows only the encoder bindings, so callers keep other fields free.
-    fn resource_target<'a>(
-        encoders: &'a BTreeMap<String, NativeBinding>,
-        active_encoder: &str,
-        handoff: Option<amaterasu_module_sdk::processing::ResourceHandoff>,
-    ) -> Result<Option<dmabuf::ResourceTarget<'a>>, &'static str> {
-        let Some(handoff) = handoff else {
-            return Ok(None);
-        };
-        // SAFETY: the active encoder binding is a typed encoder table and
-        // outlives this pump.
-        let binding = encoders.get(active_encoder).ok_or("encoder_unavailable")?;
-        let encoder = unsafe { binding.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
-        // SAFETY: as above; the tail is read only when advertised in full.
-        let encoder = unsafe { amaterasu_module_sdk::processing::resource_input_table(encoder) }
-            .ok_or("encoder_resource_interface_required")?;
-        Ok(Some(dmabuf::ResourceTarget { encoder, handoff }))
-    }
-
+    /// Plain capture-to-encoder delivery; selected effects use only the SDK
+    /// resource processing chain above, independent of capture storage.
     fn deliver_dmabuf(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
         if !input.capture_due && !input.repeat_due {
             return Ok(Progress::default());
         }
-        let handoff = match self.resource_handoff(input) {
-            Err("gpu_processor_resource_handoff_pending") => {
-                return Ok(Progress {
-                    capture_deferred: true,
-                    ..Progress::default()
-                });
-            }
-            result => result?,
-        };
         let binding = self
             .captures
             .get(&input.provider)
             .ok_or("capture_provider_unavailable")?;
-        // SAFETY: both bindings retain validated v1.0 prefixes; the tails are
-        // read only after their advertised minor and size cover them.
-        let capture_prefix =
+        let capture =
             unsafe { binding.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
-        let encoder_prefix = unsafe {
-            self.encoders
-                .get(&self.active_encoder)
-                .expect("validated encoder binding")
-                .table::<EncoderApi>()
-        }
-        .map_err(|_| "encoder_interface")?;
-        if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
-            // Ask before every conversion. Processing only queues GPU work, so
-            // this gate does not serialize the CPU behind the encoder; it keeps
-            // a busy encoder from discarding a finished conversion whose GPU
-            // time would delay the next accepted frame. The query is advisory
-            // and the enclosing pump still polls encoded output.
-            // SAFETY: this is the selected typed encoder binding and session.
-            match unsafe {
-                amaterasu_module_sdk::media::encoder_gpu_input_ready(encoder_prefix, input.encoder)
-            } {
-                Ok(Some(false)) => {
-                    return Ok(Progress {
-                        capture_deferred: true,
-                        gpu_input_deferred: true,
-                        ..Progress::default()
-                    });
-                }
-                Ok(Some(true) | None) => {}
-                Err(_) => return Err("encoder_gpu_readiness_failed"),
-            }
-        }
-        if capture_resources_available(capture_prefix.base.header) {
-            if !dmabuf::encoder_lease_tail_available(encoder_prefix.base.header) {
+        let encoder_binding = self
+            .encoders
+            .get(&self.active_encoder)
+            .ok_or("encoder_unavailable")?;
+        let encoder =
+            unsafe { encoder_binding.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        if capture_resources_available(capture.base.header) {
+            if !dmabuf::encoder_lease_tail_available(encoder.base.header) {
                 return Ok(Progress {
                     dmabuf_fallback: Some("encoder_dmabuf_lease_interface_unavailable"),
                     ..Progress::default()
@@ -1561,112 +1518,50 @@ impl NativePlane {
             }
             let capture =
                 unsafe { binding.table::<CaptureApiV1_8>() }.map_err(|_| "capture_interface")?;
-            let encoder = unsafe {
-                self.encoders
-                    .get(&self.active_encoder)
-                    .expect("validated encoder binding")
-                    .table::<EncoderApiV1_2>()
-            }
-            .map_err(|_| "encoder_interface")?;
-            let processor = self
-                .gpu_processor
-                .as_ref()
-                .filter(|_| !self.gpu_bypassed.contains(&input.video))
-                .map(|binding| unsafe { gpu_processor::table(binding) })
-                .transpose()?;
-            // SAFETY: these bindings remain live until mandatory cancellation completes.
+            let encoder = unsafe { encoder_binding.table::<EncoderApiV1_2>() }
+                .map_err(|_| "encoder_interface")?;
             unsafe {
                 self.leased_streams
-                    .register(input.video, input.encoder, encoder, processor);
-            }
-            let resource = Self::resource_target(&self.encoders, &self.active_encoder, handoff)?;
+                    .register(input.video, input.encoder, encoder)
+            };
             let progress = dmabuf::deliver_resource(
                 capture,
                 encoder,
-                processor,
-                resource,
                 input,
                 &mut self.dmabuf_resource_selections,
             )?;
-            if (processor.is_some() || self.require_frame_lease)
+            if self.require_frame_lease
                 && let Some(reason) = progress.dmabuf_fallback
             {
                 return Err(reason);
             }
             return Ok(progress);
         }
-        if let Some(reason) =
-            dmabuf::path_unavailable(capture_prefix.base.header, encoder_prefix.base.header)
-        {
+        if let Some(reason) = dmabuf::path_unavailable(capture.base.header, encoder.base.header) {
             return Ok(Progress {
                 dmabuf_fallback: Some(reason),
                 ..Progress::default()
             });
         }
-        let capture_api =
-            unsafe { binding.table::<CaptureApiV1_4>() }.map_err(|_| "capture_interface")?;
-        let encoder_api = unsafe {
-            self.encoders
-                .get(&self.active_encoder)
-                .expect("validated encoder binding")
-                .table::<EncoderApiV1_1>()
-        }
-        .map_err(|_| "encoder_interface")?;
-        if dmabuf::use_lease_path(
-            capture_prefix.base.header,
-            encoder_prefix.base.header,
-            self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video),
-        )? {
-            let leased_capture =
+        if dmabuf::use_lease_path(capture.base.header, encoder.base.header) {
+            let capture =
                 unsafe { binding.table::<CaptureApiV1_6>() }.map_err(|_| "capture_interface")?;
-            let processor = self
-                .gpu_processor
-                .as_ref()
-                .filter(|_| !self.gpu_bypassed.contains(&input.video))
-                .map(|binding| unsafe { gpu_processor::table(binding) })
-                .transpose()?;
-            let leased_encoder = unsafe {
-                self.encoders
-                    .get(&self.active_encoder)
-                    .expect("validated encoder binding")
-                    .table::<EncoderApiV1_2>()
-            }
-            .map_err(|_| "encoder_interface")?;
-            // Register before calling either native stage: even a rejected
-            // submission can have processor-owned GPU work requiring cleanup.
-            // SAFETY: all tables are validated and their bindings outlive this
-            // plane's mandatory shutdown barrier.
+            let encoder = unsafe { encoder_binding.table::<EncoderApiV1_2>() }
+                .map_err(|_| "encoder_interface")?;
             unsafe {
                 self.leased_streams
-                    .register(input.video, input.encoder, leased_encoder, processor);
-            }
-            let resource = Self::resource_target(&self.encoders, &self.active_encoder, handoff)?;
-            let progress = dmabuf::deliver_leased(
-                leased_capture,
-                leased_encoder,
-                processor,
-                resource,
-                input,
-                !input.capture_due,
-            )?;
-            if let Some(reason) = progress.dmabuf_fallback {
-                if (self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video))
-                    || self.require_frame_lease
-                {
-                    return Err(reason);
-                }
-                if reason == "capture_dmabuf_lease_unsupported" {
-                    return dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due);
-                }
-            }
-            Ok(progress)
-        } else if self.require_frame_lease {
-            Err("capture_frame_lease_required")
-        } else if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
-            Err("gpu_processor_requires_frame_lease")
-        } else {
-            dmabuf::deliver(capture_api, encoder_api, input, !input.capture_due)
+                    .register(input.video, input.encoder, encoder)
+            };
+            return dmabuf::deliver_leased(capture, encoder, input, !input.capture_due);
         }
+        if self.require_frame_lease {
+            return Err("capture_frame_lease_required");
+        }
+        let capture =
+            unsafe { binding.table::<CaptureApiV1_4>() }.map_err(|_| "capture_interface")?;
+        let encoder = unsafe { encoder_binding.table::<EncoderApiV1_1>() }
+            .map_err(|_| "encoder_interface")?;
+        dmabuf::deliver(capture, encoder, input, !input.capture_due)
     }
 
     /// Polls at most one encoded packet into the stream's bounded queue.

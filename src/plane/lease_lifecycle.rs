@@ -1,5 +1,5 @@
 //! Retirement barriers for native stages that can retain source GPU leases.
-use amaterasu_media::{EncoderApiV1_2, GpuProcessorApi};
+use amaterasu_media::EncoderApiV1_2;
 use std::{collections::BTreeMap, ffi::c_void};
 
 type Cancel = unsafe extern "C" fn(*mut c_void, u64);
@@ -21,7 +21,6 @@ impl Stage {
 
 struct Stages {
     encoder: Stage,
-    processor: Option<Stage>,
 }
 
 #[derive(Default)]
@@ -35,13 +34,7 @@ impl LeasedStreams {
     /// # Safety
     /// Both native bindings must remain live until finish/finish_all completes.
     /// Tables and callbacks must obey their advertised lease cancellation ABI.
-    pub unsafe fn register(
-        &mut self,
-        video: u64,
-        encoder: u64,
-        api: &EncoderApiV1_2,
-        processor: Option<&GpuProcessorApi>,
-    ) {
+    pub unsafe fn register(&mut self, video: u64, encoder: u64, api: &EncoderApiV1_2) {
         if let Some(previous) = self.values.get(&video) {
             if previous.encoder.stream == encoder {
                 return;
@@ -56,24 +49,14 @@ impl LeasedStreams {
                     cancel: api.cancel_dmabuf_leases,
                     stream: encoder,
                 },
-                processor: processor.map(|api| Stage {
-                    context: api.base.context,
-                    cancel: api.cancel_dmabuf_leases,
-                    stream: video,
-                }),
             },
         );
     }
 
-    pub fn finish(&mut self, video: u64) -> bool {
+    pub fn finish(&mut self, video: u64) {
         if let Some(stages) = self.values.remove(&video) {
             stages.encoder.finish();
-            if let Some(processor) = stages.processor {
-                processor.finish();
-                return true;
-            }
         }
-        false
     }
 
     pub fn finish_all(&mut self) {
@@ -82,11 +65,6 @@ impl LeasedStreams {
         // downstream users before retiring any processor-owned GPU work.
         for stages in values.values() {
             stages.encoder.finish();
-        }
-        for stages in values.values() {
-            if let Some(processor) = &stages.processor {
-                processor.finish();
-            }
         }
     }
 }

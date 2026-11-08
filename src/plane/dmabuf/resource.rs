@@ -258,8 +258,6 @@ unsafe extern "C" fn frame(context: *mut c_void, frame: *const CaptureResourceFr
 pub(in crate::plane) fn deliver(
     api: &CaptureApiV1_8,
     encoder: &EncoderApiV1_2,
-    processor: Option<&GpuProcessorApi>,
-    resource: Option<super::ResourceTarget<'_>>,
     input: &Pump<'_>,
     cache: &mut BTreeMap<u64, CachedSelection>,
 ) -> Result<Progress, &'static str> {
@@ -376,11 +374,7 @@ pub(in crate::plane) fn deliver(
                     encoder_submit_us: 0,
                 },
                 encoder,
-                processor,
-                resource,
-                gpu_processor_us: None,
                 encoder_busy: false,
-                video: input.video,
                 calls: 0,
                 invalid: false,
             },
@@ -436,7 +430,6 @@ pub(in crate::plane) fn deliver(
             capture_callback_count: 1,
             capture_frame_count: u64::from(delivery.calls == 1),
             encoder_submit_us: common.encoder_submit_us,
-            gpu_processor_us: delivery.common.gpu_processor_us,
             gpu_encoder_busy: delivery.common.encoder_busy,
             ..Progress::default()
         });
@@ -619,11 +612,7 @@ mod tests {
                     encoder_submit_us: 0,
                 },
                 encoder: &api,
-                processor: None,
-                resource: None,
-                gpu_processor_us: None,
                 encoder_busy: false,
-                video: 1,
                 calls: 0,
                 invalid: false,
             },

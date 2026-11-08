@@ -92,16 +92,17 @@ impl CpuSourceProvider for Source {
         _: &CpuSourceFormat,
     ) -> Result<Option<CpuSourcePresentation>, Status> {
         self.counts.reads.fetch_add(1, Ordering::SeqCst);
-        let bytes = (0..16 * 16 * 3 / 2)
+        let bytes: Vec<u8> = (0..16 * 16 * 3 / 2)
             .flat_map(|i| if i < 256 { 64u16 << 6 } else { 512u16 << 6 }.to_le_bytes())
             .collect();
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: 16,
             height: 16,
             stride: 32,
             pixel_format: PIXEL_P010,
             color: color(true, false),
-            bytes: Arc::new(bytes),
+            bytes: Arc::new(bytes).into(),
             timestamp_us: 11,
             capture_pacing_timestamp_us: 10,
             sequence: 1,
@@ -569,7 +570,7 @@ fn an_equal_layout_or_service_alias_cannot_substitute_another_processor_family()
         },
         counts,
         true,
-        native_contracts::GPU_PROCESSOR,
+        native_contracts::FRAME_PROCESSOR,
         Err("wrong_family"),
     );
 }
