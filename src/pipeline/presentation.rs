@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 /// A mapped presentation timestamp further behind the stream clock than this
 /// belongs to a discontinuous provider clock and re-anchors the mapping.
 const MAX_TIMESTAMP_LAG_US: u64 = 200_000;
+/// Fraction of a frame interval by which a presentation may precede its cap
+/// slot. Nothing wakes the pipeline exactly at a slot, so holding a frame that
+/// arrived just early delays it until the next host pass. The slot grid itself
+/// still advances by whole intervals, so the sustained rate stays capped.
+const EARLY_ADMISSION_DIVISOR: u32 = 8;
 
 /// Maps the provider's presentation clock onto the video stream clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +50,8 @@ pub(super) struct PresentationPacing {
     pending: Option<PresentationStatus>,
     /// Earliest instant the frame-rate cap admits another submit.
     next_submit_at: Option<Instant>,
+    /// How far ahead of `next_submit_at` a presentation is still admitted.
+    early_admission: Duration,
     clock: Option<ClockAnchor>,
     fresh_pushes: u64,
     repeats: u64,
@@ -102,7 +109,10 @@ impl PresentationPacing {
 
     /// The frame-rate cap admits a submit at `now`.
     pub(super) fn submit_allowed(&self, now: Instant) -> bool {
-        self.next_submit_at.is_none_or(|slot| now >= slot)
+        self.next_submit_at.is_none_or(|slot| {
+            now.checked_add(self.early_admission)
+                .is_some_and(|t| t >= slot)
+        })
     }
 
     /// A newer presentation waits and the frame-rate cap admits it.
@@ -215,6 +225,7 @@ impl PresentationPacing {
     /// make the next one sooner than half an interval, and a submit after a
     /// whole missed slot re-anchors the grid instead of bursting to catch up.
     fn advance_rate_cap(&mut self, submitted_at: Instant, interval: Duration) {
+        self.early_admission = interval / EARLY_ADMISSION_DIVISOR;
         let fresh_grid = submitted_at.checked_add(interval);
         self.next_submit_at = match self.next_submit_at {
             Some(slot)
@@ -259,6 +270,51 @@ pub(super) fn frame_interval(fps: u32) -> Duration {
 }
 
 #[cfg(test)]
+mod early_admission_tests {
+    use super::*;
+
+    fn submitted() -> PresentationDelivery {
+        PresentationDelivery {
+            pushed: false,
+            repeat: false,
+            delivered: None,
+            submitted: true,
+        }
+    }
+
+    #[test]
+    fn a_presentation_just_before_its_slot_is_not_held() {
+        let interval = frame_interval(120);
+        let start = Instant::now();
+        let mut pacing = PresentationPacing::default();
+        pacing.record(start, interval, submitted());
+
+        assert!(pacing.submit_allowed(start + interval - interval / 16));
+        assert!(!pacing.submit_allowed(start + interval / 2));
+    }
+
+    #[test]
+    fn early_admission_does_not_raise_the_sustained_rate() {
+        let interval = frame_interval(120);
+        let start = Instant::now();
+        let mut pacing = PresentationPacing::default();
+        pacing.record(start, interval, submitted());
+        let mut now = start;
+        let frames = 1_000u32;
+        for _ in 0..frames {
+            while !pacing.submit_allowed(now) {
+                now += Duration::from_micros(10);
+            }
+            pacing.record(now, interval, submitted());
+        }
+        // Every submission lands as early as the cap allows, yet the elapsed
+        // time still covers all but the tolerance of a single interval.
+        let floor = interval * frames - interval / EARLY_ADMISSION_DIVISOR;
+        assert!(now - start >= floor, "{:?} < {floor:?}", now - start);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -299,8 +355,10 @@ mod tests {
         let start = Instant::now();
         let mut pacing = PresentationPacing::default();
         pacing.record(start, INTERVAL, fresh_submit(1));
-        assert!(!pacing.submit_allowed(start + INTERVAL - Duration::from_micros(1)));
-        assert!(pacing.submit_allowed(start + INTERVAL));
+        // A presentation may land up to an eighth of an interval early.
+        let earliest = start + INTERVAL - INTERVAL / EARLY_ADMISSION_DIVISOR;
+        assert!(!pacing.submit_allowed(earliest - Duration::from_micros(1)));
+        assert!(pacing.submit_allowed(earliest));
 
         // Submitting 1.9 ms late (a host tick) still claims the original grid.
         pacing.record(
