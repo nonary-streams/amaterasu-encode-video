@@ -104,7 +104,55 @@ enum Outcome {
     Busy,
     /// This stream cannot use DMA-BUF frames; the reason selects CPU capture.
     Unsupported(&'static str),
-    Rejected,
+    Rejected(Rejection),
+}
+
+/// Identifies the check that refused a presentation. A rejection terminates
+/// the stream, so its single diagnostic names the failed stage and frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rejection {
+    reason: &'static str,
+    status: Status,
+    color: u32,
+    fourcc: u32,
+}
+
+impl Rejection {
+    fn of(reason: &'static str, status: Status, frame: &DmaBufFrame) -> Outcome {
+        Outcome::Rejected(Self {
+            reason,
+            status,
+            color: frame.color,
+            fourcc: frame.fourcc,
+        })
+    }
+}
+
+/// Reports a rejection under the stable `frame_rejected` stream error.
+fn frame_rejected(rejection: Rejection) -> &'static str {
+    eprintln!(
+        "amaterasu video frame rejected reason={} status={} color={} fourcc={:#010x}",
+        rejection.reason, rejection.status, rejection.color, rejection.fourcc
+    );
+    "frame_rejected"
+}
+
+/// Names the first descriptor or range check that `frame` fails.
+fn frame_check_failure(
+    frame: &DmaBufFrame,
+    descriptor_valid: bool,
+    source_hdr_required: Option<bool>,
+    output_hdr_required: Option<bool>,
+) -> Option<&'static str> {
+    if !descriptor_valid {
+        Some("invalid_descriptor")
+    } else if !source_color_matches(source_hdr_required, frame.color) {
+        Some("source_color_mismatch")
+    } else if !source_color_matches(output_hdr_required, frame.color) {
+        Some("output_color_mismatch")
+    } else {
+        None
+    }
 }
 
 /// No source constraint preserves legacy operation. Explicit processing plans
@@ -143,11 +191,13 @@ impl Submission<'_> {
     /// Every descriptor in `frame` must remain open until this call returns.
     unsafe fn forward(&mut self, frame: &DmaBufFrame) -> Outcome {
         self.presentation = Some(frame.sequence);
-        if frame.validate().is_err()
-            || !source_color_matches(self.source_hdr_required, frame.color)
-            || !source_color_matches(self.output_hdr_required, frame.color)
-        {
-            return Outcome::Rejected;
+        if let Some(reason) = frame_check_failure(
+            frame,
+            frame.validate().is_ok(),
+            self.source_hdr_required,
+            self.output_hdr_required,
+        ) {
+            return Rejection::of(reason, STATUS_OK, frame);
         }
         if frame.width != self.width || frame.height != self.height {
             // The GPU path never scales; PipeWire capture fits mismatched sizes.
@@ -182,7 +232,7 @@ impl Submission<'_> {
             }
             MEDIA_BUSY => Outcome::Busy,
             MEDIA_UNSUPPORTED => Outcome::Unsupported("encoder_dmabuf_unsupported"),
-            _ => Outcome::Rejected,
+            status => Rejection::of("encoder_submit_failed", status, frame),
         }
     }
 }
@@ -259,7 +309,7 @@ pub fn deliver(
     };
     let delivered = submission.outcome != Outcome::NotDelivered;
     let dmabuf_fallback = match submission.outcome {
-        Outcome::Rejected => return Err("frame_rejected"),
+        Outcome::Rejected(rejection) => return Err(frame_rejected(rejection)),
         Outcome::Unsupported(reason) => Some(reason),
         _ => capture_fallback,
     };
@@ -280,10 +330,21 @@ pub fn deliver(
     })
 }
 
+/// A negotiated processor-to-encoder resource handoff for this stream.
+#[derive(Clone, Copy)]
+pub(super) struct ResourceTarget<'a> {
+    pub encoder: &'a EncoderApiV1_5,
+    pub handoff: amaterasu_module_sdk::processing::ResourceHandoff,
+}
+
 struct LeasedSubmission<'a> {
     common: Submission<'a>,
     encoder: &'a EncoderApiV1_2,
     processor: Option<&'a GpuProcessorApi>,
+    /// When set, the processor output reaches the encoder as a resource.
+    resource: Option<ResourceTarget<'a>>,
+    gpu_processor_us: Option<u64>,
+    encoder_busy: bool,
     video: u64,
     calls: usize,
     invalid: bool,
@@ -295,10 +356,13 @@ impl LeasedSubmission<'_> {
     unsafe fn forward(&mut self, lease: &DmaBufFrameLease) -> Outcome {
         let frame = &lease.frame;
         self.common.presentation = Some(frame.sequence);
-        if lease.validate().is_err()
-            || !source_color_matches(self.common.output_hdr_required, frame.color)
-        {
-            return Outcome::Rejected;
+        if let Some(reason) = frame_check_failure(
+            frame,
+            lease.validate().is_ok(),
+            None,
+            self.common.output_hdr_required,
+        ) {
+            return Rejection::of(reason, STATUS_OK, frame);
         }
         if frame.width != self.common.width || frame.height != self.common.height {
             return Outcome::Unsupported("dmabuf_size_mismatch");
@@ -318,6 +382,7 @@ impl LeasedSubmission<'_> {
             )
         };
         self.common.encoder_submit_us = elapsed_micros(started);
+        self.encoder_busy = status == MEDIA_BUSY;
         match status {
             STATUS_OK => {
                 self.common.frame = Some(FrameMetadata {
@@ -331,7 +396,64 @@ impl LeasedSubmission<'_> {
             }
             MEDIA_BUSY => Outcome::Busy,
             MEDIA_UNSUPPORTED => Outcome::Unsupported("encoder_dmabuf_lease_unsupported"),
-            _ => Outcome::Rejected,
+            status => Rejection::of("encoder_lease_submit_failed", status, frame),
+        }
+    }
+}
+
+impl LeasedSubmission<'_> {
+    /// Hands a processor's resource output to the encoder, which retains it
+    /// for asynchronous work. `source` names the capture frame in diagnostics.
+    unsafe fn forward_resource(
+        &mut self,
+        target: ResourceTarget<'_>,
+        frame: &CaptureResourceFrame,
+        source: &DmaBufFrame,
+    ) -> Outcome {
+        self.common.presentation = Some(source.sequence);
+        if frame.width != self.common.width || frame.height != self.common.height {
+            return Outcome::Unsupported("resource_size_mismatch");
+        }
+        if self.common.output_hdr_required == Some(true)
+            && frame.color.transfer != FRAME_TRANSFER_PQ
+        {
+            return Outcome::Unsupported("resource_color_mismatch");
+        }
+        let mut forwarded = *frame;
+        forwarded.timestamp_us = self.common.timestamp_us;
+        forwarded.sequence = self.common.sequence;
+        let flags = if self.common.force_idr {
+            FRAME_RESOURCE_SUBMIT_FORCE_IDR
+        } else {
+            0
+        };
+        let started = Instant::now();
+        // SAFETY: the processor keeps the output referenced during this call
+        // and the encoder retains its own reference before accepting.
+        let status = unsafe {
+            (target.encoder.submit_resource)(
+                target.encoder.base.base.base.base.context,
+                self.common.encoder,
+                &forwarded,
+                flags,
+            )
+        };
+        self.common.encoder_submit_us = elapsed_micros(started);
+        self.encoder_busy = status == MEDIA_BUSY;
+        match status {
+            STATUS_OK => {
+                self.common.frame = Some(FrameMetadata {
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.width * 4,
+                    timestamp_us: self.common.timestamp_us,
+                    sequence: self.common.sequence,
+                });
+                Outcome::Accepted
+            }
+            MEDIA_BUSY => Outcome::Busy,
+            MEDIA_UNSUPPORTED => Outcome::Unsupported("encoder_resource_unsupported"),
+            status => Rejection::of("encoder_resource_submit_failed", status, source),
         }
     }
 }
@@ -357,7 +479,7 @@ unsafe extern "C" fn submit_leased_frame(
     // SAFETY: capture lends this descriptor through the callback.
     let lease = unsafe { &*lease };
     if !source_color_matches(submission.common.source_hdr_required, lease.frame.color) {
-        submission.common.outcome = Outcome::Rejected;
+        submission.common.outcome = Rejection::of("source_color_mismatch", STATUS_OK, &lease.frame);
         return STATUS_OK;
     }
     submission.common.fresh = Some(freshness == CAPTURE_FRAME_FRESH);
@@ -369,32 +491,55 @@ unsafe extern "C" fn submit_leased_frame(
             submission.common.outcome = if status == MEDIA_BUSY {
                 Outcome::Busy
             } else {
-                Outcome::Rejected
+                Rejection::of("capture_lease_retain_failed", status, &lease.frame)
             };
             return STATUS_OK;
         }
     };
     submission.common.outcome = if let Some(processor) = submission.processor {
+        let started = Instant::now();
         // SAFETY: retained frame and processor table stay alive throughout the
         // synchronous processing callback and encoder submission.
-        match unsafe {
-            super::gpu_processor::dispatch(
-                processor,
-                submission.video,
-                retained.descriptor(),
-                freshness,
-                |output| {
-                    let outcome = submission.forward(output);
-                    submission.common.outcome = outcome;
-                    match outcome {
-                        Outcome::Accepted => STATUS_OK,
-                        Outcome::Busy => MEDIA_BUSY,
-                        Outcome::Unsupported(_) => MEDIA_UNSUPPORTED,
-                        _ => STATUS_INVALID_ARGUMENT,
-                    }
-                },
-            )
-        } {
+        let status_of = |outcome: Outcome| match outcome {
+            Outcome::Accepted => STATUS_OK,
+            Outcome::Busy => MEDIA_BUSY,
+            Outcome::Unsupported(_) => MEDIA_UNSUPPORTED,
+            _ => STATUS_INVALID_ARGUMENT,
+        };
+        let dispatched = if let Some(target) = submission.resource {
+            let source = lease.frame;
+            // SAFETY: as below; the encoder retains the resource output itself.
+            unsafe {
+                super::gpu_processor::dispatch_to_resource(
+                    processor,
+                    submission.video,
+                    target.handoff,
+                    retained.descriptor(),
+                    freshness,
+                    |output| {
+                        let outcome = submission.forward_resource(target, output, &source);
+                        submission.common.outcome = outcome;
+                        status_of(outcome)
+                    },
+                )
+            }
+        } else {
+            // SAFETY: as below.
+            unsafe {
+                super::gpu_processor::dispatch(
+                    processor,
+                    submission.video,
+                    retained.descriptor(),
+                    freshness,
+                    |output| {
+                        let outcome = submission.forward(output);
+                        submission.common.outcome = outcome;
+                        status_of(outcome)
+                    },
+                )
+            }
+        };
+        let outcome = match dispatched {
             super::processor::Outcome::Accepted => Outcome::Accepted,
             super::processor::Outcome::Busy => Outcome::Busy,
             super::processor::Outcome::Failed(MEDIA_UNSUPPORTED) => {
@@ -404,8 +549,24 @@ unsafe extern "C" fn submit_leased_frame(
                     Outcome::Unsupported("gpu_processor_unsupported")
                 }
             }
-            _ => Outcome::Rejected,
-        }
+            // An output refused by this stage keeps its more specific reason.
+            _ if matches!(submission.common.outcome, Outcome::Rejected(_)) => {
+                submission.common.outcome
+            }
+            super::processor::Outcome::Failed(status) => {
+                Rejection::of("gpu_processor_failed", status, &lease.frame)
+            }
+            super::processor::Outcome::ProtocolViolation => Rejection::of(
+                "gpu_processor_protocol_violation",
+                MEDIA_BACKEND_ERROR,
+                &lease.frame,
+            ),
+        };
+        // Dispatch includes the downstream submit callback, which is timed
+        // separately and must not be attributed to GPU processing.
+        submission.gpu_processor_us =
+            Some(elapsed_micros(started).saturating_sub(submission.common.encoder_submit_us));
+        outcome
     } else {
         // SAFETY: this retained frame outlives synchronous submission.
         unsafe { submission.forward(retained.descriptor()) }
@@ -419,6 +580,7 @@ pub fn deliver_leased(
     capture: &CaptureApiV1_6,
     encoder: &EncoderApiV1_2,
     processor: Option<&GpuProcessorApi>,
+    resource: Option<ResourceTarget<'_>>,
     input: &Pump<'_>,
     repeat: bool,
 ) -> Result<Progress, &'static str> {
@@ -450,6 +612,9 @@ pub fn deliver_leased(
         },
         encoder,
         processor,
+        resource,
+        gpu_processor_us: None,
+        encoder_busy: false,
         video: input.video,
         calls: 0,
         invalid: false,
@@ -476,7 +641,7 @@ pub fn deliver_leased(
         _ => return Err("capture_failed"),
     };
     let dmabuf_fallback = match common.outcome {
-        Outcome::Rejected => return Err("frame_rejected"),
+        Outcome::Rejected(rejection) => return Err(frame_rejected(rejection)),
         Outcome::Unsupported(reason) => Some(reason),
         _ => fallback,
     };
@@ -493,6 +658,8 @@ pub fn deliver_leased(
         capture_callback_count: 1,
         capture_frame_count: u64::from(submission.calls == 1),
         encoder_submit_us: common.encoder_submit_us,
+        gpu_processor_us: submission.gpu_processor_us,
+        gpu_encoder_busy: submission.encoder_busy,
         ..Progress::default()
     })
 }

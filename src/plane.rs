@@ -102,6 +102,10 @@ pub struct Progress {
     /// A bounded asynchronous processor is still busy; retain the due capture
     /// slot so the next available frame does not wait an additional period.
     pub capture_deferred: bool,
+    /// The selected encoder reported no space before GPU processing began.
+    pub gpu_input_deferred: bool,
+    /// A processed GPU frame reached the encoder and was rejected as busy.
+    pub gpu_encoder_busy: bool,
     pub repeat_attempted: bool,
     /// The capture provider delivered cached pixels for this scheduled slot.
     /// This is only known when the provider exposes a v1.2-or-newer freshness tail.
@@ -126,6 +130,9 @@ pub struct Progress {
     pub encoder_submit_us: u64,
     pub frame_copy_us: u64,
     pub preprocessing_us: u64,
+    /// Time spent dispatching a GPU processor, excluding the encoder's submit
+    /// call. This still overlaps the enclosing capture callback.
+    pub gpu_processor_us: Option<u64>,
     pub encoder_poll_us: u64,
     pub transport_admission_us: u64,
     pub transport_admission_count: u64,
@@ -256,6 +263,13 @@ pub trait Plane {
     }
 }
 
+/// One stream's negotiated processor-to-encoder handoff.
+struct ResourceNegotiation {
+    encoder_service: String,
+    encoder_session: u64,
+    handoff: Option<amaterasu_module_sdk::processing::ResourceHandoff>,
+}
+
 pub struct NativePlane {
     require_frame_lease: bool,
     resource_processor: Option<resource_processor::Processor>,
@@ -273,6 +287,10 @@ pub struct NativePlane {
     gpu_processor_opt_in: bool,
     gpu_bypassed: std::collections::BTreeSet<u64>,
     gpu_configured: std::collections::BTreeSet<u64>,
+    gpu_encoder_backpressure: BTreeMap<u64, (String, u64)>,
+    /// Per video stream: the processor-to-encoder resource handoff negotiated
+    /// for one encoder session. `None` keeps the DMA-BUF lease path.
+    resource_handoffs: BTreeMap<u64, ResourceNegotiation>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
     capture_preflights:
@@ -437,6 +455,8 @@ impl NativePlane {
                 gpu_processor_opt_in: false,
                 gpu_bypassed: Default::default(),
                 gpu_configured: Default::default(),
+                gpu_encoder_backpressure: BTreeMap::new(),
+                resource_handoffs: BTreeMap::new(),
                 gpu_processor: gpu_processor_service
                     .map(|service| {
                         runtime.bind_native_typed(
@@ -1270,6 +1290,8 @@ impl Plane for NativePlane {
             unsafe { (api.cancel_dmabuf_leases)(api.base.context, video) };
         }
         self.gpu_bypassed.remove(&video);
+        self.gpu_encoder_backpressure.remove(&video);
+        self.resource_handoffs.remove(&video);
     }
 
     fn release_stream(&mut self, video: u64) {
@@ -1396,10 +1418,86 @@ impl NativePlane {
 
     /// Reads one DMA-BUF presentation for a due capture, or re-reads the latest
     /// one as a keepalive repeat when only a repeat is due.
+    /// Negotiates, once per encoder session, whether the GPU processor's
+    /// output reaches the encoder as a negotiated resource (for example CUDA
+    /// device memory) instead of a DMA-BUF lease. Both sides must advertise
+    /// the handoff tails and agree on an offer; otherwise the lease path stays.
+    fn resource_handoff(
+        &mut self,
+        input: &Pump<'_>,
+    ) -> Option<amaterasu_module_sdk::processing::ResourceHandoff> {
+        if self.gpu_processor.is_none()
+            || self.gpu_bypassed.contains(&input.video)
+            || !self.gpu_configured.contains(&input.video)
+        {
+            self.resource_handoffs.remove(&input.video);
+            return None;
+        }
+        if let Some(existing) = self.resource_handoffs.get(&input.video)
+            && existing.encoder_service == self.active_encoder
+            && existing.encoder_session == input.encoder
+        {
+            return existing.handoff;
+        }
+        let processor = unsafe { gpu_processor::table(self.gpu_processor.as_ref()?) }.ok()?;
+        // SAFETY: the active encoder binding is a typed encoder table.
+        let encoder = unsafe {
+            self.encoders
+                .get(&self.active_encoder)?
+                .table::<EncoderApi>()
+        }
+        .ok()?;
+        // SAFETY: both typed bindings and streams are live on this thread.
+        let negotiated = unsafe {
+            amaterasu_module_sdk::processing::negotiate_resource_handoff(
+                processor,
+                input.video,
+                encoder,
+                input.encoder,
+            )
+        };
+        match negotiated {
+            Ok(_) => eprintln!(
+                "amaterasu video processor handoff stream={} selected=resource",
+                input.video
+            ),
+            Err(status) => eprintln!(
+                "amaterasu video processor handoff stream={} selected=lease status={status}",
+                input.video
+            ),
+        }
+        let handoff = negotiated.ok();
+        self.resource_handoffs.insert(
+            input.video,
+            ResourceNegotiation {
+                encoder_service: self.active_encoder.clone(),
+                encoder_session: input.encoder,
+                handoff,
+            },
+        );
+        handoff
+    }
+
+    /// Borrows only the encoder bindings, so callers keep other fields free.
+    fn resource_target<'a>(
+        encoders: &'a BTreeMap<String, NativeBinding>,
+        active_encoder: &str,
+        handoff: Option<amaterasu_module_sdk::processing::ResourceHandoff>,
+    ) -> Option<dmabuf::ResourceTarget<'a>> {
+        let handoff = handoff?;
+        // SAFETY: the active encoder binding is a typed encoder table and
+        // outlives this pump.
+        let encoder = unsafe { encoders.get(active_encoder)?.table::<EncoderApi>() }.ok()?;
+        // SAFETY: as above; the tail is read only when advertised in full.
+        let encoder = unsafe { amaterasu_module_sdk::processing::resource_input_table(encoder) }?;
+        Some(dmabuf::ResourceTarget { encoder, handoff })
+    }
+
     fn deliver_dmabuf(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
         if !input.capture_due && !input.repeat_due {
             return Ok(Progress::default());
         }
+        let handoff = self.resource_handoff(input);
         let binding = self
             .captures
             .get(&input.provider)
@@ -1415,6 +1513,27 @@ impl NativePlane {
                 .table::<EncoderApi>()
         }
         .map_err(|_| "encoder_interface")?;
+        if self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video) {
+            // Ask before every conversion. Processing only queues GPU work, so
+            // this gate does not serialize the CPU behind the encoder; it keeps
+            // a busy encoder from discarding a finished conversion whose GPU
+            // time would delay the next accepted frame. The query is advisory
+            // and the enclosing pump still polls encoded output.
+            // SAFETY: this is the selected typed encoder binding and session.
+            match unsafe {
+                amaterasu_module_sdk::media::encoder_gpu_input_ready(encoder_prefix, input.encoder)
+            } {
+                Ok(Some(false)) => {
+                    return Ok(Progress {
+                        capture_deferred: true,
+                        gpu_input_deferred: true,
+                        ..Progress::default()
+                    });
+                }
+                Ok(Some(true) | None) => {}
+                Err(_) => return Err("encoder_gpu_readiness_failed"),
+            }
+        }
         if capture_resources_available(capture_prefix.base.header) {
             if !dmabuf::encoder_lease_tail_available(encoder_prefix.base.header) {
                 return Ok(Progress {
@@ -1442,10 +1561,12 @@ impl NativePlane {
                 self.leased_streams
                     .register(input.video, input.encoder, encoder, processor);
             }
+            let resource = Self::resource_target(&self.encoders, &self.active_encoder, handoff);
             let progress = dmabuf::deliver_resource(
                 capture,
                 encoder,
                 processor,
+                resource,
                 input,
                 &mut self.dmabuf_resource_selections,
             )?;
@@ -1501,10 +1622,12 @@ impl NativePlane {
                 self.leased_streams
                     .register(input.video, input.encoder, leased_encoder, processor);
             }
+            let resource = Self::resource_target(&self.encoders, &self.active_encoder, handoff);
             let progress = dmabuf::deliver_leased(
                 leased_capture,
                 leased_encoder,
                 processor,
+                resource,
                 input,
                 !input.capture_due,
             )?;

@@ -26,6 +26,7 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
         capture_frame_count: 1,
         encoder_submit_us: 12,
         frame_copy_us: 31,
+        gpu_processor_us: Some(45),
         encoder_poll_us: 7,
         transport_admission_us: 4,
         transport_admission_count: 1,
@@ -42,6 +43,8 @@ fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admissio
     assert_eq!(timings.captured_frames, 1);
     assert_eq!(timings.encoder_submit.total_us, 12);
     assert_eq!(timings.frame_copy.total_us, 31);
+    assert_eq!(timings.gpu_processor.calls, 1);
+    assert_eq!(timings.gpu_processor.total_us, 45);
     assert_eq!(timings.encoder_poll.calls, 2);
     assert_eq!(timings.encoder_poll.total_us, 9);
     assert_eq!(timings.transport_admission.total_us, 4);
@@ -1865,6 +1868,60 @@ fn tick(pipeline: &mut Pipeline, runtime: &mut Runtime, plane: &mut FakePlane, c
     for _ in 0..count {
         pipeline.tick(plane, &mut |command| runtime.send(command));
     }
+}
+
+#[test]
+fn hdr_encoder_configuration_preserves_requested_range() {
+    let Operation::Open {
+        mut configuration, ..
+    } = open()
+    else {
+        unreachable!()
+    };
+    configuration.color_mode = ColorMode::Bt601Full;
+    configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+    };
+    let hdr = encoder::configuration_for_encoder(&configuration);
+    assert_eq!(hdr.color_mode, ColorMode::Bt601Full);
+    assert_eq!(hdr.video_stream_format, configuration.video_stream_format);
+    assert_eq!(configuration.color_mode, ColorMode::Bt601Full);
+    configuration.video_stream_format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+    assert_eq!(
+        encoder::configuration_for_encoder(&configuration).color_mode,
+        ColorMode::Bt601Full
+    );
+}
+
+#[test]
+fn gpu_processing_is_kept_out_of_encoder_probe_and_open_contracts() {
+    let selected = json!({"service":"example.processor/1", "enabled":true,
+        "source_hdr_required":false, "settings":{"strength":7}});
+    let mut operation = auto_open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    configuration.gpu_processing = Some(serde_json::from_value(selected.clone()).unwrap());
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 100);
+    assert_eq!(plane.gpu_configurations, vec![(1, Some(selected))]);
+    for action in ["probe", "open"] {
+        let payload = runtime
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == ENCODE && payload["action"] == action => Some(payload),
+                _ => None,
+            })
+            .expect("encoder request must be reached");
+        assert!(payload["configuration"].get("gpu_processing").is_none());
+    }
+    assert!(plane.calls > 0);
 }
 
 #[test]

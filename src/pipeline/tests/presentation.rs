@@ -218,6 +218,25 @@ fn fresh_presentation_is_pushed_on_the_next_tick_not_the_next_timer_slot() {
 }
 
 #[test]
+fn last_presentation_is_retried_after_encoder_backpressure_without_another_update() {
+    let (mut pipeline, mut runtime, mut plane) = presentation_stream();
+    present(&mut plane, 1, 2_000_000);
+    plane.dropped = true;
+    let before = pipeline.streams[&1].submitted;
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    assert_eq!(pipeline.streams[&1].submitted, before);
+
+    // No new presentation and the keepalive timer is still a minute away.
+    // The previously rejected frame must not require a menu or scene change.
+    plane.dropped = false;
+    assert!(pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+    assert_eq!(pipeline.streams[&1].submitted, before + 1);
+    assert_eq!(counters(&pipeline).0, 1);
+    open_rate_cap(pipeline.streams.get_mut(&1).unwrap());
+    assert!(!pump_once(&mut pipeline, &mut runtime, &mut plane).0);
+}
+
+#[test]
 fn rate_cap_holds_newer_presentations_and_pushes_only_the_newest() {
     let (mut pipeline, mut runtime, mut plane) = presentation_stream();
     present(&mut plane, 1, 1_000_000);

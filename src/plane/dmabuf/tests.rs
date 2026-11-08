@@ -63,6 +63,11 @@ struct Harness {
     processor_lease: RefCell<Option<DmaBufFrameLease>>,
     lifecycle_events: RefCell<Vec<&'static str>>,
     source_binding_alive: Cell<bool>,
+    gpu_readiness: Cell<Status>,
+    readiness_queries: Cell<usize>,
+    capture_reads: Cell<usize>,
+    processor_calls: Cell<usize>,
+    encoder_polls: Cell<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,6 +101,11 @@ impl Default for Harness {
             processor_lease: RefCell::new(None),
             lifecycle_events: RefCell::new(Vec::new()),
             source_binding_alive: Cell::new(true),
+            gpu_readiness: Cell::new(STATUS_OK),
+            readiness_queries: Cell::new(0),
+            capture_reads: Cell::new(0),
+            processor_calls: Cell::new(0),
+            encoder_polls: Cell::new(0),
         }
     }
 }
@@ -176,7 +186,9 @@ unsafe extern "C" fn no_timed_frame(_: *mut c_void, _: u64, _: FreshFrameSinkV1_
 unsafe extern "C" fn reject_cpu(_: *mut c_void, _: u64, _: *const CpuFrame, _: u32) -> Status {
     MEDIA_UNSUPPORTED
 }
-unsafe extern "C" fn no_packet(_: *mut c_void, _: u64, _: PacketSink) -> Status {
+unsafe extern "C" fn no_packet(context: *mut c_void, _: u64, _: PacketSink) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    harness.encoder_polls.set(harness.encoder_polls.get() + 1);
     MEDIA_PENDING
 }
 unsafe extern "C" fn drained(_: *mut c_void, _: u64) -> Status {
@@ -549,6 +561,7 @@ fn lease(harness: &Harness) -> DmaBufFrameLease {
 unsafe extern "C" fn read_lease(context: *mut c_void, _: u64, sink: DmaBufLeaseSink) -> Status {
     // SAFETY: table context is the live harness and callback is synchronous.
     let harness = unsafe { &*context.cast::<Harness>() };
+    harness.capture_reads.set(harness.capture_reads.get() + 1);
     if let Some(freshness) = harness.deliver_freshness.get() {
         harness.in_capture_callback.set(true);
         let status = unsafe { (sink.write)(sink.context, &lease(harness), freshness) };
@@ -653,6 +666,9 @@ unsafe extern "C" fn process_lease(
 ) -> Status {
     // SAFETY: test context and input remain live throughout this function.
     let harness = unsafe { &*context.cast::<Harness>() };
+    harness
+        .processor_calls
+        .set(harness.processor_calls.get() + 1);
     match harness.processor_mode.get() {
         0 => unsafe { (sink.write)(sink.context, input, freshness) },
         1 => MEDIA_BUSY,
@@ -831,6 +847,7 @@ fn encoder_keeps_immutable_lease_after_capture_callback_and_releases_on_completi
         &leased_capture_api(&harness),
         &leased_encoder_api(&harness),
         None,
+        None,
         &pump(&config, true, true),
         false,
     )
@@ -865,6 +882,7 @@ fn leased_delivery_releases_on_encoder_busy_failure_and_retain_refusal() {
             &leased_capture_api(&harness),
             &leased_encoder_api(&harness),
             None,
+            None,
             &pump(&config, true, false),
             false,
         );
@@ -888,6 +906,7 @@ fn leased_delivery_releases_on_encoder_busy_failure_and_retain_refusal() {
     let result = deliver_leased(
         &leased_capture_api(&harness),
         &leased_encoder_api(&harness),
+        None,
         None,
         &pump(&config, true, false),
         false,
@@ -930,6 +949,7 @@ fn selected_processing_checks_capture_color_before_processing_or_bypass() {
             &leased_capture_api(&harness),
             &leased_encoder_api(&harness),
             enabled.then_some(&processor),
+            None,
             &pump(&config, true, false),
             false,
         );
@@ -966,6 +986,7 @@ fn selected_processor_output_must_match_negotiated_range() {
             &leased_capture_api(&harness),
             &leased_encoder_api(&harness),
             Some(&processor),
+            None,
             &pump(&config, true, false),
             false,
         );
@@ -1026,11 +1047,13 @@ fn gpu_processor_preserves_ownership_and_rejects_invalid_output_protocols() {
         &leased_capture_api(&harness),
         &leased_encoder_api(&harness),
         Some(&processor),
+        None,
         &pump(&config, true, false),
         false,
     )
     .unwrap();
     assert!(result.submitted);
+    assert!(result.gpu_processor_us.is_some());
     assert_eq!(harness.retained.get(), 1);
     assert_eq!(
         harness.released.get(),
@@ -1047,11 +1070,18 @@ fn gpu_processor_preserves_ownership_and_rejects_invalid_output_protocols() {
             &leased_capture_api(&harness),
             &leased_encoder_api(&harness),
             Some(&processor),
+            None,
             &pump(&config, true, false),
             false,
         );
         if mode == 1 {
-            assert!(result.unwrap().dropped);
+            let progress = result.unwrap();
+            assert!(progress.dropped);
+            assert!(progress.gpu_processor_us.is_some());
+            assert!(
+                !progress.gpu_encoder_busy,
+                "processor saturation is not encoder backpressure"
+            );
         } else {
             assert_eq!(result.err(), Some("frame_rejected"));
         }
@@ -1105,6 +1135,7 @@ fn optional_leases_preserve_legacy_compatibility_but_processors_require_ownershi
         &leased_capture_api(&harness),
         &leased_encoder_api(&harness),
         None,
+        None,
         &pump(&config, true, false),
         false,
     )
@@ -1129,6 +1160,7 @@ fn gpu_processor_receives_cached_reuse_freshness_without_reclassifying_it() {
         &leased_capture_api(&harness),
         &leased_encoder_api(&harness),
         Some(&processor),
+        None,
         &pump(&config, false, false),
         true,
     )
@@ -1384,6 +1416,160 @@ fn native_plane_drop_retires_encoder_and_processor_before_releasing_source_bindi
     }
 }
 
+unsafe extern "C" fn fixture_encoder_ready(context: *mut c_void, _: u64) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    harness
+        .readiness_queries
+        .set(harness.readiness_queries.get() + 1);
+    harness.gpu_readiness.get()
+}
+
+unsafe extern "C" fn alternate_encoder_ready(context: *mut c_void, id: u64) -> Status {
+    let harness = unsafe { &*context.cast::<Harness>() };
+    assert_eq!(id, 5);
+    harness
+        .readiness_queries
+        .set(harness.readiness_queries.get() + 1);
+    harness.gpu_readiness.get()
+}
+
+unsafe extern "C" fn fixture_encoder_timing(
+    _: *mut c_void,
+    _: u64,
+    _: *mut EncodeTimingSnapshotV1,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}
+
+#[test]
+fn busy_encoder_defers_gpu_processing_but_keeps_polling_and_recovers() {
+    use crate::plane::{NativePlane, Plane};
+    use amaterasu_module_sdk::RuntimeClient;
+    use std::sync::{Arc, Mutex};
+
+    // Exercise a new provider and two old/short-table providers against the
+    // same unchanged video consumer. Old providers keep the submission path.
+    for version in ["ready", "alternate", "legacy", "short", "unsupported"] {
+        let harness = Harness::default();
+        harness.gpu_readiness.set(if version == "unsupported" {
+            MEDIA_UNSUPPORTED
+        } else {
+            MEDIA_BUSY
+        });
+        let capture = leased_capture_api(&harness);
+        let old_encoder = leased_encoder_api(&harness);
+        let mut new_encoder = EncoderApiV1_4 {
+            base: EncoderApiV1_3 {
+                base: leased_encoder_api(&harness),
+                encode_timing: fixture_encoder_timing,
+            },
+            gpu_input_ready: if version == "alternate" {
+                alternate_encoder_ready
+            } else {
+                fixture_encoder_ready
+            },
+        };
+        new_encoder.base.base.base.header.minor = ENCODER_GPU_READINESS_INTERFACE_MINOR;
+        new_encoder.base.base.base.header.size = if version == "short" {
+            std::mem::size_of::<EncoderApiV1_3>() as u32
+        } else {
+            ENCODER_API_V1_4_SIZE
+        };
+        let encoder = if version == "legacy" {
+            std::ptr::from_ref(&old_encoder) as usize
+        } else {
+            std::ptr::from_ref(&new_encoder) as usize
+        };
+        let processor = gpu_processor_api(&harness);
+        let fixture = RuntimeFixture {
+            harness: &harness,
+            capture: std::ptr::from_ref(&capture) as usize,
+            encoder,
+            external_encoder: 0,
+            processor: std::ptr::from_ref(&processor) as usize,
+        };
+        // SAFETY: the fixture and both tables outlive the plane and its calls.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(&fixture).cast_mut().cast(),
+                invoke: invoke_lifecycle_runtime,
+            })
+        };
+        let mut plane = NativePlane::bind(
+            &runtime,
+            Arc::new(Mutex::new(crate::queue::Queues::default())),
+            &[CaptureProvider::Vkms].into(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            Some("fixture.gpu-processor/1"),
+        )
+        .unwrap();
+        let config = configuration();
+        let calls = || (harness.capture_reads.get(), harness.processor_calls.get());
+        if matches!(version, "ready" | "alternate") {
+            // Processing only queues GPU work, so readiness is checked before
+            // every conversion. A busy encoder defers the frame before any
+            // capture read or processor call, and output is still polled.
+            let progress = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(progress.capture_deferred && progress.gpu_input_deferred);
+            assert!(!progress.submitted && !progress.dropped);
+            assert_eq!(calls(), (0, 0));
+            assert_eq!(harness.readiness_queries.get(), 1);
+            assert_eq!(
+                harness.encoder_polls.get(),
+                1,
+                "output must still be polled"
+            );
+            harness.gpu_readiness.set(MEDIA_PENDING);
+            assert!(
+                plane
+                    .pump(pump(&config, true, false))
+                    .unwrap()
+                    .capture_deferred
+            );
+            assert_eq!(calls(), (0, 0));
+            assert_eq!(harness.encoder_polls.get(), 2);
+            harness.gpu_readiness.set(STATUS_OK);
+            let first = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(first.submitted);
+            assert_eq!(calls(), (1, 1));
+            finish_encoder(&harness);
+            // Readiness reserves nothing: a later submit can still be busy.
+            harness.encoder_status.set(MEDIA_BUSY);
+            let raced = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(raced.dropped && !raced.submitted && raced.gpu_encoder_busy);
+            assert_eq!(harness.retained.get(), 0);
+            assert_eq!(calls(), (2, 2));
+            harness.encoder_status.set(STATUS_OK);
+            let recovered = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(recovered.submitted);
+            assert_eq!(calls(), (3, 3));
+            assert_eq!(harness.readiness_queries.get(), 5);
+            assert_eq!(harness.encoder_polls.get(), 5);
+        } else {
+            // Providers without a readiness tail, or reporting it unsupported,
+            // keep the ordinary submission path and its busy rejection.
+            let first = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(first.submitted);
+            finish_encoder(&harness);
+            harness.encoder_status.set(MEDIA_BUSY);
+            let rejected = plane.pump(pump(&config, true, false)).unwrap();
+            assert!(rejected.dropped && rejected.gpu_encoder_busy);
+            harness.encoder_status.set(STATUS_OK);
+            assert!(plane.pump(pump(&config, true, false)).unwrap().submitted);
+            assert_eq!(calls(), (3, 3));
+            assert_eq!(
+                harness.readiness_queries.get(),
+                if version == "unsupported" { 3 } else { 0 }
+            );
+        }
+        finish_encoder(&harness);
+    }
+}
+
 #[test]
 fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
     use crate::plane::{NativePlane, Plane};
@@ -1587,6 +1773,7 @@ fn negotiated_resource_checks_capture_color_before_encoder() {
         &capture,
         &leased_encoder_api(&harness),
         None,
+        None,
         &pump(&config, true, true),
         &mut std::collections::BTreeMap::new(),
     );
@@ -1622,11 +1809,13 @@ fn negotiated_resource_reaches_encoder_and_retains_until_completion() {
         &capture,
         &encoder,
         None,
+        None,
         &pump(&configuration, true, true),
         &mut cache,
     )
     .unwrap();
     assert!(result.submitted);
+    assert_eq!(result.gpu_processor_us, None);
     assert_eq!(result.dmabuf_presentation, Some(44));
     assert_eq!(
         harness.submitted.borrow()[0],
@@ -1742,6 +1931,7 @@ fn vkms_resource_color_metadata_reaches_the_encoder() {
             &capture,
             &encoder,
             None,
+            None,
             &pump(&config, true, false),
             &mut std::collections::BTreeMap::new(),
         )
@@ -1793,6 +1983,7 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
             &capture,
             &encoder,
             None,
+            None,
             &pump(&config, true, false),
             &mut cache
         )
@@ -1805,6 +1996,7 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
         let progress = deliver_resource(
             &capture,
             &encoder,
+            None,
             None,
             &pump(&config, true, false),
             &mut cache,
@@ -1822,6 +2014,7 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
             &capture,
             &encoder,
             None,
+            None,
             &pump(&config, true, false),
             &mut cache
         )
@@ -1837,6 +2030,7 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
         &capture,
         &encoder,
         None,
+        None,
         &pump(&config, true, false),
         &mut cache,
     )
@@ -1844,5 +2038,222 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
     assert_eq!(
         initial.dmabuf_fallback,
         Some("capture_resource_no_dmabuf_offer")
+    );
+}
+
+/// Resource-handoff fixtures: a v1.4 processor whose output is an opaque
+/// vendor resource, and a v1.5 encoder that retains what it accepts.
+#[derive(Default)]
+struct HandoffCounters {
+    process_to_resource: Cell<usize>,
+    resource_submits: Cell<usize>,
+    references: Cell<i32>,
+}
+
+thread_local! {
+    static HANDOFF: HandoffCounters = HandoffCounters::default();
+}
+
+unsafe extern "C" fn handoff_retain(_: *mut c_void) -> Status {
+    HANDOFF.with(|counters| counters.references.set(counters.references.get() + 1));
+    STATUS_OK
+}
+unsafe extern "C" fn handoff_release(_: *mut c_void, completion: *const FrameDescriptor) {
+    assert_eq!(unsafe { (*completion).kind }, FRAME_SYNC_NONE);
+    HANDOFF.with(|counters| counters.references.set(counters.references.get() - 1));
+}
+const HANDOFF_NONE: FrameDescriptor = FrameDescriptor {
+    kind: FRAME_SYNC_NONE,
+    version: 0,
+    size: 0,
+    reserved: 0,
+    namespace: [0; 16],
+    data: std::ptr::null(),
+};
+
+unsafe extern "C" fn process_to_resource(
+    _: *mut c_void,
+    _: u64,
+    input: *const DmaBufFrameLease,
+    freshness: u32,
+    sink: CaptureResourceFrameSink,
+) -> Status {
+    let input = unsafe { &*input };
+    HANDOFF.with(|counters| {
+        counters
+            .process_to_resource
+            .set(counters.process_to_resource.get() + 1);
+        counters.references.set(counters.references.get() + 1);
+    });
+    let frame = CaptureResourceFrame {
+        offer_generation: 1,
+        offer_id: 1,
+        timestamp_us: input.frame.timestamp_us,
+        capture_pacing_timestamp_us: 0,
+        sequence: input.frame.sequence,
+        width: input.frame.width,
+        height: input.frame.height,
+        freshness,
+        reserved: 0,
+        color: FrameColorMetadata::default(),
+        clock: FrameClockMetadata::default(),
+        pacing_clock: FrameClockMetadata::default(),
+        resource: FrameDescriptor {
+            kind: FRAME_RESOURCE_VENDOR_BASE | 0x55,
+            version: 1,
+            size: 0,
+            reserved: 0,
+            namespace: [3; 16],
+            data: std::ptr::null(),
+        },
+        acquire_sync: HANDOFF_NONE,
+        context: std::ptr::null_mut(),
+        retain: handoff_retain,
+        release: handoff_release,
+    };
+    let status = unsafe { (sink.write)(sink.context, &frame) };
+    // The provider releases its initial reference after delivery.
+    unsafe { handoff_release(std::ptr::null_mut(), &HANDOFF_NONE) };
+    status
+}
+unsafe extern "C" fn no_metadata(_: *mut c_void, _: u64, _: *mut HdrMetadata) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_json(_: *mut c_void, _: u64, _: *const u8, _: usize) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_offers(
+    _: *mut c_void,
+    _: u64,
+    _: CaptureResourceOfferSink,
+    _: *mut u64,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_select(_: *mut c_void, _: u64, _: u64, _: u64) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_configure(
+    _: *mut c_void,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: *const CaptureResourceOffer,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_timing(_: *mut c_void, _: u64, _: *mut EncodeTimingSnapshotV1) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn always_ready(_: *mut c_void, _: u64) -> Status {
+    STATUS_OK
+}
+unsafe extern "C" fn submit_resource(
+    _: *mut c_void,
+    _: u64,
+    frame: *const CaptureResourceFrame,
+    flags: u32,
+) -> Status {
+    assert_eq!(flags, 0);
+    let frame = unsafe { &*frame };
+    assert_eq!(frame.sequence, 9, "the pump's identity is forwarded");
+    assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+    HANDOFF.with(|counters| {
+        counters
+            .resource_submits
+            .set(counters.resource_submits.get() + 1)
+    });
+    STATUS_OK
+}
+
+#[test]
+fn a_negotiated_handoff_routes_processor_output_to_resource_submission() {
+    use amaterasu_module_sdk::processing::ResourceHandoff;
+    let harness = Harness::default();
+    let config = configuration();
+    let base = gpu_processor_api(&harness);
+    let processor = GpuProcessorApiV1_4 {
+        base: GpuProcessorApiV1_3 {
+            base: GpuProcessorApiV1_2 {
+                base: GpuProcessorApiV1_1 {
+                    base: GpuProcessorApi {
+                        base: interface(
+                            GPU_PROCESSOR_API_V1_4_SIZE,
+                            GPU_PROCESSOR_RESOURCE_OUTPUT_INTERFACE_MINOR,
+                            &harness,
+                        ),
+                        ..base
+                    },
+                    hdr_metadata: no_metadata,
+                },
+                configure_stream: no_json,
+            },
+            update_stream: no_json,
+        },
+        enumerate_outputs: no_offers,
+        select_output: no_select,
+        process_to_resource,
+    };
+    let lease = leased_encoder_api(&harness);
+    let encoder = EncoderApiV1_5 {
+        base: EncoderApiV1_4 {
+            base: EncoderApiV1_3 {
+                base: EncoderApiV1_2 {
+                    base: interface(
+                        ENCODER_API_V1_5_SIZE,
+                        ENCODER_RESOURCE_INTERFACE_MINOR,
+                        &harness,
+                    ),
+                    ..lease
+                },
+                encode_timing: no_timing,
+            },
+            gpu_input_ready: always_ready,
+        },
+        enumerate_resources: no_offers,
+        configure_resource: no_configure,
+        submit_resource,
+    };
+    let target = ResourceTarget {
+        encoder: &encoder,
+        handoff: ResourceHandoff {
+            generation: 1,
+            offer: 1,
+        },
+    };
+    let mut input = pump(&config, true, false);
+    input.sequence = 9;
+    let result = deliver_leased(
+        &leased_capture_api(&harness),
+        &encoder.base.base.base,
+        Some(&processor.base.base.base.base),
+        Some(target),
+        &input,
+        false,
+    )
+    .unwrap();
+    assert!(
+        result.submitted,
+        "the resource submission is the frame's submission"
+    );
+    assert!(result.gpu_processor_us.is_some());
+    HANDOFF.with(|counters| {
+        assert_eq!(counters.process_to_resource.get(), 1);
+        assert_eq!(counters.resource_submits.get(), 1);
+        assert_eq!(
+            counters.references.get(),
+            1,
+            "only the encoder's reference remains"
+        );
+    });
+    assert!(
+        harness.submitted.borrow().is_empty(),
+        "no lease reaches the encoder"
+    );
+    assert_eq!(
+        harness.processor_calls.get(),
+        0,
+        "the lease process is unused"
     );
 }

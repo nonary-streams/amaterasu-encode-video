@@ -213,6 +213,10 @@ struct StageTimings {
     encoder_submit: TimingMetric,
     frame_copy: TimingMetric,
     preprocessing: TimingMetric,
+    gpu_processor: TimingMetric,
+    gpu_input_deferred: u64,
+    /// Conversions that finished but were refused by a busy encoder.
+    gpu_output_rejected: u64,
     encoder_poll: TimingMetric,
     transport_admission: TimingMetric,
     captured_frames: u64,
@@ -265,6 +269,15 @@ impl StageTimings {
         if progress.preprocessing_us > 0 {
             self.preprocessing.record(progress.preprocessing_us);
         }
+        if let Some(elapsed) = progress.gpu_processor_us {
+            self.gpu_processor.record(elapsed);
+        }
+        self.gpu_input_deferred = self
+            .gpu_input_deferred
+            .saturating_add(u64::from(progress.gpu_input_deferred));
+        self.gpu_output_rejected = self
+            .gpu_output_rejected
+            .saturating_add(u64::from(progress.gpu_encoder_busy));
         if progress.owned_frame.is_some() {
             self.frame_copy.record(progress.frame_copy_us);
         }
@@ -2206,7 +2219,11 @@ fn apply_result(
             stream.cleanup("invalid_encoder_probe_reply");
             return false;
         };
-        match encoder::probe_result(identity, &stream.configuration, &payload) {
+        match encoder::probe_result(
+            identity,
+            &encoder::configuration_for_encoder(&stream.configuration),
+            &payload,
+        ) {
             Ok(None) => {
                 stream.encoder_configuration_probed = true;
                 // A software candidate selected by probing has already used

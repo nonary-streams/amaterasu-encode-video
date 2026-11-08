@@ -39,7 +39,7 @@ pub(super) struct PresentationDelivery {
 pub(super) struct PresentationPacing {
     /// The latest pump tick paced this stream by presentations.
     active: bool,
-    /// Newest presentation handed to the encoder, accepted or dropped.
+    /// Newest presentation actually accepted by the encoder.
     delivered_sequence: u64,
     /// Newest observed presentation that has not been delivered yet.
     pending: Option<PresentationStatus>,
@@ -169,25 +169,28 @@ impl PresentationPacing {
         stream_now_us
     }
 
-    /// Applies one pump's outcome: a delivered presentation is consumed even
-    /// when encoder backpressure dropped it, and an accepted submit advances
-    /// the frame-rate cap.
+    /// Only an accepted presentation consumes pending work. A busy encoder
+    /// can reject the last new frame, and capture can temporarily return an
+    /// older frame than its latest presentation query. Keep the newest pending
+    /// until it is actually submitted or superseded by a later presentation.
     pub(super) fn record(
         &mut self,
         submitted_at: Instant,
         interval: Duration,
         delivery: PresentationDelivery,
     ) {
-        if let Some(delivered) = delivery.delivered {
+        if delivery.submitted
+            && let Some(delivered) = delivery.delivered
+        {
             let requested = if delivery.pushed {
                 self.pending.map_or(0, |pending| pending.sequence)
             } else {
                 0
             };
-            if delivery.submitted && requested != 0 && delivered > requested {
+            if requested != 0 && delivered > requested {
                 self.newer_during_read = self.newer_during_read.saturating_add(1);
             }
-            self.delivered_sequence = self.delivered_sequence.max(delivered).max(requested);
+            self.delivered_sequence = self.delivered_sequence.max(delivered);
             if self
                 .pending
                 .is_some_and(|pending| pending.sequence <= self.delivered_sequence)
@@ -388,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_presentation_is_consumed_without_advancing_the_cap() {
+    fn dropped_presentation_remains_pending_without_advancing_the_cap() {
         let start = Instant::now();
         let mut pacing = PresentationPacing::default();
         pacing.observe(presented(5, 1_000));
@@ -400,9 +403,47 @@ mod tests {
                 ..fresh_submit(5)
             },
         );
-        assert!(pacing.pending.is_none());
+        assert_eq!(pacing.pending.unwrap().sequence, 5);
+        assert!(pacing.fresh_due(start));
         assert!(pacing.submit_allowed(start));
         assert_eq!(pacing.fresh_pushes, 0);
+        pacing.record(start, INTERVAL, fresh_submit(5));
+        assert!(pacing.pending.is_none());
+        assert_eq!(pacing.fresh_pushes, 1);
+    }
+
+    #[test]
+    fn a_newer_presentation_replaces_a_backpressured_frame() {
+        let start = Instant::now();
+        let mut pacing = PresentationPacing::default();
+        pacing.observe(presented(5, 1_000));
+        pacing.record(
+            start,
+            INTERVAL,
+            PresentationDelivery {
+                submitted: false,
+                ..fresh_submit(5)
+            },
+        );
+        pacing.observe(presented(6, 2_000));
+        assert_eq!(pacing.pending.unwrap().sequence, 6);
+        assert_eq!(pacing.coalesced, 1);
+        pacing.record(start, INTERVAL, fresh_submit(6));
+        assert!(pacing.pending.is_none());
+        assert_eq!(pacing.delivered_sequence, 6);
+    }
+
+    #[test]
+    fn an_older_accepted_capture_does_not_consume_the_newest_presentation() {
+        let start = Instant::now();
+        let mut pacing = PresentationPacing::default();
+        pacing.observe(presented(8, 1_000));
+        pacing.record(start, INTERVAL, fresh_submit(7));
+        assert_eq!(pacing.pending.unwrap().sequence, 8);
+        assert!(!pacing.fresh_due(start));
+        assert!(pacing.fresh_due(start + INTERVAL));
+        pacing.record(start + INTERVAL, INTERVAL, fresh_submit(8));
+        assert!(pacing.pending.is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Synchronous processing of immutable GPU frame leases. Every retained lease
 //! is released before the native bindings can be destroyed.
-use amaterasu_media::{DmaBufFrameLease, GpuProcessorApi};
+use amaterasu_media::{CaptureResourceFrame, DmaBufFrameLease, GpuProcessorApi};
 pub(super) use amaterasu_module_sdk::processing::ScopedGpuFrame as ScopedLease;
 use amaterasu_module_sdk::{
     NativeBinding,
@@ -43,6 +43,31 @@ pub unsafe fn table(binding: &NativeBinding) -> Result<&GpuProcessorApi, &'stati
         return Err("gpu_processor_interface");
     }
     Ok(api)
+}
+
+/// Like `dispatch`, but delivers the processor's negotiated resource output.
+///
+/// # Safety
+/// As for `dispatch`; `handoff` must be the stream's current selection.
+pub unsafe fn dispatch_to_resource<F>(
+    api: &GpuProcessorApi,
+    stream: u64,
+    handoff: amaterasu_module_sdk::processing::ResourceHandoff,
+    lease: &DmaBufFrameLease,
+    freshness: u32,
+    submit: F,
+) -> super::processor::Outcome
+where
+    F: FnMut(&CaptureResourceFrame) -> Status,
+{
+    use amaterasu_module_sdk::processing::{ProcessingOutcome, process_gpu_to_resource};
+    // SAFETY: caller supplies live input and provider bindings for this call.
+    match unsafe { process_gpu_to_resource(api, stream, handoff, lease, freshness, submit) } {
+        ProcessingOutcome::Accepted => super::processor::Outcome::Accepted,
+        ProcessingOutcome::Busy => super::processor::Outcome::Busy,
+        ProcessingOutcome::Failed(status) => super::processor::Outcome::Failed(status),
+        ProcessingOutcome::ProtocolViolation => super::processor::Outcome::ProtocolViolation,
+    }
 }
 
 /// Built-in video uses the same dispatch adapter available to external consumers.
