@@ -49,8 +49,13 @@ impl ManagedModule for Video {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("video settings unavailable".into());
         };
-        let settings: Settings =
+        let mut settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid video settings")?;
+        let service = if let Some(composition) = runtime.processing_composition()? {
+            configure_processing(&mut settings, &composition)?
+        } else {
+            SERVICE.to_owned()
+        };
         settings.validate()?;
         let source_preflight = source_preflight::SourcePreflight::new(&settings);
         let queues = Arc::new(Mutex::new(queue::Queues::default()));
@@ -72,7 +77,8 @@ impl ManagedModule for Video {
                     &settings.resolved_source_preflight_routes(),
                 )
                 .with_required_frame_leases(settings.require_frame_lease)
-                .with_gpu_processor_opt_in(settings.gpu_processor_opt_in),
+                .with_gpu_processor_opt_in(settings.gpu_processor_opt_in)
+                .with_processing_frame_settings(settings.processing_frame_settings.clone()),
             )
         } else {
             Box::new(Disabled)
@@ -86,11 +92,11 @@ impl ManagedModule for Video {
         );
         let factory = native::Factory::new(queues);
         runtime.require_success(Command::Register {
-            service: SERVICE.into(),
+            service: service.clone(),
         })?;
         // SAFETY: factory is boxed before registration and retained through module
         // lifetime. Signed dependency order stops consumers before destroying video.
-        unsafe { amaterasu_module_sdk::video::register(&runtime, SERVICE, &factory.api) }?;
+        unsafe { amaterasu_module_sdk::video::register(&runtime, &service, &factory.api) }?;
         Ok(Self {
             runtime,
             pipeline,
@@ -161,6 +167,53 @@ impl ManagedModule for Video {
             _ => Err("video request polling failed".into()),
         }
     }
+}
+
+fn configure_processing(
+    settings: &mut Settings,
+    composition: &amaterasu_module_sdk::processing_composition::ProcessingComposition,
+) -> ModuleResult<String> {
+    use amaterasu_module_sdk::{media::native_contracts, processing_composition as sdk};
+    let consumer = composition
+        .frame_consumer
+        .as_ref()
+        .ok_or("video processing composition has no selected consumer")?;
+    let service = sdk::require_contract(consumer, amaterasu_module_sdk::video::CONTRACT, 1, 0)?;
+    let processor = composition
+        .processor
+        .as_ref()
+        .ok_or("video processing composition has no selected processor")?;
+    let processor_service =
+        sdk::require_contract(processor, native_contracts::FRAME_PROCESSOR, 1, 0)?;
+    if settings.cpu_processor_service.is_some() || settings.resource_processor_service.is_some() {
+        return Err("video already selects a different processor".into());
+    }
+    settings.gpu_processor_service = Some(processor_service.to_owned());
+    settings.gpu_processor_opt_in = composition.lifecycle.is_some();
+    settings.processing_frame_settings = match (&composition.lifecycle, &composition.frame_settings)
+    {
+        (None, Some(settings)) if settings.is_object() => Some(settings.clone()),
+        (Some(_), None) => None,
+        _ => {
+            return Err(
+                "selected frame processor requires explicit frame settings or lifecycle".into(),
+            );
+        }
+    };
+    settings.processing_lifecycle_service = composition
+        .lifecycle
+        .as_ref()
+        .map(|lifecycle| {
+            sdk::require_contract(
+                lifecycle,
+                amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+                1,
+                0,
+            )
+            .map(str::to_owned)
+        })
+        .transpose()?;
+    Ok(service.to_owned())
 }
 
 impl Drop for Video {

@@ -293,14 +293,19 @@ pub struct Settings {
     pub source_encoder_providers: BTreeMap<String, SourceEncoderRegistration>,
     #[serde(default)]
     pub cpu_processor_service: Option<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub gpu_processor_service: Option<String>,
     /// Explicit generic resource processor; v1.0 uses signed startup settings.
     #[serde(default)]
     pub resource_processor_service: Option<String>,
     /// Keep the selected processor inactive until a stream explicitly selects it.
-    #[serde(default)]
+    #[serde(skip)]
     pub gpu_processor_opt_in: bool,
+    #[serde(skip)]
+    pub processing_frame_settings: Option<serde_json::Value>,
+    /// Selected lifecycle service for live processor settings.
+    #[serde(skip)]
+    pub processing_lifecycle_service: Option<String>,
     /// Refuse borrowed/CPU fallbacks when this composition requires retained GPU frames.
     #[serde(default)]
     pub require_frame_lease: bool,
@@ -335,6 +340,8 @@ impl Default for Settings {
             gpu_processor_service: None,
             resource_processor_service: None,
             gpu_processor_opt_in: false,
+            processing_frame_settings: None,
+            processing_lifecycle_service: None,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
         }
@@ -1603,6 +1610,8 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            processing_frame_settings: None,
+            processing_lifecycle_service: None,
             resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
@@ -1632,6 +1641,8 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            processing_frame_settings: None,
+            processing_lifecycle_service: None,
             resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
@@ -1721,30 +1732,42 @@ mod tests {
 
     #[test]
     fn processor_settings_validate_services_and_require_one_frame_domain() {
-        let valid: Settings =
-            serde_json::from_value(json!({"gpu_processor_service":"example.process/1"})).unwrap();
+        assert!(
+            serde_json::from_value::<Settings>(
+                json!({"gpu_processor_service":"example.process/1"})
+            )
+            .is_err()
+        );
+        let valid = Settings {
+            gpu_processor_service: Some("example.process/1".into()),
+            ..Settings::default()
+        };
         assert!(valid.validate().is_ok());
-        let both: Settings = serde_json::from_value(json!({"gpu_processor_service":"example.gpu/1", "cpu_processor_service":"example.cpu/1"})).unwrap();
+        let both = Settings {
+            gpu_processor_service: Some("example.gpu/1".into()),
+            cpu_processor_service: Some("example.cpu/1".into()),
+            ..Settings::default()
+        };
         assert_eq!(both.validate(), Err("invalid_video_settings"));
         for service in ["", "no-version", "example /1", "../service/1"] {
-            let settings: Settings =
-                serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
+            let settings = Settings {
+                gpu_processor_service: Some(service.into()),
+                ..Settings::default()
+            };
             assert_eq!(settings.validate(), Err("invalid_video_settings"));
         }
         let resource: Settings =
             serde_json::from_value(json!({"resource_processor_service":"third-party.effects/1"}))
                 .unwrap();
         assert!(resource.validate().is_ok());
-        for other in ["gpu_processor_service", "cpu_processor_service"] {
-            let mut settings = json!({"resource_processor_service":"third-party.effects/1"});
-            settings[other] = json!("other.effects/1");
-            assert_eq!(
-                serde_json::from_value::<Settings>(settings)
-                    .unwrap()
-                    .validate(),
-                Err("invalid_video_settings")
-            );
-        }
+        let mut both: Settings =
+            serde_json::from_value(json!({"resource_processor_service":"third-party.effects/1"}))
+                .unwrap();
+        both.cpu_processor_service = Some("other.effects/1".into());
+        assert_eq!(both.validate(), Err("invalid_video_settings"));
+        both.cpu_processor_service = None;
+        both.gpu_processor_service = Some("other.effects/1".into());
+        assert_eq!(both.validate(), Err("invalid_video_settings"));
         let invalid: Settings =
             serde_json::from_value(json!({"resource_processor_service":"no-version"})).unwrap();
         assert_eq!(invalid.validate(), Err("invalid_video_settings"));
@@ -1790,14 +1813,9 @@ mod tests {
                 .validate(),
             Err("invalid_video_settings")
         );
-        let mut collision = valid.clone();
-        collision["gpu_processor_service"] = json!("example.native/1");
-        assert_eq!(
-            serde_json::from_value::<Settings>(collision)
-                .unwrap()
-                .validate(),
-            Err("invalid_video_settings")
-        );
+        let mut collision: Settings = serde_json::from_value(valid.clone()).unwrap();
+        collision.gpu_processor_service = Some("example.native/1".into());
+        assert_eq!(collision.validate(), Err("invalid_video_settings"));
         let mut bad_source = valid;
         bad_source["source_encoder_providers"]["s"]["source_ids"] = json!([0]);
         assert_eq!(

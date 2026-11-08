@@ -74,6 +74,7 @@ impl Control {
         &mut self,
         streams: &mut BTreeMap<u64, Stream>,
         epoch: &str,
+        lifecycle_service: Option<&str>,
         plane: &mut dyn Plane,
         send: &mut Send<'_>,
     ) {
@@ -191,11 +192,14 @@ impl Control {
         let Some((stream, reference)) = candidate else {
             return;
         };
+        let Some(lifecycle_service) = lifecycle_service else {
+            return;
+        };
         self.sequence = self.sequence.wrapping_add(1);
         let operation_id = format!("video-live-settings-{epoch}-{}", self.sequence);
         let Ok(command) = live_provider_settings_command(
             RequestOptions {
-                service: "amaterasu.session-lifecycle/1",
+                service: lifecycle_service,
                 timeout_ms: 5000,
                 operation_id: &operation_id,
                 parent: None,
@@ -213,6 +217,6 @@ impl Control {
             retry_at: now,
             result: None,
         });
-        self.tick(streams, epoch, plane, send);
+        self.tick(streams, epoch, Some(lifecycle_service), plane, send);
     }
 }

@@ -328,7 +328,12 @@ unsafe extern "C" fn invoke(context: *mut c_void, bytes: BorrowedBytes, sink: Re
 }
 #[test]
 fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_bindings() {
-    for provider in [CaptureProvider::Pipewire, CaptureProvider::X11] {
+    for (provider, managed) in [
+        (CaptureProvider::Pipewire, true),
+        (CaptureProvider::X11, true),
+        (CaptureProvider::Pipewire, false),
+        (CaptureProvider::X11, false),
+    ] {
         let events = Rc::new(RefCell::new(Vec::new()));
         let pixels = Arc::new(vec![37; 16 * 16 * 4]);
         let source = CpuSourceFactory::new(Arc::new(Source(pixels.clone())));
@@ -383,12 +388,15 @@ fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_
             None,
             Some("fixture.effect/1"),
         )
-        .unwrap();
+        .unwrap()
+        .with_processing_frame_settings((!managed).then(|| serde_json::json!({})));
         let mut configuration: Configuration = serde_json::from_value(
             serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100_000}),
         )
         .unwrap();
-        configuration.gpu_processing=Some(serde_json::from_value(serde_json::json!({"service":"fixture.effect/1","enabled":true,"source_hdr_required":false,"settings":{}})).unwrap());
+        if managed {
+            configuration.gpu_processing=Some(serde_json::from_value(serde_json::json!({"service":"fixture.effect/1","enabled":true,"source_hdr_required":false,"settings":{}})).unwrap());
+        }
         plane
             .configure_gpu(1, configuration.gpu_processing.as_ref())
             .unwrap();

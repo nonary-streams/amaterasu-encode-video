@@ -605,27 +605,20 @@ pinned DMA-BUF provider fails with `processor_requires_cpu`. The built-in
 PipeWire conversion fast path is bypassed when a processor is configured.
 
 
-An optional `gpu_processor_service` selects a native GPU processor instead of
-`cpu_processor_service`; configuring both is rejected. GPU processing requires
-capture v1.6 immutable DMA-BUF leases and encoder v1.2 lease submission. Each
-pump retains and releases its temporary input/output references before returning;
-an encoder that continues reading afterward owns a separate retained reference.
-A processor must deliver exactly one output on success, preserve capture sequence,
-timestamp and freshness, and propagate sink refusal. Missing lease support fails
-the stream rather than skipping the configured processor. Without a processor,
-old capture and encoder pairs keep the borrowed DMA-BUF route, and a provider
-that declines leases for one stream is retried through its existing v1.4 callback.
-Native dependencies must outlive every retained reference. Encoder v1.2 and
-GPU processor v1.0 provide mandatory synchronous `cancel_dmabuf_leases` barriers.
-Video records active leased streams before entering native processing; final
-control cleanup cancels their encoder then processor work. On module shutdown,
-`NativePlane` cancels every encoder first, then every processor, before releasing
-any native source binding. These barriers may block on native GPU calls and must
-retire retained references and completion fences before returning. Completed
-streams are removed from tracking, and encoder replacement retires the previous
-encoder. The built-in encoder's initial v1.2 implementation completes its source
-GPU copy synchronously rather than retaining provider callbacks on its worker.
-These contracts do not establish GPU hardware or client playback qualification.
+To select a frame processor, the host supplies a signed processing composition
+through the SDK. Video binds the selected service by its native contract identity
+and version, with an explicit native-use grant and ordered dependency. A
+processor-only composition supplies stream settings directly; a managed session
+can instead use the selected lifecycle and settings contracts. A separately
+configured CPU processor cannot be combined with the selected frame processor.
+
+The processing SDK negotiates the actual input and output resources, color
+formats, and synchronization. The producer and consumer retain their own frame
+references, and teardown retires the encoder and processor before releasing
+their providers. Unsupported combinations fail explicitly. See the
+[frame-processing SDK guide](../../docs/gpu-processing-sdk.md) for the contract,
+ownership rules, and a separately built processor example. Hardware and client
+playback require separate qualification.
 
 ## Remaining provider abstraction boundaries
 

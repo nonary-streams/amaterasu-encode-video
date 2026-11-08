@@ -560,6 +560,7 @@ pub struct Pipeline {
     portal: portal::Control,
     observations: observation::Control,
     live_settings: live_settings::Control,
+    processing_lifecycle_service: Option<String>,
     pub queues: Arc<Mutex<Queues>>,
     processing_generation: Arc<AtomicU64>,
 }
@@ -607,6 +608,7 @@ impl Pipeline {
             portal: portal::Control::default(),
             observations: observation::Control::default(),
             live_settings: live_settings::Control::default(),
+            processing_lifecycle_service: settings.processing_lifecycle_service,
             queues,
             processing_generation,
         }
@@ -951,6 +953,14 @@ impl Pipeline {
             || output.chars().any(char::is_control)
         {
             Some("invalid_request")
+        } else if configuration
+            .gpu_processing
+            .as_ref()
+            .and_then(|processing| processing.live_settings.as_ref())
+            .is_some()
+            && self.processing_lifecycle_service.is_none()
+        {
+            Some("processing_lifecycle_unavailable")
         } else if self.streams.len() >= 2 {
             Some("stream_limit")
         } else {
@@ -1146,8 +1156,13 @@ impl Pipeline {
         } else {
             self.portal.tick(send);
             self.observations.tick(&self.streams, send);
-            self.live_settings
-                .tick(&mut self.streams, &self.epoch, plane, send);
+            self.live_settings.tick(
+                &mut self.streams,
+                &self.epoch,
+                self.processing_lifecycle_service.as_deref(),
+                plane,
+                send,
+            );
         }
         if self.streams.is_empty() {
             return;

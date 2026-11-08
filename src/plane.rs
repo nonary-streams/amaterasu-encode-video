@@ -278,6 +278,7 @@ pub struct NativePlane {
     gpu_processor: Option<NativeBinding>,
     gpu_processor_service: Option<String>,
     gpu_processor_opt_in: bool,
+    processing_frame_settings: Option<serde_json::Value>,
     gpu_bypassed: std::collections::BTreeSet<u64>,
     gpu_configured: std::collections::BTreeSet<u64>,
     processing_sessions: BTreeMap<u64, frame_processor::Session>,
@@ -335,6 +336,10 @@ impl NativePlane {
     }
     pub fn with_gpu_processor_opt_in(mut self, opt_in: bool) -> Self {
         self.gpu_processor_opt_in = opt_in;
+        self
+    }
+    pub fn with_processing_frame_settings(mut self, settings: Option<serde_json::Value>) -> Self {
+        self.processing_frame_settings = settings;
         self
     }
     pub fn with_required_frame_leases(mut self, required: bool) -> Self {
@@ -443,6 +448,7 @@ impl NativePlane {
                     .transpose()?,
                 gpu_processor_service: gpu_processor_service.map(str::to_owned),
                 gpu_processor_opt_in: false,
+                processing_frame_settings: None,
                 gpu_bypassed: Default::default(),
                 gpu_configured: Default::default(),
                 processing_sessions: BTreeMap::new(),
@@ -765,25 +771,32 @@ impl Plane for NativePlane {
         if let Some(processor) = self.resource_processor.as_mut() {
             return processor.configure(stream, selection);
         }
-        let Some(selection) = selection else {
-            if self.gpu_processor_opt_in {
-                self.gpu_bypassed.insert(stream);
-            }
+        if self.gpu_processor.is_none() && selection.is_none() {
             return Ok(());
-        };
-        if self.gpu_processor_service.as_deref() != Some(selection.service.as_str()) {
-            return Err("gpu_processor_selection_mismatch");
         }
+        let settings = if let Some(selection) = selection {
+            if self.gpu_processor_service.as_deref() != Some(selection.service.as_str()) {
+                return Err("gpu_processor_selection_mismatch");
+            }
+            if !selection.enabled {
+                self.gpu_bypassed.insert(stream);
+                return Ok(());
+            }
+            &selection.settings
+        } else if self.gpu_processor_opt_in {
+            self.gpu_bypassed.insert(stream);
+            return Ok(());
+        } else {
+            self.processing_frame_settings
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .ok_or("gpu_processor_settings_missing")?
+        };
         let binding = self
             .gpu_processor
             .as_ref()
             .ok_or("gpu_processor_unavailable")?;
-        if !selection.enabled {
-            self.gpu_bypassed.insert(stream);
-            return Ok(());
-        }
-        let json = serde_json::to_vec(&selection.settings)
-            .map_err(|_| "gpu_processor_settings_invalid")?;
+        let json = serde_json::to_vec(settings).map_err(|_| "gpu_processor_settings_invalid")?;
         let api = unsafe { frame_processor::table(binding) }?;
         unsafe {
             amaterasu_module_sdk::frame_processing::configure_frame_stream(api, stream, &json)

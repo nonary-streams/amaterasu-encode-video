@@ -22,6 +22,9 @@ unsafe extern "C" fn invoke(
         Command::GetSettings {} => Response::Result {
             payload: json!({"enabled":false}),
         },
+        Command::GetProcessingComposition {} => {
+            Response::error("not_found", "no processor selected")
+        }
         Command::Poll {} => Response::Pending,
         Command::Complete { request, payload } => {
             host.completed.push((request, payload));

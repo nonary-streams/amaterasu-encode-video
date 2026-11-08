@@ -5623,8 +5623,20 @@ fn live_effect_toggle_keeps_the_same_running_stream_and_processing_path() {
             .get_mut(&1)
             .unwrap()
             .live_settings_next_poll = Instant::now();
-        control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
-        control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+        control.tick(
+            &mut pipeline.streams,
+            "epoch",
+            Some("replacement.lifecycle/1"),
+            &mut plane,
+            &mut send,
+        );
+        control.tick(
+            &mut pipeline.streams,
+            "epoch",
+            Some("replacement.lifecycle/1"),
+            &mut plane,
+            &mut send,
+        );
         assert_eq!(pipeline.streams.len(), 1);
         let stream = &pipeline.streams[&1];
         assert_eq!(stream.stage, Stage::Running);
@@ -5688,8 +5700,20 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         .get_mut(&1)
         .unwrap()
         .live_settings_next_poll = Instant::now();
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
     assert_eq!(
         pipeline.streams[&1]
             .configuration
@@ -5708,8 +5732,20 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         .get_mut(&1)
         .unwrap()
         .live_settings_next_poll = Instant::now();
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
     assert_eq!(
         pipeline.streams[&1]
             .configuration
@@ -5737,8 +5773,20 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         .get_mut(&1)
         .unwrap()
         .live_settings_next_poll = Instant::now();
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
     assert_eq!(plane.gpu_updates.len(), 2);
     assert_eq!(
         pipeline.streams[&1]
@@ -5767,7 +5815,13 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         .get_mut(&1)
         .unwrap()
         .live_settings_next_poll = Instant::now();
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut send);
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut send,
+    );
     assert_eq!(pipeline.streams[&1].stage, Stage::FindEncoder);
     assert_eq!(
         pipeline.streams[&1].error,
@@ -5782,13 +5836,19 @@ fn live_gpu_settings_require_matching_active_target_and_only_record_success() {
         .unwrap()
         .live_settings_next_poll = Instant::now();
     let mut first_operation = String::new();
-    control.tick(&mut pipeline.streams, "epoch", &mut plane, &mut |command| {
-        let Command::Request { operation_id, .. } = command else {
-            unreachable!()
-        };
-        first_operation = operation_id;
-        Err("lost admission".into())
-    });
+    control.tick(
+        &mut pipeline.streams,
+        "epoch",
+        Some("replacement.lifecycle/1"),
+        &mut plane,
+        &mut |command| {
+            let Command::Request { operation_id, .. } = command else {
+                unreachable!()
+            };
+            first_operation = operation_id;
+            Err("lost admission".into())
+        },
+    );
     let mut retired = Vec::new();
     control.shutdown(&mut |command| match command {
         Command::Request { operation_id, .. } => {
