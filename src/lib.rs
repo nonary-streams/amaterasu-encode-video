@@ -108,7 +108,7 @@ impl ManagedModule for Video {
     fn quiesce(&mut self) -> ModuleResult<bool> {
         let runtime = &self.runtime;
         self.pipeline.quiesce(&mut *self.plane, &mut |command| {
-            runtime.send_ephemeral(command)
+            send_pipeline_command(runtime, command)
         })
     }
 
@@ -118,7 +118,7 @@ impl ManagedModule for Video {
         );
         let runtime = &self.runtime;
         self.pipeline.tick(&mut *self.plane, &mut |command| {
-            runtime.send_ephemeral(command)
+            send_pipeline_command(runtime, command)
         });
         match runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -134,7 +134,7 @@ impl ManagedModule for Video {
                 ) {
                     return Ok(());
                 }
-                let mut send = |command| runtime.send_ephemeral(command);
+                let mut send = |command| send_pipeline_command(runtime, command);
                 if !self.source_preflight.operation_allowed(&caller, &payload) {
                     rpc::complete(&mut send, id, error("source_preflight_only"));
                     return Ok(());
@@ -168,8 +168,15 @@ impl Drop for Video {
         let runtime = &self.runtime;
         self.pipeline.stop_native(&mut *self.plane);
         self.pipeline
-            .shutdown(&mut |command| runtime.send_ephemeral(command));
+            .shutdown(&mut |command| send_pipeline_command(runtime, command));
     }
+}
+
+// Pipeline state machines retain each observed result before separately
+// releasing its broker record. The ephemeral helper releases internally and
+// can hide that result when the release acknowledgement is lost.
+fn send_pipeline_command(runtime: &RuntimeClient, command: Command) -> ModuleResult<Response> {
+    runtime.send(command)
 }
 
 amaterasu_module_sdk::export_module!(Video);

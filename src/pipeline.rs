@@ -156,6 +156,8 @@ struct Stream {
     pending: Option<u64>,
     completed_payload: Option<Value>,
     unsettled: Option<u64>,
+    unsettled_effect: bool,
+    unsettled_observed: bool,
     uncertain: Option<Command>,
     settlement_attempts: u8,
     capture: Option<u64>,
@@ -506,6 +508,8 @@ impl Stream {
         eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage);
         if let Some(request) = self.pending.take() {
             self.unsettled = Some(request);
+            self.unsettled_effect = stage_mutates_provider(self.stage);
+            self.unsettled_observed = self.completed_payload.is_some();
         }
         self.completed_payload = None;
         if let Some(parent) = self.parent.take() {
@@ -1065,6 +1069,8 @@ impl Pipeline {
                 pending: None,
                 completed_payload: None,
                 unsettled: None,
+                unsettled_effect: false,
+                unsettled_observed: false,
                 uncertain: None,
                 settlement_attempts: 0,
                 capture: None,
@@ -1283,6 +1289,19 @@ impl Pipeline {
             }
         }
     }
+}
+
+fn stage_mutates_provider(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::Capture
+            | Stage::Encoder
+            | Stage::CloseEncoder
+            | Stage::RestartCloseEncoder
+            | Stage::CloseCapture
+            | Stage::StopCapture
+            | Stage::ReplaceCapture
+    )
 }
 
 fn close_queue(queues: &Arc<Mutex<Queues>>, pending: &mut BTreeSet<u64>, id: u64) {
@@ -1723,6 +1742,8 @@ fn advance(
             // Selection children retain no codec session. Their result must be
             // released before another probe, capture allocation or failure.
             stream.unsettled = Some(request);
+            stream.unsettled_effect = result.is_err() && stage_mutates_provider(stream.stage);
+            stream.unsettled_observed = false;
         } else if !rpc::release(send, request) {
             // TakeResult retains the broker's payload and operation record.
             // Keep both the exact request and its observed result until release

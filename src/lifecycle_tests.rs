@@ -71,7 +71,7 @@ fn quiesce_waits_for_an_owned_open_to_finish_cleanup_before_reporting_ready() {
     module
         .pipeline
         .handle("consumer", 91, open(), &mut |command| {
-            module.runtime.send_ephemeral(command)
+            send_pipeline_command(&module.runtime, command)
         });
     assert!(!module.quiesce().unwrap());
     module.tick().unwrap();
@@ -93,14 +93,14 @@ fn shutdown_announcement_fences_new_video_open_without_starting_cleanup() {
     module
         .pipeline
         .handle("consumer", 91, open(), &mut |command| {
-            module.runtime.send_ephemeral(command)
+            send_pipeline_command(&module.runtime, command)
         });
     module.prepare_shutdown(5_000).unwrap();
     assert!(host.completed.is_empty());
     module
         .pipeline
         .handle("consumer", 92, open(), &mut |command| {
-            module.runtime.send_ephemeral(command)
+            send_pipeline_command(&module.runtime, command)
         });
     assert!(
         host.completed

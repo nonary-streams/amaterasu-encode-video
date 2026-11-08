@@ -128,6 +128,11 @@ impl Runtime {
                     Response::Ok
                 }
             }
+            Command::LookupRequest { operation_id, .. } => match self.operations.get(&operation_id)
+            {
+                Some(id) => Response::Accepted { id: *id },
+                None => Response::error("not_found", "operation missing"),
+            },
             Command::Request {
                 service,
                 payload,
@@ -339,7 +344,8 @@ impl Runtime {
                 Response::Result {
                     payload: self
                         .pending
-                        .remove(&request)
+                        .get(&request)
+                        .cloned()
                         .unwrap_or(json!({"ok":false,"code":"not_found"})),
                 }
             }
@@ -350,6 +356,10 @@ impl Runtime {
             Command::ReleaseResult { .. } if self.release_failures > 0 => {
                 self.release_failures -= 1;
                 return Err("release lost".into());
+            }
+            Command::ReleaseResult { request } => {
+                self.pending.remove(&request);
+                Response::Ok
             }
             Command::Complete { request, payload } => {
                 if self.parent_failures > 0 {
@@ -2032,11 +2042,23 @@ fn cancelled_open_recovers_owned_ids_and_closes_without_parent() {
     tick(&mut pipeline, &mut runtime, &mut plane, 9);
     assert!(pipeline.streams.is_empty());
     assert!(
-        runtime
+        !runtime
             .commands
             .iter()
             .any(|command| matches!(command, Command::Cancel { .. }))
     );
+    let observed = runtime
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::TakeResult { request: 1 }))
+        .unwrap();
+    let released = runtime
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::ReleaseResult { request: 1 }))
+        .unwrap();
+    let lookup = runtime.commands.iter().position(|command| matches!(command, Command::Request { payload, .. } if payload["action"] == "lookup")).unwrap();
+    assert!(observed < released && released < lookup);
     let closes: Vec<_> = runtime
         .commands
         .iter()
@@ -2228,16 +2250,22 @@ fn shutdown_invalidates_delivery_and_enqueues_exact_known_closes() {
 }
 
 #[test]
-fn shutdown_cancels_pending_open_and_ends_parent_without_replaying_it() {
+fn shutdown_settles_pending_open_and_ends_parent_without_replaying_it() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     pipeline.shutdown(&mut |command| runtime.send(command));
     assert!(
-        runtime
+        !runtime
             .commands
             .iter()
             .any(|command| matches!(command, Command::Cancel { request: 1 }))
+    );
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::TakeResult { request: 1 }))
     );
     assert_eq!(
         runtime.completed.last().unwrap().1["code"],
@@ -2254,29 +2282,18 @@ fn shutdown_cancels_pending_open_and_ends_parent_without_replaying_it() {
 }
 
 #[test]
-fn cancellation_or_release_failure_blocks_lookup_and_retains_retry_handle() {
-    for cancel_failure in [true, false] {
+fn release_failure_blocks_lookup_and_retains_retry_handle() {
+    for release_failures in [1, 3] {
         let (mut pipeline, mut runtime, mut plane) = setup();
         pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
         tick(&mut pipeline, &mut runtime, &mut plane, 1);
         runtime.cancelled = true;
-        if cancel_failure {
-            runtime.cancel_failures = 3;
-        } else {
-            runtime.release_failures = 3;
-        }
-        tick(&mut pipeline, &mut runtime, &mut plane, 4);
-        assert_eq!(pipeline.streams[&1].stage as u8, Stage::Failed as u8);
+        runtime.release_failures = release_failures;
+        tick(&mut pipeline, &mut runtime, &mut plane, release_failures);
         assert_eq!(pipeline.streams[&1].unsettled, Some(1));
         assert!(!runtime.commands.iter().any(
             |command| matches!(command,Command::Request {payload,..} if payload["action"]=="lookup")
         ));
-        pipeline.handle(
-            "alice",
-            100,
-            Operation::Close { stream: 1 },
-            &mut |command| runtime.send(command),
-        );
         tick(&mut pipeline, &mut runtime, &mut plane, 8);
         assert!(pipeline.streams.is_empty());
         assert_eq!(runtime.open_effects, 1);
@@ -2284,14 +2301,20 @@ fn cancellation_or_release_failure_blocks_lookup_and_retains_retry_handle() {
 }
 
 #[test]
-fn unknown_accept_waits_for_confirmed_parent_end_before_broker_retry() {
+fn unknown_accept_looks_up_admission_before_parent_completion() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     runtime.lose_accept = true;
     runtime.parent_failures = 3;
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));
     tick(&mut pipeline, &mut runtime, &mut plane, 5);
     assert_eq!(pipeline.streams[&1].stage as u8, Stage::Failed as u8);
-    assert!(pipeline.streams[&1].uncertain.is_some());
+    assert!(pipeline.streams[&1].uncertain.is_none());
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::LookupRequest { .. }))
+    );
     assert_eq!(
         runtime
             .commands
@@ -2319,9 +2342,18 @@ fn expired_dedup_cannot_replay_open_after_parent_termination() {
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     runtime.operations.clear(); // Model broker's retention expiry after the lost reply.
     tick(&mut pipeline, &mut runtime, &mut plane, 8);
-    assert!(runtime.ended.contains(&99));
+    assert!(!runtime.ended.contains(&99));
     assert_eq!(runtime.open_effects, 1);
-    assert!(pipeline.streams.is_empty());
+    assert_eq!(pipeline.streams[&1].stage, Stage::Failed);
+    assert!(pipeline.streams[&1].uncertain.is_some());
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::LookupRequest { .. }))
+    );
+    assert_eq!(runtime.commands.iter().filter(|command| matches!(command, Command::Request { payload, .. } if payload["action"] == "open")).count(), 1);
+    assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request { payload, .. } if payload["action"] == "lookup")));
 }
 
 #[test]
@@ -3444,14 +3476,15 @@ fn drain_timeout_settles_pending_capture_close_and_reports_failure_after_cleanup
     );
     tick(&mut pipeline, &mut runtime, &mut plane, 1);
     output::expire(pipeline.streams.get_mut(&1).unwrap());
-    runtime.cancel_failures = 3;
-    tick(&mut pipeline, &mut runtime, &mut plane, 4);
+    runtime.release_failures = 3;
+    tick(&mut pipeline, &mut runtime, &mut plane, 3);
     assert_eq!(plane.drains, 0);
-    assert_eq!(pipeline.streams[&1].stage as u8, Stage::Failed as u8);
     assert!(pipeline.streams[&1].unsettled.is_some());
     assert!(!runtime.commands.iter().any(
         |command| matches!(command,Command::Request {payload,..} if payload["action"]=="lookup")
     ));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+    assert!(pipeline.streams.is_empty());
 
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline.handle("alice", 99, open(), &mut |command| runtime.send(command));

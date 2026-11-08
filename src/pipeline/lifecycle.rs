@@ -77,6 +77,8 @@ impl Pipeline {
         for stream in self.streams.values_mut() {
             if let Some(request) = stream.pending.take() {
                 stream.unsettled = Some(request);
+                stream.unsettled_effect = stage_mutates_provider(stream.stage);
+                stream.unsettled_observed = stream.completed_payload.is_some();
             }
             if let Some(parent) = stream.parent.take() {
                 stream.ending_parent = Some(parent);
@@ -114,10 +116,62 @@ fn close_known(stream: &Stream, send: &mut Send<'_>) {
 /// Lookup must not run while an older request can still create a resource later.
 pub(super) fn settle(stream: &mut Stream, send: &mut Send<'_>) -> bool {
     if let Some(request) = stream.unsettled {
-        if !rpc::cancel(send, request) {
+        if stream.unsettled_effect {
+            // Broker cancellation only ends bookkeeping; a provider may still
+            // be allocating or retiring the native resource. Wait for its real
+            // result before allowing lookup or declaring cleanup complete.
+            if !stream.unsettled_observed {
+                match send(Command::TakeResult { request }) {
+                    Ok(Response::Result { .. }) => stream.unsettled_observed = true,
+                    Ok(Response::Pending) => return false,
+                    Ok(Response::Error { .. }) => {
+                        stream.stage = Stage::Failed;
+                        stream.error = Some("effect_retirement_unconfirmed");
+                        return false;
+                    }
+                    _ => return false,
+                }
+            }
+            if !rpc::release(send, request) {
+                return false;
+            }
+        } else if !rpc::cancel(send, request) {
             return unsettled(stream);
         }
         stream.unsettled = None;
+        stream.unsettled_effect = false;
+        stream.unsettled_observed = false;
+    }
+    if let Some(Command::Request {
+        service,
+        payload,
+        operation_id,
+        parent,
+        ..
+    }) = stream.uncertain.as_ref()
+        && matches!(payload["action"].as_str(), Some("open" | "close"))
+    {
+        // Query the exact admission without reissuing an operation that
+        // may never have reached the broker before shutdown.
+        match send(Command::LookupRequest {
+            service: service.clone(),
+            payload: payload.clone(),
+            operation_id: operation_id.clone(),
+            parent: *parent,
+        }) {
+            Ok(Response::Accepted { id }) => {
+                stream.unsettled = Some(id);
+                stream.unsettled_effect = true;
+                stream.unsettled_observed = false;
+                stream.uncertain = None;
+            }
+            Ok(Response::Error { code, .. }) if code == "not_found" => {
+                stream.stage = Stage::Failed;
+                stream.error = Some("effect_retirement_unconfirmed");
+            }
+            _ => {}
+        }
+        return false;
     }
     if let Some(parent) = stream.ending_parent {
         if !rpc::end_parent(send, parent, error(stream.error.unwrap_or("request_ended"))) {
