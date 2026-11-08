@@ -17,6 +17,13 @@ struct ProbeReply {
     reason: Option<String>,
 }
 
+/// GPU processing is owned by video, not by the encoder provider.
+pub(super) fn configuration_for_encoder(configuration: &Configuration) -> Configuration {
+    let mut projected = configuration.clone();
+    projected.gpu_processing = None;
+    projected
+}
+
 /// A negative result authorizes fallback only after exact correlation and teardown.
 pub(super) fn probe_result(
     identity: &EncoderIdentity,
@@ -29,7 +36,7 @@ pub(super) fn probe_result(
         || !reply.settled
         || reply.codec != super::codec_name(configuration.codec)
         || &reply.encoder != identity
-        || &reply.configuration != configuration
+        || reply.configuration != configuration_for_encoder(configuration)
     {
         return Err("invalid_encoder_probe_reply");
     }

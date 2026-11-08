@@ -4457,6 +4457,100 @@ fn auto_probes_all_hardware_before_software_and_freezes_the_usable_identity() {
 }
 
 #[test]
+fn gpu_processing_is_kept_out_of_encoder_probe_and_open() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = auto_open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt601Limited;
+    configuration.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "example.processor/1".into(),
+        enabled: true,
+        source_hdr_required: false,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 18);
+    let requests: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == ENCODE
+                && matches!(payload["action"].as_str(), Some("probe" | "open")) =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        requests.len(),
+        2,
+        "probe and open must both reach the encoder"
+    );
+    for request in requests {
+        assert!(request["configuration"].get("gpu_processing").is_none());
+        assert_eq!(
+            request["configuration"]["color_mode"],
+            json!("bt601_limited")
+        );
+    }
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert!(pipeline.streams[&1].configuration.gpu_processing.is_some());
+}
+
+#[test]
+fn full_range_hdr_probe_accepts_real_encoder_reply_and_checks_correlation() {
+    let identity = EncoderIdentity {
+        clsid: "amaterasu.hardware.nvenc-cuda.hevc".into(),
+        hardware_url: Some("pci:0000:01:00.0".into()),
+        friendly_name: "NVIDIA GeForce RTX 4090 NVENC HEVC (CUDA)".into(),
+    };
+    let mut configuration = open_configuration();
+    configuration.width = 2560;
+    configuration.height = 1440;
+    configuration.fps = 120;
+    configuration.bitrate = 20_000_000;
+    configuration.codec = amaterasu_media::VideoCodec::Hevc;
+    configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
+    configuration.max_reference_frames = 1;
+    configuration.sw_preset = Some("superfast".into());
+    configuration.sw_tune = Some("zerolatency".into());
+    configuration.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "amaterasu.rtx-hdr/1".into(),
+        enabled: true,
+        source_hdr_required: false,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    // Captured from the built encoder's actual NVENC probe: default fields
+    // are omitted by the encoder rather than echoed verbatim.
+    let mut reply = json!({"code":null,"codec":"hevc","configuration":{
+        "bitrate":20000000,"codec":"hevc","color_mode":"bt709_full","fps":120,
+        "height":1440,"max_reference_frames":1,"sw_preset":"superfast",
+        "sw_tune":"zerolatency","video_stream_format":{"bit_depth":10,"codec":"hevc","dynamic_range":"hdr"},"width":2560
+    },"encoder":identity,"ok":true,"reason":null,"settled":true,"usable":true});
+    assert_eq!(
+        encoder::probe_result(&identity, &configuration, &reply),
+        Ok(None)
+    );
+    reply["configuration"]["fps"] = json!(60);
+    assert_eq!(
+        encoder::probe_result(&identity, &configuration, &reply),
+        Err("invalid_encoder_probe_reply")
+    );
+}
+
+#[test]
 fn explicit_encoder_selection_never_probes_or_substitutes_another_candidate() {
     for selection in [
         EncoderSelection::Identity(encoder_identity()),
@@ -5956,6 +6050,252 @@ fn capture_source_preflight_rejects_unknown_ten_bit_or_retargeted_and_unready_so
         ),
         Ok(capture_open::FormatProgress::Ready(None))
     );
+}
+
+#[test]
+fn sdr_processing_source_does_not_inherit_hdr_output_depth() {
+    let mut configuration = open_configuration();
+    configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+    };
+    configuration.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "amaterasu.rtx-hdr/1".into(),
+        enabled: true,
+        source_hdr_required: false,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    let mut plane = FakePlane::default();
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Vkms,
+            "kwin:Virtual-1",
+            &configuration,
+            &mut plane
+        ),
+        Ok(capture_open::FormatProgress::Ready(None))
+    );
+    assert!(plane.source_queries.is_empty());
+    configuration.video_stream_format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Vkms,
+            "kwin:Virtual-1",
+            &configuration,
+            &mut plane
+        ),
+        Err("capture_source_route_required")
+    );
+    configuration.video_stream_format.dynamic_range = amaterasu_module_sdk::DynamicRange::Hdr;
+    configuration
+        .gpu_processing
+        .as_mut()
+        .unwrap()
+        .source_hdr_required = true;
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Vkms,
+            "kwin:Virtual-1",
+            &configuration,
+            &mut plane
+        ),
+        Err("capture_source_route_required")
+    );
+    configuration.gpu_processing.as_mut().unwrap().enabled = false;
+    configuration
+        .gpu_processing
+        .as_mut()
+        .unwrap()
+        .source_hdr_required = false;
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Vkms,
+            "kwin:Virtual-1",
+            &configuration,
+            &mut plane
+        ),
+        Err("capture_source_route_required")
+    );
+    configuration.gpu_processing = None;
+    configuration.video_stream_format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+    assert_eq!(
+        capture_open::format(
+            None,
+            CaptureProvider::Vkms,
+            "kwin:Virtual-1",
+            &configuration,
+            &mut plane
+        ),
+        Err("capture_source_route_required")
+    );
+}
+
+#[test]
+fn hdr_processing_opens_legacy_sdr_capture_after_encoder_probe() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    let Operation::Open { configuration, .. } = &mut operation else {
+        unreachable!()
+    };
+    configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
+    configuration.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "amaterasu.rtx-hdr/1".into(),
+        enabled: true,
+        source_hdr_required: false,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert!(matches!(pipeline.streams[&1].stage, Stage::Running));
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == ENCODE && payload["action"] == "probe")));
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == CAPTURE && payload["action"] == "open" && payload.get("source_format").is_none())));
+    assert!(plane.gpu_configurations[0].1.is_some());
+}
+
+#[test]
+fn hdr_processing_opens_owned_vkms_capture_with_legacy_source_contract() {
+    let (mut pipeline, mut runtime, mut plane) =
+        setup_with_providers([CaptureProvider::Pipewire, CaptureProvider::Vkms].into());
+    plane.dmabuf_ready = true;
+    plane.owned_geometry = Some(
+        CaptureGeometry::new(
+            DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+            DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+        )
+        .unwrap(),
+    );
+    let identity = EncoderIdentity {
+        clsid: "amaterasu.hardware.nvenc-cuda.hevc".into(),
+        hardware_url: Some("pci:0000:01:00.0".into()),
+        friendly_name: "NVENC HEVC".into(),
+    };
+    runtime.encoder_enumeration_override = Some(json!({"ok":true,"enabled":true,"encoders":[{
+        "identity":identity,"name":"NVENC","codec":"hevc","hardware":true,
+        "vendor_id":4318,"inputs":["cpu","dmabuf"]
+    }]}));
+    let mut operation = auto_open();
+    let Operation::Open {
+        configuration,
+        capture_provider,
+        output,
+        ..
+    } = &mut operation
+    else {
+        unreachable!()
+    };
+    *capture_provider = CaptureProvider::Pipewire;
+    *output = "kwin:Virtual-1".into();
+    configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+        codec: amaterasu_module_sdk::VideoCodec::Hevc,
+        bit_depth: 10,
+        dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+    };
+    configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
+    configuration.gpu_processing = Some(crate::model::GpuProcessing {
+        service: "amaterasu.rtx-hdr/1".into(),
+        enabled: true,
+        source_hdr_required: false,
+        settings: serde_json::Map::new(),
+        live_settings: None,
+    });
+    pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert!(
+        matches!(pipeline.streams[&1].stage, Stage::Running),
+        "stage {:?}, requests {:?}",
+        pipeline.streams[&1].stage,
+        runtime.commands
+    );
+    assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == CaptureProvider::Vkms.service()
+            && payload["action"] == "open" && payload["output"] == "kwin:Virtual-1"
+            && payload.get("source_format").is_none())));
+}
+
+#[test]
+fn managed_ten_bit_capture_preflights_without_auxiliary_route_context() {
+    for dynamic_range in [
+        amaterasu_module_sdk::DynamicRange::Sdr,
+        amaterasu_module_sdk::DynamicRange::Hdr,
+    ] {
+        let (mut pipeline, mut runtime, mut plane) =
+            setup_with_providers([CaptureProvider::Pipewire, CaptureProvider::Vkms].into());
+        plane.dmabuf_ready = true;
+        plane.owned_geometry = Some(
+            CaptureGeometry::new(
+                DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+                DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+            )
+            .unwrap(),
+        );
+        let identity = EncoderIdentity {
+            clsid: "amaterasu.hardware.nvenc-cuda.hevc".into(),
+            hardware_url: Some("pci:0000:01:00.0".into()),
+            friendly_name: "NVENC HEVC".into(),
+        };
+        runtime.encoder_enumeration_override = Some(json!({"ok":true,"enabled":true,"encoders":[{
+            "identity":identity,"name":"NVENC","codec":"hevc","hardware":true,
+            "vendor_id":4318,"inputs":["cpu","dmabuf"]
+        }]}));
+        let mut operation = auto_open();
+        let Operation::Open {
+            configuration,
+            capture_provider,
+            output,
+            ..
+        } = &mut operation
+        else {
+            unreachable!()
+        };
+        *capture_provider = CaptureProvider::Pipewire;
+        *output = "kwin:Virtual-1".into();
+        configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: amaterasu_module_sdk::VideoCodec::Hevc,
+            bit_depth: 10,
+            dynamic_range,
+        };
+        configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
+        configuration.gpu_processing = None;
+        pipeline.handle("alice", 99, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 20);
+        assert!(
+            matches!(pipeline.streams[&1].stage, Stage::Running),
+            "stage {:?}, requests {:?}",
+            pipeline.streams[&1].stage,
+            runtime.commands
+        );
+        assert!(runtime.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == CaptureProvider::Vkms.service()
+            && payload["action"] == "open" && payload["output"] == "kwin:Virtual-1"
+            && payload.get("source_format").is_none())));
+        assert_eq!(plane.source_queries.len(), 1);
+        let (provider, query) = &plane.source_queries[0];
+        assert_eq!(*provider, CaptureProvider::Vkms);
+        assert_eq!(
+            query.source_class,
+            amaterasu_module_sdk::capture::SourceClass::ManagedOutput
+        );
+        assert_eq!(query.route.as_deref(), Some("kwin:Virtual-1"));
+        assert_eq!(query.mode.bit_depth, Some(10));
+        assert_eq!(
+            query.mode.hdr,
+            dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr
+        );
+    }
 }
 
 #[test]

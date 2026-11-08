@@ -23,6 +23,29 @@ pub(super) enum FormatProgress {
     Ready(Option<SourceFormat>),
 }
 
+/// Managed outputs already have an exact selector from display preparation.
+/// They do not use the auxiliary presentation route-key namespace. Query the
+/// selected provider through the same SDK before opening a high-depth source.
+pub(super) fn managed_format(
+    provider: CaptureProvider,
+    output: &str,
+    configuration: &Configuration,
+    plane: &mut dyn Plane,
+) -> Result<FormatProgress, &'static str> {
+    let selection = Selection {
+        context: SourceCaptureContext {
+            route_key: "managed-output".into(),
+            source_mode: None,
+        },
+        route: SourcePreflightRoute {
+            provider,
+            source_class: amaterasu_module_sdk::capture::SourceClass::ManagedOutput,
+        },
+        output: output.into(),
+    };
+    format(Some(&selection), provider, output, configuration, plane)
+}
+
 pub(super) fn select(
     context: Option<&SourceCaptureContext>,
     provider: CaptureProvider,
@@ -74,6 +97,19 @@ pub(super) fn format(
     configuration: &Configuration,
     plane: &mut dyn Plane,
 ) -> Result<FormatProgress, &'static str> {
+    // An enabled processor that requires SDR accepts the capture provider's
+    // native SDR pixels and owns conversion to the negotiated output depth.
+    // Legacy capture opens retain their original schema; the processing path
+    // validates the actual frame's color and format before submitting it.
+    if selection.is_none()
+        && configuration.video_stream_format.dynamic_range == DynamicRange::Hdr
+        && configuration
+            .gpu_processing
+            .as_ref()
+            .is_some_and(|processing| processing.enabled && !processing.source_hdr_required)
+    {
+        return Ok(FormatProgress::Ready(None));
+    }
     let format = required_format(configuration);
     format
         .validate()

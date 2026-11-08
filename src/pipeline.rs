@@ -1771,7 +1771,15 @@ fn advance(
         if stream.stage != Stage::Capture {
             return false;
         }
-        if stream.capture_selection.is_some() {
+        let managed_preflight = stream.capture_selection.is_none()
+            && is_owned_kwin_output(&stream.capture_output)
+            && stream.configuration.video_stream_format.bit_depth > 8
+            && !stream
+                .configuration
+                .gpu_processing
+                .as_ref()
+                .is_some_and(|processing| processing.enabled && !processing.source_hdr_required);
+        if stream.capture_selection.is_some() || managed_preflight {
             stream
                 .capture_preflight_started
                 .get_or_insert_with(Instant::now);
@@ -1780,13 +1788,22 @@ fn advance(
             stream.cleanup("capture_source_preflight_timeout");
             return false;
         }
-        let preflight = capture_open::format(
-            stream.capture_selection.as_ref(),
-            stream.provider,
-            &stream.capture_output,
-            &stream.configuration,
-            plane,
-        );
+        let preflight = if managed_preflight {
+            capture_open::managed_format(
+                stream.provider,
+                &stream.capture_output,
+                &stream.configuration,
+                plane,
+            )
+        } else {
+            capture_open::format(
+                stream.capture_selection.as_ref(),
+                stream.provider,
+                &stream.capture_output,
+                &stream.configuration,
+                plane,
+            )
+        };
         // A provider's synchronous callback may have returned after the
         // admission deadline. Do not create a capture from an expired result.
         if capture_preflight_expired(stream) {
@@ -1933,7 +1950,7 @@ fn request(stream: &Stream) -> (&str, Value) {
             &stream.encoder_service,
             json!({
                 "action":"probe", "encoder":stream.encoder,
-                "configuration":stream.configuration,
+                "configuration":encoder::configuration_for_encoder(&stream.configuration),
             }),
         ),
         Stage::Capture => {
@@ -2018,7 +2035,7 @@ fn encoder_open_request(stream: &Stream) -> Value {
             .encoder
             .as_ref()
             .expect("encoder stage follows encoder selection"),
-        "configuration": stream.configuration,
+        "configuration": encoder::configuration_for_encoder(&stream.configuration),
         "operation_id": stream.encoder_operation(),
     });
     if stream.generic_input {
@@ -2207,7 +2224,27 @@ fn apply_result(
                     stream.cleanup("encoder_unavailable");
                 }
             }
-            Err(code) => stream.cleanup(code),
+            Err(code) => {
+                // Preserve the provider's rejection without exposing settings or
+                // identity payloads; the generic correlation error alone hides
+                // whether the provider rejected or returned malformed data.
+                let provider_code = payload
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .filter(|value| {
+                        value.len() <= 128
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    })
+                    .unwrap_or("unavailable");
+                eprintln!(
+                    "amaterasu encoder probe rejected: provider_code={provider_code} ok={:?} settled={:?}",
+                    payload.get("ok"),
+                    payload.get("settled")
+                );
+                stream.cleanup(code);
+            }
         }
         return false;
     }
