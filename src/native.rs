@@ -28,10 +28,10 @@ impl Registration {
     }
 }
 
-/// The v1.3 table preserves both earlier prefixes. Provider references remain
+/// The v1.5 table preserves earlier prefixes. Provider references remain
 /// on the module thread until encoded output or joined encoder shutdown.
 struct Binding {
-    api: EncoderApiV1_3,
+    api: EncoderApiV1_5,
     owner: String,
     shared: Shared,
 }
@@ -52,8 +52,8 @@ unsafe extern "C" fn bind(
             let query = &*query;
             if !query.header.supports::<NativeInterfaceQuery>()
                 || query.interface_major != INTERFACE_MAJOR
-                || query.min_minor > ENCODER_TIMING_INTERFACE_MINOR
-                || query.min_size > size_of::<EncoderApiV1_3>() as u32
+                || query.min_minor > ENCODER_RESOURCE_INTERFACE_MINOR
+                || query.min_size > ENCODER_API_V1_5_SIZE
             {
                 return MEDIA_UNSUPPORTED;
             }
@@ -67,32 +67,40 @@ unsafe extern "C" fn bind(
             };
             let shared = (&*context.cast::<Shared>()).clone();
             let mut binding = Box::new(Binding {
-                api: EncoderApiV1_3 {
-                    base: EncoderApiV1_2 {
-                        base: NativeInterface {
-                            header: AbiHeader {
-                                size: size_of::<EncoderApiV1_3>() as u32,
-                                major: INTERFACE_MAJOR,
-                                minor: ENCODER_TIMING_INTERFACE_MINOR,
+                api: EncoderApiV1_5 {
+                    base: EncoderApiV1_4 {
+                        base: EncoderApiV1_3 {
+                            base: EncoderApiV1_2 {
+                                base: NativeInterface {
+                                    header: AbiHeader {
+                                        size: ENCODER_API_V1_5_SIZE,
+                                        major: INTERFACE_MAJOR,
+                                        minor: ENCODER_RESOURCE_INTERFACE_MINOR,
+                                    },
+                                    context: std::ptr::null_mut(),
+                                    release: Some(release),
+                                },
+                                submit,
+                                receive,
+                                drain,
+                                submit_dmabuf,
+                                submit_dmabuf_leased,
+                                cancel_dmabuf_leases,
                             },
-                            context: std::ptr::null_mut(),
-                            release: Some(release),
+                            encode_timing,
                         },
-                        submit,
-                        receive,
-                        drain,
-                        submit_dmabuf,
-                        submit_dmabuf_leased,
-                        cancel_dmabuf_leases,
+                        gpu_input_ready,
                     },
-                    encode_timing,
+                    enumerate_resources,
+                    configure_resource,
+                    submit_resource,
                 },
                 owner,
                 shared,
             });
-            binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
+            binding.api.base.base.base.base.context = (&mut *binding as *mut Binding).cast();
             let pointer = Box::into_raw(binding);
-            *output = &(*pointer).api.base.base;
+            *output = &(*pointer).api.base.base.base.base;
         }
         STATUS_OK
     })
@@ -168,6 +176,90 @@ unsafe extern "C" fn submit_dmabuf_leased(
         };
         // SAFETY: the caller holds immutable source storage until return.
         unsafe { sessions.submit_dmabuf_leased(&binding.owner, id, &*lease, force) }
+    })
+}
+
+unsafe extern "C" fn enumerate_resources(
+    context: *mut c_void,
+    id: u64,
+    sink: CaptureResourceOfferSink,
+    generation: *mut u64,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || generation.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains the binding; the caller's outputs are live.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: the sink and generation output are live for this call.
+        unsafe { sessions.enumerate_resources(&binding.owner, id, sink, &mut *generation) }
+    })
+}
+
+unsafe extern "C" fn configure_resource(
+    context: *mut c_void,
+    id: u64,
+    consumer_generation: u64,
+    consumer_offer: u64,
+    producer_generation: u64,
+    producer: *const CaptureResourceOffer,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || producer.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains the binding; the producer offer is borrowed live.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        unsafe {
+            sessions.configure_resource(
+                &binding.owner,
+                id,
+                consumer_generation,
+                consumer_offer,
+                producer_generation,
+                &*producer,
+            )
+        }
+    })
+}
+
+unsafe extern "C" fn submit_resource(
+    context: *mut c_void,
+    id: u64,
+    frame: *const CaptureResourceFrame,
+    flags: u32,
+) -> Status {
+    guarded(|| {
+        if context.is_null() || frame.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains the binding; the producer lends a live frame.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: the frame, payloads and callbacks are live for this call.
+        unsafe { sessions.submit_resource(&binding.owner, id, &*frame, flags) }
+    })
+}
+
+unsafe extern "C" fn gpu_input_ready(context: *mut c_void, id: u64) -> Status {
+    guarded(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the runtime keeps this authenticated binding live during the query.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut sessions) = binding.shared.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        sessions.gpu_input_ready(&binding.owner, id)
     })
 }
 

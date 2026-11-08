@@ -17,6 +17,9 @@ pub struct InputSupport {
     pub gpu_bgra_conversion: bool,
     /// `None` when the backend cannot import DMA-BUFs at all.
     pub dmabuf: Option<Arc<DmaBufImportSupport>>,
+    /// CUDA vendor-schema input (encoder v1.5): the UUID of the device whose
+    /// primary context holds accepted frames, when this session converts them.
+    pub cuda_device: Option<[u8; 16]>,
 }
 
 /// DRM fourcc/modifier pairs a backend can import, fixed when it opens.
@@ -76,6 +79,22 @@ pub enum GpuInput {
     Bgra(Vec<u8>),
     #[cfg(unix)]
     DmaBuf(DmaBufInput),
+    /// A producer frame in CUDA device memory.
+    Cuda(CudaInput),
+}
+
+/// A producer frame in CUDA device memory (packed X2B10G10R10) and the CUDA
+/// event recorded after its last write. The session holds a reference to the
+/// frame until this picture's encoded output, so both stay valid until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaInput {
+    pub pointer: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    /// `CUevent` handle, carried as an integer so the input can cross to the
+    /// encoder worker; only the CUDA driver dereferences it.
+    pub ready: usize,
 }
 
 #[cfg(unix)]
@@ -106,6 +125,9 @@ mod dmabuf {
         pub fourcc: u32,
         pub modifier: u64,
         pub planes: Vec<DmaBufPlaneInput>,
+        /// The producer's lease is retained until this frame's encoded output
+        /// or a joined shutdown, so imports need not block on source reads.
+        pub source_retained: bool,
     }
 
     impl DmaBufInput {
@@ -140,6 +162,7 @@ mod dmabuf {
                 fourcc: frame.fourcc,
                 modifier: frame.modifier,
                 planes,
+                source_retained: false,
             })
         }
     }

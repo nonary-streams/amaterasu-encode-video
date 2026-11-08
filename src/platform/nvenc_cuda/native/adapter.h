@@ -59,6 +59,14 @@ struct am_nvcuda_timings {
     uint64_t lock_output_us;
     /* 1 when input copies are ordered with NVENC on a CUDA stream. */
     uint64_t stream_ordered;
+    /* GPU-clock stages of an imported frame, valid when gpu_timed is 1:
+     * submission until the conversion starts executing (upstream GPU work and
+     * scheduling), the conversion itself, and conversion end until the
+     * bitstream is ready (CUDA copy, NVENC and the waiting thread). */
+    uint64_t gpu_timed;
+    uint64_t gpu_queue_us;
+    uint64_t gpu_convert_us;
+    uint64_t gpu_encode_us;
 };
 
 /* One NVENC API version and the struct versions used with it. The Rust
@@ -131,10 +139,17 @@ struct am_nvcuda_dmabuf {
     int32_t fence_fds[AM_NVCUDA_MAX_PLANES];
     uint32_t offsets[AM_NVCUDA_MAX_PLANES];
     uint32_t pitches[AM_NVCUDA_MAX_PLANES];
+    /* Nonzero when the producer's reference is held until this frame's
+     * encoded output or a joined shutdown. Encode completion then orders the
+     * import's source reads, so the import queues them instead of blocking. */
+    uint32_t source_retained;
+    uint32_t reserved;
 };
 
+#define AM_NVCUDA_SLOTS 2u
+
 struct am_nvcuda_encoder;
-void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder,
+void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder, uint32_t slot,
                                   struct am_nvcuda_timings *timings);
 
 /* GPU-free: record sizes, so Rust tests can check their mirrored layouts. */
@@ -171,21 +186,47 @@ int amaterasu_nvcuda_import_modifiers(struct am_nvcuda_encoder *encoder, uint32_
                                       uint64_t *modifiers, uint32_t capacity,
                                       uint32_t *modifier_count, uint32_t *implicit);
 
-int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_t *nv12,
-                                 size_t length, struct am_nvcuda_status *status);
-int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, const uint8_t *bgra,
-                                 size_t length, struct am_nvcuda_status *status);
-int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder,
+/* Slots let one frame convert and submit while the previous one encodes.
+ * Each call below names the idle (or, for lock/release, submitted) slot. The
+ * worker thread converts and submits; one output thread locks and releases,
+ * in submission order. GL and CUDA conversion stay on the worker thread. */
+int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 const uint8_t *nv12, size_t length,
+                                 struct am_nvcuda_status *status);
+int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 const uint8_t *bgra, size_t length,
+                                 struct am_nvcuda_status *status);
+int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder, uint32_t slot,
                                    struct am_nvcuda_dmabuf *frame,
                                    struct am_nvcuda_status *status);
 
-/* Encodes the current input buffer. On success *data stays valid, and the
- * bitstream stays locked, until amaterasu_nvcuda_release_output or close. */
-int amaterasu_nvcuda_encode(struct am_nvcuda_encoder *encoder, int64_t timestamp_100ns,
-                            int force_idr, const uint8_t **data, size_t *length,
-                            uint32_t *picture_type, struct am_nvcuda_status *status);
-int amaterasu_nvcuda_release_output(struct am_nvcuda_encoder *encoder,
+/* Maps the slot's converted input and submits it without waiting. */
+int amaterasu_nvcuda_submit(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                            int64_t timestamp_100ns, int force_idr,
+                            struct am_nvcuda_status *status);
+/* Blocks until the slot's picture is encoded. On success *data stays valid,
+ * and the bitstream stays locked, until amaterasu_nvcuda_release_output. */
+int amaterasu_nvcuda_lock(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                          const uint8_t **data, size_t *length, uint32_t *picture_type,
+                          struct am_nvcuda_status *status);
+int amaterasu_nvcuda_release_output(struct am_nvcuda_encoder *encoder, uint32_t slot,
                                     struct am_nvcuda_status *status);
+/* Worker thread: reads the slot's GPU-clock conversion stages. The encode
+ * completed `completed_ago_us` before this call. Returns 1 when timed. */
+int amaterasu_nvcuda_take_gpu_timing(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                     uint64_t completed_ago_us);
+/* CUDA resource input. Returns 1 and the device UUID when this encoder can
+ * convert X2B10G10R10 frames from the device's primary-context memory. */
+int amaterasu_nvcuda_cuda_input(const struct am_nvcuda_encoder *encoder, uint8_t *device_uuid);
+/* Queues a GPU wait on `ready` (a CUevent) and the conversion of the frame at
+ * `pointer` into the slot. The frame and event must stay valid until the
+ * slot's output is locked. */
+int amaterasu_nvcuda_import_cuda(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 uint64_t pointer, uint32_t pitch, uint32_t width,
+                                 uint32_t height, void *ready, struct am_nvcuda_status *status);
+/* Makes the encoder's CUDA context current on the calling output thread. */
+int amaterasu_nvcuda_bind_thread(struct am_nvcuda_encoder *encoder);
+void amaterasu_nvcuda_unbind_thread(struct am_nvcuda_encoder *encoder);
 int amaterasu_nvcuda_drain(struct am_nvcuda_encoder *encoder, struct am_nvcuda_status *status);
 void amaterasu_nvcuda_close(struct am_nvcuda_encoder *encoder);
 

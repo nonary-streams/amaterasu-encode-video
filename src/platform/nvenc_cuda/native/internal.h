@@ -63,6 +63,19 @@ struct am_cuda_api {
     tcuGraphicsMapResources *graphics_map;
     tcuGraphicsUnmapResources *graphics_unmap;
     tcuGraphicsSubResourceGetMappedArray *graphics_mapped_array;
+    /* Optional primary-context entry points; absent drivers create a context. */
+    tcuDevicePrimaryCtxRetain *primary_ctx_retain;
+    tcuDevicePrimaryCtxRelease *primary_ctx_release;
+    tcuCtxPushCurrent_v2 *ctx_push_current;
+    tcuCtxPopCurrent_v2 *ctx_pop_current;
+    tcuCtxGetCurrent *ctx_get_current;
+    /* Optional CUDA resource input; absent entry points disable it. */
+    tcuModuleLoadData *module_load;
+    tcuModuleUnload *module_unload;
+    tcuModuleGetFunction *module_get_function;
+    tcuLaunchKernel *launch_kernel;
+    tcuStreamWaitEvent *stream_wait_event;
+    tcuDeviceGetUuid_v2 *device_get_uuid;
 };
 
 typedef NVENCSTATUS(NVENCAPI *am_nvenc_create_instance_fn)(NV_ENCODE_API_FUNCTION_LIST *list);
@@ -91,6 +104,7 @@ struct am_egl_api {
     PFNEGLCREATESYNCKHRPROC create_sync;
     PFNEGLDESTROYSYNCKHRPROC destroy_sync;
     PFNEGLWAITSYNCKHRPROC wait_sync;
+    PFNEGLQUERYCONTEXTPROC query_context;
 };
 
 /* Opaque GBM entry points; signatures follow gbm.h and are cast at use. */
@@ -127,6 +141,8 @@ struct am_egl_display {
     int wait_sync;
     /* EGL_KHR_no_config_context: offscreen contexts need no EGLConfig. */
     int no_config_context;
+    /* EGL_IMG_context_priority: contexts may request GPU scheduling priority. */
+    int context_priority;
 };
 
 int am_egl_display_for_device(const struct am_driver *driver, CUdevice device,
@@ -169,6 +185,13 @@ struct am_gl_api {
     PFNGLDRAWARRAYSPROC draw_arrays;
     PFNGLFLUSHPROC flush;
     PFNGLFINISHPROC finish;
+    /* Optional ARB_timer_query entry points; absent ones disable GPU timing. */
+    PFNGLGENQUERIESPROC gen_queries;
+    PFNGLDELETEQUERIESPROC delete_queries;
+    PFNGLQUERYCOUNTERPROC query_counter;
+    PFNGLGETQUERYOBJECTIVPROC get_query_objectiv;
+    PFNGLGETQUERYOBJECTUI64VPROC get_query_objectui64v;
+    PFNGLGETINTEGER64VPROC get_integer64v;
     /* GL_OES_EGL_image; the desktop GL headers carry no typedef for it. */
     void(APIENTRY *egl_image_target_texture_2d)(GLenum target, void *image);
 };
@@ -187,6 +210,8 @@ struct am_converter {
     const struct am_driver *driver;
     const struct am_egl_display *display;
     EGLContext context;
+    /* EGL_CONTEXT_PRIORITY_*_IMG granted to `context`, or 0 when unknown. */
+    EGLint context_priority;
     /* Set only once every entry of `gl` was resolved. */
     int gl_loaded;
     struct am_gl_api gl;
@@ -198,6 +223,10 @@ struct am_converter {
     GLuint chroma_texture;
     GLuint luma_framebuffer;
     GLuint chroma_framebuffer;
+    /* Timestamps around each slot's imported conversion, on the GPU clock. */
+    GLuint timer_queries[AM_NVCUDA_SLOTS][2];
+    int timer_pending[AM_NVCUDA_SLOTS];
+    GLint64 timer_submitted[AM_NVCUDA_SLOTS];
     CUgraphicsResource luma_resource;
     CUgraphicsResource chroma_resource;
     /* Set until CUDA confirms that unmapping was successfully submitted. */
@@ -218,7 +247,32 @@ int am_converter_open(struct am_converter *converter, const struct am_driver *dr
 void am_converter_close(struct am_converter *converter);
 int am_converter_upload_bgra(struct am_converter *converter, const uint8_t *bgra,
                              struct am_nvcuda_status *status);
-int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_dmabuf *frame,
+/* CUDA resource input (cuda_input.c): one kernel module per encoder, loaded
+ * only for ten-bit sessions with an ordered conversion stream. */
+struct am_cuda_input {
+    int available;
+    CUmodule module;
+    CUfunction to_p010;
+    uint8_t device_uuid[16];
+};
+int am_cuda_input_open(struct am_cuda_input *input, const struct am_driver *driver,
+                       CUdevice device);
+void am_cuda_input_close(struct am_cuda_input *input, const struct am_driver *driver);
+/* Queues: wait for `ready`, then convert `source` into the slot at `target`. */
+int am_cuda_input_convert(const struct am_cuda_input *input, const struct am_driver *driver,
+                          const struct am_converter *converter, CUstream stream, CUevent ready,
+                          CUdeviceptr source, uint32_t source_pitch, CUdeviceptr target,
+                          size_t target_pitch, struct am_nvcuda_status *status);
+
+/* Completes queued GL conversion reads; the converter's context is current. */
+void am_converter_finish(struct am_converter *converter);
+/* Reads a slot's import stage times once its encode has completed, which
+ * happened `completed_ago_us` ago. Never waits: returns 0 when unavailable. */
+int am_converter_take_gpu_timing(struct am_converter *converter, uint32_t slot,
+                                 uint64_t completed_ago_us, uint64_t *queue_us,
+                                 uint64_t *convert_us, uint64_t *encode_us);
+int am_converter_import_dmabuf(struct am_converter *converter, uint32_t slot,
+                               struct am_nvcuda_dmabuf *frame,
                                struct am_nvcuda_status *status);
 int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destination,
                            size_t pitch, CUstream stream, struct am_nvcuda_status *status);

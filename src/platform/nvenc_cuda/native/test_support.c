@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -323,4 +324,121 @@ void amaterasu_nvcuda_test_release_gbm(struct am_nvcuda_test_buffer *buffer) {
     memset(buffer, 0, sizeof(*buffer));
     buffer->render_fd = -1;
     buffer->dmabuf_fd = -1;
+}
+
+/* A producer-side CUDA frame for the resource-input GPU tests: packed
+ * X2B10G10R10 in device 0's primary context, top and bottom halves filled,
+ * with an event recorded after the upload. */
+typedef CUresult CUDAAPI am_test_event_create(CUevent *event, unsigned int flags);
+typedef CUresult CUDAAPI am_test_event_record(CUevent event, CUstream stream);
+typedef CUresult CUDAAPI am_test_event_destroy(CUevent event);
+
+static int am_test_primary(const struct am_driver **driver, CUdevice *device) {
+    struct am_nvcuda_status status;
+    int result = AM_NVCUDA_OK;
+    *driver = am_driver_load(&status, &result);
+    if (*driver == NULL) {
+        return result;
+    }
+    const struct am_cuda_api *cuda = &(*driver)->cuda;
+    CUcontext context = NULL;
+    if (cuda->init(0) != CUDA_SUCCESS || cuda->device_get(device, 0) != CUDA_SUCCESS ||
+        cuda->primary_ctx_retain == NULL ||
+        cuda->primary_ctx_retain(&context, *device) != CUDA_SUCCESS) {
+        return AM_NVCUDA_NO_DEVICE;
+    }
+    if (cuda->ctx_push_current(context) != CUDA_SUCCESS) {
+        cuda->primary_ctx_release(*device);
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+static void am_test_primary_done(const struct am_driver *driver, CUdevice device) {
+    CUcontext popped = NULL;
+    driver->cuda.ctx_pop_current(&popped);
+    driver->cuda.primary_ctx_release(device);
+}
+
+int amaterasu_nvcuda_test_cuda_frame(uint32_t width, uint32_t height, uint32_t top,
+                                     uint32_t bottom, uint64_t *pointer, uint32_t *pitch,
+                                     void **event) {
+    void *library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    am_test_event_create *create =
+        library != NULL ? (am_test_event_create *)dlsym(library, "cuEventCreate") : NULL;
+    am_test_event_record *record =
+        library != NULL ? (am_test_event_record *)dlsym(library, "cuEventRecord") : NULL;
+    if (create == NULL || record == NULL) {
+        return AM_NVCUDA_LIBRARY_UNAVAILABLE;
+    }
+    const struct am_driver *driver = NULL;
+    CUdevice device = 0;
+    int result = am_test_primary(&driver, &device);
+    if (result != AM_NVCUDA_OK) {
+        return result;
+    }
+    const struct am_cuda_api *cuda = &driver->cuda;
+    size_t row = (size_t)width * 4u;
+    uint32_t *pixels = malloc(row * height);
+    CUdeviceptr memory = 0;
+    size_t memory_pitch = 0;
+    CUevent ready = NULL;
+    result = AM_NVCUDA_NATIVE_FAILURE;
+    if (pixels != NULL &&
+        cuda->mem_alloc_pitch(&memory, &memory_pitch, row, height, 16) == CUDA_SUCCESS) {
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                pixels[(size_t)y * width + x] = (y < height / 2 ? top : bottom) | (3u << 30);
+            }
+        }
+        CUDA_MEMCPY2D copy;
+        memset(&copy, 0, sizeof(copy));
+        copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+        copy.srcHost = pixels;
+        copy.srcPitch = row;
+        copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.dstDevice = memory;
+        copy.dstPitch = memory_pitch;
+        copy.WidthInBytes = row;
+        copy.Height = height;
+        if (cuda->memcpy_2d(&copy) == CUDA_SUCCESS && create(&ready, 0x2) == CUDA_SUCCESS &&
+            record(ready, NULL) == CUDA_SUCCESS) {
+            *pointer = memory;
+            *pitch = (uint32_t)memory_pitch;
+            *event = ready;
+            result = AM_NVCUDA_OK;
+        }
+    }
+    free(pixels);
+    if (result != AM_NVCUDA_OK && memory != 0) {
+        cuda->mem_free(memory);
+    }
+    if (result == AM_NVCUDA_OK) {
+        /* Like a real producer, keep the primary context retained while the
+         * frame exists: releasing the last retain destroys its memory and event. */
+        CUcontext popped = NULL;
+        cuda->ctx_pop_current(&popped);
+    } else {
+        am_test_primary_done(driver, device);
+    }
+    return result;
+}
+
+void amaterasu_nvcuda_test_release_cuda_frame(uint64_t pointer, void *event) {
+    void *library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    am_test_event_destroy *destroy =
+        library != NULL ? (am_test_event_destroy *)dlsym(library, "cuEventDestroy_v2") : NULL;
+    const struct am_driver *driver = NULL;
+    CUdevice device = 0;
+    if (am_test_primary(&driver, &device) != AM_NVCUDA_OK) {
+        return;
+    }
+    driver->cuda.ctx_synchronize();
+    if (destroy != NULL && event != NULL) {
+        destroy((CUevent)event);
+    }
+    driver->cuda.mem_free((CUdeviceptr)pointer);
+    am_test_primary_done(driver, device);
+    /* Balances the retain held since the frame was created. */
+    driver->cuda.primary_ctx_release(device);
 }

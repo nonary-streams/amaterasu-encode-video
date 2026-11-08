@@ -127,18 +127,17 @@ pub fn sdr_ten_bit_conversion_rows(mode: ColorMode) -> ConversionRows {
     rows
 }
 
-/// HDR10 RGB input is already PQ/BT.2020; conversion changes only the matrix
-/// and limited-range code values, never the transfer function or primaries.
-pub fn hdr_signal() -> ColorSignal {
+/// HDR RGB input is already PQ/BT.2020; preserve the negotiated code range.
+pub fn hdr_signal(mode: ColorMode) -> ColorSignal {
     ColorSignal {
         primaries: 9,
         transfer: 16,
         matrix: 9,
-        full_range: false,
+        full_range: matches!(mode, ColorMode::Bt601Full | ColorMode::Bt709Full),
     }
 }
 
-pub fn hdr_conversion_rows() -> ConversionRows {
+pub fn hdr_conversion_rows(mode: ColorMode) -> ConversionRows {
     let kr = 0.2627_f64;
     let kb = 0.0593_f64;
     let kg = 1.0 - kr - kb;
@@ -150,16 +149,21 @@ pub fn hdr_conversion_rows() -> ConversionRows {
             offset as f32,
         ]
     };
+    let (luma_scale, luma_offset, chroma_scale) = if hdr_signal(mode).full_range {
+        (1.0, 0.0, 1.0)
+    } else {
+        (876.0 / 1023.0, 64.0 / 1023.0, 896.0 / 1023.0)
+    };
     ConversionRows {
-        luma: row([kr, kg, kb], 876.0 / 1023.0, 64.0 / 1023.0),
+        luma: row([kr, kg, kb], luma_scale, luma_offset),
         cb: row(
             [-kr / (2.0 * (1.0 - kb)), -kg / (2.0 * (1.0 - kb)), 0.5],
-            896.0 / 1023.0,
+            chroma_scale,
             512.0 / 1023.0,
         ),
         cr: row(
             [0.5, -kg / (2.0 * (1.0 - kr)), -kb / (2.0 * (1.0 - kr))],
-            896.0 / 1023.0,
+            chroma_scale,
             512.0 / 1023.0,
         ),
     }

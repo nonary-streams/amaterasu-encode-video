@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -69,6 +70,23 @@ static int load_gl_symbol(const struct am_egl_api *egl, const char *name, void *
 
 #define AM_GL(field, name) load_gl_symbol(egl, name, &gl->field)
 
+/* Timing is diagnostic: a driver without these keeps converting untimed. */
+static int load_timer_queries(const struct am_egl_api *egl, struct am_gl_api *gl) {
+    if (!(AM_GL(gen_queries, "glGenQueries") && AM_GL(delete_queries, "glDeleteQueries") &&
+          AM_GL(query_counter, "glQueryCounter") &&
+          AM_GL(get_query_objectiv, "glGetQueryObjectiv") &&
+          AM_GL(get_query_objectui64v, "glGetQueryObjectui64v") &&
+          AM_GL(get_integer64v, "glGetInteger64v"))) {
+        gl->query_counter = NULL;
+    }
+    return 1;
+}
+
+static int timing_available(const struct am_converter *converter, uint32_t slot) {
+    return slot < AM_NVCUDA_SLOTS && converter->gl.query_counter != NULL &&
+           converter->timer_queries[slot][0] != 0;
+}
+
 static int load_gl(const struct am_egl_api *egl, struct am_gl_api *gl) {
     return AM_GL(get_error, "glGetError") && AM_GL(gen_textures, "glGenTextures") &&
            AM_GL(delete_textures, "glDeleteTextures") && AM_GL(bind_texture, "glBindTexture") &&
@@ -92,7 +110,8 @@ static int load_gl(const struct am_egl_api *egl, struct am_gl_api *gl) {
            AM_GL(delete_vertex_arrays, "glDeleteVertexArrays") &&
            AM_GL(bind_vertex_array, "glBindVertexArray") && AM_GL(draw_arrays, "glDrawArrays") &&
            AM_GL(flush, "glFlush") && AM_GL(finish, "glFinish") &&
-           AM_GL(egl_image_target_texture_2d, "glEGLImageTargetTexture2DOES");
+           AM_GL(egl_image_target_texture_2d, "glEGLImageTargetTexture2DOES") &&
+           load_timer_queries(egl, gl);
 }
 
 /* Desktop OpenGL 3.3 core, surfaceless, made current on the calling thread. */
@@ -127,7 +146,35 @@ static int create_context(struct am_converter *converter, struct am_nvcuda_statu
         EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
         EGL_NONE,
     };
-    converter->context = egl->create_context(display, config, EGL_NO_CONTEXT, context_attributes);
+    /* Every conversion sits between a game's frames on the GPU. A default
+     * priority context waits out the game's scheduling timeslice before each
+     * one runs. Request high priority; the driver may grant less, so query it.
+     * A refused request falls back to the ordinary context. */
+    const EGLint prioritized_attributes[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG,
+        EGL_NONE,
+    };
+    converter->context = EGL_NO_CONTEXT;
+    if (converter->display->context_priority) {
+        converter->context =
+            egl->create_context(display, config, EGL_NO_CONTEXT, prioritized_attributes);
+    }
+    if (converter->context == EGL_NO_CONTEXT) {
+        converter->context =
+            egl->create_context(display, config, EGL_NO_CONTEXT, context_attributes);
+    }
+    converter->context_priority = 0;
+    if (converter->context != EGL_NO_CONTEXT && converter->display->context_priority &&
+        egl->query_context != NULL) {
+        EGLint granted = 0;
+        if (egl->query_context(display, converter->context, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                               &granted)) {
+            converter->context_priority = granted;
+        }
+    }
     if (converter->context == EGL_NO_CONTEXT) {
         am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
         return AM_NVCUDA_CONVERTER_UNAVAILABLE;
@@ -236,6 +283,11 @@ static int create_gl_resources(struct am_converter *converter, struct am_nvcuda_
         return AM_NVCUDA_CONVERTER_UNAVAILABLE;
     }
     gl->gen_vertex_arrays(1, &converter->vertex_array);
+    if (gl->query_counter != NULL) {
+        for (uint32_t slot = 0; slot < AM_NVCUDA_SLOTS; ++slot) {
+            gl->gen_queries(2, converter->timer_queries[slot]);
+        }
+    }
     converter->upload_texture =
         allocate_texture(gl, GL_RGBA8, GL_BGRA, converter->width, converter->height);
     converter->luma_texture =
@@ -271,6 +323,18 @@ static int register_with_cuda(struct am_converter *converter, struct am_nvcuda_s
     return AM_NVCUDA_OK;
 }
 
+/* Operators need the granted level: drivers may silently ignore the request. */
+static void report_context_priority(const struct am_converter *converter) {
+    const char *level = "unavailable";
+    switch (converter->context_priority) {
+    case EGL_CONTEXT_PRIORITY_HIGH_IMG: level = "high"; break;
+    case EGL_CONTEXT_PRIORITY_MEDIUM_IMG: level = "medium"; break;
+    case EGL_CONTEXT_PRIORITY_LOW_IMG: level = "low"; break;
+    default: break;
+    }
+    fprintf(stderr, "amaterasu nvenc: converter GPU priority=%s requested=high\n", level);
+}
+
 int am_converter_open(struct am_converter *converter, const struct am_driver *driver,
                       CUdevice device, const struct am_nvcuda_settings *settings,
                       struct am_nvcuda_status *status) {
@@ -287,6 +351,7 @@ int am_converter_open(struct am_converter *converter, const struct am_driver *dr
         result = create_context(converter, status);
     }
     if (result == AM_NVCUDA_OK) {
+        report_context_priority(converter);
         result = create_gl_resources(converter, status);
     }
     if (result == AM_NVCUDA_OK) {
@@ -297,10 +362,50 @@ int am_converter_open(struct am_converter *converter, const struct am_driver *dr
 
 /* Safe on a partially opened converter. CUDA registrations are released
  * before the textures they reference, while the context is still current. */
+int am_converter_take_gpu_timing(struct am_converter *converter, uint32_t slot,
+                                 uint64_t completed_ago_us, uint64_t *queue_us,
+                                 uint64_t *convert_us, uint64_t *encode_us) {
+    if (!timing_available(converter, slot) || !converter->timer_pending[slot]) {
+        return 0;
+    }
+    converter->timer_pending[slot] = 0;
+    const struct am_gl_api *gl = &converter->gl;
+    GLint ready = 0;
+    gl->get_query_objectiv(converter->timer_queries[slot][1], GL_QUERY_RESULT_AVAILABLE,
+                           &ready);
+    if (!ready) {
+        return 0;
+    }
+    GLuint64 started = 0, converted = 0;
+    GLint64 now = 0;
+    gl->get_query_objectui64v(converter->timer_queries[slot][0], GL_QUERY_RESULT, &started);
+    gl->get_query_objectui64v(converter->timer_queries[slot][1], GL_QUERY_RESULT, &converted);
+    gl->get_integer64v(GL_TIMESTAMP, &now);
+    /* The GPU and monotonic clocks advance together; step back to completion. */
+    const GLint64 completed = now - (GLint64)completed_ago_us * 1000;
+    const GLint64 submitted = converter->timer_submitted[slot];
+    if ((GLint64)started < submitted || converted < started || completed < (GLint64)converted) {
+        return 0;
+    }
+    *queue_us = (uint64_t)((GLint64)started - submitted) / 1000;
+    *convert_us = (uint64_t)(converted - started) / 1000;
+    *encode_us = (uint64_t)(completed - (GLint64)converted) / 1000;
+    return 1;
+}
+
+void am_converter_finish(struct am_converter *converter) {
+    if (converter->gl_loaded) {
+        converter->gl.finish();
+    }
+}
+
 void am_converter_close(struct am_converter *converter) {
     if (converter->driver == NULL) {
         return;
     }
+    /* Retained sources may still be read by queued conversions; their leases
+     * are released only after close returns. */
+    am_converter_finish(converter);
     const struct am_cuda_api *cuda = &converter->driver->cuda;
     if (converter->chroma_resource != NULL) {
         cuda->graphics_unregister(converter->chroma_resource);
@@ -318,6 +423,11 @@ void am_converter_close(struct am_converter *converter) {
         gl->delete_vertex_arrays(1, &converter->vertex_array);
         gl->delete_program(converter->luma_pass.program);
         gl->delete_program(converter->chroma_pass.program);
+        for (uint32_t slot = 0; slot < AM_NVCUDA_SLOTS; ++slot) {
+            if (converter->timer_queries[slot][0] != 0) {
+                gl->delete_queries(2, converter->timer_queries[slot]);
+            }
+        }
     }
     if (converter->context != EGL_NO_CONTEXT) {
         const struct am_egl_api *egl = &converter->driver->egl;
@@ -505,7 +615,8 @@ static int validate_dmabuf(const struct am_converter *converter,
     return 1;
 }
 
-int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_dmabuf *frame,
+int am_converter_import_dmabuf(struct am_converter *converter, uint32_t slot,
+                               struct am_nvcuda_dmabuf *frame,
                                struct am_nvcuda_status *status) {
     if (!converter->display->dmabuf_import) {
         am_set_status(status, AM_STAGE_IMPORT, 0);
@@ -515,9 +626,19 @@ int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_
         am_set_status(status, AM_STAGE_IMPORT, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
+    const struct am_gl_api *gl = &converter->gl;
+    const int timed = timing_available(converter, slot);
+    if (timed) {
+        converter->timer_pending[slot] = 0;
+        gl->get_integer64v(GL_TIMESTAMP, &converter->timer_submitted[slot]);
+    }
     int result = wait_for_acquire_fences(converter, frame, status);
     if (result != AM_NVCUDA_OK) {
         return result;
+    }
+    /* Follows the queued producer-fence wait: marks when conversion executes. */
+    if (timed) {
+        gl->query_counter(converter->timer_queries[slot][0], GL_TIMESTAMP);
     }
     const struct am_egl_api *egl = &converter->driver->egl;
     EGLImageKHR image = create_dmabuf_image(converter, frame);
@@ -527,7 +648,6 @@ int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_
     }
     /* A fresh texture per frame: deleting it drops the last GL reference to
      * the producer's buffer once the conversion has been consumed. */
-    const struct am_gl_api *gl = &converter->gl;
     GLuint source = 0;
     gl->gen_textures(1, &source);
     gl->bind_texture(GL_TEXTURE_2D, source);
@@ -540,12 +660,23 @@ int am_converter_import_dmabuf(struct am_converter *converter, struct am_nvcuda_
         result = AM_NVCUDA_IMPORT_FAILED;
     } else {
         result = convert_texture(converter, source, status);
+        if (result == AM_NVCUDA_OK && timed) {
+            gl->query_counter(converter->timer_queries[slot][1], GL_TIMESTAMP);
+            converter->timer_pending[slot] = 1;
+        }
     }
-    /* A lease may be released as soon as this import returns. Complete the
-     * source texture reads on both success and failed conversion paths before
-     * dropping the imported image; descriptor duplication alone cannot protect
-     * immutable pixels from producer reuse. CUDA conversion output is private. */
-    gl->finish();
+    /* A borrowed source may be reused as soon as this import returns, so
+     * complete its reads; descriptor duplication alone cannot protect
+     * immutable pixels from producer reuse. A retained source stays
+     * referenced until its encoded output, which the CUDA map orders after
+     * this conversion. Queue it instead of blocking the encode worker while a
+     * game holds the GPU. Failed conversions always complete their reads.
+     * GL defers deleting the texture and image until queued reads finish. */
+    if (frame->source_retained && result == AM_NVCUDA_OK) {
+        gl->flush();
+    } else {
+        gl->finish();
+    }
     gl->delete_textures(1, &source);
     egl->destroy_image(converter->display->display, image);
     return result;

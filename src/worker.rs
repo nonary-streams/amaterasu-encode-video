@@ -94,6 +94,10 @@ pub struct NativeStageTimings {
     pub submit_picture_us: u64,
     pub lock_output_us: u64,
     pub stream_ordered: u64,
+    pub gpu_timed: u64,
+    pub gpu_queue_us: u64,
+    pub gpu_convert_us: u64,
+    pub gpu_encode_us: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -105,7 +109,20 @@ pub struct NativeStageTotals {
     pub submit_picture_us: u64,
     pub lock_output_us: u64,
     pub stream_ordered_samples: u64,
+    /// GPU-clock stages, summed over `gpu_timed_samples` with their maxima.
+    pub gpu_timed_samples: u64,
+    pub gpu_queue_us: u64,
+    pub gpu_queue_max_us: u64,
+    pub gpu_convert_us: u64,
+    pub gpu_convert_max_us: u64,
+    pub gpu_encode_us: u64,
+    pub gpu_encode_max_us: u64,
+    /// Frames whose timed GPU chain exceeded `SLOW_GPU_FRAME_US`.
+    pub gpu_slow_frames: u64,
 }
+
+/// One and a half frame intervals at 120 Hz: such a frame delays its successor.
+const SLOW_GPU_FRAME_US: u64 = 12_500;
 
 impl NativeStageTotals {
     fn record(&mut self, sample: NativeStageTimings) {
@@ -122,6 +139,22 @@ impl NativeStageTotals {
         self.stream_ordered_samples = self
             .stream_ordered_samples
             .saturating_add(u64::from(sample.stream_ordered != 0));
+        if sample.gpu_timed != 0 {
+            self.gpu_timed_samples = self.gpu_timed_samples.saturating_add(1);
+            self.gpu_queue_us = self.gpu_queue_us.saturating_add(sample.gpu_queue_us);
+            self.gpu_queue_max_us = self.gpu_queue_max_us.max(sample.gpu_queue_us);
+            self.gpu_convert_us = self.gpu_convert_us.saturating_add(sample.gpu_convert_us);
+            self.gpu_convert_max_us = self.gpu_convert_max_us.max(sample.gpu_convert_us);
+            self.gpu_encode_us = self.gpu_encode_us.saturating_add(sample.gpu_encode_us);
+            self.gpu_encode_max_us = self.gpu_encode_max_us.max(sample.gpu_encode_us);
+            let chain = sample
+                .gpu_queue_us
+                .saturating_add(sample.gpu_convert_us)
+                .saturating_add(sample.gpu_encode_us);
+            self.gpu_slow_frames = self
+                .gpu_slow_frames
+                .saturating_add(u64::from(chain > SLOW_GPU_FRAME_US));
+        }
     }
 }
 
@@ -167,13 +200,16 @@ pub(crate) trait WorkerBackend {
     fn native_stage_timings(&self) -> Option<NativeStageTimings> {
         None
     }
+    /// A backend producing output on its own thread notifies through this.
+    fn set_output_notifier(&mut self, _notifier: amaterasu_module_sdk::WorkNotifier) {}
     /// Reported once, on the worker thread, right after the backend opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
     }
-    /// Opt-in promise: submit_gpu finishes all source pixel reads on return,
-    /// including failure. Merely importing or duplicating descriptors is not
-    /// completion. Backends retaining input beyond return must leave false.
+    /// Opt-in promise: every source pixel read finishes before that frame's
+    /// encoded output is delivered, or before a failed submit_gpu returns, or
+    /// before the backend closes. Merely importing or duplicating descriptors
+    /// is not completion; backends without that ordering must leave false.
     fn supports_gpu_completion(&self) -> bool {
         false
     }
@@ -190,6 +226,9 @@ pub(crate) trait WorkerBackend {
 impl WorkerBackend for platform::Encoder {
     fn native_stage_timings(&self) -> Option<NativeStageTimings> {
         platform::Encoder::native_stage_timings(self)
+    }
+    fn set_output_notifier(&mut self, notifier: amaterasu_module_sdk::WorkNotifier) {
+        platform::Encoder::set_output_notifier(self, notifier);
     }
     fn uses_background_encode(&self) -> bool {
         platform::Encoder::uses_background_encode(self)
@@ -212,8 +251,9 @@ impl WorkerBackend for platform::Encoder {
     }
 
     fn supports_gpu_completion(&self) -> bool {
-        // The only current DMA-BUF importer is native NVENC/CUDA. Its import
-        // finishes source GL reads and synchronizes copies before returning.
+        // The only current DMA-BUF importer is native NVENC/CUDA. Encoded
+        // output follows its queued source reads, and close and failed imports
+        // finish them, so retained leases are released only after completion.
         self.input_support().dmabuf.is_some()
     }
     fn submit_gpu(
@@ -292,6 +332,9 @@ impl Worker {
                         return;
                     }
                 };
+                if let Some(notifier) = &notifier {
+                    encoder.set_output_notifier(notifier.clone());
+                }
                 let background_encode = encoder.uses_background_encode();
                 let gpu_completion = encoder.supports_gpu_completion();
                 if ready
@@ -751,6 +794,7 @@ mod tests {
             submit_picture_us: 4,
             lock_output_us: u64::MAX,
             stream_ordered: 1,
+            ..Default::default()
         });
         totals.record(super::NativeStageTimings {
             import_convert_us: 50,
@@ -762,6 +806,30 @@ mod tests {
         assert_eq!(totals.interop_copy_us, 200);
         assert_eq!(totals.lock_output_us, u64::MAX);
         assert_eq!(totals.stream_ordered_samples, 1);
+        assert_eq!(
+            totals.gpu_timed_samples, 0,
+            "untimed samples add no GPU stages"
+        );
+    }
+
+    #[test]
+    fn native_stage_totals_track_timed_gpu_stages_and_slow_frames() {
+        let mut totals = super::NativeStageTotals::default();
+        for (queue, convert, encode) in [(1_000, 200, 2_000), (9_000, 300, 4_000)] {
+            totals.record(super::NativeStageTimings {
+                gpu_timed: 1,
+                gpu_queue_us: queue,
+                gpu_convert_us: convert,
+                gpu_encode_us: encode,
+                ..Default::default()
+            });
+        }
+        assert_eq!(totals.gpu_timed_samples, 2);
+        assert_eq!(totals.gpu_queue_us, 10_000);
+        assert_eq!(totals.gpu_queue_max_us, 9_000);
+        assert_eq!(totals.gpu_convert_max_us, 300);
+        assert_eq!(totals.gpu_encode_us, 6_000);
+        assert_eq!(totals.gpu_slow_frames, 1);
     }
     use super::*;
     use std::sync::{Condvar, Mutex};

@@ -22,12 +22,14 @@ struct Observed {
     bgra: Vec<Vec<u8>>,
     /// Accepted DMA-BUF inputs stay alive here until a test drops them.
     dmabuf: Vec<crate::input::DmaBufInput>,
+    cuda: Vec<crate::input::CudaInput>,
 }
 
 struct GpuFake {
     support: InputSupport,
     capacity: Arc<Mutex<bool>>,
     observed: Arc<Mutex<Observed>>,
+    completion: bool,
 }
 
 impl Backend for GpuFake {
@@ -47,6 +49,9 @@ impl Backend for GpuFake {
     fn has_gpu_submit_capacity(&mut self) -> Result<bool, &'static str> {
         Ok(*self.capacity.lock().unwrap())
     }
+    fn supports_gpu_completion(&self) -> bool {
+        self.completion
+    }
     fn submit_gpu(
         &mut self,
         input: GpuInput,
@@ -57,6 +62,7 @@ impl Backend for GpuFake {
         match input {
             GpuInput::Bgra(bytes) => observed.bgra.push(bytes),
             GpuInput::DmaBuf(frame) => observed.dmabuf.push(frame),
+            GpuInput::Cuda(frame) => observed.cuda.push(frame),
         }
         Ok(SubmitResult::Accepted)
     }
@@ -83,6 +89,7 @@ fn harness(support: InputSupport) -> Harness {
         support,
         capacity: capacity.clone(),
         observed: observed.clone(),
+        completion: false,
     };
     sessions
         .insert("alice", configuration(), Box::new(backend), false)
@@ -99,6 +106,7 @@ fn gpu_harness() -> Harness {
     harness(InputSupport {
         gpu_bgra_conversion: true,
         dmabuf: Some(import_support()),
+        cuda_device: None,
     })
 }
 
@@ -381,11 +389,9 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
     // SAFETY: a successful bind returns a live v1.1 table until release.
     unsafe {
         let api = &*output.cast::<EncoderApiV1_1>();
-        assert_eq!(api.base.header.minor, ENCODER_TIMING_INTERFACE_MINOR);
-        assert_eq!(
-            api.base.header.size,
-            std::mem::size_of::<EncoderApiV1_3>() as u32
-        );
+        // The newest table is offered; every older prefix stays intact.
+        assert_eq!(api.base.header.minor, ENCODER_RESOURCE_INTERFACE_MINOR);
+        assert_eq!(api.base.header.size, ENCODER_API_V1_5_SIZE);
         let (plane, _writer) = stand_in();
         let borrowed = frame(&plane, None, 1);
         assert_eq!(
@@ -410,10 +416,7 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
     // SAFETY: the successful v1.2 query returns the complete additive table.
     unsafe {
         let api = &*output.cast::<EncoderApiV1_2>();
-        assert_eq!(
-            api.base.header.size,
-            std::mem::size_of::<EncoderApiV1_3>() as u32
-        );
+        assert_eq!(api.base.header.size, ENCODER_API_V1_5_SIZE);
         assert_eq!(
             (api.submit_dmabuf_leased)(api.base.context, 99, std::ptr::null(), 0),
             STATUS_INVALID_ARGUMENT
@@ -424,14 +427,136 @@ fn the_native_table_preserves_old_prefixes_and_offers_leased_submission() {
         std::mem::offset_of!(EncoderApiV1_2, submit_dmabuf_leased),
         ENCODER_API_V1_1_SIZE as usize
     );
+    let (status, output) = bind(ENCODER_RESOURCE_INTERFACE_MINOR, ENCODER_API_V1_5_SIZE);
+    assert_eq!(status, STATUS_OK);
+    // SAFETY: the v1.5 query returns the complete table; unknown sessions are closed.
+    unsafe {
+        let api = &*output.cast::<EncoderApiV1_5>();
+        let mut generation = 0;
+        let sink = CaptureResourceOfferSink {
+            context: std::ptr::null_mut(),
+            write: collect_offers,
+        };
+        let context = api.base.base.base.base.context;
+        assert_eq!(
+            (api.enumerate_resources)(context, 99, sink, &mut generation),
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            (api.submit_resource)(context, 99, std::ptr::null(), 0),
+            STATUS_INVALID_ARGUMENT
+        );
+        api.base.base.base.base.release.unwrap()(context);
+    }
     assert_eq!(
-        bind(ENCODER_TIMING_INTERFACE_MINOR + 1, ENCODER_API_V1_2_SIZE).0,
-        MEDIA_UNSUPPORTED
+        std::mem::offset_of!(EncoderApiV1_5, enumerate_resources),
+        ENCODER_API_V1_4_SIZE as usize
     );
     assert_eq!(
-        bind(0, std::mem::size_of::<EncoderApiV1_3>() as u32 + 8).0,
+        bind(ENCODER_RESOURCE_INTERFACE_MINOR + 1, ENCODER_API_V1_2_SIZE).0,
         MEDIA_UNSUPPORTED
     );
+    assert_eq!(bind(0, ENCODER_API_V1_5_SIZE + 8).0, MEDIA_UNSUPPORTED);
+}
+
+#[test]
+fn gpu_readiness_is_authorized_and_never_accepts_or_reserves_an_input() {
+    let capacity = Arc::new(Mutex::new(false));
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(GpuFake {
+                support: InputSupport {
+                    gpu_bgra_conversion: true,
+                    dmabuf: Some(import_support()),
+                    cuda_device: None,
+                },
+                capacity: capacity.clone(),
+                observed: observed.clone(),
+                completion: true,
+            }),
+            false,
+        )
+        .unwrap();
+    let id = sessions.latest_id();
+    assert_eq!(
+        sessions.encode_timing("mallory", id).unwrap_err(),
+        MEDIA_CLOSED
+    );
+    assert_eq!(
+        sessions
+            .encode_timing("alice", id)
+            .unwrap()
+            .completed_frames,
+        0
+    );
+    assert_eq!(sessions.gpu_input_ready("mallory", id), MEDIA_CLOSED);
+    assert_eq!(sessions.gpu_input_ready("alice", id), MEDIA_BUSY);
+    *capacity.lock().unwrap() = true;
+    assert_eq!(sessions.gpu_input_ready("alice", id), STATUS_OK);
+    assert_eq!(sessions.gpu_input_ready("alice", id), STATUS_OK);
+    assert!(sessions.values[&id].metadata.is_empty());
+    assert!(observed.lock().unwrap().dmabuf.is_empty());
+    sessions.values.get_mut(&id).unwrap().draining = true;
+    assert_eq!(sessions.gpu_input_ready("alice", id), MEDIA_CLOSED);
+}
+
+#[test]
+fn installed_compatibility_table_keeps_the_timing_prefix_and_exposes_readiness() {
+    let capacity = Arc::new(Mutex::new(true));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(GpuFake {
+                support: InputSupport {
+                    gpu_bgra_conversion: true,
+                    dmabuf: Some(import_support()),
+                    cuda_device: None,
+                },
+                capacity,
+                observed: Arc::new(Mutex::new(Observed::default())),
+                completion: true,
+            }),
+            false,
+        )
+        .unwrap();
+    let id = sessions.latest_id();
+    let registration = Registration::new(Arc::new(Mutex::new(sessions)));
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: ENCODER_GPU_READINESS_INTERFACE_MINOR,
+        min_size: ENCODER_API_V1_4_SIZE,
+    };
+    let mut output: *const NativeInterface = std::ptr::null();
+    // SAFETY: all factory/query data and the returned table outlive these calls.
+    unsafe {
+        assert_eq!(
+            registration.factory.bind.unwrap()(
+                registration.factory.context,
+                BorrowedBytes::new(b"alice"),
+                &query,
+                &mut output,
+            ),
+            STATUS_OK
+        );
+        let api = &*output.cast::<EncoderApiV1_4>();
+        let context = api.base.base.base.context;
+        let mut timing = EncodeTimingSnapshotV1::empty(11);
+        assert_eq!(
+            (api.base.encode_timing)(context, id, &mut timing),
+            STATUS_OK
+        );
+        assert_eq!(timing, EncodeTimingSnapshotV1::empty(1));
+        assert_eq!((api.gpu_input_ready)(context, id), STATUS_OK);
+        assert_eq!((api.gpu_input_ready)(context, id + 1), MEDIA_CLOSED);
+        api.base.base.base.release.unwrap()(context);
+    }
 }
 
 /// Holds every GPU input it receives, blocking the first until released.
@@ -458,6 +583,7 @@ impl WorkerBackend for HoldingBackend {
         InputSupport {
             gpu_bgra_conversion: true,
             dmabuf: Some(import_support()),
+            cuda_device: None,
         }
     }
     fn submit_gpu(&mut self, input: GpuInput, _: i64, _: bool) -> Result<(), &'static str> {
@@ -664,6 +790,7 @@ impl WorkerBackend for CompletionBackend {
         InputSupport {
             gpu_bgra_conversion: true,
             dmabuf: Some(import_support()),
+            cuda_device: None,
         }
     }
     fn submit_gpu(&mut self, input: GpuInput, _: i64, _: bool) -> Result<(), &'static str> {
@@ -950,6 +1077,7 @@ impl Backend for ImmediateGpuPacket {
         InputSupport {
             gpu_bgra_conversion: true,
             dmabuf: Some(import_support()),
+            cuda_device: None,
         }
     }
     fn supports_gpu_completion(&self) -> bool {
@@ -1042,4 +1170,265 @@ fn provider_backpressure_does_not_queue_or_release_an_unowned_reference() {
     );
     assert!(sessions.values[&id].metadata.is_empty());
     assert_no_retained_lease(&callbacks);
+}
+
+#[derive(Default)]
+struct ResourceCallbacks {
+    retained: std::sync::atomic::AtomicU32,
+    released: std::sync::atomic::AtomicU32,
+}
+
+unsafe extern "C" fn resource_retain(context: *mut std::ffi::c_void) -> Status {
+    let callbacks = unsafe { &*context.cast::<ResourceCallbacks>() };
+    callbacks
+        .retained
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STATUS_OK
+}
+
+unsafe extern "C" fn resource_release(
+    context: *mut std::ffi::c_void,
+    completion: *const FrameDescriptor,
+) {
+    assert_eq!(unsafe { (*completion).kind }, FRAME_SYNC_NONE);
+    let callbacks = unsafe { &*context.cast::<ResourceCallbacks>() };
+    callbacks
+        .released
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+const CUDA_DEVICE: [u8; 16] = [5; 16];
+
+fn cuda_harness() -> Harness {
+    let mut harness = harness(InputSupport {
+        gpu_bgra_conversion: false,
+        dmabuf: None,
+        cuda_device: Some(CUDA_DEVICE),
+    });
+    // Resource input requires a backend that orders completion with output.
+    let mut sessions = Sessions::new(true);
+    let backend = GpuFake {
+        support: InputSupport {
+            gpu_bgra_conversion: false,
+            dmabuf: None,
+            cuda_device: Some(CUDA_DEVICE),
+        },
+        capacity: harness.capacity.clone(),
+        observed: harness.observed.clone(),
+        completion: true,
+    };
+    sessions
+        .insert("alice", configuration(), Box::new(backend), false)
+        .unwrap();
+    harness.id = sessions.latest_id();
+    harness.sessions = sessions;
+    harness
+}
+
+unsafe extern "C" fn collect_offers(
+    context: *mut std::ffi::c_void,
+    offer: *const CaptureResourceOffer,
+) -> Status {
+    let offers = unsafe { &mut *context.cast::<Vec<(u64, CudaDeviceCapabilities)>>() };
+    let offer = unsafe { &*offer };
+    let resource = unsafe { cuda_device_capabilities(&offer.resource) }.copied();
+    offers.push((offer.id, resource.expect("CUDA offer payload")));
+    STATUS_OK
+}
+
+fn offers(harness: &mut Harness) -> (u64, Vec<(u64, CudaDeviceCapabilities)>) {
+    let mut offers = Vec::new();
+    let mut generation = 0;
+    let sink = CaptureResourceOfferSink {
+        context: (&mut offers as *mut Vec<(u64, CudaDeviceCapabilities)>).cast(),
+        write: collect_offers,
+    };
+    let status = unsafe {
+        harness
+            .sessions
+            .enumerate_resources("alice", harness.id, sink, &mut generation)
+    };
+    assert_eq!(status, STATUS_OK);
+    (generation, offers)
+}
+
+struct Producer {
+    resource: CudaDeviceCapabilities,
+    event: CudaEventCapabilities,
+}
+
+impl Producer {
+    fn new(device: [u8; 16]) -> Self {
+        Self {
+            resource: CudaDeviceCapabilities {
+                device_uuid: device,
+                format: CUDA_FORMAT_X2B10G10R10,
+                min_width: 16,
+                max_width: 8192,
+                min_height: 16,
+                max_height: 8192,
+                reserved: 0,
+            },
+            event: CudaEventCapabilities {
+                device_uuid: device,
+            },
+        }
+    }
+    fn offer(&self, id: u64) -> CaptureResourceOffer {
+        CaptureResourceOffer {
+            id,
+            ownership: FRAME_OWNERSHIP_RETAINABLE,
+            accessibility: FRAME_ACCESS_GPU,
+            reserved: 0,
+            resource: cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &self.resource),
+            acquire_sync: cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &self.event),
+            completion_sync: FrameDescriptor {
+                kind: FRAME_SYNC_NONE,
+                version: 0,
+                size: 0,
+                reserved: 0,
+                namespace: [0; 16],
+                data: std::ptr::null(),
+            },
+        }
+    }
+}
+
+struct ResourceFrame {
+    pixels: CudaDeviceFrame,
+    ready: CudaEventSync,
+}
+
+impl ResourceFrame {
+    fn new() -> Self {
+        Self {
+            pixels: CudaDeviceFrame {
+                device_uuid: CUDA_DEVICE,
+                device_pointer: 0x1000,
+                pitch: 64,
+                format: CUDA_FORMAT_X2B10G10R10,
+                width: 16,
+                height: 16,
+            },
+            ready: CudaEventSync {
+                event: std::ptr::dangling_mut::<u8>().cast(),
+            },
+        }
+    }
+    fn frame(
+        &self,
+        generation: u64,
+        offer: u64,
+        sequence: u64,
+        callbacks: &ResourceCallbacks,
+    ) -> CaptureResourceFrame {
+        CaptureResourceFrame {
+            offer_generation: generation,
+            offer_id: offer,
+            timestamp_us: sequence * 1000,
+            capture_pacing_timestamp_us: 0,
+            sequence,
+            width: 16,
+            height: 16,
+            freshness: CAPTURE_FRAME_FRESH,
+            reserved: 0,
+            color: FrameColorMetadata::default(),
+            clock: FrameClockMetadata::default(),
+            pacing_clock: FrameClockMetadata::default(),
+            resource: cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &self.pixels),
+            acquire_sync: cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &self.ready),
+            context: std::ptr::from_ref(callbacks).cast_mut().cast(),
+            retain: resource_retain,
+            release: resource_release,
+        }
+    }
+}
+
+#[test]
+fn sessions_without_cuda_input_offer_no_resources() {
+    let mut harness = gpu_harness();
+    let (generation, offers) = offers(&mut harness);
+    assert_ne!(generation, 0);
+    assert!(offers.is_empty(), "lease-only sessions keep the lease path");
+}
+
+#[test]
+fn cuda_resource_input_is_negotiated_retained_and_released_at_close() {
+    use std::sync::atomic::Ordering;
+    let mut harness = cuda_harness();
+    let (generation, offers) = offers(&mut harness);
+    assert_eq!(offers.len(), 1);
+    let (offer_id, offered) = offers[0];
+    assert_eq!(offered.device_uuid, CUDA_DEVICE);
+    assert_eq!((offered.min_width, offered.max_width), (16, 16));
+    let id = harness.id;
+    let configure = |harness: &mut Harness, producer: &Producer| unsafe {
+        harness.sessions.configure_resource(
+            "alice",
+            id,
+            generation,
+            offer_id,
+            7,
+            &producer.offer(3),
+        )
+    };
+    let callbacks = ResourceCallbacks::default();
+    let source = ResourceFrame::new();
+    let submit = |harness: &mut Harness, frame: &CaptureResourceFrame, flags| unsafe {
+        harness.sessions.submit_resource("alice", id, frame, flags)
+    };
+    // Another device's memory is never accepted, and nothing is configured.
+    assert_eq!(
+        configure(&mut harness, &Producer::new([6; 16])),
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        submit(&mut harness, &source.frame(7, 3, 1, &callbacks), 0),
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        configure(&mut harness, &Producer::new(CUDA_DEVICE)),
+        STATUS_OK
+    );
+    // Unknown flags and stale offers consume nothing.
+    assert_eq!(
+        submit(&mut harness, &source.frame(7, 3, 1, &callbacks), 2),
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        submit(&mut harness, &source.frame(8, 3, 1, &callbacks), 0),
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(callbacks.retained.load(Ordering::Relaxed), 0);
+    // A busy encoder accepts nothing either.
+    *harness.capacity.lock().unwrap() = false;
+    assert_eq!(
+        submit(&mut harness, &source.frame(7, 3, 1, &callbacks), 0),
+        MEDIA_BUSY
+    );
+    *harness.capacity.lock().unwrap() = true;
+    assert_eq!(callbacks.retained.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        submit(
+            &mut harness,
+            &source.frame(7, 3, 1, &callbacks),
+            FRAME_RESOURCE_SUBMIT_FORCE_IDR
+        ),
+        STATUS_OK
+    );
+    assert_eq!(callbacks.retained.load(Ordering::Relaxed), 1);
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 0);
+    let observed = harness.observed.lock().unwrap().cuda.clone();
+    assert_eq!(
+        observed,
+        vec![crate::input::CudaInput {
+            pointer: 0x1000,
+            pitch: 64,
+            width: 16,
+            height: 16,
+            ready: source.ready.event as usize,
+        }]
+    );
+    harness.sessions.close("alice", id).unwrap();
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
 }

@@ -220,8 +220,9 @@ fn add_ffmpeg_abi_marker(build: &mut cc::Build, avcodec_major: u32, avutil_major
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_ffmpeg_abi_marker");
 }
 
-const NVENC_CUDA_SOURCES: [&str; 5] = [
+const NVENC_CUDA_SOURCES: [&str; 6] = [
     "src/platform/nvenc_cuda/native/loader.c",
+    "src/platform/nvenc_cuda/native/cuda_input.c",
     "src/platform/nvenc_cuda/native/display.c",
     "src/platform/nvenc_cuda/native/convert.c",
     "src/platform/nvenc_cuda/native/nvenc.c",
@@ -283,10 +284,17 @@ fn build_linux_nvenc_cuda() {
     for header in ["nvEncodeAPI.h", "dynlink_cuda.h"] {
         println!("cargo:rerun-if-changed={}", nvenc.join(header).display());
     }
+    let out_dir = std::env::var("OUT_DIR").expect("cargo provides OUT_DIR");
+    embed_ptx(
+        "src/platform/nvenc_cuda/native/cuda/convert.ptx",
+        std::path::Path::new(&out_dir).join("nvenc_convert_ptx.h"),
+        "am_nvenc_convert_ptx",
+    );
     let mut build = cc::Build::new();
     build
         .include(&nvenc)
         .include(&egl)
+        .include(&out_dir)
         .define("_POSIX_C_SOURCE", "200809L")
         .std("c11")
         .warnings(true)
@@ -322,4 +330,20 @@ fn header_directory(variable: &str, candidates: &[&str], headers: &[&str]) -> Op
         .iter()
         .map(PathBuf::from)
         .find(|directory| complete(directory))
+}
+
+/// Embeds checked-in PTX (see scripts/generate-cuda-ptx.sh) as a C byte
+/// array, so building needs no CUDA compiler; the driver JIT-compiles it.
+fn embed_ptx(source: &str, header: std::path::PathBuf, symbol: &str) {
+    println!("cargo:rerun-if-changed={source}");
+    let ptx = std::fs::read(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let mut text = format!("static const unsigned char {symbol}[] = {{");
+    for (index, byte) in ptx.iter().chain(std::iter::once(&0u8)).enumerate() {
+        if index % 24 == 0 {
+            text.push('\n');
+        }
+        text.push_str(&format!("{byte},"));
+    }
+    text.push_str("\n};\n");
+    std::fs::write(header, text).expect("write embedded PTX");
 }

@@ -11,7 +11,8 @@
 use super::{
     codec::Codec,
     runtime::{
-        Encoder, TestBuffer, amaterasu_nvcuda_test_allocate_gbm, amaterasu_nvcuda_test_release_gbm,
+        Encoder, TestBuffer, amaterasu_nvcuda_test_allocate_gbm, amaterasu_nvcuda_test_cuda_frame,
+        amaterasu_nvcuda_test_release_cuda_frame, amaterasu_nvcuda_test_release_gbm,
     },
 };
 use crate::{
@@ -384,7 +385,11 @@ fn region_mean(frame: &[u8], first_row: u32, last_row: u32) -> [f64; 3] {
 
 /// Compares the halves away from the boundary with the CPU reference.
 fn assert_decoded_colours(frames: &[Vec<u8>], mode: ColorMode) {
-    assert_eq!(frames.len() as u64, FRAMES);
+    assert_decoded_frame_colours(frames, mode, FRAMES);
+}
+
+fn assert_decoded_frame_colours(frames: &[Vec<u8>], mode: ColorMode, expected: u64) {
+    assert_eq!(frames.len() as u64, expected);
     let last = frames.last().unwrap();
     for (rows, xrgb) in [
         ((16, HEIGHT / 2 - 16), TOP_XRGB),
@@ -621,6 +626,205 @@ fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Counts provider references held by the encoder. A leased source is read
+/// by a queued GPU conversion, so it must stay referenced until its output.
+struct CountedLease {
+    references: std::cell::Cell<u32>,
+    peak: std::cell::Cell<u32>,
+}
+unsafe extern "C" fn counted_retain(context: *mut c_void) -> Status {
+    // SAFETY: the test lends a live CountedLease for every lease it builds.
+    let lease = unsafe { &*context.cast::<CountedLease>() };
+    lease.references.set(lease.references.get() + 1);
+    lease.peak.set(lease.peak.get().max(lease.references.get()));
+    STATUS_OK
+}
+unsafe extern "C" fn counted_release(context: *mut c_void, fence: i32) {
+    assert_eq!(fence, -1, "encoded output certifies completion");
+    // SAFETY: as in `counted_retain`.
+    let lease = unsafe { &*context.cast::<CountedLease>() };
+    lease.references.set(lease.references.get() - 1);
+}
+
+#[test]
+#[ignore = "requires an NVIDIA GPU with NVENC and a GBM render node on it"]
+fn nvenc_cuda_gpu_retained_dmabuf_queues_conversion_until_encoded_output() {
+    let description = published()
+        .into_iter()
+        .find(|entry| entry.capabilities.inputs.contains(&"dmabuf"))
+        .expect("no NVENC/CUDA encoder advertises DMA-BUF input");
+    let codec = Codec::from_clsid(&description.identity.clsid).unwrap();
+    let mode = ColorMode::Bt709Limited;
+    let mut sessions = Sessions::new(true);
+    let reply = sessions
+        .open(
+            "gpu-test",
+            description.identity.clone(),
+            configuration(codec, mode),
+            None,
+            false,
+        )
+        .unwrap();
+    let id = reply["session_id"].as_u64().unwrap();
+    let buffer = GbmBuffer::allocate();
+    let counted = CountedLease {
+        references: std::cell::Cell::new(0),
+        peak: std::cell::Cell::new(0),
+    };
+    let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
+    let sink = PacketSink {
+        context: (&mut packets as *mut Vec<(u32, Vec<u8>)>).cast(),
+        write: collect_packet,
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for sequence in 1..=FRAMES {
+        let lease = DmaBufFrameLease {
+            frame: buffer.frame(sequence),
+            context: std::ptr::from_ref(&counted).cast_mut().cast(),
+            retain: Some(counted_retain),
+            release: Some(counted_release),
+        };
+        let force = u32::from(sequence == 1);
+        loop {
+            // SAFETY: the GBM buffer and counter outlive every reference.
+            let status = unsafe { sessions.submit_dmabuf_leased("gpu-test", id, &lease, force) };
+            if status == STATUS_OK {
+                break;
+            }
+            assert_eq!(status, MEDIA_BUSY, "submit_dmabuf_leased failed");
+            // SAFETY: the sink context outlives the call.
+            let _ = unsafe { sessions.receive("gpu-test", id, sink) };
+            assert!(Instant::now() < deadline);
+        }
+    }
+    while sessions.drain("gpu-test", id) == MEDIA_BUSY {
+        assert!(Instant::now() < deadline);
+    }
+    while !packets
+        .iter()
+        .any(|(flags, _)| flags & FLAG_END_OF_STREAM != 0)
+    {
+        // SAFETY: the sink context outlives the call.
+        let status = unsafe { sessions.receive("gpu-test", id, sink) };
+        assert!(
+            matches!(status, STATUS_OK | MEDIA_PENDING),
+            "receive {status}"
+        );
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(counted.peak.get() >= 1, "sources were retained in flight");
+    assert_eq!(counted.references.get(), 0, "every source released");
+    // Imported frames report GPU-clock stages for live diagnosis. Pipelined
+    // frames finish after their submission, so the last two may be pending.
+    let status = sessions.status("gpu-test", id).unwrap();
+    let stages = &status["encoder_timing"]["native_stage_totals"];
+    let timed = stages["gpu_timed_samples"].as_u64().unwrap();
+    assert!(
+        timed + 2 >= FRAMES && timed <= FRAMES,
+        "GPU timing: {stages}"
+    );
+    assert!(stages["gpu_convert_us"].as_u64().unwrap() > 0);
+    eprintln!("leased GPU stages: {stages}");
+    let encoded: Vec<Vec<u8>> = packets
+        .into_iter()
+        .filter(|(flags, _)| flags & FLAG_END_OF_STREAM == 0)
+        .map(|(_, bytes)| bytes)
+        .collect();
+    assert_eq!(encoded.len() as u64, FRAMES);
+    let path = stream_file(codec, "dmabuf-leased", encoded);
+    assert_stream_signal(codec, mode, &probe(codec, &path));
+    assert_decoded_colours(&decode(codec, &path), mode);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires an NVIDIA GPU with NVENC and a GBM render node on it"]
+fn nvenc_cuda_gpu_accepts_a_second_frame_while_the_first_encodes() {
+    let description = published()
+        .into_iter()
+        .find(|entry| entry.capabilities.inputs.contains(&"dmabuf"))
+        .expect("no NVENC/CUDA encoder advertises DMA-BUF input");
+    let codec = Codec::from_clsid(&description.identity.clsid).unwrap();
+    let mode = ColorMode::Bt709Limited;
+    let mut sessions = Sessions::new(true);
+    let reply = sessions
+        .open(
+            "gpu-test",
+            description.identity.clone(),
+            configuration(codec, mode),
+            None,
+            false,
+        )
+        .unwrap();
+    let id = reply["session_id"].as_u64().unwrap();
+    let buffer = GbmBuffer::allocate();
+    let counted = CountedLease {
+        references: std::cell::Cell::new(0),
+        peak: std::cell::Cell::new(0),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // Submit two frames without receiving any output in between. The second
+    // is accepted once the first has been handed to NVENC, while its
+    // bitstream may still be pending: two frames are then in flight.
+    for sequence in 1..=2 {
+        let lease = DmaBufFrameLease {
+            frame: buffer.frame(sequence),
+            context: std::ptr::from_ref(&counted).cast_mut().cast(),
+            retain: Some(counted_retain),
+            release: Some(counted_release),
+        };
+        loop {
+            // SAFETY: the GBM buffer and counter outlive every reference.
+            let status = unsafe {
+                sessions.submit_dmabuf_leased("gpu-test", id, &lease, u32::from(sequence == 1))
+            };
+            if status == STATUS_OK {
+                break;
+            }
+            assert_eq!(status, MEDIA_BUSY, "submit_dmabuf_leased failed");
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(
+        counted.references.get(),
+        2,
+        "both sources retained in flight"
+    );
+    let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
+    let sink = PacketSink {
+        context: (&mut packets as *mut Vec<(u32, Vec<u8>)>).cast(),
+        write: collect_packet,
+    };
+    while sessions.drain("gpu-test", id) == MEDIA_BUSY {
+        assert!(Instant::now() < deadline);
+    }
+    while !packets
+        .iter()
+        .any(|(flags, _)| flags & FLAG_END_OF_STREAM != 0)
+    {
+        // SAFETY: the sink context outlives the call.
+        let status = unsafe { sessions.receive("gpu-test", id, sink) };
+        assert!(
+            matches!(status, STATUS_OK | MEDIA_PENDING),
+            "receive {status}"
+        );
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(counted.references.get(), 0, "every source released");
+    let encoded: Vec<Vec<u8>> = packets
+        .into_iter()
+        .filter(|(flags, _)| flags & FLAG_END_OF_STREAM == 0)
+        .map(|(_, bytes)| bytes)
+        .collect();
+    assert_eq!(encoded.len(), 2);
+    let path = stream_file(codec, "dmabuf-pipelined", encoded);
+    assert_decoded_frame_colours(&decode(codec, &path), mode, 2);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 #[ignore = "requires NVIDIA NVENC with ten-bit HEVC and AV1"]
 fn nvenc_cuda_gpu_encodes_ten_bit_sdr_cpu_input() {
@@ -831,20 +1035,26 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
     };
     assert_eq!(result, 0, "RGB10 allocation failed");
     let buffer = GbmBuffer(raw);
-    for (codec, dynamic_range) in [Codec::Hevc, Codec::Av1].into_iter().flat_map(|codec| {
-        [
-            amaterasu_module_sdk::DynamicRange::Sdr,
-            amaterasu_module_sdk::DynamicRange::Hdr,
-        ]
-        .into_iter()
-        .map(move |range| (codec, range))
-    }) {
+    for (codec, dynamic_range, color_mode) in
+        [Codec::Hevc, Codec::Av1].into_iter().flat_map(|codec| {
+            [
+                amaterasu_module_sdk::DynamicRange::Sdr,
+                amaterasu_module_sdk::DynamicRange::Hdr,
+            ]
+            .into_iter()
+            .flat_map(move |range| {
+                [ColorMode::Bt709Limited, ColorMode::Bt709Full]
+                    .into_iter()
+                    .map(move |color_mode| (codec, range, color_mode))
+            })
+        })
+    {
         let hdr = dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
         let description = published()
             .into_iter()
             .find(|entry| entry.codec == codec.token())
             .unwrap();
-        let mut config = configuration(codec, ColorMode::Bt709Limited);
+        let mut config = configuration(codec, color_mode);
         config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
             codec: if codec == Codec::Hevc {
                 amaterasu_module_sdk::VideoCodec::Hevc
@@ -894,7 +1104,15 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
         let info = probe(codec, &path);
         let stream = &info;
         assert_eq!(stream["pix_fmt"], "yuv420p10le", "{stream}");
-        assert_eq!(stream["color_range"], "tv", "{stream}");
+        assert_eq!(
+            stream["color_range"],
+            if color_mode == ColorMode::Bt709Full {
+                "pc"
+            } else {
+                "tv"
+            },
+            "{stream}"
+        );
         if codec == Codec::Hevc {
             assert_eq!(stream["profile"], "Main 10", "{stream}");
         }
@@ -941,9 +1159,9 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
             .collect();
         assert_eq!(pixels.len(), (WIDTH * HEIGHT * 3 / 2) as usize);
         let rows = if hdr {
-            super::color::hdr_conversion_rows()
+            super::color::hdr_conversion_rows(color_mode)
         } else {
-            super::color::sdr_ten_bit_conversion_rows(ColorMode::Bt709Limited)
+            super::color::sdr_ten_bit_conversion_rows(color_mode)
         };
         for (color, y) in [(top, HEIGHT / 4), (bottom, HEIGHT * 3 / 4)] {
             let rgb = [
@@ -998,4 +1216,123 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
         }
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
+fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
+    // Same picture in both inputs: AR30 orders blue in the low bits, the CUDA
+    // schema red; channel values are identical.
+    let (red, green, blue) = (719u32, 321u32, 183u32);
+    let (red2, green2, blue2) = (201u32, 553u32, 877u32);
+    let ar30_top = (red << 20) | (green << 10) | blue;
+    let ar30_bottom = (red2 << 20) | (green2 << 10) | blue2;
+    let cuda_top = red | (green << 10) | (blue << 20);
+    let cuda_bottom = red2 | (green2 << 10) | (blue2 << 20);
+    let node = CString::new(
+        std::env::var("AMATERASU_TEST_RENDER_NODE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
+    )
+    .unwrap();
+    let mut raw = TestBuffer {
+        device: std::ptr::null_mut(),
+        buffer: std::ptr::null_mut(),
+        render_fd: -1,
+        dmabuf_fd: -1,
+        pitch: 0,
+        offset: 0,
+        modifier: 0,
+    };
+    // SAFETY: the test retains this owned allocation through all reads.
+    let result = unsafe {
+        amaterasu_nvcuda_test_allocate_gbm(
+            node.as_ptr(),
+            WIDTH,
+            HEIGHT,
+            ar30_top,
+            ar30_bottom,
+            u32::from_le_bytes(*b"AR30"),
+            &mut raw,
+        )
+    };
+    assert_eq!(result, 0, "RGB10 allocation failed");
+    let buffer = GbmBuffer(raw);
+    let (mut pointer, mut pitch, mut event) = (0u64, 0u32, std::ptr::null_mut());
+    // SAFETY: test-only CUDA allocation released at the end of this test.
+    let result = unsafe {
+        amaterasu_nvcuda_test_cuda_frame(
+            WIDTH,
+            HEIGHT,
+            cuda_top,
+            cuda_bottom,
+            &mut pointer,
+            &mut pitch,
+            &mut event,
+        )
+    };
+    assert_eq!(result, 0, "CUDA frame allocation failed");
+    for (codec, color_mode) in [Codec::Hevc, Codec::Av1]
+        .into_iter()
+        .flat_map(|codec| [ColorMode::Bt709Limited, ColorMode::Bt709Full].map(|mode| (codec, mode)))
+    {
+        let description = published()
+            .into_iter()
+            .find(|entry| entry.codec == codec.token())
+            .unwrap();
+        let mut config = configuration(codec, color_mode);
+        config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: if codec == Codec::Hevc {
+                amaterasu_module_sdk::VideoCodec::Hevc
+            } else {
+                amaterasu_module_sdk::VideoCodec::Av1
+            },
+            bit_depth: 10,
+            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+        };
+        let encode = |cuda: bool| -> Vec<Vec<u8>> {
+            let mut encoder = Encoder::open(&description.identity, &config)
+                .unwrap_or_else(|error| panic!("{error}: {:?}", super::last_open_failure()));
+            assert!(
+                encoder.input_support().cuda_device.is_some(),
+                "HDR sessions offer CUDA input"
+            );
+            let mut packets = Vec::new();
+            for sequence in 1..=FRAMES {
+                let input = if cuda {
+                    GpuInput::Cuda(crate::input::CudaInput {
+                        pointer,
+                        pitch,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        ready: event as usize,
+                    })
+                } else {
+                    let mut frame = buffer.frame(sequence);
+                    frame.fourcc = u32::from_le_bytes(*b"AR30");
+                    frame.color = DMABUF_COLOR_BT2020_PQ;
+                    // SAFETY: allocation and descriptors outlive this duplication.
+                    GpuInput::DmaBuf(
+                        unsafe { crate::input::DmaBufInput::duplicate(&frame) }.unwrap(),
+                    )
+                };
+                encoder
+                    .submit_gpu(input, (sequence * 333_333) as i64, sequence == 1)
+                    .unwrap_or_else(|error| panic!("cuda={cuda} frame {sequence}: {error}"));
+                packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
+            }
+            encoder.drain().unwrap();
+            packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
+            packets.into_iter().map(|packet| packet.bytes).collect()
+        };
+        let through_gl = encode(false);
+        let through_cuda = encode(true);
+        assert_eq!(through_gl.len() as u64, FRAMES);
+        // Identical P010 input makes NVENC's output byte-identical.
+        assert!(
+            through_gl == through_cuda,
+            "{codec:?} {color_mode:?}: CUDA input changed the encoded stream"
+        );
+    }
+    // SAFETY: every encoder using the frame has been closed.
+    unsafe { amaterasu_nvcuda_test_release_cuda_frame(pointer, event) };
 }

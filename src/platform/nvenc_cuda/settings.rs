@@ -53,12 +53,12 @@ pub fn reference_frames(configuration: &Configuration, codec: Codec) -> u32 {
 
 pub fn native_settings(configuration: &Configuration, codec: Codec) -> NativeSettings {
     let color = if configuration.is_hdr() {
-        super::color::hdr_signal()
+        super::color::hdr_signal(configuration.color_mode)
     } else {
         signal(configuration.color_mode)
     };
     let rows = if configuration.is_hdr() {
-        super::color::hdr_conversion_rows()
+        super::color::hdr_conversion_rows(configuration.color_mode)
     } else if configuration.is_ten_bit() {
         super::color::sdr_ten_bit_conversion_rows(configuration.color_mode)
     } else {
@@ -186,5 +186,37 @@ mod tests {
         assert_eq!(settings.luma_row, rows.luma);
         assert_eq!(settings.cb_row, rows.cb);
         assert_eq!(settings.cr_row, rows.cr);
+    }
+
+    #[test]
+    fn hdr_respects_requested_range_and_pq_signal() {
+        let mut config = configuration(VideoCodec::Hevc);
+        config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: amaterasu_module_sdk::VideoCodec::Hevc,
+            bit_depth: 10,
+            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+        };
+        for (mode, full, black, white) in [
+            (ColorMode::Bt709Limited, 0, 64.0, 940.0),
+            (ColorMode::Bt709Full, 1, 0.0, 1023.0),
+        ] {
+            config.color_mode = mode;
+            assert_eq!(validate(&config, Codec::Hevc), Ok(()));
+            let settings = native_settings(&config, Codec::Hevc);
+            assert_eq!(settings.full_range, full);
+            assert_eq!(
+                (
+                    settings.color_primaries,
+                    settings.transfer_characteristics,
+                    settings.matrix_coefficients
+                ),
+                (9, 16, 9)
+            );
+            let luma = settings.luma_row;
+            assert!((luma[3] * 1023.0 - black).abs() < 0.01);
+            assert!(((luma.iter().sum::<f32>()) * 1023.0 - white).abs() < 0.01);
+            assert!((settings.cb_row.iter().sum::<f32>() * 1023.0 - 512.0).abs() < 0.01);
+            assert!((settings.cr_row.iter().sum::<f32>() * 1023.0 - 512.0).abs() < 0.01);
+        }
     }
 }

@@ -24,19 +24,32 @@
  * bounded active session set can be quarantined until process teardown. */
 static atomic_int am_retirement_failed = 0;
 
+/* One input buffer and bitstream. The worker thread converts into an idle
+ * slot and submits it; the output thread locks it, in submission order, and
+ * releases it. A slot is never shared between those steps. */
+struct am_nvcuda_slot {
+    CUdeviceptr input;
+    size_t input_pitch;
+    NV_ENC_REGISTERED_PTR registered_input;
+    /* Non-NULL from a successful submit until its output is released. */
+    NV_ENC_INPUT_PTR mapped_input;
+    NV_ENC_OUTPUT_PTR bitstream;
+    int bitstream_locked;
+    int64_t timestamp_100ns;
+    struct am_nvcuda_timings timings;
+};
+
 struct am_nvcuda_encoder {
     const struct am_driver *driver;
     NV_ENCODE_API_FUNCTION_LIST functions;
     struct am_nvcuda_struct_versions versions;
     CUcontext context;
+    /* Nonzero when `context` is the device's retained primary context. */
+    int primary_context;
+    CUdevice device;
     void *session;
-    NV_ENC_OUTPUT_PTR bitstream;
-    CUdeviceptr input;
-    size_t input_pitch;
-    NV_ENC_REGISTERED_PTR registered_input;
-    /* Non-NULL from a successful encode until its output is released. */
-    NV_ENC_INPUT_PTR mapped_input;
-    int bitstream_locked;
+    /* Frames in flight: one can convert and submit while another encodes. */
+    struct am_nvcuda_slot slots[AM_NVCUDA_SLOTS];
     struct am_converter converter;
     uint32_t codec;
     uint32_t bit_depth;
@@ -45,7 +58,7 @@ struct am_nvcuda_encoder {
     int draining;
     /* Non-NULL only after NVENC accepts this stream for input and output. */
     CUstream conversion_stream;
-    struct am_nvcuda_timings timings;
+    struct am_cuda_input cuda_input;
 };
 
 static uint64_t monotonic_us(void) {
@@ -59,10 +72,14 @@ static uint64_t elapsed_us(uint64_t start) {
     return start != 0 && end >= start ? end - start : 0;
 }
 
-void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder,
+static struct am_nvcuda_slot *slot_at(struct am_nvcuda_encoder *encoder, uint32_t slot) {
+    return encoder != NULL && slot < AM_NVCUDA_SLOTS ? &encoder->slots[slot] : NULL;
+}
+
+void amaterasu_nvcuda_get_timings(const struct am_nvcuda_encoder *encoder, uint32_t slot,
                                   struct am_nvcuda_timings *timings) {
-    if (encoder != NULL && timings != NULL) {
-        *timings = encoder->timings;
+    if (encoder != NULL && slot < AM_NVCUDA_SLOTS && timings != NULL) {
+        *timings = encoder->slots[slot].timings;
         timings->stream_ordered = encoder->conversion_stream != NULL;
     }
 }
@@ -494,7 +511,8 @@ static int configure_encoder(struct am_nvcuda_encoder *encoder,
     return AM_NVCUDA_OK;
 }
 
-static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_status *status) {
+static int create_slot(struct am_nvcuda_encoder *encoder, struct am_nvcuda_slot *slot,
+                       struct am_nvcuda_status *status) {
     NV_ENC_CREATE_BITSTREAM_BUFFER bitstream;
     memset(&bitstream, 0, sizeof(bitstream));
     bitstream.version = encoder->versions.create_bitstream;
@@ -504,14 +522,14 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
         am_set_status(status, AM_STAGE_BITSTREAM, (int32_t)native_status);
         return AM_NVCUDA_NATIVE_FAILURE;
     }
-    encoder->bitstream = bitstream.bitstreamBuffer;
+    slot->bitstream = bitstream.bitstreamBuffer;
 
     /* One allocation: luma rows followed by interleaved chroma rows, both at
      * the same pitch, which is the layout NVENC expects for NV12. */
     CUresult cuda_status = encoder->driver->cuda.mem_alloc_pitch(
-        &encoder->input, &encoder->input_pitch, encoder->width * (encoder->bit_depth == 10 ? 2 : 1),
+        &slot->input, &slot->input_pitch, encoder->width * (encoder->bit_depth == 10 ? 2 : 1),
         (size_t)encoder->height + encoder->height / 2, 16);
-    if (cuda_status != CUDA_SUCCESS || encoder->input_pitch > UINT32_MAX) {
+    if (cuda_status != CUDA_SUCCESS || slot->input_pitch > UINT32_MAX) {
         am_set_status(status, AM_STAGE_INPUT, (int32_t)cuda_status);
         return AM_NVCUDA_ALLOCATION_FAILED;
     }
@@ -521,8 +539,8 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
     resource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
     resource.width = encoder->width;
     resource.height = encoder->height;
-    resource.pitch = (uint32_t)encoder->input_pitch;
-    resource.resourceToRegister = (void *)(uintptr_t)encoder->input;
+    resource.pitch = (uint32_t)slot->input_pitch;
+    resource.resourceToRegister = (void *)(uintptr_t)slot->input;
     resource.bufferFormat = encoder->bit_depth == 10 ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12;
     resource.bufferUsage = NV_ENC_INPUT_IMAGE;
     native_status = encoder->functions.nvEncRegisterResource(encoder->session, &resource);
@@ -530,7 +548,17 @@ static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_st
         am_set_status(status, AM_STAGE_INPUT, (int32_t)native_status);
         return AM_NVCUDA_NATIVE_FAILURE;
     }
-    encoder->registered_input = resource.registeredResource;
+    slot->registered_input = resource.registeredResource;
+    return AM_NVCUDA_OK;
+}
+
+static int create_buffers(struct am_nvcuda_encoder *encoder, struct am_nvcuda_status *status) {
+    for (uint32_t index = 0; index < AM_NVCUDA_SLOTS; ++index) {
+        int result = create_slot(encoder, &encoder->slots[index], status);
+        if (result != AM_NVCUDA_OK) {
+            return result;
+        }
+    }
     return AM_NVCUDA_OK;
 }
 
@@ -647,6 +675,44 @@ int amaterasu_nvcuda_test_failed_retirement(int mapping_unproven) {
     return retained;
 }
 
+/* Share the device's primary context, as GPU processors such as RTX HDR do.
+ * Each CUDA context is scheduled on the GPU separately; while a game holds the
+ * GPU, every additional context waits for its own timeslice. Sharing one
+ * context lets the conversion copy run with the processor's CUDA work. */
+static CUresult acquire_context(struct am_nvcuda_encoder *encoder, CUdevice device) {
+    const struct am_cuda_api *cuda = &encoder->driver->cuda;
+    if (cuda->primary_ctx_retain != NULL && cuda->primary_ctx_release != NULL &&
+        cuda->ctx_push_current != NULL && cuda->ctx_pop_current != NULL &&
+        cuda->ctx_get_current != NULL) {
+        CUresult result = cuda->primary_ctx_retain(&encoder->context, device);
+        if (result == CUDA_SUCCESS) {
+            result = cuda->ctx_push_current(encoder->context);
+            if (result == CUDA_SUCCESS) {
+                encoder->primary_context = 1;
+                return CUDA_SUCCESS;
+            }
+            cuda->primary_ctx_release(device);
+        }
+        encoder->context = NULL;
+    }
+    return cuda->ctx_create(&encoder->context, CU_CTX_SCHED_BLOCKING_SYNC, device);
+}
+
+static void release_context(struct am_nvcuda_encoder *encoder) {
+    const struct am_cuda_api *cuda = &encoder->driver->cuda;
+    if (!encoder->primary_context) {
+        cuda->ctx_destroy(encoder->context);
+        return;
+    }
+    /* Unbind it from this thread before dropping the retained reference. */
+    CUcontext current = NULL;
+    if (cuda->ctx_get_current(&current) == CUDA_SUCCESS && current == encoder->context) {
+        CUcontext popped = NULL;
+        (void)cuda->ctx_pop_current(&popped);
+    }
+    cuda->primary_ctx_release(encoder->device);
+}
+
 static int open_encoder(struct am_nvcuda_encoder *encoder, const char *pci_bus_id,
                         const struct am_nvcuda_struct_versions *candidates,
                         uint32_t candidate_count, const struct am_nvcuda_settings *settings,
@@ -656,9 +722,9 @@ static int open_encoder(struct am_nvcuda_encoder *encoder, const char *pci_bus_i
         am_set_status(status, AM_STAGE_DEVICE, 0);
         return AM_NVCUDA_NO_DEVICE;
     }
-    /* Created on, and left current for, the encoder worker thread. */
-    CUresult cuda_status =
-        encoder->driver->cuda.ctx_create(&encoder->context, CU_CTX_SCHED_BLOCKING_SYNC, device);
+    /* Made current for the encoder worker thread. */
+    encoder->device = device;
+    CUresult cuda_status = acquire_context(encoder, device);
     if (cuda_status != CUDA_SUCCESS) {
         encoder->context = NULL;
         am_set_status(status, AM_STAGE_DEVICE, (int32_t)cuda_status);
@@ -679,8 +745,14 @@ static int open_encoder(struct am_nvcuda_encoder *encoder, const char *pci_bus_i
         result = am_converter_open(&encoder->converter, encoder->driver, device, settings,
                                    status);
     }
+    /* CUDA resource input is optional; it needs the ordered stream to wait on
+     * the producer's event and currently converts to ten-bit P010 only. */
+    if (result == AM_NVCUDA_OK && encoder->bit_depth == 10 && encoder->conversion_stream != NULL) {
+        (void)am_cuda_input_open(&encoder->cuda_input, encoder->driver, device);
+    }
     return result;
 }
+
 
 struct am_nvcuda_encoder *amaterasu_nvcuda_open(
     const char *pci_bus_id, const struct am_nvcuda_struct_versions *candidates,
@@ -733,29 +805,32 @@ int amaterasu_nvcuda_import_modifiers(struct am_nvcuda_encoder *encoder, uint32_
                                          modifier_count, implicit);
 }
 
-static int input_writable(const struct am_nvcuda_encoder *encoder) {
-    return encoder != NULL && !encoder->draining && encoder->mapped_input == NULL;
+static int input_writable(struct am_nvcuda_encoder *encoder, uint32_t slot) {
+    const struct am_nvcuda_slot *target = slot_at(encoder, slot);
+    return target != NULL && !encoder->draining && target->mapped_input == NULL;
 }
 
-int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_t *nv12,
-                                 size_t length, struct am_nvcuda_status *status) {
+int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 const uint8_t *nv12, size_t length,
+                                 struct am_nvcuda_status *status) {
     /* Internal planar upload: NV12 at eight bits, P010 at ten bits. Public
      * CPU NV12 input remains rejected for ten-bit sessions by Rust validation. */
     size_t row_bytes = encoder != NULL ? (size_t)encoder->width * (encoder->bit_depth == 10 ? 2u : 1u) : 0;
     size_t luma_bytes = encoder != NULL ? row_bytes * encoder->height : 0;
-    if (!input_writable(encoder) || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
+    if (!input_writable(encoder, slot) || nv12 == NULL || length != luma_bytes + luma_bytes / 2) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
-    memset(&encoder->timings, 0, sizeof(encoder->timings));
+    struct am_nvcuda_slot *target = &encoder->slots[slot];
+    memset(&target->timings, 0, sizeof(target->timings));
     CUDA_MEMCPY2D copy;
     memset(&copy, 0, sizeof(copy));
     copy.srcMemoryType = CU_MEMORYTYPE_HOST;
     copy.srcHost = nv12;
     copy.srcPitch = row_bytes;
     copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    copy.dstDevice = encoder->input;
-    copy.dstPitch = encoder->input_pitch;
+    copy.dstDevice = target->input;
+    copy.dstPitch = target->input_pitch;
     copy.WidthInBytes = row_bytes;
     /* The packed chroma rows directly follow the luma rows in both layouts. */
     copy.Height = (size_t)encoder->height + encoder->height / 2;
@@ -767,86 +842,123 @@ int amaterasu_nvcuda_upload_nv12(struct am_nvcuda_encoder *encoder, const uint8_
     return AM_NVCUDA_OK;
 }
 
-int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, const uint8_t *bgra,
-                                 size_t length, struct am_nvcuda_status *status) {
-    if (!input_writable(encoder) || bgra == NULL ||
+int amaterasu_nvcuda_upload_bgra(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 const uint8_t *bgra, size_t length,
+                                 struct am_nvcuda_status *status) {
+    if (!input_writable(encoder, slot) || bgra == NULL ||
         length != (size_t)encoder->width * encoder->height * 4u) {
         am_set_status(status, AM_STAGE_UPLOAD, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
-    memset(&encoder->timings, 0, sizeof(encoder->timings));
+    struct am_nvcuda_slot *target = &encoder->slots[slot];
+    memset(&target->timings, 0, sizeof(target->timings));
     uint64_t started = monotonic_us();
     int result = am_converter_upload_bgra(&encoder->converter, bgra, status);
-    encoder->timings.import_convert_us = elapsed_us(started);
+    target->timings.import_convert_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK) {
         return result;
     }
     started = monotonic_us();
-    result = am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
+    result = am_converter_copy_nv12(&encoder->converter, target->input, target->input_pitch,
                                     encoder->conversion_stream, status);
-    encoder->timings.interop_copy_us = elapsed_us(started);
+    target->timings.interop_copy_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK)
         return AM_NVCUDA_NATIVE_FAILURE;
     return result;
 }
 
-int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder,
+int amaterasu_nvcuda_import_dmabuf(struct am_nvcuda_encoder *encoder, uint32_t slot,
                                    struct am_nvcuda_dmabuf *frame,
                                    struct am_nvcuda_status *status) {
-    if (!input_writable(encoder) || frame == NULL) {
+    if (!input_writable(encoder, slot) || frame == NULL) {
         am_set_status(status, AM_STAGE_IMPORT, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
-    memset(&encoder->timings, 0, sizeof(encoder->timings));
+    struct am_nvcuda_slot *target = &encoder->slots[slot];
+    memset(&target->timings, 0, sizeof(target->timings));
     uint64_t started = monotonic_us();
-    int result = am_converter_import_dmabuf(&encoder->converter, frame, status);
-    encoder->timings.import_convert_us = elapsed_us(started);
+    int result = am_converter_import_dmabuf(&encoder->converter, slot, frame, status);
+    target->timings.import_convert_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK) {
         return result;
     }
     started = monotonic_us();
-    result = am_converter_copy_nv12(&encoder->converter, encoder->input, encoder->input_pitch,
+    result = am_converter_copy_nv12(&encoder->converter, target->input, target->input_pitch,
                                     encoder->conversion_stream, status);
-    encoder->timings.interop_copy_us = elapsed_us(started);
-    if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK)
-        return AM_NVCUDA_NATIVE_FAILURE;
+    target->timings.interop_copy_us = elapsed_us(started);
+    if (result != AM_NVCUDA_OK) {
+        /* No encoded output will order a retained source's queued reads. */
+        am_converter_finish(&encoder->converter);
+        if (synchronize_conversion(encoder, status) != AM_NVCUDA_OK)
+            return AM_NVCUDA_NATIVE_FAILURE;
+    }
     return result;
 }
 
-static void unmap_input(struct am_nvcuda_encoder *encoder) {
-    if (encoder->mapped_input != NULL) {
-        encoder->functions.nvEncUnmapInputResource(encoder->session, encoder->mapped_input);
-        encoder->mapped_input = NULL;
+int amaterasu_nvcuda_cuda_input(const struct am_nvcuda_encoder *encoder, uint8_t *device_uuid) {
+    if (encoder == NULL || device_uuid == NULL || !encoder->cuda_input.available) {
+        return 0;
+    }
+    memcpy(device_uuid, encoder->cuda_input.device_uuid, sizeof(encoder->cuda_input.device_uuid));
+    return 1;
+}
+
+int amaterasu_nvcuda_import_cuda(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                 uint64_t pointer, uint32_t pitch, uint32_t width,
+                                 uint32_t height, void *ready, struct am_nvcuda_status *status) {
+    if (!input_writable(encoder, slot) || width != encoder->width ||
+        height != encoder->height || pointer == 0 || pitch < width * 4u) {
+        am_set_status(status, AM_STAGE_IMPORT, 0);
+        return AM_NVCUDA_INVALID_ARGUMENT;
+    }
+    struct am_nvcuda_slot *target = &encoder->slots[slot];
+    memset(&target->timings, 0, sizeof(target->timings));
+    uint64_t started = monotonic_us();
+    int result = am_cuda_input_convert(&encoder->cuda_input, encoder->driver,
+                                       &encoder->converter, encoder->conversion_stream,
+                                       (CUevent)ready, (CUdeviceptr)pointer, pitch, target->input,
+                                       target->input_pitch, status);
+    target->timings.import_convert_us = elapsed_us(started);
+    if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK) {
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return result;
+}
+
+static void unmap_input(struct am_nvcuda_encoder *encoder, struct am_nvcuda_slot *slot) {
+    if (slot->mapped_input != NULL) {
+        encoder->functions.nvEncUnmapInputResource(encoder->session, slot->mapped_input);
+        slot->mapped_input = NULL;
     }
 }
 
-static int map_input(struct am_nvcuda_encoder *encoder, NV_ENC_BUFFER_FORMAT *format,
-                     struct am_nvcuda_status *status) {
+static int map_input(struct am_nvcuda_encoder *encoder, struct am_nvcuda_slot *slot,
+                     NV_ENC_BUFFER_FORMAT *format, struct am_nvcuda_status *status) {
     NV_ENC_MAP_INPUT_RESOURCE map;
     memset(&map, 0, sizeof(map));
     map.version = encoder->versions.map_input;
-    map.registeredResource = encoder->registered_input;
+    map.registeredResource = slot->registered_input;
     NVENCSTATUS native_status = encoder->functions.nvEncMapInputResource(encoder->session, &map);
     if (native_status != NV_ENC_SUCCESS || map.mappedResource == NULL) {
         am_set_status(status, AM_STAGE_ENCODE, (int32_t)native_status);
         return AM_NVCUDA_NATIVE_FAILURE;
     }
-    encoder->mapped_input = map.mappedResource;
+    slot->mapped_input = map.mappedResource;
     *format = map.mappedBufferFmt;
     return AM_NVCUDA_OK;
 }
 
-static int submit_picture(struct am_nvcuda_encoder *encoder, NV_ENC_BUFFER_FORMAT format,
-                          int64_t timestamp_100ns, int force_idr,
+static int submit_picture(struct am_nvcuda_encoder *encoder, struct am_nvcuda_slot *slot,
+                          NV_ENC_BUFFER_FORMAT format, int64_t timestamp_100ns, int force_idr,
                           struct am_nvcuda_status *status) {
     NV_ENC_PIC_PARAMS picture;
     memset(&picture, 0, sizeof(picture));
     picture.version = encoder->versions.pic_params;
     picture.inputWidth = encoder->width;
     picture.inputHeight = encoder->height;
-    picture.inputPitch = (uint32_t)encoder->input_pitch;
-    picture.inputBuffer = encoder->mapped_input;
-    picture.outputBitstream = encoder->bitstream;
+    picture.inputPitch = (uint32_t)slot->input_pitch;
+    picture.inputBuffer = slot->mapped_input;
+    picture.outputBitstream = slot->bitstream;
     picture.bufferFmt = format;
     picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picture.inputTimeStamp = (uint64_t)timestamp_100ns;
@@ -854,8 +966,8 @@ static int submit_picture(struct am_nvcuda_encoder *encoder, NV_ENC_BUFFER_FORMA
         force_idr ? (uint32_t)(NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) : 0u;
     NVENCSTATUS native_status = encoder->functions.nvEncEncodePicture(encoder->session, &picture);
     if (native_status == NV_ENC_ERR_NEED_MORE_INPUT) {
-        /* Impossible without B frames or lookahead; one input buffer cannot
-         * back a delayed picture, so fail closed instead of reusing it. */
+        /* Impossible without B frames or lookahead; a slot cannot back a
+         * delayed picture, so fail closed instead of reusing it. */
         am_set_status(status, AM_STAGE_ENCODE, (int32_t)native_status);
         return AM_NVCUDA_INVALID_OUTPUT;
     }
@@ -866,24 +978,26 @@ static int submit_picture(struct am_nvcuda_encoder *encoder, NV_ENC_BUFFER_FORMA
     return AM_NVCUDA_OK;
 }
 
-/* Synchronous mode: the blocking lock returns the picture just submitted. */
-static int lock_output(struct am_nvcuda_encoder *encoder, int64_t timestamp_100ns,
+/* Synchronous mode: the blocking lock returns this slot's picture. NVENC
+ * permits it on another thread while later pictures are being submitted, as
+ * long as bitstreams are locked in submission order. */
+static int lock_output(struct am_nvcuda_encoder *encoder, struct am_nvcuda_slot *slot,
                        const uint8_t **data, size_t *length, uint32_t *picture_type,
                        struct am_nvcuda_status *status) {
     NV_ENC_LOCK_BITSTREAM lock;
     memset(&lock, 0, sizeof(lock));
     lock.version = encoder->versions.lock_bitstream;
-    lock.outputBitstream = encoder->bitstream;
+    lock.outputBitstream = slot->bitstream;
     lock.doNotWait = 0;
     NVENCSTATUS native_status = encoder->functions.nvEncLockBitstream(encoder->session, &lock);
     if (native_status != NV_ENC_SUCCESS) {
         am_set_status(status, AM_STAGE_ENCODE, (int32_t)native_status);
         return AM_NVCUDA_NATIVE_FAILURE;
     }
-    encoder->bitstream_locked = 1;
+    slot->bitstream_locked = 1;
     if (lock.bitstreamBufferPtr == NULL || lock.bitstreamSizeInBytes == 0 ||
         lock.bitstreamSizeInBytes > AM_NVCUDA_MAX_PACKET_BYTES ||
-        lock.outputTimeStamp != (uint64_t)timestamp_100ns) {
+        lock.outputTimeStamp != (uint64_t)slot->timestamp_100ns) {
         am_set_status(status, AM_STAGE_ENCODE, 0);
         return AM_NVCUDA_INVALID_OUTPUT;
     }
@@ -893,64 +1007,116 @@ static int lock_output(struct am_nvcuda_encoder *encoder, int64_t timestamp_100n
     return AM_NVCUDA_OK;
 }
 
-int amaterasu_nvcuda_release_output(struct am_nvcuda_encoder *encoder,
+int amaterasu_nvcuda_release_output(struct am_nvcuda_encoder *encoder, uint32_t slot,
                                     struct am_nvcuda_status *status) {
-    if (encoder == NULL) {
+    struct am_nvcuda_slot *target = slot_at(encoder, slot);
+    if (target == NULL) {
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
     int result = AM_NVCUDA_OK;
-    if (encoder->bitstream_locked) {
+    if (target->bitstream_locked) {
         NVENCSTATUS native_status =
-            encoder->functions.nvEncUnlockBitstream(encoder->session, encoder->bitstream);
-        encoder->bitstream_locked = 0;
+            encoder->functions.nvEncUnlockBitstream(encoder->session, target->bitstream);
+        target->bitstream_locked = 0;
         if (native_status != NV_ENC_SUCCESS) {
             am_set_status(status, AM_STAGE_ENCODE, (int32_t)native_status);
             result = AM_NVCUDA_NATIVE_FAILURE;
         }
     }
-    unmap_input(encoder);
+    unmap_input(encoder, target);
     return result;
 }
 
-int amaterasu_nvcuda_encode(struct am_nvcuda_encoder *encoder, int64_t timestamp_100ns,
-                            int force_idr, const uint8_t **data, size_t *length,
-                            uint32_t *picture_type, struct am_nvcuda_status *status) {
-    if (!input_writable(encoder) || timestamp_100ns < 0 || data == NULL || length == NULL ||
-        picture_type == NULL) {
+int amaterasu_nvcuda_submit(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                            int64_t timestamp_100ns, int force_idr,
+                            struct am_nvcuda_status *status) {
+    if (!input_writable(encoder, slot) || timestamp_100ns < 0) {
+        am_set_status(status, AM_STAGE_ENCODE, 0);
+        return AM_NVCUDA_INVALID_ARGUMENT;
+    }
+    struct am_nvcuda_slot *target = &encoder->slots[slot];
+    target->timestamp_100ns = timestamp_100ns;
+    NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+    uint64_t started = monotonic_us();
+    int result = map_input(encoder, target, &format, status);
+    target->timings.map_input_us = elapsed_us(started);
+    if (result == AM_NVCUDA_OK) {
+        started = monotonic_us();
+        result = submit_picture(encoder, target, format, timestamp_100ns, force_idr, status);
+        target->timings.submit_picture_us = elapsed_us(started);
+    }
+    if (result != AM_NVCUDA_OK) {
+        am_converter_finish(&encoder->converter);
+        if (synchronize_conversion(encoder, status) != AM_NVCUDA_OK) {
+            return AM_NVCUDA_NATIVE_FAILURE;
+        }
+        unmap_input(encoder, target);
+    }
+    return result;
+}
+
+int amaterasu_nvcuda_lock(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                          const uint8_t **data, size_t *length, uint32_t *picture_type,
+                          struct am_nvcuda_status *status) {
+    struct am_nvcuda_slot *target = slot_at(encoder, slot);
+    if (target == NULL || target->mapped_input == NULL || target->bitstream_locked ||
+        data == NULL || length == NULL || picture_type == NULL) {
         am_set_status(status, AM_STAGE_ENCODE, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
     *data = NULL;
     *length = 0;
-    NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
     uint64_t started = monotonic_us();
-    int result = map_input(encoder, &format, status);
-    encoder->timings.map_input_us = elapsed_us(started);
-    if (result == AM_NVCUDA_OK) {
-        started = monotonic_us();
-        result = submit_picture(encoder, format, timestamp_100ns, force_idr, status);
-        encoder->timings.submit_picture_us = elapsed_us(started);
-    }
-    if (result == AM_NVCUDA_OK) {
-        started = monotonic_us();
-        result = lock_output(encoder, timestamp_100ns, data, length, picture_type, status);
-        encoder->timings.lock_output_us = elapsed_us(started);
-    }
+    int result = lock_output(encoder, target, data, length, picture_type, status);
+    target->timings.lock_output_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK) {
-        if (synchronize_conversion(encoder, status) != AM_NVCUDA_OK) {
-            return AM_NVCUDA_NATIVE_FAILURE;
-        }
-        amaterasu_nvcuda_release_output(encoder, NULL);
         *data = NULL;
         *length = 0;
     }
     return result;
 }
 
-/* Every submitted picture was already returned synchronously, so EOS only
- * tells NVENC no further input will arrive; no bitstream follows it. */
+int amaterasu_nvcuda_take_gpu_timing(struct am_nvcuda_encoder *encoder, uint32_t slot,
+                                     uint64_t completed_ago_us) {
+    struct am_nvcuda_slot *target = slot_at(encoder, slot);
+    if (target == NULL) {
+        return 0;
+    }
+    target->timings.gpu_timed = (uint64_t)am_converter_take_gpu_timing(
+        &encoder->converter, slot, completed_ago_us, &target->timings.gpu_queue_us,
+        &target->timings.gpu_convert_us, &target->timings.gpu_encode_us);
+    return (int)target->timings.gpu_timed;
+}
+
+int amaterasu_nvcuda_bind_thread(struct am_nvcuda_encoder *encoder) {
+    if (encoder == NULL || encoder->driver->cuda.ctx_push_current == NULL) {
+        return AM_NVCUDA_OK;
+    }
+    return encoder->driver->cuda.ctx_push_current(encoder->context) == CUDA_SUCCESS
+               ? AM_NVCUDA_OK
+               : AM_NVCUDA_NATIVE_FAILURE;
+}
+
+void amaterasu_nvcuda_unbind_thread(struct am_nvcuda_encoder *encoder) {
+    if (encoder != NULL && encoder->driver->cuda.ctx_pop_current != NULL) {
+        CUcontext popped = NULL;
+        (void)encoder->driver->cuda.ctx_pop_current(&popped);
+    }
+}
+
+static int any_slot_mapped(const struct am_nvcuda_encoder *encoder) {
+    for (uint32_t index = 0; index < AM_NVCUDA_SLOTS; ++index) {
+        if (encoder->slots[index].mapped_input != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Every submitted picture's output was already locked and released, so EOS
+ * only tells NVENC no further input will arrive; no bitstream follows it. */
 int amaterasu_nvcuda_drain(struct am_nvcuda_encoder *encoder, struct am_nvcuda_status *status) {
-    if (encoder == NULL || encoder->mapped_input != NULL) {
+    if (encoder == NULL || any_slot_mapped(encoder)) {
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
     if (encoder->draining) {
@@ -975,19 +1141,28 @@ void amaterasu_nvcuda_close(struct am_nvcuda_encoder *encoder) {
     }
     /* A failed or partially submitted frame can leave private GPU resources
      * in use. Quarantine the entire encoder if the driver cannot prove stream
-     * retirement; freeing its CUDA/GL allocations would risk use-after-free. */
+     * retirement; freeing its CUDA/GL allocations would risk use-after-free.
+     * Retained sources are released after close returns, even when the
+     * encoder is quarantined, so finish their queued GL reads first. */
+    am_converter_finish(&encoder->converter);
     if (synchronize_conversion(encoder, NULL) != AM_NVCUDA_OK) {
         return;
     }
     if (encoder->session != NULL) {
-        amaterasu_nvcuda_release_output(encoder, NULL);
+        for (uint32_t index = 0; index < AM_NVCUDA_SLOTS; ++index) {
+            amaterasu_nvcuda_release_output(encoder, index, NULL);
+        }
     }
     am_converter_close(&encoder->converter);
-    if (encoder->registered_input != NULL) {
-        encoder->functions.nvEncUnregisterResource(encoder->session, encoder->registered_input);
-    }
-    if (encoder->bitstream != NULL) {
-        encoder->functions.nvEncDestroyBitstreamBuffer(encoder->session, encoder->bitstream);
+    am_cuda_input_close(&encoder->cuda_input, encoder->driver);
+    for (uint32_t index = 0; index < AM_NVCUDA_SLOTS; ++index) {
+        struct am_nvcuda_slot *slot = &encoder->slots[index];
+        if (slot->registered_input != NULL) {
+            encoder->functions.nvEncUnregisterResource(encoder->session, slot->registered_input);
+        }
+        if (slot->bitstream != NULL) {
+            encoder->functions.nvEncDestroyBitstreamBuffer(encoder->session, slot->bitstream);
+        }
     }
     if (encoder->session != NULL) {
         encoder->functions.nvEncDestroyEncoder(encoder->session);
@@ -995,11 +1170,13 @@ void amaterasu_nvcuda_close(struct am_nvcuda_encoder *encoder) {
     if (encoder->conversion_stream != NULL) {
         encoder->driver->cuda.stream_destroy(encoder->conversion_stream);
     }
-    if (encoder->input != 0) {
-        encoder->driver->cuda.mem_free(encoder->input);
+    for (uint32_t index = 0; index < AM_NVCUDA_SLOTS; ++index) {
+        if (encoder->slots[index].input != 0) {
+            encoder->driver->cuda.mem_free(encoder->slots[index].input);
+        }
     }
     if (encoder->context != NULL) {
-        encoder->driver->cuda.ctx_destroy(encoder->context);
+        release_context(encoder);
     }
     free(encoder);
 }

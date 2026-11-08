@@ -32,6 +32,17 @@ static int load_cuda(struct am_cuda_api *cuda, void *library) {
     load_symbol(library, "cuStreamCreate", &cuda->stream_create);
     load_symbol(library, "cuStreamDestroy_v2", &cuda->stream_destroy);
     load_symbol(library, "cuStreamSynchronize", &cuda->stream_synchronize);
+    load_symbol(library, "cuDevicePrimaryCtxRetain", &cuda->primary_ctx_retain);
+    load_symbol(library, "cuDevicePrimaryCtxRelease_v2", &cuda->primary_ctx_release);
+    load_symbol(library, "cuCtxPushCurrent_v2", &cuda->ctx_push_current);
+    load_symbol(library, "cuCtxPopCurrent_v2", &cuda->ctx_pop_current);
+    load_symbol(library, "cuCtxGetCurrent", &cuda->ctx_get_current);
+    load_symbol(library, "cuModuleLoadData", &cuda->module_load);
+    load_symbol(library, "cuModuleUnload", &cuda->module_unload);
+    load_symbol(library, "cuModuleGetFunction", &cuda->module_get_function);
+    load_symbol(library, "cuLaunchKernel", &cuda->launch_kernel);
+    load_symbol(library, "cuStreamWaitEvent", &cuda->stream_wait_event);
+    load_symbol(library, "cuDeviceGetUuid_v2", &cuda->device_get_uuid);
     return load_symbol(library, "cuInit", &cuda->init) &&
            load_symbol(library, "cuDeviceGetCount", &cuda->device_get_count) &&
            load_symbol(library, "cuDeviceGet", &cuda->device_get) &&
@@ -76,6 +87,8 @@ static void load_egl(struct am_egl_api *egl) {
         !load_symbol(library, "eglMakeCurrent", &egl->make_current)) {
         return;
     }
+    /* Optional: only reports the granted context priority. */
+    (void)load_symbol(library, "eglQueryContext", &egl->query_context);
     AM_EGL_EXTENSION(egl, query_devices, "eglQueryDevicesEXT");
     AM_EGL_EXTENSION(egl, query_device_attrib, "eglQueryDeviceAttribEXT");
     AM_EGL_EXTENSION(egl, query_device_string, "eglQueryDeviceStringEXT");

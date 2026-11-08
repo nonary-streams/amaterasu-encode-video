@@ -148,14 +148,34 @@ pub struct Session {
     color_conversion_frames: u64,
     opened_at: Instant,
     encode_timing: EncodeTimingSnapshotV1,
+    /// Producer offer configured for resource frames (generation, offer).
+    resource_producer: Option<(u64, u64)>,
 }
 
 /// Owned provider reference; callbacks stay on the module thread. Only duplicated
 /// descriptors cross to the encoder worker, never this callback/context pair.
 struct RetainedFrame {
-    lease: DmaBufFrameLease,
+    reference: RetainedReference,
     owner: std::thread::ThreadId,
 }
+
+/// A DMA-BUF lease or a negotiated resource frame (encoder v1.5).
+enum RetainedReference {
+    Lease(DmaBufFrameLease),
+    Resource(CaptureResourceFrame),
+}
+
+/// Resource offers never change for a session: one generation, one offer.
+const RESOURCE_GENERATION: u64 = 1;
+const RESOURCE_OFFER: u64 = 1;
+const NO_COMPLETION: FrameDescriptor = FrameDescriptor {
+    kind: FRAME_SYNC_NONE,
+    version: 0,
+    size: 0,
+    reserved: 0,
+    namespace: [0; 16],
+    data: std::ptr::null(),
+};
 // SAFETY: moving the record does not access its raw pointer. Drop checks thread
 // affinity before invoking provider code; native entry points require calls on
 // the owning module thread. Worker requests never contain this record.
@@ -169,7 +189,15 @@ impl Drop for RetainedFrame {
             std::thread::current().id(),
             "frame lease released off its module thread"
         );
-        unsafe { (self.lease.release.expect("validated lease"))(self.lease.context, -1) };
+        match &self.reference {
+            RetainedReference::Lease(lease) => unsafe {
+                (lease.release.expect("validated lease"))(lease.context, -1)
+            },
+            // SAFETY: as above; v1 CUDA completion is NONE after finished reads.
+            RetainedReference::Resource(frame) => unsafe {
+                (frame.release)(frame.context, &NO_COMPLETION)
+            },
+        }
     }
 }
 
@@ -365,6 +393,7 @@ impl Sessions {
                 color_conversion_frames: 0,
                 opened_at: Instant::now(),
                 encode_timing: EncodeTimingSnapshotV1::empty(1),
+                resource_producer: None,
             },
         );
         Ok(response)
@@ -673,6 +702,122 @@ impl Sessions {
         }
     }
 
+    /// Advisory only: a concurrent submission may consume the observed space.
+    /// Encoder v1.5: offers CUDA vendor-schema input when this session can
+    /// convert it. An empty list (with its generation) means the lease path.
+    ///
+    /// # Safety
+    /// The sink and generation output must be live for this call.
+    pub unsafe fn enumerate_resources(
+        &mut self,
+        owner: &str,
+        id: u64,
+        sink: CaptureResourceOfferSink,
+        generation: &mut u64,
+    ) -> Status {
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if let Err(status) = session.check_accepting() {
+            return status;
+        }
+        *generation = RESOURCE_GENERATION;
+        let Some(payloads) = session.cuda_offer_payloads() else {
+            return STATUS_OK;
+        };
+        let offer = cuda_offer(&payloads);
+        // SAFETY: the caller's sink is live; payloads outlive the callback.
+        unsafe { (sink.write)(sink.context, &offer) }
+    }
+
+    /// Accepts a producer offer this session's own offer can consume.
+    ///
+    /// # Safety
+    /// The producer offer and its payloads must be live for this call.
+    pub unsafe fn configure_resource(
+        &mut self,
+        owner: &str,
+        id: u64,
+        consumer_generation: u64,
+        consumer_offer: u64,
+        producer_generation: u64,
+        producer: &CaptureResourceOffer,
+    ) -> Status {
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if let Err(status) = session.check_accepting() {
+            return status;
+        }
+        if consumer_generation != RESOURCE_GENERATION
+            || consumer_offer != RESOURCE_OFFER
+            || producer_generation == 0
+            || producer.id == 0
+        {
+            return MEDIA_UNSUPPORTED;
+        }
+        let Some(payloads) = session.cuda_offer_payloads() else {
+            return MEDIA_UNSUPPORTED;
+        };
+        // SAFETY: the producer offer is borrowed live; ours lives on this frame.
+        if !unsafe { cuda_offers_compatible(producer, &cuda_offer(&payloads)) } {
+            return MEDIA_UNSUPPORTED;
+        }
+        session.resource_producer = Some((producer_generation, producer.id));
+        STATUS_OK
+    }
+
+    /// Encodes a frame of the configured producer offer. OK retains it until
+    /// this picture's encoded output; other results retain nothing.
+    ///
+    /// # Safety
+    /// The frame, its payloads and callbacks must be live for this call.
+    pub unsafe fn submit_resource(
+        &mut self,
+        owner: &str,
+        id: u64,
+        frame: &CaptureResourceFrame,
+        flags: u32,
+    ) -> Status {
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if let Err(status) = session.check_accepting() {
+            return status;
+        }
+        if flags & !FRAME_RESOURCE_SUBMIT_FORCE_IDR != 0 {
+            return MEDIA_UNSUPPORTED;
+        }
+        if session.resource_producer != Some((frame.offer_generation, frame.offer_id)) {
+            return MEDIA_UNSUPPORTED;
+        }
+        // SAFETY: the caller keeps the frame and payloads live for this call.
+        unsafe { session.submit_cuda(frame, flags & FRAME_RESOURCE_SUBMIT_FORCE_IDR) }
+    }
+
+    pub fn gpu_input_ready(&mut self, owner: &str, id: u64) -> Status {
+        let Ok(session) = self.owned(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if let Err(status) = session.check_accepting() {
+            return status;
+        }
+        if session.input_support.dmabuf.is_none() || !session.backend.supports_gpu_completion() {
+            return MEDIA_UNSUPPORTED;
+        }
+        if session.metadata.len() >= 16 {
+            return MEDIA_BUSY;
+        }
+        match session.backend.has_gpu_submit_capacity() {
+            Ok(true) => STATUS_OK,
+            Ok(false) => MEDIA_BUSY,
+            Err(_) => {
+                session.failed = true;
+                MEDIA_BACKEND_ERROR
+            }
+        }
+    }
+
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
@@ -921,6 +1066,88 @@ impl Session {
     ///
     /// # Safety
     /// Every descriptor in `frame` is open for the duration of this call.
+    /// The CUDA input offer's payloads, when this session can convert it.
+    fn cuda_offer_payloads(&self) -> Option<(CudaDeviceCapabilities, CudaEventCapabilities)> {
+        let device_uuid = self.input_support.cuda_device?;
+        self.backend.supports_gpu_completion().then_some((
+            CudaDeviceCapabilities {
+                device_uuid,
+                format: CUDA_FORMAT_X2B10G10R10,
+                min_width: self.config.width,
+                max_width: self.config.width,
+                min_height: self.config.height,
+                max_height: self.config.height,
+                reserved: 0,
+            },
+            CudaEventCapabilities { device_uuid },
+        ))
+    }
+
+    /// # Safety
+    /// The frame, its payloads and callbacks must be live for this call.
+    unsafe fn submit_cuda(&mut self, frame: &CaptureResourceFrame, force: u32) -> Status {
+        let timestamp = match self.admit(
+            frame.width,
+            frame.height,
+            frame.timestamp_us,
+            frame.sequence,
+            force,
+        ) {
+            Ok(timestamp) => timestamp,
+            Err(status) => return status,
+        };
+        // SAFETY: the caller keeps the descriptors' payloads live for this call.
+        let (Some(pixels), Some(ready)) = (unsafe { cuda_device_frame(&frame.resource) }, unsafe {
+            cuda_event_sync(&frame.acquire_sync)
+        }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if Some(pixels.device_uuid) != self.input_support.cuda_device
+            || pixels.format != CUDA_FORMAT_X2B10G10R10
+            || pixels.width != frame.width
+            || pixels.height != frame.height
+            || pixels.device_pointer == 0
+            || ready.event.is_null()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        match self.backend.has_gpu_submit_capacity() {
+            Ok(true) => {}
+            Ok(false) => return MEDIA_BUSY,
+            Err(_) => {
+                self.failed = true;
+                return MEDIA_BACKEND_ERROR;
+            }
+        }
+        // SAFETY: the producer keeps its callbacks live; a failed retain
+        // transfers nothing.
+        let status = unsafe { (frame.retain)(frame.context) };
+        if status != STATUS_OK {
+            return status;
+        }
+        let retained = RetainedFrame {
+            reference: RetainedReference::Resource(*frame),
+            owner: std::thread::current().id(),
+        };
+        let input = crate::input::CudaInput {
+            pointer: pixels.device_pointer,
+            pitch: pixels.pitch,
+            width: pixels.width,
+            height: pixels.height,
+            ready: ready.event as usize,
+        };
+        let started_at = Instant::now();
+        let result = self
+            .backend
+            .submit_gpu(GpuInput::Cuda(input), timestamp, force != 0);
+        let status =
+            self.record_submission(result, timestamp, frame.sequence, force != 0, started_at);
+        if status == STATUS_OK {
+            self.retained_frames.insert(timestamp, retained);
+        }
+        status
+    }
+
     #[cfg(unix)]
     unsafe fn submit_dmabuf(
         &mut self,
@@ -964,10 +1191,13 @@ impl Session {
             return MEDIA_UNSUPPORTED;
         }
         // SAFETY: validated shape; the caller keeps the descriptors open.
-        let input = match unsafe { crate::input::DmaBufInput::duplicate(frame) } {
+        let mut input = match unsafe { crate::input::DmaBufInput::duplicate(frame) } {
             Ok(input) => input,
             Err(status) => return status,
         };
+        // A retained lease is released only with this frame's encoded output
+        // or after the backend joins shutdown, both after its GPU reads.
+        input.source_retained = lease.is_some();
         let retained = if let Some(lease) = lease {
             // SAFETY: validated provider callbacks and initial reference remain
             // live during this call. Failed retain transfers no ownership.
@@ -976,7 +1206,7 @@ impl Session {
                 return status;
             }
             Some(RetainedFrame {
-                lease: *lease,
+                reference: RetainedReference::Lease(*lease),
                 owner: std::thread::current().id(),
             })
         } else {
@@ -1021,6 +1251,19 @@ impl Session {
         });
         self.last_input = Some((timestamp, sequence));
         STATUS_OK
+    }
+}
+
+/// This session's CUDA input offer; descriptors point into `payloads`.
+fn cuda_offer(payloads: &(CudaDeviceCapabilities, CudaEventCapabilities)) -> CaptureResourceOffer {
+    CaptureResourceOffer {
+        id: RESOURCE_OFFER,
+        ownership: FRAME_OWNERSHIP_RETAINABLE,
+        accessibility: FRAME_ACCESS_GPU,
+        reserved: 0,
+        resource: cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &payloads.0),
+        acquire_sync: cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &payloads.1),
+        completion_sync: NO_COMPLETION,
     }
 }
 

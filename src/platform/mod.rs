@@ -129,8 +129,18 @@ impl Encoder {
     pub fn native_stage_timings(&self) -> Option<crate::worker::NativeStageTimings> {
         match self {
             #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
-            Self::NvencCuda(encoder) => Some(encoder.native_stage_timings()),
+            Self::NvencCuda(encoder) => encoder.native_stage_timings(),
             _ => None,
+        }
+    }
+    /// Encoders that finish output on their own thread wake the module there.
+    pub fn set_output_notifier(&mut self, notifier: amaterasu_module_sdk::WorkNotifier) {
+        match self {
+            #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
+            Self::NvencCuda(encoder) => encoder.set_output_notifier(notifier),
+            _ => {
+                let _ = notifier;
+            }
         }
     }
     pub fn open_with_log_emitter(

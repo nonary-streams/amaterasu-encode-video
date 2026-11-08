@@ -1,7 +1,9 @@
 //! Rust side of the NVENC/CUDA adapter boundary. The adapter handle is
 //! created by `Encoder::open` on the encoder worker thread and closed by
-//! `Drop` on the same thread; it never crosses threads (`NonNull` keeps the
-//! type `!Send`). Borrowed output bytes are copied before they are released.
+//! `Drop` on the same thread. Encoding is pipelined over the adapter's slots:
+//! the worker thread converts and submits a frame while a dedicated output
+//! thread waits for the previous frame's bitstream. The two threads only ever
+//! touch different slots. Borrowed output bytes are copied before release.
 use super::{
     codec::Codec,
     description::{self, CodecCaps, DeviceRecord},
@@ -16,11 +18,14 @@ use crate::{
     worker::NativeStageTimings,
 };
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     ffi::{CStr, CString, c_char, c_void},
     os::fd::{AsRawFd, IntoRawFd},
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc},
+    thread::JoinHandle,
+    time::Instant,
 };
 
 const MAX_DEVICES: usize = 16;
@@ -127,6 +132,8 @@ struct NativeDmaBuf {
     fence_fds: [i32; MAX_PLANES],
     offsets: [u32; MAX_PLANES],
     pitches: [u32; MAX_PLANES],
+    source_retained: u32,
+    reserved: u32,
 }
 
 impl NativeDmaBuf {
@@ -144,6 +151,8 @@ impl NativeDmaBuf {
             fence_fds: [-1; MAX_PLANES],
             offsets: [0; MAX_PLANES],
             pitches: [0; MAX_PLANES],
+            source_retained: u32::from(frame.source_retained),
+            reserved: 0,
         };
         for (index, plane) in frame.planes.iter().enumerate() {
             native.plane_fds[index] = plane.fd.as_raw_fd();
@@ -186,7 +195,11 @@ pub(super) struct TestBuffer {
 }
 
 unsafe extern "C" {
-    fn amaterasu_nvcuda_get_timings(encoder: *mut c_void, timings: *mut NativeStageTimings);
+    fn amaterasu_nvcuda_get_timings(
+        encoder: *mut c_void,
+        slot: u32,
+        timings: *mut NativeStageTimings,
+    );
     fn amaterasu_nvcuda_header_versions(versions: *mut StructVersions) -> i32;
     fn amaterasu_nvcuda_driver_api(packed_version: *mut u32, status: *mut NativeStatus) -> i32;
     fn amaterasu_nvcuda_enumerate(
@@ -215,31 +228,62 @@ unsafe extern "C" {
     ) -> i32;
     fn amaterasu_nvcuda_upload_nv12(
         encoder: *mut c_void,
+        slot: u32,
         nv12: *const u8,
         length: usize,
         status: *mut NativeStatus,
     ) -> i32;
     fn amaterasu_nvcuda_upload_bgra(
         encoder: *mut c_void,
+        slot: u32,
         bgra: *const u8,
         length: usize,
         status: *mut NativeStatus,
     ) -> i32;
     fn amaterasu_nvcuda_import_dmabuf(
         encoder: *mut c_void,
+        slot: u32,
         frame: *mut NativeDmaBuf,
         status: *mut NativeStatus,
     ) -> i32;
-    fn amaterasu_nvcuda_encode(
+    fn amaterasu_nvcuda_submit(
         encoder: *mut c_void,
+        slot: u32,
         timestamp_100ns: i64,
         force_idr: i32,
+        status: *mut NativeStatus,
+    ) -> i32;
+    fn amaterasu_nvcuda_lock(
+        encoder: *mut c_void,
+        slot: u32,
         data: *mut *const u8,
         length: *mut usize,
         picture_type: *mut u32,
         status: *mut NativeStatus,
     ) -> i32;
-    fn amaterasu_nvcuda_release_output(encoder: *mut c_void, status: *mut NativeStatus) -> i32;
+    fn amaterasu_nvcuda_release_output(
+        encoder: *mut c_void,
+        slot: u32,
+        status: *mut NativeStatus,
+    ) -> i32;
+    fn amaterasu_nvcuda_take_gpu_timing(
+        encoder: *mut c_void,
+        slot: u32,
+        completed_ago_us: u64,
+    ) -> i32;
+    fn amaterasu_nvcuda_cuda_input(encoder: *mut c_void, device_uuid: *mut u8) -> i32;
+    fn amaterasu_nvcuda_import_cuda(
+        encoder: *mut c_void,
+        slot: u32,
+        pointer: u64,
+        pitch: u32,
+        width: u32,
+        height: u32,
+        ready: *mut c_void,
+        status: *mut NativeStatus,
+    ) -> i32;
+    fn amaterasu_nvcuda_bind_thread(encoder: *mut c_void) -> i32;
+    fn amaterasu_nvcuda_unbind_thread(encoder: *mut c_void);
     fn amaterasu_nvcuda_drain(encoder: *mut c_void, status: *mut NativeStatus) -> i32;
     fn amaterasu_nvcuda_close(encoder: *mut c_void);
     #[cfg(test)]
@@ -265,6 +309,16 @@ unsafe extern "C" {
         buffer: *mut TestBuffer,
     ) -> i32;
     pub(super) fn amaterasu_nvcuda_test_release_gbm(buffer: *mut TestBuffer);
+    pub(super) fn amaterasu_nvcuda_test_cuda_frame(
+        width: u32,
+        height: u32,
+        top: u32,
+        bottom: u32,
+        pointer: *mut u64,
+        pitch: *mut u32,
+        event: *mut *mut c_void,
+    ) -> i32;
+    pub(super) fn amaterasu_nvcuda_test_release_cuda_frame(pointer: u64, event: *mut c_void);
 }
 
 fn check(result: i32) -> Result<(), &'static str> {
@@ -343,10 +397,70 @@ const IMPORT_FOURCCS: [u32; 8] = [
     fourcc(b"AB30"),
 ];
 
+/// Adapter slots: one frame converts and submits while another encodes.
+const SLOTS: u32 = 2;
+
+/// The adapter handle as seen by the output thread. The adapter keeps each
+/// slot's state separate; the output thread only locks and releases slots the
+/// worker has submitted, and the worker only reuses slots handed back.
+#[derive(Clone, Copy)]
+struct OutputHandle(NonNull<c_void>);
+// SAFETY: NVENC permits locking output on another thread in synchronous mode.
+// The adapter state each thread touches is disjoint per slot, and Encoder's
+// Drop joins the output thread before the handle is closed.
+unsafe impl Send for OutputHandle {}
+
+/// A submitted picture waiting for its bitstream.
+struct Submission {
+    slot: u32,
+    timestamp_100ns: i64,
+    force_idr: bool,
+}
+
+/// State shared by the worker and output threads.
+#[derive(Default)]
+struct PipelineState {
+    idle: Vec<u32>,
+    /// Released slots whose GPU timing the worker thread has not read yet.
+    completed: VecDeque<(u32, Instant)>,
+    packets: VecDeque<Packet>,
+    failure: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct Pipeline {
+    state: Mutex<PipelineState>,
+    changed: Condvar,
+    notifier: Mutex<Option<amaterasu_module_sdk::WorkNotifier>>,
+}
+
+impl Pipeline {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PipelineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn notify(&self) {
+        self.changed.notify_all();
+        if let Some(notifier) = self
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            notifier.notify();
+        }
+    }
+}
+
 pub struct Encoder {
     native: NonNull<c_void>,
-    framer: OutputFramer,
-    packets: VecDeque<Packet>,
+    pipeline: Arc<Pipeline>,
+    submissions: Option<mpsc::Sender<Submission>>,
+    output_thread: Option<JoinHandle<()>>,
+    /// Finished frames' stage timings, reported once each.
+    stage_timings: RefCell<VecDeque<NativeStageTimings>>,
     input_support: InputSupport,
     draining: bool,
 }
@@ -357,12 +471,13 @@ impl Encoder {
         // SAFETY: encoder is live and accessed on its owning worker thread.
         unsafe { amaterasu_nvcuda_test_stream_enabled(self.native.as_ptr()) != 0 }
     }
-    pub fn native_stage_timings(&self) -> NativeStageTimings {
-        let mut timings = NativeStageTimings::default();
-        // SAFETY: the live encoder and output belong to this worker thread.
-        unsafe { amaterasu_nvcuda_get_timings(self.native.as_ptr(), &mut timings) };
-        timings
+
+    /// One finished frame's stages, oldest first. Pipelining completes a frame
+    /// after its submission returns, so these trail submissions by a frame.
+    pub fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+        self.stage_timings.borrow_mut().pop_front()
     }
+
     pub fn open(
         identity: &EncoderIdentity,
         configuration: &Configuration,
@@ -396,16 +511,39 @@ impl Encoder {
             record_open_failure(status);
             return Err(result_code(result));
         };
+        let pipeline = Arc::new(Pipeline::default());
+        pipeline.lock().idle = (0..SLOTS).rev().collect();
+        let (submissions, queued) = mpsc::channel();
+        let output = OutputHandle(native);
+        let output_pipeline = Arc::clone(&pipeline);
+        let framer = OutputFramer::new(codec);
+        let output_thread = std::thread::Builder::new()
+            .name("amaterasu-nvenc-output".into())
+            .spawn(move || run_output_thread(output, &output_pipeline, framer, &queued))
+            .map_err(|_| "nvenc_cuda_output_thread_failed");
+        let output_thread = match output_thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                // SAFETY: the handle has no other owner yet; close it once here.
+                unsafe { amaterasu_nvcuda_close(native.as_ptr()) };
+                return Err(error);
+            }
+        };
         let mut encoder = Self {
             native,
-            framer: OutputFramer::new(codec),
-            packets: VecDeque::new(),
+            pipeline,
+            submissions: Some(submissions),
+            output_thread: Some(output_thread),
+            stage_timings: RefCell::new(VecDeque::new()),
             input_support: InputSupport::default(),
             draining: false,
         };
         encoder.input_support = InputSupport {
             gpu_bgra_conversion: !configuration.is_hdr(),
             dmabuf: encoder.import_support(configuration.is_hdr()),
+            cuda_device: encoder
+                .cuda_input_device()
+                .filter(|_| configuration.is_hdr()),
         };
         Ok(encoder)
     }
@@ -451,6 +589,15 @@ impl Encoder {
         (!support.is_empty()).then(|| Arc::new(support))
     }
 
+    /// Wakes the module as soon as the output thread finishes a packet.
+    pub fn set_output_notifier(&mut self, notifier: amaterasu_module_sdk::WorkNotifier) {
+        *self
+            .pipeline
+            .notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notifier);
+    }
+
     pub fn submit(
         &mut self,
         nv12: Vec<u8>,
@@ -458,17 +605,20 @@ impl Encoder {
         force_idr: bool,
     ) -> Result<(), &'static str> {
         self.ensure_accepting()?;
+        let slot = self.acquire_slot()?;
         let mut status = NativeStatus::default();
-        // SAFETY: the bytes stay live for this synchronous host-to-device copy.
-        check(unsafe {
+        // SAFETY: the bytes stay live for this synchronous host-to-device copy
+        // into an idle slot owned by this worker thread.
+        let uploaded = check(unsafe {
             amaterasu_nvcuda_upload_nv12(
                 self.native.as_ptr(),
+                slot,
                 nv12.as_ptr(),
                 nv12.len(),
                 &mut status,
             )
-        })?;
-        self.encode_input(timestamp_100ns, force_idr)
+        });
+        self.submit_slot(slot, uploaded, timestamp_100ns, force_idr)
     }
 
     pub fn submit_gpu(
@@ -478,20 +628,120 @@ impl Encoder {
         force_idr: bool,
     ) -> Result<(), &'static str> {
         self.ensure_accepting()?;
-        match input {
-            GpuInput::Bgra(bgra) => self.upload_bgra(&bgra)?,
-            GpuInput::DmaBuf(frame) => self.import_dmabuf(frame)?,
-        }
-        self.encode_input(timestamp_100ns, force_idr)
+        let slot = self.acquire_slot()?;
+        let converted = match input {
+            GpuInput::Bgra(bgra) => self.upload_bgra(slot, &bgra),
+            GpuInput::DmaBuf(frame) => self.import_dmabuf(slot, frame),
+            GpuInput::Cuda(frame) => self.import_cuda(slot, frame),
+        };
+        self.submit_slot(slot, converted, timestamp_100ns, force_idr)
     }
 
-    fn upload_bgra(&mut self, bgra: &[u8]) -> Result<(), &'static str> {
+    /// Submits a converted slot and hands it to the output thread. A failed
+    /// conversion or submission returns the slot unused.
+    fn submit_slot(
+        &mut self,
+        slot: u32,
+        converted: Result<(), &'static str>,
+        timestamp_100ns: i64,
+        force_idr: bool,
+    ) -> Result<(), &'static str> {
+        let submitted = converted.and_then(|()| {
+            let mut status = NativeStatus::default();
+            // SAFETY: live handle on its owning thread; the slot holds a
+            // converted input and is not visible to the output thread.
+            check(unsafe {
+                amaterasu_nvcuda_submit(
+                    self.native.as_ptr(),
+                    slot,
+                    timestamp_100ns,
+                    i32::from(force_idr),
+                    &mut status,
+                )
+            })
+        });
+        if let Err(error) = submitted {
+            self.pipeline.lock().idle.push(slot);
+            return Err(error);
+        }
+        let queued = self.submissions.as_ref().is_some_and(|submissions| {
+            submissions
+                .send(Submission {
+                    slot,
+                    timestamp_100ns,
+                    force_idr,
+                })
+                .is_ok()
+        });
+        if queued {
+            Ok(())
+        } else {
+            Err("nvenc_cuda_output_thread_failed")
+        }
+    }
+
+    /// Waits for an idle slot. Two frames may be in flight; a third waits for
+    /// the oldest bitstream, which keeps backpressure within one frame.
+    fn acquire_slot(&mut self) -> Result<u32, &'static str> {
+        loop {
+            self.read_completed_timings();
+            let mut state = self.pipeline.lock();
+            if let Some(failure) = state.failure {
+                return Err(failure);
+            }
+            if state.packets.len() >= MAX_PENDING_PACKETS {
+                return Err("nvenc_cuda_packet_queue_full");
+            }
+            if let Some(slot) = state.idle.pop() {
+                return Ok(slot);
+            }
+            if state.completed.is_empty() {
+                drop(
+                    self.pipeline
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            }
+        }
+    }
+
+    /// Reads finished slots' GPU timing on this thread, which owns the
+    /// conversion context, then makes those slots available for reuse.
+    fn read_completed_timings(&mut self) {
+        let completed: Vec<_> = self.pipeline.lock().completed.drain(..).collect();
+        if completed.is_empty() {
+            return;
+        }
+        for &(slot, finished_at) in &completed {
+            let ago = finished_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            let mut timings = NativeStageTimings::default();
+            // SAFETY: the output thread released this slot; only this worker
+            // thread touches it until it is marked idle below.
+            unsafe {
+                amaterasu_nvcuda_take_gpu_timing(self.native.as_ptr(), slot, ago);
+                amaterasu_nvcuda_get_timings(self.native.as_ptr(), slot, &mut timings);
+            }
+            let mut reported = self.stage_timings.borrow_mut();
+            if reported.len() >= MAX_PENDING_PACKETS {
+                reported.pop_front();
+            }
+            reported.push_back(timings);
+        }
+        self.pipeline
+            .lock()
+            .idle
+            .extend(completed.into_iter().map(|(slot, _)| slot));
+    }
+
+    fn upload_bgra(&mut self, slot: u32, bgra: &[u8]) -> Result<(), &'static str> {
         let mut status = NativeStatus::default();
         // SAFETY: the bytes stay live until the GL upload call returns, and
         // GL copies client memory before glTexSubImage2D returns.
         check(unsafe {
             amaterasu_nvcuda_upload_bgra(
                 self.native.as_ptr(),
+                slot,
                 bgra.as_ptr(),
                 bgra.len(),
                 &mut status,
@@ -499,65 +749,53 @@ impl Encoder {
         })
     }
 
-    /// Converts the frame into the encoder's input buffer, then closes the
+    /// Converts the frame into the slot's input buffer, then closes the
     /// duplicated descriptors before encoding so the producer's buffer is
     /// released as early as possible.
-    fn import_dmabuf(&mut self, mut frame: DmaBufInput) -> Result<(), &'static str> {
+    fn import_dmabuf(&mut self, slot: u32, mut frame: DmaBufInput) -> Result<(), &'static str> {
         let mut native = NativeDmaBuf::borrow(&frame)?;
         let mut status = NativeStatus::default();
         // SAFETY: `frame` owns every descriptor in `native` for the call. The
-        // adapter waits for fences and finishes its copy before returning.
+        // adapter orders fences before its reads. A borrowed source is fully
+        // read before return; a retained source stays referenced until its
+        // encoded output, whose completion follows the queued reads.
         let result = unsafe {
-            amaterasu_nvcuda_import_dmabuf(self.native.as_ptr(), &mut native, &mut status)
+            amaterasu_nvcuda_import_dmabuf(self.native.as_ptr(), slot, &mut native, &mut status)
         };
         release_consumed_fences(&mut frame, &native);
         drop(frame);
         check(result)
     }
 
-    fn encode_input(&mut self, timestamp_100ns: i64, force_idr: bool) -> Result<(), &'static str> {
-        if self.packets.len() >= MAX_PENDING_PACKETS {
-            return Err("nvenc_cuda_packet_queue_full");
-        }
-        let mut data = std::ptr::null();
-        let mut length = 0usize;
-        let mut picture_type = 0u32;
+    /// Queues a GPU wait on the producer's event and the conversion of its
+    /// CUDA frame into the slot; no CPU wait and no GL context is involved.
+    fn import_cuda(
+        &mut self,
+        slot: u32,
+        frame: crate::input::CudaInput,
+    ) -> Result<(), &'static str> {
         let mut status = NativeStatus::default();
-        // SAFETY: live handle on its owning thread and live out-pointers.
+        // SAFETY: the session retains the producer frame until this picture's
+        // encoded output, keeping its memory and event valid while queued.
         check(unsafe {
-            amaterasu_nvcuda_encode(
+            amaterasu_nvcuda_import_cuda(
                 self.native.as_ptr(),
-                timestamp_100ns,
-                i32::from(force_idr),
-                &mut data,
-                &mut length,
-                &mut picture_type,
+                slot,
+                frame.pointer,
+                frame.pitch,
+                frame.width,
+                frame.height,
+                frame.ready as *mut c_void,
                 &mut status,
             )
-        })?;
-        let framed = if data.is_null() || length == 0 || length > MAX_PACKET_BYTES {
-            Err("nvenc_cuda_invalid_output")
-        } else {
-            // SAFETY: the locked bitstream stays valid until release_output;
-            // the framer copies it into an owned packet first.
-            let bitstream = unsafe { std::slice::from_raw_parts(data, length) };
-            self.framer.frame(bitstream, picture_type)
-        };
-        // SAFETY: releases the lock taken by the successful encode above.
-        let released =
-            unsafe { amaterasu_nvcuda_release_output(self.native.as_ptr(), &mut status) };
-        let (bytes, keyframe) = framed?;
-        check(released)?;
-        if force_idr && !keyframe {
-            return Err("nvenc_cuda_forced_idr_missing");
-        }
-        self.packets.push_back(Packet {
-            ready_at: Some(std::time::Instant::now()),
-            bytes,
-            timestamp_100ns,
-            keyframe,
-        });
-        Ok(())
+        })
+    }
+
+    fn cuda_input_device(&self) -> Option<[u8; 16]> {
+        let mut uuid = [0u8; 16];
+        // SAFETY: live handle on its owning thread and a 16-byte output.
+        (unsafe { amaterasu_nvcuda_cuda_input(self.native.as_ptr(), uuid.as_mut_ptr()) } == 1)
+            .then_some(uuid)
     }
 
     fn ensure_accepting(&self) -> Result<(), &'static str> {
@@ -568,27 +806,148 @@ impl Encoder {
         }
     }
 
+    /// Delivers finished packets in order; an output failure is reported
+    /// only after the packets completed before it.
     pub fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
-        Ok(self.packets.pop_front())
+        self.read_completed_timings();
+        let mut state = self.pipeline.lock();
+        if let Some(packet) = state.packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        match state.failure {
+            Some(failure) => Err(failure),
+            None => Ok(None),
+        }
     }
 
-    /// Every picture was returned by its own synchronous encode, so drain
-    /// only ends the stream; queued packets remain available to receive.
+    /// Waits for every submitted picture's output, then ends the stream;
+    /// queued packets remain available to receive.
     pub fn drain(&mut self) -> Result<(), &'static str> {
         if self.draining {
             return Ok(());
         }
+        loop {
+            self.read_completed_timings();
+            let state = self.pipeline.lock();
+            if let Some(failure) = state.failure {
+                return Err(failure);
+            }
+            if state.idle.len() == SLOTS as usize {
+                break;
+            }
+            if state.completed.is_empty() {
+                drop(
+                    self.pipeline
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            }
+        }
         let mut status = NativeStatus::default();
-        // SAFETY: live handle on its owning thread.
+        // SAFETY: live handle on its owning thread with no slot in flight.
         check(unsafe { amaterasu_nvcuda_drain(self.native.as_ptr(), &mut status) })?;
         self.draining = true;
         Ok(())
     }
 }
 
+/// Locks each submitted slot's bitstream in submission order, frames it into
+/// a packet, releases the slot and wakes the module. Exits when the encoder
+/// closes the submission channel, after every queued picture has finished.
+fn run_output_thread(
+    handle: OutputHandle,
+    pipeline: &Pipeline,
+    mut framer: OutputFramer,
+    queued: &mpsc::Receiver<Submission>,
+) {
+    amaterasu_module_sdk::threading::configure_worker_priority(
+        amaterasu_module_sdk::threading::ThreadPriority::High,
+    );
+    // SAFETY: the handle stays open until Encoder::drop joins this thread.
+    let bound = unsafe { amaterasu_nvcuda_bind_thread(handle.0.as_ptr()) } == 0;
+    while let Ok(submission) = queued.recv() {
+        let result = if bound {
+            finish_submission(handle, &mut framer, &submission)
+        } else {
+            Err("nvenc_cuda_output_thread_failed")
+        };
+        let finished_at = Instant::now();
+        let mut state = pipeline.lock();
+        match result {
+            Ok(packet) if state.failure.is_none() => state.packets.push_back(packet),
+            Ok(_) => {}
+            Err(error) => {
+                state.failure.get_or_insert(error);
+            }
+        }
+        state.completed.push_back((submission.slot, finished_at));
+        drop(state);
+        pipeline.notify();
+    }
+    if bound {
+        // SAFETY: balances the successful bind on this thread.
+        unsafe { amaterasu_nvcuda_unbind_thread(handle.0.as_ptr()) };
+    }
+}
+
+fn finish_submission(
+    handle: OutputHandle,
+    framer: &mut OutputFramer,
+    submission: &Submission,
+) -> Result<Packet, &'static str> {
+    let mut data = std::ptr::null();
+    let mut length = 0usize;
+    let mut picture_type = 0u32;
+    let mut status = NativeStatus::default();
+    // SAFETY: this submitted slot belongs to the output thread until it is
+    // reported completed; the out-pointers are live for the call.
+    let locked = check(unsafe {
+        amaterasu_nvcuda_lock(
+            handle.0.as_ptr(),
+            submission.slot,
+            &mut data,
+            &mut length,
+            &mut picture_type,
+            &mut status,
+        )
+    });
+    let framed = locked.and_then(|()| {
+        if data.is_null() || length == 0 || length > MAX_PACKET_BYTES {
+            Err("nvenc_cuda_invalid_output")
+        } else {
+            // SAFETY: the locked bitstream stays valid until release_output;
+            // the framer copies it into an owned packet first.
+            let bitstream = unsafe { std::slice::from_raw_parts(data, length) };
+            framer.frame(bitstream, picture_type)
+        }
+    });
+    // SAFETY: unlocks (when locked) and unmaps this slot's input in all cases.
+    let released =
+        unsafe { amaterasu_nvcuda_release_output(handle.0.as_ptr(), submission.slot, &mut status) };
+    let (bytes, keyframe) = framed?;
+    check(released)?;
+    if submission.force_idr && !keyframe {
+        return Err("nvenc_cuda_forced_idr_missing");
+    }
+    Ok(Packet {
+        ready_at: Some(Instant::now()),
+        bytes,
+        timestamp_100ns: submission.timestamp_100ns,
+        keyframe,
+    })
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // SAFETY: the unique handle, closed once, on the thread that opened it.
+        // Closing the channel lets the output thread finish every submitted
+        // picture and exit; the handle must outlive it.
+        self.submissions.take();
+        if let Some(thread) = self.output_thread.take() {
+            let _ = thread.join();
+        }
+        // SAFETY: the unique handle, closed once, on the thread that opened it,
+        // after the output thread has exited.
         unsafe { amaterasu_nvcuda_close(self.native.as_ptr()) };
     }
 }
@@ -741,9 +1100,11 @@ mod tests {
                     pitch: 256,
                 },
             ],
+            source_retained: true,
         };
         let mut native = NativeDmaBuf::borrow(&frame).unwrap();
         assert_eq!(native.plane_count, 2);
+        assert_eq!(native.source_retained, 1);
         assert_eq!(native.plane_fds[0], plane_fd);
         assert_eq!(native.fence_fds[..2], [kept_fd, moved_fd]);
         assert_eq!(native.plane_fds[2..], [-1, -1]);
