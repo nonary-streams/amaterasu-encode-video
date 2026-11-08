@@ -239,9 +239,14 @@ impl EncodeModule {
 
 impl Drop for EncodeModule {
     fn drop(&mut self) {
-        if let Ok(mut sessions) = self.shared.lock() {
-            let _ = sessions.clear();
-        }
+        // A panic in a native callback may poison this lock. Teardown still
+        // owns every session, so recover the guard and join/retire its backend
+        // workers before the module releases its final reference.
+        let mut sessions = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = sessions.clear();
         self.log_queue.flush(&self.runtime);
     }
 }

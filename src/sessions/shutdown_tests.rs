@@ -789,3 +789,61 @@ fn failed_close_does_not_prevent_other_sessions_from_being_retired() {
     );
     assert_eq!(close_calls.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn module_drop_retires_sessions_when_a_native_callback_poisoned_state() {
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Backend for DropCounter {
+        fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<SubmitResult, &'static str> {
+            Ok(SubmitResult::Accepted)
+        }
+
+        fn receive(&mut self) -> Result<ReceiveResult, &'static str> {
+            Ok(ReceiveResult::Ready(None))
+        }
+
+        fn drain(&mut self) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+    }
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert(
+            "alice",
+            configuration(),
+            Box::new(DropCounter(drops.clone())),
+            false,
+        )
+        .unwrap();
+    let module = module(sessions);
+    let shared = module.shared.clone();
+    let poisoned = shared.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("controlled native callback panic");
+        })
+        .join()
+        .is_err()
+    );
+
+    drop(module);
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(
+        shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values
+            .is_empty()
+    );
+}
