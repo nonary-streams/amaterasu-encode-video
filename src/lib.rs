@@ -236,3 +236,33 @@ amaterasu_module_sdk::export_module!(Video);
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod migrated_policy_tests {
+    use super::*;
+
+    fn migrated_policy() -> serde_json::Value {
+        let path = std::env::var("AMATERASU_MIGRATED_REPORT").unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        report["optional_bootstrap"]["policy"].clone()
+    }
+
+    #[test]
+    #[ignore = "needs AMATERASU_MIGRATED_REPORT from the release review"]
+    fn reviewed_installed_policy_starts_video() {
+        let policy = migrated_policy();
+        let id = "amaterasu.linux-session-video";
+        let mut settings: Settings =
+            serde_json::from_value(policy["settings"][id].clone()).unwrap();
+        let composition =
+            serde_json::from_value(policy["processing_compositions"][id].clone()).unwrap();
+        configure_processing(&mut settings, &composition).unwrap();
+        settings.validate().unwrap();
+        assert!(settings.require_frame_lease);
+        assert_eq!(
+            settings.gpu_processor_service.as_deref(),
+            Some("amaterasu.rtx-hdr/1")
+        );
+    }
+}
