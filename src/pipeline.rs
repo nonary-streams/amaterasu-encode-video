@@ -576,6 +576,15 @@ pub struct Pipeline {
     processing_lifecycle_service: Option<String>,
     pub queues: Arc<Mutex<Queues>>,
     processing_generation: Arc<AtomicU64>,
+    frame_trace: Option<crate::frame_trace::FrameTrace>,
+}
+
+impl Pipeline {
+    /// Traces frames from capture to the encoder. The packet queue marks the
+    /// encoder's output itself.
+    pub fn trace_frames(&mut self, trace: crate::frame_trace::FrameTrace) {
+        self.frame_trace = Some(trace);
+    }
 }
 
 fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
@@ -624,6 +633,7 @@ impl Pipeline {
             processing_lifecycle_service: settings.processing_lifecycle_service,
             queues,
             processing_generation,
+            frame_trace: None,
         }
     }
 
@@ -1290,7 +1300,14 @@ impl Pipeline {
                     Err(code) => stream.cleanup(code),
                 }
             } else {
-                pump(plane, stream, id, &self.queues, &self.processing_generation);
+                pump(
+                    plane,
+                    stream,
+                    id,
+                    &self.queues,
+                    &self.processing_generation,
+                    self.frame_trace.as_ref(),
+                );
             }
             log_diagnostics(stream, id, &self.queues, send);
             if let Ok(mut queues) = self.queues.try_lock() {
@@ -1447,6 +1464,7 @@ fn pump(
     id: u64,
     queues: &Arc<Mutex<Queues>>,
     generation: &AtomicU64,
+    frame_trace: Option<&crate::frame_trace::FrameTrace>,
 ) {
     let now = Instant::now();
     // Notifications wake the consumer; presentation metadata still owns frame
@@ -1533,6 +1551,10 @@ fn pump(
     if capture_start_recorded {
         record_processing_start(queues, generation, id, sequence);
     }
+    // Read the trace clock only for pumps that may produce a frame.
+    let capture_started = frame_trace
+        .filter(|_| capture_due || repeat_due)
+        .map(|trace| (trace, trace.now()));
     match plane.pump(Pump {
         video: id,
         provider: stream.provider,
@@ -1552,6 +1574,11 @@ fn pump(
             let completed_at = Instant::now();
             if capture_start_recorded && !progress.submitted {
                 cancel_processing_start(queues, generation, id, sequence);
+            }
+            if progress.submitted
+                && let Some((trace, started)) = capture_started
+            {
+                trace.submitted(id, sequence, started);
             }
             if stream.capture_notifications
                 && capture_due

@@ -1,4 +1,5 @@
 //! Managed capture-to-encode coordination with bounded native packet delivery.
+mod frame_trace;
 mod image_fit;
 mod model;
 mod native;
@@ -58,7 +59,11 @@ impl ManagedModule for Video {
         };
         settings.validate()?;
         let source_preflight = source_preflight::SourcePreflight::new(&settings);
-        let queues = Arc::new(Mutex::new(queue::Queues::default()));
+        let frame_trace =
+            frame_trace::FrameTrace::new(amaterasu_module_sdk::trace::Tracer::bind(&runtime));
+        let mut queues = queue::Queues::default();
+        queues.trace_frames(frame_trace);
+        let queues = Arc::new(Mutex::new(queues));
         let plane: Box<dyn Plane> = if settings.enabled {
             Box::new(
                 NativePlane::bind(
@@ -85,11 +90,12 @@ impl ManagedModule for Video {
         };
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|_| "video entropy unavailable")?;
-        let pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new(
             settings,
             format!("{:016x}", u64::from_le_bytes(random)),
             queues.clone(),
         );
+        pipeline.trace_frames(frame_trace);
         let factory = native::Factory::new(queues);
         runtime.require_success(Command::Register {
             service: service.clone(),

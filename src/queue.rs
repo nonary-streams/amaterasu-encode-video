@@ -55,9 +55,14 @@ struct Stream {
 pub struct Queues {
     streams: BTreeMap<u64, Stream>,
     processing_generation: Arc<AtomicU64>,
+    frame_trace: Option<crate::frame_trace::FrameTrace>,
 }
 
 impl Queues {
+    pub fn trace_frames(&mut self, trace: crate::frame_trace::FrameTrace) {
+        self.frame_trace = Some(trace);
+    }
+
     pub fn processing_generation(&self) -> Arc<AtomicU64> {
         self.processing_generation.clone()
     }
@@ -255,6 +260,12 @@ impl Queues {
                     .insert(packet.sequence, value);
                 while stream.frozen_processing_starts.len() > 128 {
                     stream.frozen_processing_starts.pop_first();
+                }
+                // This branch runs once per frame, on its first fragment.
+                if packet.flags != FLAG_END_OF_STREAM
+                    && let Some(trace) = &self.frame_trace
+                {
+                    trace.packet_queued(id, packet.sequence);
                 }
                 value
             };
