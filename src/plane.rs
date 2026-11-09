@@ -380,6 +380,16 @@ impl NativePlane {
                     Err(error) => return Err(error),
                 }
             }
+            require_retained_capture(
+                gpu_processor_service.is_some(),
+                // Each binding was validated with its v1.0 prefix above.
+                captures.values().filter_map(|binding: &NativeBinding| {
+                    binding
+                        .table::<CaptureApiPrefix>()
+                        .ok()
+                        .map(|api| api.base.header)
+                }),
+            )?;
             let mut encoders = BTreeMap::new();
             for service in (!providers.is_empty())
                 .then_some(ENCODE)
@@ -473,6 +483,24 @@ impl NativePlane {
             })
         }
     }
+}
+
+/// A GPU processor reads captured storage after the capture callback returns,
+/// so only a provider publishing the retained-resource interface can feed it.
+/// Providers that can only lend mutable scanout buffers do not publish it, and
+/// each processed stream is refused on such a provider. With none available
+/// the composition could never process a frame, so it does not start at all.
+fn require_retained_capture(
+    gpu_processor_selected: bool,
+    capture_headers: impl IntoIterator<Item = AbiHeader>,
+) -> ModuleResult<()> {
+    if gpu_processor_selected && !capture_headers.into_iter().any(capture_resources_available) {
+        return Err(
+            "selected frame processor requires a capture provider that retains immutable frames"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 impl Drop for NativePlane {
@@ -1950,6 +1978,24 @@ mod tests {
         let fixture = unsafe { &mut *context.cast::<ProcessorFixture>() };
         fixture.encoded = unsafe { (&*frame).bytes().unwrap() }.to_vec();
         STATUS_OK
+    }
+
+    #[test]
+    fn a_selected_gpu_processor_needs_a_retaining_capture_provider() {
+        let lending = AbiHeader {
+            size: CAPTURE_API_V1_0_SIZE,
+            major: 1,
+            minor: 0,
+        };
+        let retaining = AbiHeader {
+            size: amaterasu_media::CAPTURE_API_V1_8_SIZE,
+            major: 1,
+            minor: amaterasu_media::CAPTURE_RESOURCE_INTERFACE_MINOR,
+        };
+        assert!(require_retained_capture(true, []).is_err());
+        assert!(require_retained_capture(true, [lending]).is_err());
+        assert!(require_retained_capture(true, [lending, retaining]).is_ok());
+        assert!(require_retained_capture(false, [lending]).is_ok());
     }
 
     #[test]
