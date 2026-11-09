@@ -27,6 +27,7 @@ const MAX_PENDING: usize = 16;
 struct Waiter {
     id: u64,
     owner: String,
+    open_operation: Option<String>,
 }
 struct Request {
     waiter: Waiter,
@@ -81,6 +82,7 @@ pub(crate) struct Preparation {
     completed: Receiver<Completion>,
     worker: Option<JoinHandle<()>>,
     active: bool,
+    active_open: Option<(String, String)>,
     ready: Option<Completion>,
 }
 
@@ -114,6 +116,7 @@ impl Preparation {
             completed,
             worker: Some(worker),
             active: false,
+            active_open: None,
             ready: None,
         })
     }
@@ -132,8 +135,16 @@ impl Preparation {
         {
             return Err("encoder_preparation_limit");
         }
+        let open_operation = match &operation {
+            Operation::Open { operation_id, .. } => operation_id.clone(),
+            _ => None,
+        };
         self.queued.push_back(Request {
-            waiter: Waiter { id, owner },
+            waiter: Waiter {
+                id,
+                owner,
+                open_operation,
+            },
             operation,
         });
         Ok(())
@@ -150,6 +161,7 @@ impl Preparation {
             match self.completed.try_recv() {
                 Ok(completion) => {
                     self.active = false;
+                    self.active_open = None;
                     self.ready = Some(completion);
                 }
                 Err(TryRecvError::Empty) => (),
@@ -305,9 +317,31 @@ impl Preparation {
         Ok(())
     }
 
+    /// A lookup for an admitted open must follow its preparation and native
+    /// retirement; absence is only authoritative once that owned work settles.
+    pub fn has_pending_open(&self, owner: &str, operation: &str) -> bool {
+        let matches = |waiter: &Waiter| {
+            waiter.owner == owner && waiter.open_operation.as_deref() == Some(operation)
+        };
+        self.active_open
+            .as_ref()
+            .is_some_and(|(pending_owner, pending_operation)| {
+                pending_owner == owner && pending_operation == operation
+            })
+            || self
+                .ready
+                .as_ref()
+                .is_some_and(|completion| matches(&completion.waiter))
+            || self.queued.iter().any(|request| matches(&request.waiter))
+    }
+
     fn dispatch(&mut self, waiter: Waiter, work: Work) -> ModuleResult<()> {
         // A single outstanding task makes this bounded send nonblocking. A
         // disconnected worker is fatal; no native task is silently detached.
+        self.active_open = waiter
+            .open_operation
+            .as_ref()
+            .map(|operation| (waiter.owner.clone(), operation.clone()));
         self.sender
             .as_ref()
             .ok_or("encoder preparation stopped")?
@@ -415,6 +449,9 @@ fn prepare(
                     packet_boundaries,
                 },
             }
+        }
+        Operation::Lookup { operation_id } => {
+            return sessions.lookup(owner, &operation_id).map(Admission::Reply);
         }
         _ => return Err("invalid_request"),
     }))

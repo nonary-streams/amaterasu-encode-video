@@ -313,3 +313,48 @@ fn orphan_retirement_does_not_hold_the_host_tick_and_quiescence_waits_for_it() {
     }
     assert_eq!(module.shared.lock().unwrap().latest_id(), 0);
 }
+
+#[test]
+fn lookup_never_reports_absence_while_a_cancelled_open_still_owns_native_preparation() {
+    let (host, mut module) = Host::start();
+    let (gate, entered, closed, _) = install(&module);
+    host.queue(42, open_request(&hardware_identity(), &configuration()));
+    module.tick().unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    host.cancel(42);
+    host.queue(43, json!({"action":"lookup","operation_id":"winner-open"}));
+    module.tick().unwrap();
+    for _ in 0..20 {
+        module.tick().unwrap();
+    }
+    assert!(host.take_reply(43).is_none());
+    assert_eq!(closed.load(Ordering::SeqCst), 0);
+    drop(gate);
+    assert_eq!(
+        until_reply(&host, &mut module, 43)["code"],
+        "session_not_found"
+    );
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+    assert_eq!(module.shared.lock().unwrap().latest_id(), 0);
+}
+
+#[test]
+fn queued_duplicate_open_and_lookup_observe_one_published_session() {
+    let (host, mut module) = Host::start();
+    let (gate, entered, closed, calls) = install(&module);
+    host.queue(42, open_request(&hardware_identity(), &configuration()));
+    module.tick().unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    host.queue(43, open_request(&hardware_identity(), &configuration()));
+    module.tick().unwrap();
+    host.queue(44, json!({"action":"lookup","operation_id":"winner-open"}));
+    module.tick().unwrap();
+    assert!(host.take_reply(44).is_none());
+    drop(gate);
+    assert_eq!(until_reply(&host, &mut module, 42)["session_id"], 1);
+    assert_eq!(until_reply(&host, &mut module, 43)["session_id"], 1);
+    assert_eq!(until_reply(&host, &mut module, 44)["session_id"], 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(module);
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+}

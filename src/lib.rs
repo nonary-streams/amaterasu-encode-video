@@ -106,16 +106,23 @@ impl ManagedModule for EncodeModule {
                 }
                 let result = if service == SERVICE {
                     let operation = serde_json::from_value::<Operation>(payload.clone());
-                    if let Ok(
-                        operation @ (Operation::Enumerate
-                        | Operation::Probe { .. }
-                        | Operation::Open { .. }),
-                    ) = operation
-                    {
+                    let needs_preparation = match &operation {
+                        Ok(
+                            Operation::Enumerate | Operation::Probe { .. } | Operation::Open { .. },
+                        ) => true,
+                        Ok(Operation::Lookup { operation_id }) => {
+                            self.preparation.has_pending_open(&caller, operation_id)
+                        }
+                        _ => false,
+                    };
+                    if needs_preparation {
                         if self.shutting_down {
                             Err("encoder_shutting_down")
                         } else {
-                            match self.preparation.admit(id, caller.clone(), operation) {
+                            match self
+                                .preparation
+                                .admit(id, caller.clone(), operation.unwrap())
+                            {
                                 Ok(()) => {
                                     return self.preparation.advance(
                                         &self.runtime,
