@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Default)]
 struct HostState {
-    incoming: Option<Response>,
-    completed: Option<Value>,
+    incoming: std::collections::VecDeque<Response>,
+    completed: std::collections::BTreeMap<u64, Value>,
+    live: std::collections::BTreeSet<u64>,
     registered_factory: usize,
     registrations: usize,
 }
@@ -45,14 +46,22 @@ unsafe extern "C" fn dispatch(
             state.registrations += 1;
             Response::Ok
         }
-        Command::Poll {} => state.incoming.take().unwrap_or(Response::Pending),
-        Command::CheckRequest { request: 42 } => Response::Ok,
-        Command::Complete {
-            request: 42,
-            payload,
-        } => {
-            state.completed = Some(payload);
-            Response::Ok
+        Command::NotifyWorkReady {} | Command::Log { .. } => Response::Ok,
+        Command::Poll {} => state.incoming.pop_front().unwrap_or(Response::Pending),
+        Command::CheckRequest { request } => {
+            if state.live.contains(&request) {
+                Response::Ok
+            } else {
+                Response::error("request_ended", "cancelled fixture")
+            }
+        }
+        Command::Complete { request, payload } => {
+            if state.live.remove(&request) {
+                state.completed.insert(request, payload);
+                Response::Ok
+            } else {
+                Response::error("request_ended", "cancelled fixture")
+            }
         }
         _ => panic!("unexpected acceptance-test runtime command"),
     };
@@ -79,21 +88,40 @@ impl Host {
     }
 
     pub(super) fn request(&self, module: &mut EncodeModule, payload: Value) -> Value {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.completed = None;
-            state.incoming = Some(Response::Request {
-                id: 42,
-                caller: "test.video".into(),
-                initiator: "untrusted-request-initiator".into(),
-                service: SERVICE.into(),
-                remaining_ms: 5_000,
-                payload,
-            });
+        self.queue(42, payload);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            module.tick().unwrap();
+            let reply = self.state.lock().unwrap().completed.remove(&42);
+            if let Some(reply) = reply {
+                self.assert_registration(module);
+                return reply;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "encoder request did not settle"
+            );
+            std::thread::yield_now();
         }
-        module.tick().unwrap();
-        self.assert_registration(module);
-        self.state.lock().unwrap().completed.take().unwrap()
+    }
+
+    pub(super) fn queue(&self, id: u64, payload: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.live.insert(id);
+        state.incoming.push_back(Response::Request {
+            id,
+            caller: "test.video".into(),
+            initiator: "untrusted-request-initiator".into(),
+            service: SERVICE.into(),
+            remaining_ms: 5_000,
+            payload,
+        });
+    }
+    pub(super) fn take_reply(&self, id: u64) -> Option<Value> {
+        self.state.lock().unwrap().completed.remove(&id)
+    }
+    pub(super) fn cancel(&self, id: u64) {
+        self.state.lock().unwrap().live.remove(&id);
     }
 
     pub(super) fn assert_registration(&self, module: &EncodeModule) {

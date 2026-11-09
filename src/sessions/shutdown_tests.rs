@@ -320,7 +320,12 @@ fn repeated_unkeyed_open_and_close_do_not_accumulate_retirement_receipts() {
     let broker = Broker::attach(&mut module);
     for cycle in 0..16 {
         broker.request(100 + cycle * 2, "alice", json!({"action":"open","encoder":{"clsid":"fixture","friendly_name":"fixture"},"configuration":configuration()}));
-        module.tick().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while broker.completed().len() < (cycle * 2 + 1) as usize {
+            module.tick().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(
             broker.completed().last().unwrap().1["session_id"],
             cycle + 1
@@ -368,7 +373,15 @@ fn cancelled_open_delivery_retains_background_rollback_without_an_inline_close()
     let open = json!({"action":"open","encoder":{"clsid":"fixture","friendly_name":"fixture"},"configuration":configuration(),"operation_id":"cancelled-open"});
     broker.request(52, "alice", open.clone());
     broker.fail_completion(52, "request_ended");
-    module.tick().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        module.tick().unwrap();
+        if module.shared.lock().unwrap().latest_id() == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     assert!(broker.completed().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -376,7 +389,11 @@ fn cancelled_open_delivery_retains_background_rollback_without_an_inline_close()
         "closing"
     );
     broker.request(53, "alice", open);
-    module.tick().unwrap();
+    while broker.completed().is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     let replay_reply = broker.completed();
     ready.store(true, Ordering::SeqCst);
     module.tick().unwrap();
@@ -584,6 +601,7 @@ pub(super) fn module(sessions: Sessions) -> crate::EncodeModule {
     let (_, log_queue) = runtime.log_emitter();
     let shared = Arc::new(Mutex::new(sessions));
     crate::EncodeModule {
+        preparation: crate::preparation::Preparation::new(runtime.work_notifier()).unwrap(),
         runtime,
         _registration: Box::new(crate::native::Registration::new(shared.clone())),
         shared,
@@ -696,7 +714,11 @@ fn shutdown_announcement_is_nonblocking_and_preserves_consumers_until_quiesce() 
         Err("encoder_shutting_down")
     );
     drop(held_native_call);
-    assert_eq!(module.quiesce(), Ok(true));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !module.quiesce().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
 }
 
 #[test]

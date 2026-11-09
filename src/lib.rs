@@ -10,6 +10,7 @@ mod layout;
 mod model;
 mod native;
 mod platform;
+mod preparation;
 mod probe;
 mod sessions;
 mod worker;
@@ -37,6 +38,7 @@ struct EncodeModule {
     last_timing_log: Instant,
     shutting_down: bool,
     closing: closing::Closing,
+    preparation: preparation::Preparation,
     _registration: Box<native::Registration>,
 }
 
@@ -67,6 +69,7 @@ impl ManagedModule for EncodeModule {
             )?;
         }
         Ok(Self {
+            preparation: preparation::Preparation::new(runtime.work_notifier())?,
             runtime,
             shared,
             log_queue,
@@ -79,6 +82,12 @@ impl ManagedModule for EncodeModule {
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
         self.log_worker_timings();
+        self.preparation.advance(
+            &self.runtime,
+            &self.shared,
+            &mut self.closing,
+            self.shutting_down,
+        )?;
         self.closing.advance(&self.runtime, &self.shared)?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -96,9 +105,29 @@ impl ManagedModule for EncodeModule {
                     return Ok(());
                 }
                 let result = if service == SERVICE {
-                    if let Ok(Operation::Close { session_id }) =
-                        serde_json::from_value(payload.clone())
+                    let operation = serde_json::from_value::<Operation>(payload.clone());
+                    if let Ok(
+                        operation @ (Operation::Enumerate
+                        | Operation::Probe { .. }
+                        | Operation::Open { .. }),
+                    ) = operation
                     {
+                        if self.shutting_down {
+                            Err("encoder_shutting_down")
+                        } else {
+                            match self.preparation.admit(id, caller.clone(), operation) {
+                                Ok(()) => {
+                                    return self.preparation.advance(
+                                        &self.runtime,
+                                        &self.shared,
+                                        &mut self.closing,
+                                        false,
+                                    );
+                                }
+                                Err(code) => Err(code),
+                            }
+                        }
+                    } else if let Ok(Operation::Close { session_id }) = operation {
                         match self.closing.admit(id, &caller, session_id) {
                             Ok(()) => return self.closing.advance(&self.runtime, &self.shared),
                             Err(code) => Err(code),
@@ -144,11 +173,13 @@ impl ManagedModule for EncodeModule {
                 }
             }
         }
+        self.preparation
+            .advance(&self.runtime, &self.shared, &mut self.closing, true)?;
         self.closing.advance(&self.runtime, &self.shared)?;
         match self.shared.try_lock() {
             Ok(sessions) => sessions
                 .shutdown_status()
-                .map(|ready| ready && self.closing.is_empty())
+                .map(|ready| ready && self.closing.is_empty() && self.preparation.retired())
                 .map_err(str::to_owned),
             Err(std::sync::TryLockError::WouldBlock) => Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => Err("encoder state failed".into()),
@@ -186,59 +217,22 @@ impl EncodeModule {
         if matches!(&operation, Operation::Close { .. }) {
             return Err("encoder_close_requires_request");
         }
-        if let Operation::Probe {
-            encoder,
-            configuration,
-        } = operation
-        {
-            let factory = {
-                let sessions = self.shared.lock().map_err(|_| "encoder_state_failed")?;
-                sessions.probe_factory(caller, &encoder, &configuration)?
-            };
-            return probe::run(&*factory, encoder, configuration).map(|reply| (reply, None));
-        }
-        let mut sessions = self.shared.lock().map_err(|_| "encoder_state_failed")?;
-        let previous_id = sessions.latest_id();
+        let mut sessions = self.shared.try_lock().map_err(|_| "encoder_state_busy")?;
         let payload = match operation {
-            Operation::Enumerate => {
-                let encoders = sessions.enumerate()?;
-                let diagnostic = platform::last_failure().map(|detail| {
-                    json!({"stage":detail.stage,"hresult":format!("0x{:08x}", detail.hresult)})
-                });
-                let metrics = platform::metrics();
-                let software_unavailable = platform::software_availability().err();
-                Ok(
-                    json!({"ok":true,"enabled":sessions.enabled,"encoders":encoders,"diagnostic":diagnostic,
-                        "software_encoder":{"available":software_unavailable.is_none(),"reason":software_unavailable},
-                        "metrics":{"need_input_events":metrics.need_input_events,"have_output_events":metrics.have_output_events,
-                        "other_events":metrics.other_events,"process_input_calls":metrics.process_input_calls,
-                        "process_output_calls":metrics.process_output_calls}}),
-                )
+            Operation::Enumerate | Operation::Probe { .. } | Operation::Open { .. } => {
+                return Err("encoder_preparation_requires_request");
             }
-            Operation::Open {
-                packet_boundaries,
-                encoder,
-                configuration,
-                operation_id,
-            } => sessions.open(
-                caller,
-                encoder,
-                configuration,
-                operation_id,
-                packet_boundaries,
-            ),
             Operation::Lookup { operation_id } => sessions.lookup(caller, &operation_id),
             Operation::Close { .. } => unreachable!("close retains its broker request"),
             Operation::Status { session_id } => sessions.status(caller, session_id),
-            Operation::Probe { .. } => unreachable!("probe runs outside the session lock"),
         }?;
-        let created = (sessions.latest_id() != previous_id).then_some(sessions.latest_id());
-        Ok((payload, created))
+        Ok((payload, None))
     }
 }
 
 impl Drop for EncodeModule {
     fn drop(&mut self) {
+        self.preparation.join();
         // A panic in a native callback may poison this lock. Teardown still
         // owns every session, so recover the guard and join/retire its backend
         // workers before the module releases its final reference.

@@ -277,13 +277,6 @@ impl Sessions {
             ..Self::new(enabled)
         }
     }
-    pub fn enumerate(&self) -> Result<Vec<crate::model::EncoderDescription>, &'static str> {
-        if self.enabled {
-            self.factory.enumerate()
-        } else {
-            Ok(Vec::new())
-        }
-    }
     pub fn probe_factory(
         &self,
         owner: &str,
@@ -293,6 +286,7 @@ impl Sessions {
         self.validate_open(owner, encoder, configuration)?;
         Ok(self.factory.clone())
     }
+    #[cfg(test)]
     pub fn open(
         &mut self,
         owner: &str,
@@ -301,6 +295,40 @@ impl Sessions {
         operation: Option<String>,
         packet_boundaries: bool,
     ) -> Result<Value, &'static str> {
+        if let Some(reply) = self.prepare_open(
+            owner,
+            &encoder,
+            &configuration,
+            operation.as_deref(),
+            packet_boundaries,
+        )? {
+            return Ok(reply);
+        }
+        let backend = self.factory.open(encoder.clone(), configuration.clone())?;
+        self.finish_open(
+            owner,
+            encoder,
+            configuration,
+            operation,
+            packet_boundaries,
+            &mut Some(backend),
+        )
+    }
+
+    pub fn factory(&self) -> Arc<dyn Factory> {
+        self.factory.clone()
+    }
+
+    /// Validate without starting native work or reserving a session. The single
+    /// preparation worker serializes opens; admission is checked again on commit.
+    pub fn prepare_open(
+        &self,
+        owner: &str,
+        encoder: &EncoderIdentity,
+        configuration: &Configuration,
+        operation: Option<&str>,
+        packet_boundaries: bool,
+    ) -> Result<Option<Value>, &'static str> {
         if configuration.nvenc_h264_cavlc {
             return Err("nvenc_h264_cavlc_unsupported");
         }
@@ -310,11 +338,11 @@ impl Sessions {
         if configuration.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
             return Err("amd_av1_latency_mode_unsupported");
         }
-        if let Some(operation) = &operation {
+        if let Some(operation) = operation {
             validate_operation(operation)?;
-            if let Some(record) = self.operations.get(&(owner.into(), operation.clone())) {
-                if record.configuration != configuration
-                    || record.encoder != encoder
+            if let Some(record) = self.operations.get(&(owner.into(), operation.into())) {
+                if record.configuration != *configuration
+                    || record.encoder != *encoder
                     || record.packet_boundaries != packet_boundaries
                 {
                     return Err("operation_conflict");
@@ -327,15 +355,47 @@ impl Sessions {
                     Some(_) => (),
                     None => return Err("session_closed"),
                 }
-                return Ok(open_reply(record.id, &configuration, packet_boundaries));
+                return Ok(Some(open_reply(
+                    record.id,
+                    configuration,
+                    packet_boundaries,
+                )));
             }
             if self.operations.len() >= 128 {
                 return Err("operation_limit");
             }
         }
-        self.validate_open(owner, &encoder, &configuration)?;
-        let backend = self.factory.open(encoder.clone(), configuration.clone())?;
-        let response = self.insert(owner, configuration.clone(), backend, packet_boundaries)?;
+        self.validate_open(owner, encoder, configuration)?;
+        self.next_id.checked_add(1).ok_or("session_limit")?;
+        Ok(None)
+    }
+
+    /// Takes the prepared backend only after admission is revalidated. Rejected
+    /// backends stay with the preparation worker for asynchronous retirement.
+    pub fn finish_open(
+        &mut self,
+        owner: &str,
+        encoder: EncoderIdentity,
+        configuration: Configuration,
+        operation: Option<String>,
+        packet_boundaries: bool,
+        backend: &mut Option<Box<dyn Backend>>,
+    ) -> Result<Value, &'static str> {
+        if let Some(reply) = self.prepare_open(
+            owner,
+            &encoder,
+            &configuration,
+            operation.as_deref(),
+            packet_boundaries,
+        )? {
+            return Ok(reply);
+        }
+        let response = self.insert(
+            owner,
+            configuration.clone(),
+            backend.take().ok_or("encoder_worker_failed")?,
+            packet_boundaries,
+        )?;
         if let Some(operation) = operation {
             self.operations.insert(
                 (owner.into(), operation),
