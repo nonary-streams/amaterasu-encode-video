@@ -24,7 +24,7 @@ use crate::{
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
 use amaterasu_module_sdk::diagnostics::LatencyMetric as TimingMetric;
-use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, LogLevel, Response};
+use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -334,7 +334,7 @@ fn log_diagnostics(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, se
     // bounded host log queue is full or the logging transport is unavailable.
     for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
         let _ = send(Command::Log {
-            level: LogLevel::Info as u8,
+            level: amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8,
             target: "video.pipeline".into(),
             message: part.to_string(),
         });

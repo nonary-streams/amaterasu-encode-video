@@ -2047,7 +2047,11 @@ fn running_video_emits_one_interval_summary_and_keeps_stream_running() {
         })
         .collect();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].0, LogLevel::Info as u8);
+    // A periodic window is a debug record; the default log keeps events.
+    assert_eq!(
+        events[0].0,
+        amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8
+    );
     assert_eq!(events[0].1["event"], "video_stage_window");
     assert_eq!(events[0].1["target_fps"], 60);
     assert_eq!(events[0].1["pacing"], "timer");
