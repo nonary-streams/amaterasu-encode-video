@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use amaterasu_module_sdk::diagnostics::LatencyMetric;
+
 use crate::worker::{Metrics as WorkerMetrics, ReceiveResult, SubmitResult};
 
 pub trait Backend: Send {
@@ -132,10 +134,12 @@ struct DeliveryWait {
     packets: u64,
     total_us: u64,
     max_us: u64,
+    latency_us: LatencyMetric,
 }
 
 impl DeliveryWait {
     fn record(&mut self, waited_us: u64) {
+        self.latency_us.record(waited_us);
         self.packets = self.packets.saturating_add(1);
         self.total_us = self.total_us.saturating_add(waited_us);
         self.max_us = self.max_us.max(waited_us);
@@ -172,6 +176,7 @@ pub struct Session {
     opened_at: Instant,
     encode_timing: EncodeTimingSnapshotV1,
     delivery_wait: DeliveryWait,
+    encode_latency_window: LatencyMetric,
     /// Producer offer configured for resource frames (generation, offer).
     resource_producer: Option<(u64, u64)>,
 }
@@ -478,6 +483,7 @@ impl Sessions {
                 opened_at: Instant::now(),
                 encode_timing: EncodeTimingSnapshotV1::empty(1),
                 delivery_wait: DeliveryWait::default(),
+                encode_latency_window: LatencyMetric::default(),
                 resource_producer: None,
             },
         );
@@ -528,22 +534,19 @@ impl Sessions {
 
     /// A bounded, host-only snapshot; worker timings are cumulative since the
     /// session opened and do not measure capture, packet delivery or display.
-    pub fn timing_summaries(&mut self, now: Instant) -> Vec<String> {
+    pub fn timing_summaries(&mut self, now: Instant) -> Vec<Value> {
         self.values
             .iter_mut()
             .filter_map(|(id, session)| {
                 let metrics = session.backend.observed_metrics()?;
                 let elapsed_ms = now.saturating_duration_since(session.opened_at).as_millis();
                 let delivery_wait = std::mem::take(&mut session.delivery_wait);
+                let encode_latency = std::mem::take(&mut session.encode_latency_window);
                 session.backend.reset_frame_window();
-                Some(format!(
-                    "encoder_session={id} elapsed_ms={elapsed_ms} width={} height={} target_fps={} delivery_wait={} worker_metrics_cumulative={}",
-                    session.config.width,
-                    session.config.height,
-                    session.config.fps,
-                    serde_json::to_string(&delivery_wait).ok()?,
-                    serde_json::to_string(&metrics).ok()?
-                ))
+                Some(serde_json::json!({"event":"encoder_timing_window","encoder_session":id,"elapsed_ms":elapsed_ms,
+                    "width":session.config.width,"height":session.config.height,"target_fps":session.config.fps,
+                    "delivery_wait":delivery_wait,"provider_input_to_output_ready_us":encode_latency,
+                    "worker_metrics_cumulative":metrics}))
             })
             .collect()
     }
@@ -992,6 +995,7 @@ impl Sessions {
                 && let Ok(micros) = u64::try_from(elapsed.as_micros())
             {
                 session.encode_timing.record(micros);
+                session.encode_latency_window.record(micros);
             }
             if let Some(waited) = packet
                 .ready_at

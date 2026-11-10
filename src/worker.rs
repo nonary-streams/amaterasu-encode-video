@@ -4,6 +4,7 @@ use crate::{
     model::{Configuration, EncoderDescription, EncoderIdentity, Packet},
     platform,
 };
+use amaterasu_module_sdk::diagnostics::LatencyMetric;
 use serde::Serialize;
 use std::{
     collections::VecDeque,
@@ -214,6 +215,19 @@ impl FrameWindow {
     }
 }
 
+/// Interval distributions reset only at the report boundary. Native GPU stages
+/// are recorded only when the backend supplied GPU timestamps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WorkerLatencyWindow {
+    queue_wait_us: LatencyMetric,
+    submit_us: LatencyMetric,
+    receive_us: LatencyMetric,
+    drain_us: LatencyMetric,
+    gpu_queue_us: LatencyMetric,
+    gpu_convert_us: LatencyMetric,
+    gpu_encode_us: LatencyMetric,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Metrics {
     pub queue_wait_us_total: u64,
@@ -233,6 +247,7 @@ pub struct Metrics {
     pub pending_operations: u64,
     pub native_stage_totals: Option<NativeStageTotals>,
     pub frame_window: FrameWindow,
+    pub latency_window: WorkerLatencyWindow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,7 +658,31 @@ impl Worker {
     }
 
     fn record_completion(&mut self, completed: &Completed) {
+        self.metrics
+            .latency_window
+            .queue_wait_us
+            .record(completed.queue_wait_us);
+        match completed.kind {
+            AsyncKind::Submit => &mut self.metrics.latency_window.submit_us,
+            AsyncKind::Receive => &mut self.metrics.latency_window.receive_us,
+            AsyncKind::Drain => &mut self.metrics.latency_window.drain_us,
+        }
+        .record(completed.operation_us);
         if let Some(sample) = completed.native_stages {
+            if sample.gpu_timed != 0 {
+                self.metrics
+                    .latency_window
+                    .gpu_queue_us
+                    .record(sample.gpu_queue_us);
+                self.metrics
+                    .latency_window
+                    .gpu_convert_us
+                    .record(sample.gpu_convert_us);
+                self.metrics
+                    .latency_window
+                    .gpu_encode_us
+                    .record(sample.gpu_encode_us);
+            }
             self.metrics
                 .native_stage_totals
                 .get_or_insert_with(Default::default)
@@ -696,6 +735,7 @@ impl Worker {
     /// Starts a new report window after the current one has been logged.
     pub fn reset_frame_window(&mut self) {
         self.metrics.frame_window = FrameWindow::default();
+        self.metrics.latency_window = WorkerLatencyWindow::default();
     }
 
     pub fn submit(

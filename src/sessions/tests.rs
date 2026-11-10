@@ -94,7 +94,13 @@ fn measured_readiness_excludes_later_polling_and_sink_retries_and_preserves_owne
         measured.total_us, 4_000,
         "ten seconds of delayed observation must not be counted"
     );
+    assert_eq!(sessions.values[&1].encode_latency_window.calls, 1);
+    assert_eq!(sessions.values[&1].encode_latency_window.max_us, 4_000);
     assert_eq!(unsafe { sessions.receive("reader", 1, sink) }, MEDIA_BUSY);
+    assert_eq!(
+        sessions.values[&1].encode_latency_window.calls, 1,
+        "sink retries must not duplicate a latency sample"
+    );
     assert_eq!(
         unsafe {
             sessions.receive(
@@ -270,7 +276,8 @@ fn timing_summary_reports_worker_counters_without_owner_data() {
     let summaries = sessions.timing_summaries(Instant::now());
     assert_eq!(summaries.len(), 1);
     let summary = &summaries[0];
-    assert!(summary.contains("encoder_session=1"));
+    assert_eq!(summary["encoder_session"], 1);
+    let summary = summary.to_string();
     assert!(summary.contains("\"queue_wait_us_total\":300"));
     assert!(summary.contains("\"submit_total_us\":700"));
     assert!(summary.contains("\"busy_submissions\":1"));

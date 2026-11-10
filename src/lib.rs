@@ -15,7 +15,7 @@ mod probe;
 mod sessions;
 mod worker;
 use amaterasu_module_sdk::{
-    Command, LogLevel, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+    Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
 };
 use model::Operation;
 use serde::Deserialize;
@@ -209,7 +209,11 @@ impl EncodeModule {
         drop(sessions);
         self.last_timing_log = now;
         for summary in summaries {
-            let _ = self.runtime.log(LogLevel::Info, "encoder.timing", &summary);
+            amaterasu_module_sdk::diagnostics::log_window(
+                &self.runtime,
+                "encoder.timing",
+                &summary,
+            );
         }
     }
 
