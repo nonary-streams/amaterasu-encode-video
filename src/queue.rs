@@ -4,13 +4,16 @@ use amaterasu_media::{
     PacketSink, TimedEncodedPacket, TimedPacketSink,
 };
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::diagnostics::LatencyMetric;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 struct Packet {
+    queued_at: Instant,
     bytes: Vec<u8>,
     codec: u32,
     flags: u32,
@@ -20,6 +23,9 @@ struct Packet {
 }
 
 struct Stream {
+    queue_wait_us: LatencyMetric,
+    queue_high_water: usize,
+    consumer_retries: u64,
     timing_source: Option<(String, u64, u64)>,
     timing_epoch: u64,
     encode_timing: Option<amaterasu_media::EncodeTimingSnapshotV1>,
@@ -64,6 +70,9 @@ impl Queues {
         self.streams.insert(
             id,
             Stream {
+                queue_wait_us: LatencyMetric::default(),
+                queue_high_water: 0,
+                consumer_retries: 0,
                 timing_source: None,
                 timing_epoch: 0,
                 encode_timing: None,
@@ -250,6 +259,7 @@ impl Queues {
                 value
             };
         stream.packets.push_back(Packet {
+            queued_at: Instant::now(),
             bytes,
             codec: packet.codec,
             flags: packet.flags,
@@ -257,7 +267,21 @@ impl Queues {
             sequence: packet.sequence,
             processing_started_host_us,
         });
+        stream.queue_high_water = stream.queue_high_water.max(stream.packets.len());
         STATUS_OK
+    }
+
+    pub fn take_timing(&mut self, id: u64) -> Option<serde_json::Value> {
+        let stream = self.streams.get_mut(&id)?;
+        let wait = std::mem::take(&mut stream.queue_wait_us);
+        let high_water = std::mem::replace(&mut stream.queue_high_water, stream.packets.len());
+        let retries = std::mem::take(&mut stream.consumer_retries);
+        Some(
+            serde_json::json!({"queue_wait_us":wait,"queue_high_water":high_water,
+            "consumer_retries":retries,"queued_packets":stream.packets.len(),"queued_bytes":stream.bytes,
+            "oldest_queued_us":stream.packets.front().map(|packet| amaterasu_module_sdk::diagnostics::elapsed_us(packet.queued_at)),
+            "scope":"encoded_packet_enqueue_to_consumer_callback_entry"}),
+        )
     }
 
     /// # Safety
@@ -286,11 +310,22 @@ impl Queues {
             sequence: packet.sequence,
         };
         // SAFETY: queue owns packet during callback; rejection retains it.
+        let callback_started = Instant::now();
         let status = unsafe { sink.send(&borrowed) };
         if status == STATUS_OK {
+            stream.queue_wait_us.record(
+                u64::try_from(
+                    callback_started
+                        .saturating_duration_since(packet.queued_at)
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX),
+            );
             stream.eos_accepted = packet.flags == FLAG_END_OF_STREAM;
             stream.bytes -= packet.bytes.len();
             stream.packets.pop_front();
+        } else {
+            stream.consumer_retries = stream.consumer_retries.saturating_add(1);
         }
         status
     }
@@ -324,11 +359,22 @@ impl Queues {
             processing_started_host_us: packet.processing_started_host_us,
         };
         // SAFETY: queue owns packet bytes for the callback; rejection retains it.
+        let callback_started = Instant::now();
         let status = unsafe { sink.send(&borrowed) };
         if status == STATUS_OK {
+            stream.queue_wait_us.record(
+                u64::try_from(
+                    callback_started
+                        .saturating_duration_since(packet.queued_at)
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX),
+            );
             stream.eos_accepted = packet.flags == FLAG_END_OF_STREAM;
             stream.bytes -= packet.bytes.len();
             stream.packets.pop_front();
+        } else {
+            stream.consumer_retries = stream.consumer_retries.saturating_add(1);
         }
         status
     }
@@ -396,10 +442,16 @@ mod tests {
             unsafe { queues.receive_timed("alice", 1, sink) },
             MEDIA_BUSY
         );
+        let queued = queues.take_timing(1).unwrap();
+        assert_eq!(queued["queue_wait_us"]["calls"], 0);
+        assert_eq!(queued["consumer_retries"], 1);
+        assert_eq!(queued["queued_packets"], 2);
         receipt.busy = false;
         assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
         assert_eq!(unsafe { queues.receive_timed("alice", 1, sink) }, STATUS_OK);
         assert_eq!(receipt.values, vec![(7, 1099, 5000); 3]);
+        assert_eq!(queues.take_timing(1).unwrap()["queue_wait_us"]["calls"], 2);
+        assert_eq!(queues.take_timing(1).unwrap()["queue_wait_us"]["calls"], 0);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::{
     rpc::{self, Send},
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
+use amaterasu_module_sdk::diagnostics::LatencyMetric as TimingMetric;
 use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, LogLevel, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -193,21 +194,6 @@ struct Stream {
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
-struct TimingMetric {
-    calls: u64,
-    total_us: u64,
-    max_us: u64,
-}
-
-impl TimingMetric {
-    fn record(&mut self, elapsed_us: u64) {
-        self.calls = self.calls.saturating_add(1);
-        self.total_us = self.total_us.saturating_add(elapsed_us);
-        self.max_us = self.max_us.max(elapsed_us);
-    }
-}
-
-#[derive(Clone, Copy, Default, Serialize)]
 struct StageTimings {
     capture_callback: TimingMetric,
     encoder_submit: TimingMetric,
@@ -218,8 +204,11 @@ struct StageTimings {
     /// Conversions that finished but were refused by a busy encoder.
     gpu_output_rejected: u64,
     encoder_poll: TimingMetric,
+    source_pump: TimingMetric,
     transport_admission: TimingMetric,
     captured_frames: u64,
+    capture_reused: u64,
+    capture_deferred: u64,
 }
 
 /// Interval statistics are independent of the cumulative status counters.
@@ -229,6 +218,8 @@ struct DiagnosticWindow {
     timings: StageTimings,
     submitted: u64,
     dropped: u64,
+    last_pump: Option<Instant>,
+    pump_interval: TimingMetric,
 }
 
 impl DiagnosticWindow {
@@ -238,10 +229,19 @@ impl DiagnosticWindow {
             timings: StageTimings::default(),
             submitted: 0,
             dropped: 0,
+            last_pump: None,
+            pump_interval: TimingMetric::default(),
         }
     }
 
     fn record(&mut self, progress: &Progress) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_pump.replace(now) {
+            self.pump_interval.record(
+                u64::try_from(now.saturating_duration_since(previous).as_micros())
+                    .unwrap_or(u64::MAX),
+            );
+        }
         self.timings.record(progress);
         self.submitted = self.submitted.saturating_add(u64::from(progress.submitted));
         self.dropped = self.dropped.saturating_add(u64::from(progress.dropped));
@@ -251,12 +251,20 @@ impl DiagnosticWindow {
         if now.saturating_duration_since(self.started) < Duration::from_secs(10) {
             return None;
         }
-        Some(std::mem::replace(self, Self::new(now)))
+        let mut next = Self::new(now);
+        next.last_pump = self.last_pump;
+        Some(std::mem::replace(self, next))
     }
 }
 
 impl StageTimings {
     fn record(&mut self, progress: &Progress) {
+        self.capture_reused = self.capture_reused.saturating_add(u64::from(
+            progress.capture_reused || progress.dmabuf_fresh == Some(false),
+        ));
+        self.capture_deferred = self
+            .capture_deferred
+            .saturating_add(u64::from(progress.capture_deferred));
         if progress.capture_callback_count > 0 {
             self.capture_callback.record(progress.capture_callback_us);
             self.captured_frames = self
@@ -282,7 +290,7 @@ impl StageTimings {
             self.frame_copy.record(progress.frame_copy_us);
         }
         self.encoder_poll.record(progress.encoder_poll_us);
-        for _ in 0..progress.transport_admission_count {
+        if progress.transport_admission_count > 0 {
             self.transport_admission
                 .record(progress.transport_admission_us);
         }
@@ -291,7 +299,7 @@ impl StageTimings {
 
 /// Emit one bounded summary per interval through the host log transport. These
 /// are local video pipeline observations, not client delivery or encode latency.
-fn log_diagnostics(stream: &mut Stream, id: u64, send: &mut Send<'_>) {
+fn log_diagnostics(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mut Send<'_>) {
     let now = Instant::now();
     let Some(window) = stream
         .diagnostics
@@ -312,20 +320,25 @@ fn log_diagnostics(stream: &mut Stream, id: u64, send: &mut Send<'_>) {
         "encoder_service": stream.encoder_service,
         "encoder_session": stream.session,
         "frame_path": stream.frame_path.name(),
-        "submitted_frames": window.submitted,
-        "dropped_frames": window.dropped,
+        "submitted_frames": stream.source_id.is_none().then_some(window.submitted),
+        "dropped_frames": stream.source_id.is_none().then_some(window.dropped),
         "pacing": pacing["pacing"],
         "presentation_pacing_cumulative": pacing["presentation_pacing"],
         "stage_timing_us": window.timings,
+        "pump_interval_us": window.pump_interval,
+        "encoded_queue": queues.try_lock().ok().and_then(|mut queues| queues.take_timing(id)),
+        "percentiles": "histogram_upper_bounds_us",
         "timing_scope": "overlapping_local_calls_not_encode_latency_or_delivery"
     });
     // Diagnostics are best-effort and must not interrupt the stream if the
     // bounded host log queue is full or the logging transport is unavailable.
-    let _ = send(Command::Log {
-        level: LogLevel::Info as u8,
-        target: "video.pipeline".into(),
-        message: summary.to_string(),
-    });
+    for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
+        let _ = send(Command::Log {
+            level: LogLevel::Info as u8,
+            target: "video.pipeline".into(),
+            message: part.to_string(),
+        });
+    }
 }
 
 impl Stream {
@@ -1241,6 +1254,9 @@ impl Pipeline {
             }
         }
         if stream.stage == Stage::Running {
+            stream
+                .diagnostics
+                .get_or_insert_with(|| DiagnosticWindow::new(Instant::now()));
             if let Some(source_id) = stream.source_id {
                 if !stream.source_started {
                     match plane.start_source(
@@ -1258,7 +1274,14 @@ impl Pipeline {
                         }
                     }
                 }
-                match plane.pump_source(id, stream.session.unwrap(), stream.force_idr) {
+                let started = Instant::now();
+                let result = plane.pump_source(id, stream.session.unwrap(), stream.force_idr);
+                let elapsed = amaterasu_module_sdk::diagnostics::elapsed_us(started);
+                stream.timing.source_pump.record(elapsed);
+                if let Some(window) = &mut stream.diagnostics {
+                    window.timings.source_pump.record(elapsed);
+                }
+                match result {
                     Ok(completed) => {
                         if completed {
                             stream.force_idr = false;
@@ -1268,8 +1291,8 @@ impl Pipeline {
                 }
             } else {
                 pump(plane, stream, id, &self.queues, &self.processing_generation);
-                log_diagnostics(stream, id, send);
             }
+            log_diagnostics(stream, id, &self.queues, send);
             if let Ok(mut queues) = self.queues.try_lock() {
                 queues.set_geometry(id, stream.desktop_geometry);
                 if let Some(capture) = stream.capture {
