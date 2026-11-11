@@ -3641,6 +3641,39 @@ fn capture_touch_port(
     {
         return pipewire_touch_port(payload, configuration, desktop_geometry, source);
     }
+    if payload["frame_transport"] == "dmabuf"
+        && let Some(geometry) = desktop_geometry
+    {
+        // Source pixel dimensions and desktop input units are independent
+        // provider observations. Geometry alone cannot establish image size.
+        let dimensions = payload["width"].as_u64().zip(payload["height"].as_u64());
+        if let Some((width, height)) = dimensions {
+            let width = u32::try_from(width).map_err(|_| "invalid_capture_touch_surface")?;
+            let height = u32::try_from(height).map_err(|_| "invalid_capture_touch_surface")?;
+            if !consistent_output_scale(
+                geometry.output.width,
+                geometry.output.height,
+                width,
+                height,
+            ) {
+                return Err("capture_geometry_changed");
+            }
+            let surface = match payload.get("touch_surface") {
+                Some(value) => serde_json::from_value::<TouchSurface>(value.clone())
+                    .map_err(|_| "invalid_capture_touch_surface")?,
+                None => TouchSurface {
+                    width,
+                    height,
+                    logical_width: geometry.output.width,
+                    logical_height: geometry.output.height,
+                },
+            };
+            if surface.width != width || surface.height != height {
+                return Err("invalid_capture_touch_surface");
+            }
+            return fitted_touch_port(configuration, &surface).map(Some);
+        }
+    }
     let Some(value) = payload.get("touch_surface") else {
         return Ok(None);
     };
@@ -3701,9 +3734,19 @@ fn pipewire_touch_port(
     if !surface.validate() || surface.width != source.width || surface.height != source.height {
         return Err("invalid_capture_touch_surface");
     }
+    fitted_touch_port(configuration, &surface).map(Some)
+}
+
+fn fitted_touch_port(
+    configuration: &Configuration,
+    surface: &TouchSurface,
+) -> Result<Value, &'static str> {
+    if !surface.validate() {
+        return Err("invalid_capture_touch_surface");
+    }
     let fit = crate::image_fit::ImageFit::new(
-        source.width,
-        source.height,
+        surface.width,
+        surface.height,
         configuration.width,
         configuration.height,
     )
@@ -3711,11 +3754,11 @@ fn pipewire_touch_port(
     let mut port = json!({"width":configuration.width,"height":configuration.height,
         "logical_width":surface.logical_width,"logical_height":surface.logical_height,
         "client_offset_x":fit.left as f32,"client_offset_y":fit.top as f32});
-    if source.width != configuration.width || source.height != configuration.height {
+    if surface.width != configuration.width || surface.height != configuration.height {
         port["content_width"] = json!(fit.width);
         port["content_height"] = json!(fit.height);
     }
-    Ok(Some(port))
+    Ok(port)
 }
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {

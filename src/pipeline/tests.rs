@@ -1583,6 +1583,50 @@ fn capture_touch_surface_must_match_verified_output_rectangle() {
 }
 
 #[test]
+fn shared_dmabuf_source_reports_the_exact_fitted_input_rectangle() {
+    let source = json!({"width":1920,"height":1080,"frame_transport":"dmabuf"});
+    let configuration: Configuration =
+        serde_json::from_value(json!({"width":640,"height":480,"fps":60,"bitrate":1_000_000}))
+            .unwrap();
+    let port = capture_touch_port(
+        &source,
+        &configuration,
+        Some(geometry()),
+        CaptureProvider::Vkms,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        port,
+        json!({"width":640,"height":480,"logical_width":1920,"logical_height":1080,"client_offset_x":0.0,"client_offset_y":60.0,"content_width":640,"content_height":360})
+    );
+    let unknown = json!({"frame_transport":"dmabuf"});
+    assert!(
+        capture_touch_port(
+            &unknown,
+            &configuration,
+            Some(geometry()),
+            CaptureProvider::Vkms,
+            None
+        )
+        .unwrap()
+        .is_none()
+    );
+    let mismatch = json!({"width":1920,"height":1000,"frame_transport":"dmabuf"});
+    assert_eq!(
+        capture_touch_port(
+            &mismatch,
+            &configuration,
+            Some(geometry()),
+            CaptureProvider::Vkms,
+            None
+        ),
+        Err("capture_geometry_changed")
+    );
+}
+
+#[test]
 fn malformed_capture_touch_surface_fails_before_encoder_open_and_closes_capture() {
     let valid = touch_surface();
     let mut malformed = Vec::new();

@@ -398,8 +398,12 @@ fn unsupported_capture_or_encoder_requests_cpu_fallback() {
     let harness = Harness::default();
     harness.frame_width.set(32);
     let progress = deliver_once(&harness, true).unwrap();
-    assert_eq!(progress.dmabuf_fallback, Some("dmabuf_size_mismatch"));
-    assert!(harness.submitted.borrow().is_empty());
+    assert!(progress.submitted);
+    assert_eq!(progress.frame.unwrap().width, 32);
+    assert_eq!(harness.submitted.borrow().len(), 1);
+    harness.encoder_status.set(MEDIA_UNSUPPORTED);
+    let declined = deliver_once(&harness, true).unwrap();
+    assert_eq!(declined.dmabuf_fallback, Some("encoder_dmabuf_unsupported"));
 }
 
 #[test]
@@ -1344,8 +1348,6 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
     harness.frame_width.set(32);
     let initial =
         deliver_resource(&capture, &encoder, &pump(&config, true, false), &mut cache).unwrap();
-    assert_eq!(
-        initial.dmabuf_fallback,
-        Some("capture_resource_no_dmabuf_offer")
-    );
+    assert!(initial.capture_deferred);
+    assert_eq!(initial.dmabuf_fallback, None);
 }

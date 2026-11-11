@@ -154,8 +154,6 @@ fn source_color_matches(required_hdr: Option<bool>, color: u32) -> bool {
 struct Submission<'a> {
     api: &'a EncoderApiV1_1,
     encoder: u64,
-    width: u32,
-    height: u32,
     force_idr: bool,
     /// Require a capture-supplied, recognized source color on each frame.
     source_hdr_required: Option<bool>,
@@ -184,10 +182,6 @@ impl Submission<'_> {
             self.output_hdr_required,
         ) {
             return Rejection::of(reason, STATUS_OK, frame);
-        }
-        if frame.width != self.width || frame.height != self.height {
-            // The GPU path never scales; PipeWire capture fits mismatched sizes.
-            return Outcome::Unsupported("dmabuf_size_mismatch");
         }
         let mut forwarded = *frame;
         forwarded.timestamp_us = self.timestamp_us;
@@ -259,8 +253,6 @@ pub fn deliver(
     let mut submission = Submission {
         api: encoder,
         encoder: input.encoder,
-        width: input.configuration.width,
-        height: input.configuration.height,
         force_idr: input.force_idr,
         source_hdr_required: input
             .configuration
@@ -337,9 +329,6 @@ impl LeasedSubmission<'_> {
             self.common.output_hdr_required,
         ) {
             return Rejection::of(reason, STATUS_OK, frame);
-        }
-        if frame.width != self.common.width || frame.height != self.common.height {
-            return Outcome::Unsupported("dmabuf_size_mismatch");
         }
         let mut forwarded = *lease;
         forwarded.frame.timestamp_us = self.common.timestamp_us;
@@ -419,8 +408,6 @@ pub fn deliver_leased(
         common: Submission {
             api: legacy_encoder,
             encoder: input.encoder,
-            width: input.configuration.width,
-            height: input.configuration.height,
             force_idr: input.force_idr,
             source_hdr_required: input
                 .configuration

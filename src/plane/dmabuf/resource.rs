@@ -25,8 +25,6 @@ fn reconfiguration_expired(started: Option<Instant>, now: Instant) -> bool {
 struct Offers {
     ids: Vec<u64>,
     selection: Option<Selection>,
-    width: u32,
-    height: u32,
     invalid: bool,
 }
 fn sync_file_offer(d: &FrameDescriptor) -> bool {
@@ -85,8 +83,8 @@ unsafe extern "C" fn offer(context: *mut c_void, offer: *const CaptureResourceOf
         && matches!(caps.color, DMABUF_COLOR_SRGB | DMABUF_COLOR_BT2020_PQ)
         && caps.min_width > 0
         && caps.min_height > 0
-        && (caps.min_width..=caps.max_width).contains(&state.width)
-        && (caps.min_height..=caps.max_height).contains(&state.height)
+        && caps.min_width <= caps.max_width
+        && caps.min_height <= caps.max_height
     {
         state.selection = Some(Selection { id: offer.id, caps });
     }
@@ -287,8 +285,6 @@ pub(in crate::plane) fn deliver(
             let mut offers = Offers {
                 ids: vec![],
                 selection: None,
-                width: input.configuration.width,
-                height: input.configuration.height,
                 invalid: false,
             };
             let mut generation = 0;
@@ -353,8 +349,6 @@ pub(in crate::plane) fn deliver(
                 common: Submission {
                     api: legacy,
                     encoder: input.encoder,
-                    width: input.configuration.width,
-                    height: input.configuration.height,
                     force_idr: input.force_idr,
                     source_hdr_required: input
                         .configuration
@@ -598,8 +592,6 @@ mod tests {
                 common: Submission {
                     api: legacy,
                     encoder: 1,
-                    width: 1,
-                    height: 1,
                     force_idr: false,
                     source_hdr_required: None,
                     output_hdr_required: None,
@@ -667,8 +659,6 @@ mod tests {
         let mut state = Offers {
             ids: vec![],
             selection: None,
-            width: 64,
-            height: 48,
             invalid: false,
         };
         candidate.ownership = FRAME_OWNERSHIP_BORROWED;
@@ -692,8 +682,6 @@ mod tests {
         let mut invalid = Offers {
             ids: vec![],
             selection: None,
-            width: 64,
-            height: 48,
             invalid: false,
         };
         assert_eq!(

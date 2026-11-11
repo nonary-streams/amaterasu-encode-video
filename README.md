@@ -173,11 +173,17 @@ Fallbacks never fail a stream that PipeWire can still serve:
   reopens the same output through PipeWire with a fresh operation ID and records
   the provider's code. Lost or uncertain vkms replies keep the normal settle and
   cleanup path, because they may have opened a stream;
-- `MEDIA_UNSUPPORTED` from `read_dmabuf_frame` or `submit_dmabuf`, or a frame
-  size mismatch, switches a running stream to CPU capture once: video closes the
+- `MEDIA_UNSUPPORTED` from `read_dmabuf_frame` or `submit_dmabuf` switches a
+  running stream to CPU capture once: video closes the
   vkms capture (stage `cpu-fallback-close-capture`), opens PipeWire for the same
   output, keeps the encoder session and packet queue, and forces a keyframe on
   the first CPU frame.
+
+Source DMA-BUF dimensions remain intact at submission. The selected encoder
+owns fitting them to its independently configured output size; NVENC/CUDA does
+this on the GPU, including centered black borders. A provider without that
+support declines the source before accepting input. Negotiated CUDA processing
+output follows the same source/output size distinction.
 
 Status for these streams adds `frame_path` (`dmabuf` or `cpu`, reported for every
 stream), `vkms_fallback_reason` and `dmabuf_frames`; `capture_provider` names the
