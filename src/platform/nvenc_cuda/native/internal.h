@@ -202,6 +202,7 @@ struct am_gl_pass {
     GLint source;
     GLint rows[2];
     GLint ten_bit;
+    GLint image_fit;
 };
 
 /* GPU RGB -> NV12 converter owned by one encoder. The EGL context is current
@@ -261,7 +262,8 @@ void am_cuda_input_close(struct am_cuda_input *input, const struct am_driver *dr
 /* Queues: wait for `ready`, then convert `source` into the slot at `target`. */
 int am_cuda_input_convert(const struct am_cuda_input *input, const struct am_driver *driver,
                           const struct am_converter *converter, CUstream stream, CUevent ready,
-                          CUdeviceptr source, uint32_t source_pitch, CUdeviceptr target,
+                          CUdeviceptr source, uint32_t source_pitch, uint32_t source_width,
+                          uint32_t source_height, CUdeviceptr target,
                           size_t target_pitch, struct am_nvcuda_status *status);
 
 /* Completes queued GL conversion reads; the converter's context is current. */

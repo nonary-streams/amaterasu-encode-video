@@ -179,6 +179,7 @@ pub struct Session {
     encode_latency_window: LatencyMetric,
     /// Producer offer configured for resource frames (generation, offer).
     resource_producer: Option<(u64, u64)>,
+    resource_source_format: Option<CudaDeviceCapabilities>,
 }
 
 /// Owned provider reference; callbacks stay on the module thread. Only duplicated
@@ -485,6 +486,7 @@ impl Sessions {
                 delivery_wait: DeliveryWait::default(),
                 encode_latency_window: LatencyMetric::default(),
                 resource_producer: None,
+                resource_source_format: None,
             },
         );
         Ok(response)
@@ -855,6 +857,9 @@ impl Sessions {
             return MEDIA_UNSUPPORTED;
         }
         session.resource_producer = Some((producer_generation, producer.id));
+        // SAFETY: compatibility above validated this complete borrowed payload.
+        session.resource_source_format =
+            unsafe { cuda_device_capabilities(&producer.resource) }.copied();
         STATUS_OK
     }
 
@@ -880,6 +885,12 @@ impl Sessions {
             return MEDIA_UNSUPPORTED;
         }
         if session.resource_producer != Some((frame.offer_generation, frame.offer_id)) {
+            return MEDIA_UNSUPPORTED;
+        }
+        if !session.resource_source_format.is_some_and(|source| {
+            (source.min_width..=source.max_width).contains(&frame.width)
+                && (source.min_height..=source.max_height).contains(&frame.height)
+        }) {
             return MEDIA_UNSUPPORTED;
         }
         // SAFETY: the caller keeps the frame and payloads live for this call.
@@ -1171,10 +1182,26 @@ impl Session {
             CudaDeviceCapabilities {
                 device_uuid,
                 format: CUDA_FORMAT_X2B10G10R10,
-                min_width: self.config.width,
-                max_width: self.config.width,
-                min_height: self.config.height,
-                max_height: self.config.height,
+                min_width: if self.input_support.gpu_scaling {
+                    16
+                } else {
+                    self.config.width
+                },
+                max_width: if self.input_support.gpu_scaling {
+                    8192
+                } else {
+                    self.config.width
+                },
+                min_height: if self.input_support.gpu_scaling {
+                    16
+                } else {
+                    self.config.height
+                },
+                max_height: if self.input_support.gpu_scaling {
+                    8192
+                } else {
+                    self.config.height
+                },
                 reserved: 0,
             },
             CudaEventCapabilities { device_uuid },
@@ -1184,9 +1211,12 @@ impl Session {
     /// # Safety
     /// The frame, its payloads and callbacks must be live for this call.
     unsafe fn submit_cuda(&mut self, frame: &CaptureResourceFrame, force: u32) -> Status {
+        if !self.accepts_gpu_dimensions(frame.width, frame.height) {
+            return MEDIA_UNSUPPORTED;
+        }
         let timestamp = match self.admit(
-            frame.width,
-            frame.height,
+            self.config.width,
+            self.config.height,
             frame.timestamp_us,
             frame.sequence,
             force,
@@ -1256,9 +1286,12 @@ impl Session {
         let Some(import) = self.input_support.dmabuf.clone() else {
             return MEDIA_UNSUPPORTED;
         };
+        if !self.accepts_gpu_dimensions(frame.width, frame.height) {
+            return MEDIA_UNSUPPORTED;
+        }
         let timestamp = match self.admit(
-            frame.width,
-            frame.height,
+            self.config.width,
+            self.config.height,
             frame.timestamp_us,
             frame.sequence,
             force,
@@ -1322,6 +1355,13 @@ impl Session {
             self.retained_frames.insert(timestamp, retained);
         }
         status
+    }
+
+    fn accepts_gpu_dimensions(&self, width: u32, height: u32) -> bool {
+        (width == self.config.width && height == self.config.height)
+            || (self.input_support.gpu_scaling
+                && (16..=8192).contains(&width)
+                && (16..=8192).contains(&height))
     }
 
     fn record_submission(

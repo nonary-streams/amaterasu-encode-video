@@ -105,6 +105,7 @@ fn harness(support: InputSupport) -> Harness {
 fn gpu_harness() -> Harness {
     harness(InputSupport {
         gpu_bgra_conversion: true,
+        gpu_scaling: false,
         dmabuf: Some(import_support()),
         cuda_device: None,
     })
@@ -236,6 +237,46 @@ fn busy_and_unsupported_submissions_duplicate_nothing() {
 }
 
 #[test]
+fn only_scaling_backends_accept_independent_gpu_source_dimensions() {
+    for scaling in [false, true] {
+        let mut host = harness(InputSupport {
+            gpu_bgra_conversion: true,
+            gpu_scaling: scaling,
+            dmabuf: Some(import_support()),
+            cuda_device: None,
+        });
+        let (plane, mut writer) = stand_in();
+        let mut source = frame(&plane, None, 1);
+        source.width = 32;
+        source.height = 48;
+        source.planes[0].pitch = source.width * 4;
+        assert_eq!(
+            submit(&mut host, &source, 1),
+            if scaling {
+                STATUS_OK
+            } else {
+                MEDIA_UNSUPPORTED
+            }
+        );
+        let observed = host.observed.lock().unwrap();
+        assert_eq!(observed.dmabuf.len(), usize::from(scaling));
+        if scaling {
+            assert_eq!(
+                (observed.dmabuf[0].width, observed.dmabuf[0].height),
+                (32, 48)
+            );
+        }
+        drop(observed);
+        let session = host.sessions.values.get(&host.id).unwrap();
+        assert_eq!((session.config.width, session.config.height), (16, 16));
+        assert_eq!(session.last_input.is_some(), scaling);
+        host.observed.lock().unwrap().dmabuf.clear();
+        drop(plane);
+        assert!(reader_closed(&mut writer));
+    }
+}
+
+#[test]
 fn backends_without_gpu_import_report_unsupported() {
     let mut harness = harness(InputSupport::default());
     let (plane, mut plane_writer) = stand_in();
@@ -259,8 +300,6 @@ fn malformed_dmabuf_frames_are_rejected_before_duplication() {
     negative_fd.planes[0].fd = -1;
     let mut reserved = valid;
     reserved.reserved = 1;
-    let mut wrong_size = valid;
-    wrong_size.width = 32;
     let mut stray_plane = valid;
     stray_plane.planes[1].fd = plane.as_raw_fd();
     let mut force_two = valid;
@@ -269,7 +308,6 @@ fn malformed_dmabuf_frames_are_rejected_before_duplication() {
         ("no planes", no_planes, 0),
         ("negative fd", negative_fd, 0),
         ("reserved", reserved, 0),
-        ("dimensions", wrong_size, 0),
         ("unused plane", stray_plane, 0),
         ("force", force_two, 2),
     ] {
@@ -471,6 +509,7 @@ fn gpu_readiness_is_authorized_and_never_accepts_or_reserves_an_input() {
             Box::new(GpuFake {
                 support: InputSupport {
                     gpu_bgra_conversion: true,
+                    gpu_scaling: false,
                     dmabuf: Some(import_support()),
                     cuda_device: None,
                 },
@@ -515,6 +554,7 @@ fn installed_compatibility_table_keeps_the_timing_prefix_and_exposes_readiness()
             Box::new(GpuFake {
                 support: InputSupport {
                     gpu_bgra_conversion: true,
+                    gpu_scaling: false,
                     dmabuf: Some(import_support()),
                     cuda_device: None,
                 },
@@ -582,6 +622,7 @@ impl WorkerBackend for HoldingBackend {
     fn input_support(&self) -> InputSupport {
         InputSupport {
             gpu_bgra_conversion: true,
+            gpu_scaling: false,
             dmabuf: Some(import_support()),
             cuda_device: None,
         }
@@ -789,6 +830,7 @@ impl WorkerBackend for CompletionBackend {
     fn input_support(&self) -> InputSupport {
         InputSupport {
             gpu_bgra_conversion: true,
+            gpu_scaling: false,
             dmabuf: Some(import_support()),
             cuda_device: None,
         }
@@ -1076,6 +1118,7 @@ impl Backend for ImmediateGpuPacket {
     fn input_support(&self) -> InputSupport {
         InputSupport {
             gpu_bgra_conversion: true,
+            gpu_scaling: false,
             dmabuf: Some(import_support()),
             cuda_device: None,
         }
@@ -1202,6 +1245,7 @@ const CUDA_DEVICE: [u8; 16] = [5; 16];
 fn cuda_harness() -> Harness {
     let mut harness = harness(InputSupport {
         gpu_bgra_conversion: false,
+        gpu_scaling: false,
         dmabuf: None,
         cuda_device: Some(CUDA_DEVICE),
     });
@@ -1210,6 +1254,7 @@ fn cuda_harness() -> Harness {
     let backend = GpuFake {
         support: InputSupport {
             gpu_bgra_conversion: false,
+            gpu_scaling: false,
             dmabuf: None,
             cuda_device: Some(CUDA_DEVICE),
         },

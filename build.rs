@@ -239,6 +239,7 @@ fn build_linux_nvenc_cuda() {
     }
     println!("cargo:rerun-if-changed=src/platform/nvenc_cuda/native/adapter.h");
     println!("cargo:rerun-if-changed=src/platform/nvenc_cuda/native/internal.h");
+    println!("cargo:rerun-if-changed=src/platform/nvenc_cuda/native/image_fit.h");
     println!("cargo:rerun-if-env-changed=AMATERASU_NVENC_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=AMATERASU_EGL_INCLUDE_DIR");
     if env::var_os("CARGO_FEATURE_LINUX_NVENC_CUDA").is_none() {

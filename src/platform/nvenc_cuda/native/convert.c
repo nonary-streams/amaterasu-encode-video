@@ -12,6 +12,7 @@
  * which is centre sited, exactly like the CPU reference.
  */
 #include "internal.h"
+#include "image_fit.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -30,14 +31,32 @@ static const char vertex_source[] =
 
 /* Output row y reads source row y: GL texture row 0, framebuffer row 0 and
  * CUDA array row 0 are all the first row in memory, so no flip is needed. */
+/* Sample output pixels through the complete fitted source rectangle. */
+#define AM_IMAGE_SAMPLE \
+    "uniform vec4 image_fit;\n" \
+    "vec3 image_rgb(ivec2 p) {\n" \
+    "    ivec2 q = p - ivec2(image_fit.xy);\n" \
+    "    ivec2 fit = ivec2(image_fit.zw), size = textureSize(source, 0);\n" \
+    "    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, fit))) return vec3(0);\n" \
+    "    if (all(equal(size, fit))) return texelFetch(source, q, 0).rgb;\n" \
+    "    vec2 at = vec2(q) * vec2(size - 1) / vec2(max(fit - 1, ivec2(1)));\n" \
+    "    if (fit.x == 1) at.x = float(size.x - 1) * 0.5;\n" \
+    "    if (fit.y == 1) at.y = float(size.y - 1) * 0.5;\n" \
+    "    ivec2 lo = ivec2(at), hi = min(lo + 1, size - 1);\n" \
+    "    vec2 weight = fract(at);\n" \
+    "    return mix(mix(texelFetch(source, lo, 0).rgb, texelFetch(source, ivec2(hi.x, lo.y), 0).rgb, weight.x),\n" \
+    "               mix(texelFetch(source, ivec2(lo.x, hi.y), 0).rgb, texelFetch(source, hi, 0).rgb, weight.x), weight.y);\n" \
+    "}\n"
+
 static const char luma_source[] =
     "#version 330 core\n"
     "uniform sampler2D source;\n"
+    AM_IMAGE_SAMPLE
     "uniform int ten_bit;\n"
     "uniform vec4 luma_row;\n"
     "layout(location = 0) out float luma;\n"
     "void main() {\n"
-    "    vec3 rgb = texelFetch(source, ivec2(gl_FragCoord.xy), 0).rgb;\n"
+    "    vec3 rgb = image_rgb(ivec2(gl_FragCoord.xy));\n"
     "    float code = clamp(dot(luma_row.rgb, rgb) + luma_row.a, 0.0, 1.0);\n"
     "    luma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
     "}\n";
@@ -45,16 +64,17 @@ static const char luma_source[] =
 static const char chroma_source[] =
     "#version 330 core\n"
     "uniform sampler2D source;\n"
+    AM_IMAGE_SAMPLE
     "uniform int ten_bit;\n"
     "uniform vec4 cb_row;\n"
     "uniform vec4 cr_row;\n"
     "layout(location = 0) out vec2 chroma;\n"
     "void main() {\n"
     "    ivec2 origin = ivec2(gl_FragCoord.xy) * 2;\n"
-    "    vec3 rgb = (texelFetch(source, origin, 0).rgb +\n"
-    "                texelFetch(source, origin + ivec2(1, 0), 0).rgb +\n"
-    "                texelFetch(source, origin + ivec2(0, 1), 0).rgb +\n"
-    "                texelFetch(source, origin + ivec2(1, 1), 0).rgb) * 0.25;\n"
+    "    vec3 rgb = (image_rgb(origin) +\n"
+    "                image_rgb(origin + ivec2(1, 0)) +\n"
+    "                image_rgb(origin + ivec2(0, 1)) +\n"
+    "                image_rgb(origin + ivec2(1, 1))) * 0.25;\n"
     "    vec2 code = clamp(vec2(dot(cb_row.rgb, rgb) + cb_row.a, dot(cr_row.rgb, rgb) + cr_row.a), 0.0, 1.0);\n"
     "    chroma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
     "}\n";
@@ -237,9 +257,10 @@ static int build_pass(const struct am_gl_api *gl, const char *fragment_source,
     pass->program = program;
     pass->source = gl->get_uniform_location(program, "source");
     pass->ten_bit = gl->get_uniform_location(program, "ten_bit");
+    pass->image_fit = gl->get_uniform_location(program, "image_fit");
     pass->rows[0] = gl->get_uniform_location(program, first_row);
     pass->rows[1] = second_row != NULL ? gl->get_uniform_location(program, second_row) : -1;
-    return pass->ten_bit >= 0 && pass->source >= 0 && pass->rows[0] >= 0 && (second_row == NULL || pass->rows[1] >= 0);
+    return pass->image_fit >= 0 && pass->ten_bit >= 0 && pass->source >= 0 && pass->rows[0] >= 0 && (second_row == NULL || pass->rows[1] >= 0);
 }
 
 static void set_sampling(const struct am_gl_api *gl) {
@@ -440,7 +461,7 @@ void am_converter_close(struct am_converter *converter) {
 
 static void draw_pass(const struct am_converter *converter, const struct am_gl_pass *pass,
                       GLuint framebuffer, uint32_t width, uint32_t height,
-                      const float *first_row, const float *second_row, GLuint source) {
+                      const float *first_row, const float *second_row, GLuint source, const float fit[4]) {
     const struct am_gl_api *gl = &converter->gl;
     gl->bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
     gl->viewport(0, 0, (GLsizei)width, (GLsizei)height);
@@ -449,6 +470,7 @@ static void draw_pass(const struct am_converter *converter, const struct am_gl_p
     gl->bind_texture(GL_TEXTURE_2D, source);
     gl->uniform1i(pass->source, 0);
     gl->uniform1i(pass->ten_bit, converter->bit_depth == 10);
+    gl->uniform4fv(pass->image_fit, 1, fit);
     gl->uniform4fv(pass->rows[0], 1, first_row);
     if (second_row != NULL) {
         gl->uniform4fv(pass->rows[1], 1, second_row);
@@ -458,13 +480,17 @@ static void draw_pass(const struct am_converter *converter, const struct am_gl_p
 }
 
 static int convert_texture(struct am_converter *converter, GLuint source,
+                           uint32_t source_width, uint32_t source_height,
                            struct am_nvcuda_status *status) {
     const struct am_gl_api *gl = &converter->gl;
+    int rectangle[4];
+    am_image_fit(source_width, source_height, converter->width, converter->height, rectangle);
+    const float fit[4] = {(float)rectangle[0], (float)rectangle[1], (float)rectangle[2], (float)rectangle[3]};
     draw_pass(converter, &converter->luma_pass, converter->luma_framebuffer, converter->width,
-              converter->height, converter->luma_row, NULL, source);
+              converter->height, converter->luma_row, NULL, source, fit);
     draw_pass(converter, &converter->chroma_pass, converter->chroma_framebuffer,
               converter->width / 2, converter->height / 2, converter->cb_row, converter->cr_row,
-              source);
+              source, fit);
     gl->bind_texture(GL_TEXTURE_2D, 0);
     gl->bind_framebuffer(GL_FRAMEBUFFER, 0);
     gl->flush();
@@ -490,7 +516,7 @@ int am_converter_upload_bgra(struct am_converter *converter, const uint8_t *bgra
         am_set_status(status, AM_STAGE_UPLOAD, (int32_t)error);
         return AM_NVCUDA_NATIVE_FAILURE;
     }
-    return convert_texture(converter, converter->upload_texture, status);
+    return convert_texture(converter, converter->upload_texture, converter->width, converter->height, status);
 }
 
 /* Bounded CPU wait for a sync_file; used when EGL cannot wait on the GPU. */
@@ -599,7 +625,7 @@ static EGLImageKHR create_dmabuf_image(const struct am_converter *converter,
 
 static int validate_dmabuf(const struct am_converter *converter,
                            const struct am_nvcuda_dmabuf *frame) {
-    if (frame->width != converter->width || frame->height != converter->height ||
+    if (frame->width < 16 || frame->width > 8192 || frame->height < 16 || frame->height > 8192 ||
         frame->plane_count == 0 || frame->plane_count > AM_NVCUDA_MAX_PLANES) {
         return 0;
     }
@@ -659,7 +685,7 @@ int am_converter_import_dmabuf(struct am_converter *converter, uint32_t slot,
         am_set_status(status, AM_STAGE_IMPORT, (int32_t)error);
         result = AM_NVCUDA_IMPORT_FAILED;
     } else {
-        result = convert_texture(converter, source, status);
+        result = convert_texture(converter, source, frame->width, frame->height, status);
         if (result == AM_NVCUDA_OK && timed) {
             gl->query_counter(converter->timer_queries[slot][1], GL_TIMESTAMP);
             converter->timer_pending[slot] = 1;

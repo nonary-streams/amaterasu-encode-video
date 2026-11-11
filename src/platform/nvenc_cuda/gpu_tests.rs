@@ -484,6 +484,10 @@ struct GbmBuffer(TestBuffer);
 
 impl GbmBuffer {
     fn allocate() -> Self {
+        Self::allocate_size(WIDTH, HEIGHT)
+    }
+
+    fn allocate_size(width: u32, height: u32) -> Self {
         let node = std::env::var("AMATERASU_TEST_RENDER_NODE")
             .unwrap_or_else(|_| "/dev/dri/renderD128".into());
         let node = CString::new(node).unwrap();
@@ -500,8 +504,8 @@ impl GbmBuffer {
         let result = unsafe {
             amaterasu_nvcuda_test_allocate_gbm(
                 node.as_ptr(),
-                WIDTH,
-                HEIGHT,
+                width,
+                height,
                 TOP_XRGB,
                 BOTTOM_XRGB,
                 u32::from_le_bytes(*b"XR24"),
@@ -559,6 +563,16 @@ unsafe extern "C" fn collect_packet(context: *mut c_void, packet: *const Encoded
 #[test]
 #[ignore = "requires an NVIDIA GPU with NVENC and a GBM render node on it"]
 fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
+    encode_shared_sdr_source(1);
+}
+
+#[test]
+#[ignore = "requires an NVIDIA GPU with NVENC and a GBM render node on it"]
+fn nvenc_cuda_gpu_scales_shared_sdr_capture_without_cpu_readback() {
+    encode_shared_sdr_source(2);
+}
+
+fn encode_shared_sdr_source(scale: u32) {
     let description = published()
         .into_iter()
         .find(|entry| entry.capabilities.inputs.contains(&"dmabuf"))
@@ -576,7 +590,7 @@ fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
         )
         .unwrap();
     let id = reply["session_id"].as_u64().unwrap();
-    let buffer = GbmBuffer::allocate();
+    let buffer = GbmBuffer::allocate_size(WIDTH * scale, HEIGHT * scale);
     let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
     let sink = PacketSink {
         context: (&mut packets as *mut Vec<(u32, Vec<u8>)>).cast(),
@@ -584,7 +598,9 @@ fn nvenc_cuda_gpu_imports_a_gbm_dmabuf_through_the_native_session() {
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     for sequence in 1..=FRAMES {
-        let frame = buffer.frame(sequence);
+        let mut frame = buffer.frame(sequence);
+        frame.width *= scale;
+        frame.height *= scale;
         let force = u32::from(sequence == 1);
         loop {
             // SAFETY: the GBM descriptor stays open for the call.
@@ -1221,6 +1237,17 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
 #[test]
 #[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
 fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
+    compare_cuda_and_dmabuf(WIDTH, HEIGHT);
+}
+
+#[test]
+#[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
+fn nvenc_cuda_gpu_fits_shared_sources_to_independent_client_sizes() {
+    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 2);
+    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 4);
+}
+
+fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
     // Same picture in both inputs: AR30 orders blue in the low bits, the CUDA
     // schema red; channel values are identical.
     let (red, green, blue) = (719u32, 321u32, 183u32);
@@ -1247,8 +1274,8 @@ fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
     let result = unsafe {
         amaterasu_nvcuda_test_allocate_gbm(
             node.as_ptr(),
-            WIDTH,
-            HEIGHT,
+            source_width,
+            source_height,
             ar30_top,
             ar30_bottom,
             u32::from_le_bytes(*b"AR30"),
@@ -1261,8 +1288,8 @@ fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
     // SAFETY: test-only CUDA allocation released at the end of this test.
     let result = unsafe {
         amaterasu_nvcuda_test_cuda_frame(
-            WIDTH,
-            HEIGHT,
+            source_width,
+            source_height,
             cuda_top,
             cuda_bottom,
             &mut pointer,
@@ -1302,12 +1329,14 @@ fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
                     GpuInput::Cuda(crate::input::CudaInput {
                         pointer,
                         pitch,
-                        width: WIDTH,
-                        height: HEIGHT,
+                        width: source_width,
+                        height: source_height,
                         ready: event as usize,
                     })
                 } else {
                     let mut frame = buffer.frame(sequence);
+                    frame.width = source_width;
+                    frame.height = source_height;
                     frame.fourcc = u32::from_le_bytes(*b"AR30");
                     frame.color = DMABUF_COLOR_BT2020_PQ;
                     // SAFETY: allocation and descriptors outlive this duplication.
@@ -1328,10 +1357,49 @@ fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
         let through_cuda = encode(true);
         assert_eq!(through_gl.len() as u64, FRAMES);
         // Identical P010 input makes NVENC's output byte-identical.
-        assert!(
-            through_gl == through_cuda,
-            "{codec:?} {color_mode:?}: CUDA input changed the encoded stream"
-        );
+        if (source_width, source_height) == (WIDTH, HEIGHT) {
+            assert!(
+                through_gl == through_cuda,
+                "{codec:?} {color_mode:?}: CUDA input changed the encoded stream"
+            );
+        } else {
+            let mut decoded = Vec::new();
+            for (name, packets) in [("scaled-dmabuf", through_gl), ("scaled-cuda", through_cuda)] {
+                let path = stream_file(codec, name, packets);
+                let signal = probe(codec, &path);
+                assert_eq!(signal["width"], WIDTH);
+                assert_eq!(signal["height"], HEIGHT);
+                let frames = decode(codec, &path);
+                assert_eq!(frames.len() as u64, FRAMES);
+                if source_height == HEIGHT * 4 {
+                    let black = if color_mode == ColorMode::Bt709Full {
+                        0
+                    } else {
+                        16
+                    };
+                    for row in frames[0][..(WIDTH * HEIGHT) as usize].chunks(WIDTH as usize) {
+                        for pixel in row[..150].iter().chain(&row[490..]) {
+                            assert!(
+                                pixel.abs_diff(black) <= 2,
+                                "{name}: fitted image lost its black borders"
+                            );
+                        }
+                        assert!(
+                            row[WIDTH as usize / 2] > black + 20,
+                            "{name}: missing center content"
+                        );
+                    }
+                }
+                decoded.push(frames);
+                std::fs::remove_file(path).unwrap();
+            }
+            for (gl, cuda) in decoded[0].iter().zip(&decoded[1]) {
+                assert!(
+                    gl.iter().zip(cuda).all(|(a, b)| a.abs_diff(*b) <= 3),
+                    "{codec:?} {color_mode:?}: scaling paths disagree"
+                );
+            }
+        }
     }
     // SAFETY: every encoder using the frame has been closed.
     unsafe { amaterasu_nvcuda_test_release_cuda_frame(pointer, event) };

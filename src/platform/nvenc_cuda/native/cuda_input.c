@@ -6,6 +6,7 @@
  * luma and chroma passes in convert.c and ships as checked-in PTX.
  */
 #include "internal.h"
+#include "image_fit.h"
 #include "nvenc_convert_ptx.h"
 
 #include <stdio.h>
@@ -57,7 +58,8 @@ void am_cuda_input_close(struct am_cuda_input *input, const struct am_driver *dr
 
 int am_cuda_input_convert(const struct am_cuda_input *input, const struct am_driver *driver,
                           const struct am_converter *converter, CUstream stream, CUevent ready,
-                          CUdeviceptr source, uint32_t source_pitch, CUdeviceptr target,
+                          CUdeviceptr source, uint32_t source_pitch, uint32_t source_width,
+                          uint32_t source_height, CUdeviceptr target,
                           size_t target_pitch, struct am_nvcuda_status *status) {
     const struct am_cuda_api *cuda = &driver->cuda;
     if (!input->available || stream == NULL || ready == NULL || target_pitch > UINT32_MAX) {
@@ -79,7 +81,11 @@ int am_cuda_input_convert(const struct am_cuda_input *input, const struct am_dri
     unsigned int pitch_out = (unsigned int)target_pitch;
     int width = (int)converter->width;
     int height = (int)converter->height;
-    void *arguments[] = {&source, &pitch_in, &target, &pitch_out, &width, &height, &rows};
+    int source_w = (int)source_width, source_h = (int)source_height;
+    int fit[4];
+    am_image_fit(source_width, source_height, converter->width, converter->height, fit);
+    void *arguments[] = {&source, &pitch_in, &target, &pitch_out, &width, &height,
+                        &source_w, &source_h, &fit[0], &fit[1], &fit[2], &fit[3], &rows};
     const unsigned int blocks_x = (converter->width / 2 + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
     const unsigned int blocks_y = (converter->height / 2 + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
     result = cuda->launch_kernel(input->to_p010, blocks_x, blocks_y, 1, AM_CUDA_INPUT_BLOCK,

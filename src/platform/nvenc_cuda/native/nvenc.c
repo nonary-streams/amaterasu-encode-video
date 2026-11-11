@@ -906,8 +906,8 @@ int amaterasu_nvcuda_cuda_input(const struct am_nvcuda_encoder *encoder, uint8_t
 int amaterasu_nvcuda_import_cuda(struct am_nvcuda_encoder *encoder, uint32_t slot,
                                  uint64_t pointer, uint32_t pitch, uint32_t width,
                                  uint32_t height, void *ready, struct am_nvcuda_status *status) {
-    if (!input_writable(encoder, slot) || width != encoder->width ||
-        height != encoder->height || pointer == 0 || pitch < width * 4u) {
+    if (!input_writable(encoder, slot) || width < 16 || width > 8192 ||
+        height < 16 || height > 8192 || pointer == 0 || pitch < width * 4u) {
         am_set_status(status, AM_STAGE_IMPORT, 0);
         return AM_NVCUDA_INVALID_ARGUMENT;
     }
@@ -916,7 +916,7 @@ int amaterasu_nvcuda_import_cuda(struct am_nvcuda_encoder *encoder, uint32_t slo
     uint64_t started = monotonic_us();
     int result = am_cuda_input_convert(&encoder->cuda_input, encoder->driver,
                                        &encoder->converter, encoder->conversion_stream,
-                                       (CUevent)ready, (CUdeviceptr)pointer, pitch, target->input,
+                                       (CUevent)ready, (CUdeviceptr)pointer, pitch, width, height, target->input,
                                        target->input_pitch, status);
     target->timings.import_convert_us = elapsed_us(started);
     if (result != AM_NVCUDA_OK && synchronize_conversion(encoder, status) != AM_NVCUDA_OK) {

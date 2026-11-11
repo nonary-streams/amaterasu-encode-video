@@ -15,6 +15,9 @@ use std::{
 pub struct InputSupport {
     /// BGRA CPU frames are converted to NV12 on the GPU, not by `layout`.
     pub gpu_bgra_conversion: bool,
+    /// GPU source frames may differ from the encoded output size. The backend
+    /// fits the complete source into that output with centered black borders.
+    pub gpu_scaling: bool,
     /// `None` when the backend cannot import DMA-BUFs at all.
     pub dmabuf: Option<Arc<DmaBufImportSupport>>,
     /// CUDA vendor-schema input (encoder v1.5): the UUID of the device whose

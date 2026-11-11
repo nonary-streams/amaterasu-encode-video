@@ -550,6 +550,7 @@ impl Encoder {
         };
         encoder.input_support = InputSupport {
             gpu_bgra_conversion: !configuration.is_hdr(),
+            gpu_scaling: true,
             dmabuf: encoder.import_support(configuration.is_hdr()),
             cuda_device: encoder
                 .cuda_input_device()
