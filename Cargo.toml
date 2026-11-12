@@ -8,6 +8,12 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# Opt-in Vulkan PyroWave provider using the pinned standalone C API at runtime.
+pyrowave = ["dep:libloading"]
+# Direct Linux DMA-BUF import and HDR conversion on the PyroWave Vulkan device.
+pyrowave-gpu = ["pyrowave"]
+# Render-node fixtures are compiled only for explicit GPU qualification.
+pyrowave-gpu-tests = ["pyrowave-gpu"]
 # x264 is GPL-2.0-or-later or commercially licensed. Distribution is explicit.
 software-x264 = ["dep:libloading"]
 # Explicit Linux FFmpeg/NVIDIA hardware path; runtime discovery still requires

@@ -601,6 +601,8 @@ pub(super) fn module(sessions: Sessions) -> crate::EncodeModule {
     let (_, log_queue) = runtime.log_emitter();
     let shared = Arc::new(Mutex::new(sessions));
     crate::EncodeModule {
+        #[cfg(feature = "pyrowave")]
+        pyrowave: None,
         preparation: crate::preparation::Preparation::new(runtime.work_notifier()).unwrap(),
         runtime,
         _registration: Box::new(crate::native::Registration::new(shared.clone())),

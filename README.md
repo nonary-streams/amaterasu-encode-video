@@ -1,5 +1,9 @@
 # Video encoder
 
+The optional `pyrowave` feature adds a submitted-frame PyroWave provider through
+the public encoder SDK. See [PyroWave setup and qualification](PYROWAVE.md) for
+its supported profile, explicit startup composition and remaining streaming work.
+
 `amaterasu-encode` provides `amaterasu.encode/1` control and the matching native
 `amaterasu_media::EncoderApi` interface. Settings default to `{"enabled":false}`.
 Disabled enumeration returns an empty list and opening returns `disabled`.

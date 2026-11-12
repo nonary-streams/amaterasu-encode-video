@@ -12,6 +12,8 @@ mod native;
 mod platform;
 mod preparation;
 mod probe;
+#[cfg(feature = "pyrowave")]
+mod pyrowave;
 mod sessions;
 mod worker;
 use amaterasu_module_sdk::{
@@ -29,6 +31,9 @@ const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    #[cfg(feature = "pyrowave")]
+    #[serde(default)]
+    pyrowave: Option<pyrowave::Settings>,
 }
 
 struct EncodeModule {
@@ -40,6 +45,8 @@ struct EncodeModule {
     closing: closing::Closing,
     preparation: preparation::Preparation,
     _registration: Box<native::Registration>,
+    #[cfg(feature = "pyrowave")]
+    pyrowave: Option<pyrowave::Plugin>,
 }
 
 impl ManagedModule for EncodeModule {
@@ -49,6 +56,12 @@ impl ManagedModule for EncodeModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid encoder settings")?;
+        #[cfg(feature = "pyrowave")]
+        let pyrowave = settings
+            .pyrowave
+            .filter(|_| settings.enabled)
+            .map(|settings| pyrowave::Plugin::register(&runtime, settings))
+            .transpose()?;
         let (log_emitter, log_queue) = runtime.log_emitter();
         let shared = Arc::new(Mutex::new(sessions::Sessions::with_log_emitter(
             settings.enabled,
@@ -77,6 +90,8 @@ impl ManagedModule for EncodeModule {
             shutting_down: false,
             closing: closing::Closing::default(),
             _registration: registration,
+            #[cfg(feature = "pyrowave")]
+            pyrowave,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -104,6 +119,8 @@ impl ManagedModule for EncodeModule {
                 ) {
                     return Ok(());
                 }
+                #[cfg(feature = "pyrowave")]
+                let pyrowave_request = service == pyrowave::CONTROL_SERVICE;
                 let result = if service == SERVICE {
                     let operation = serde_json::from_value::<Operation>(payload.clone());
                     let needs_preparation = match &operation {
@@ -143,6 +160,22 @@ impl ManagedModule for EncodeModule {
                         self.control(&caller, payload)
                     }
                 } else {
+                    #[cfg(feature = "pyrowave")]
+                    if pyrowave_request {
+                        if self.shutting_down
+                            && matches!(payload["action"].as_str(), Some("open" | "probe"))
+                        {
+                            Err("encoder_shutting_down")
+                        } else {
+                            self.pyrowave
+                                .as_ref()
+                                .ok_or("pyrowave_disabled")
+                                .and_then(|plugin| plugin.control(&caller, payload))
+                        }
+                    } else {
+                        Err("invalid_service")
+                    }
+                    #[cfg(not(feature = "pyrowave"))]
                     Err("invalid_service")
                 };
                 let (payload, created) =
@@ -155,6 +188,13 @@ impl ManagedModule for EncodeModule {
                     Ok(Response::Ok)
                 ) && let Some(session) = created
                 {
+                    #[cfg(feature = "pyrowave")]
+                    if pyrowave_request {
+                        if let Some(plugin) = &self.pyrowave {
+                            plugin.close(&caller, session);
+                        }
+                        return Ok(());
+                    }
                     self.closing.rollback_open(&caller, session);
                     self.closing.advance(&self.runtime, &self.shared)?;
                 }
@@ -256,7 +296,15 @@ impl Drop for EncodeModule {
     }
 }
 
+#[cfg(not(feature = "pyrowave"))]
 amaterasu_module_sdk::export_module!(EncodeModule);
+// PyroWave control operations can create Vulkan devices or encode a probe.
+// Native factory callbacks own separate Arc-backed state and never borrow this
+// module instance, so its complete control lifecycle can run on the SDK worker.
+#[cfg(feature = "pyrowave")]
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<EncodeModule>
+);
 
 #[cfg(test)]
 mod module_tests;

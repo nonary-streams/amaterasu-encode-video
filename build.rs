@@ -11,6 +11,7 @@ fn x264_build_version(header: &str) -> Option<u32> {
 }
 
 fn main() {
+    build_pyrowave_gpu();
     let nvenc_abi = build_linux_ffmpeg_nvenc();
     let vaapi_abi = build_linux_ffmpeg_vaapi(nvenc_abi.is_none());
     build_linux_x265_hevc();
@@ -96,6 +97,59 @@ fn main() {
     // ABI build from the encoder artifact it is about to sign.
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_x264_build_marker");
     println!("cargo:rustc-cfg=amaterasu_x264");
+}
+
+fn build_pyrowave_gpu() {
+    println!("cargo:rerun-if-env-changed=AMATERASU_PYROWAVE_INCLUDE_DIR");
+    println!("cargo:rerun-if-changed=src/pyrowave/gpu/adapter.c");
+    println!("cargo:rerun-if-changed=src/pyrowave/gpu/adapter.h");
+    if env::var_os("CARGO_FEATURE_PYROWAVE_GPU").is_none() {
+        return;
+    }
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("linux"),
+        "pyrowave-gpu requires Linux DMA-BUF support"
+    );
+    let explicit = env::var_os("AMATERASU_PYROWAVE_INCLUDE_DIR");
+    let include = explicit.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+            .join("../../native-deps/pyrowave/source")
+    });
+    assert!(
+        include.join("pyrowave.h").is_file(),
+        "Build the pinned PyroWave dependency with scripts/build_pyrowave.py, or set AMATERASU_PYROWAVE_INCLUDE_DIR"
+    );
+    assert!(
+        env::var("HOST").ok() == env::var("TARGET").ok()
+            || env::var_os("AMATERASU_PYROWAVE_INCLUDE_DIR").is_some(),
+        "cross builds require target PyroWave/Vulkan headers"
+    );
+    println!("cargo:rerun-if-changed=src/pyrowave/gpu/test_support.c");
+    let mut build = cc::Build::new();
+    if env::var_os("CARGO_FEATURE_PYROWAVE_GPU_TESTS").is_some() {
+        for package in ["gbm", "egl", "glesv2"] {
+            let library = pkg_config::Config::new()
+                .probe(package)
+                .expect("GPU fixtures require GBM/EGL/GLES development files");
+            for path in library.include_paths {
+                build.include(path);
+            }
+        }
+        build
+            .file("src/pyrowave/gpu/test_support.c")
+            .file("src/pyrowave/gpu/test_decode.c");
+        println!("cargo:rerun-if-changed=src/pyrowave/gpu/test_decode.c");
+    }
+    build
+        .file("src/pyrowave/gpu/adapter.c")
+        .include(&include)
+        .include(include.join("Granite/third_party/khronos/vulkan-headers/include"))
+        .flag_if_supported("-std=c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .compile("amaterasu_pyrowave_gpu");
+    println!("cargo:rustc-link-lib=dl");
 }
 
 fn build_linux_x265_hevc() {
