@@ -1,0 +1,3903 @@
+mod capture_events;
+mod capture_open;
+mod encoder;
+mod lifecycle;
+mod live_settings;
+mod observation;
+mod operations;
+mod output;
+mod owned_capture;
+mod pacing;
+mod portal;
+mod presentation;
+
+use crate::{
+    model::{
+        AmdAv1LatencyMode, CaptureProvider, Configuration, EncoderSelection, OpenSpec, Operation,
+        Settings, TouchSurface, error, is_owned_kwin_output, valid_minimum_fps_target,
+    },
+    plane::{
+        ENCODE, FrameMetadata, FramePath, GeometryProgress, OwnedFrame, Plane, Progress, Pump,
+    },
+    queue::Queues,
+    rpc::{self, Send},
+};
+use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
+use amaterasu_module_sdk::diagnostics::LatencyMetric as TimingMetric;
+use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stage {
+    X11Enumerate,
+    KmsEnumerate,
+    SelectEncoder,
+    InspectEncoder,
+    ProbeEncoder,
+    Capture,
+    FallbackEnumerate,
+    Encoder,
+    RestartCloseEncoder,
+    /// Closing capture before an approved replacement; the encoder stays open.
+    ReplaceCapture,
+    Activating,
+    Running,
+    StopCapture,
+    Draining,
+    FindEncoder,
+    CloseEncoder,
+    FindCapture,
+    CloseCapture,
+    Failed,
+}
+
+/// Native capture observations describe the selected Wayland object, not the
+/// display provider's ownership or allocation incarnation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedCapture {
+    version: u32,
+    protocol: String,
+    compositor_id: String,
+    registry_global: u32,
+    output_name: String,
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+}
+
+fn observed_capture(payload: &Value) -> Result<Option<ObservedCapture>, &'static str> {
+    let Some(value) = payload.get("observed_capture") else {
+        return Ok(None);
+    };
+    let observed: ObservedCapture =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_observation")?;
+    if observed.version != 1
+        || observed.protocol != "wayland-wl-output"
+        || observed.compositor_id.len() != 64
+        || !observed
+            .compositor_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || observed.registry_global == 0
+        || observed.output_name.is_empty()
+        || observed.output_name.len() > 127
+        || observed.output_name.chars().any(char::is_control)
+        || observed.width == 0
+        || observed.height == 0
+        || observed.refresh_millihz == 0
+    {
+        return Err("invalid_capture_observation");
+    }
+    Ok(Some(observed))
+}
+
+struct Stream {
+    packet_boundaries: bool,
+    owner: String,
+    provider: CaptureProvider,
+    encoder_provider: Option<String>,
+    encoder_service: String,
+    source_id: Option<u64>,
+    capture_selection: Option<capture_open::Selection>,
+    capture_source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
+    capture_preflight_started: Option<Instant>,
+    encoder_options: Option<Value>,
+    source_started: bool,
+    generic_input: bool,
+    frame_path: FramePath,
+    owned_capture: owned_capture::OwnedOutputCapture,
+    auto_capture: bool,
+    fallback_provider: Option<CaptureProvider>,
+    fallback_device_name: Option<String>,
+    fallback_error: Option<&'static str>,
+    fallback_attempted: bool,
+    fallback_offset: usize,
+    fallback_pages: usize,
+    fallback_last_output: Option<String>,
+    fallback_match: Option<String>,
+    fallback_enumeration_id: Option<String>,
+    constant_rate: bool,
+    minimum_fps_target: f64,
+    wgc_pacing_smoothing: bool,
+    wgc_pacing: pacing::WgcPacing,
+    presentation: presentation::PresentationPacing,
+    force_idr: bool,
+    grace: Option<output::Grace>,
+    output: String,
+    capture_output: String,
+    encoder: Option<EncoderIdentity>,
+    fallback_encoder: Option<EncoderIdentity>,
+    restart_pending: bool,
+    capture_swap_target: Option<(CaptureProvider, String)>,
+    capture_notifications: bool,
+    capture_event_ready: bool,
+    encoder_index: Option<u32>,
+    encoder_attempt: u8,
+    requested_encoder: EncoderSelection,
+    encoder_candidates: VecDeque<EncoderChoice>,
+    encoder_probe_attempt: u8,
+    encoder_configuration_probed: bool,
+    encoder_probe_reason: Option<String>,
+    configuration: Configuration,
+    gpu_configured: bool,
+    live_settings_next_poll: Instant,
+    live_settings_rejected_revision: Option<String>,
+    parent: Option<u64>,
+    ending_parent: Option<u64>,
+    pending: Option<u64>,
+    completed_payload: Option<Value>,
+    unsettled: Option<u64>,
+    unsettled_effect: bool,
+    unsettled_observed: bool,
+    uncertain: Option<Command>,
+    settlement_attempts: u8,
+    capture: Option<u64>,
+    desktop_geometry: Option<CaptureGeometry>,
+    source_observation: Option<ObservedCapture>,
+    touch_port: Option<Value>,
+    session: Option<u64>,
+    operation: String,
+    capture_operation: String,
+    capture_attempt: u64,
+    no_resources: bool,
+    stage: Stage,
+    retries: u8,
+    error: Option<&'static str>,
+    next_frame: Instant,
+    opened_at: Instant,
+    /// The host clock at `opened_at`; packet timestamps are offsets from it.
+    clock_origin_us: u64,
+    clock_epoch: [u8; 16],
+    last_output_at: Option<Instant>,
+    last_repeat_attempt_at: Option<Instant>,
+    next_repeat_at: Option<Instant>,
+    last_output_timestamp_us: Option<u64>,
+    last_output_sequence: u64,
+    last_pixels: Option<OwnedFrame>,
+    dropped: u64,
+    submitted: u64,
+    timing: StageTimings,
+    diagnostics: Option<DiagnosticWindow>,
+    last_frame: Option<FrameMetadata>,
+    unresolved: bool,
+    cleanup_complete: bool,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct StageTimings {
+    capture_callback: TimingMetric,
+    encoder_submit: TimingMetric,
+    frame_copy: TimingMetric,
+    preprocessing: TimingMetric,
+    gpu_processor: TimingMetric,
+    gpu_input_deferred: u64,
+    /// Conversions that finished but were refused by a busy encoder.
+    gpu_output_rejected: u64,
+    encoder_poll: TimingMetric,
+    source_pump: TimingMetric,
+    transport_admission: TimingMetric,
+    captured_frames: u64,
+    capture_reused: u64,
+    capture_deferred: u64,
+}
+
+/// Interval statistics are independent of the cumulative status counters.
+/// Stage timings overlap: capture callback time can include encoder submission.
+struct DiagnosticWindow {
+    started: Instant,
+    timings: StageTimings,
+    submitted: u64,
+    dropped: u64,
+    last_pump: Option<Instant>,
+    pump_interval: TimingMetric,
+}
+
+impl DiagnosticWindow {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            timings: StageTimings::default(),
+            submitted: 0,
+            dropped: 0,
+            last_pump: None,
+            pump_interval: TimingMetric::default(),
+        }
+    }
+
+    fn record(&mut self, progress: &Progress) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_pump.replace(now) {
+            self.pump_interval.record(
+                u64::try_from(now.saturating_duration_since(previous).as_micros())
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        self.timings.record(progress);
+        self.submitted = self.submitted.saturating_add(u64::from(progress.submitted));
+        self.dropped = self.dropped.saturating_add(u64::from(progress.dropped));
+    }
+
+    fn take_if_due(&mut self, now: Instant) -> Option<Self> {
+        if now.saturating_duration_since(self.started) < Duration::from_secs(10) {
+            return None;
+        }
+        let mut next = Self::new(now);
+        next.last_pump = self.last_pump;
+        Some(std::mem::replace(self, next))
+    }
+}
+
+impl StageTimings {
+    fn record(&mut self, progress: &Progress) {
+        self.capture_reused = self.capture_reused.saturating_add(u64::from(
+            progress.capture_reused || progress.dmabuf_fresh == Some(false),
+        ));
+        self.capture_deferred = self
+            .capture_deferred
+            .saturating_add(u64::from(progress.capture_deferred));
+        if progress.capture_callback_count > 0 {
+            self.capture_callback.record(progress.capture_callback_us);
+            self.captured_frames = self
+                .captured_frames
+                .saturating_add(progress.capture_frame_count);
+        }
+        if progress.submitted || progress.dropped || progress.repeat_attempted {
+            self.encoder_submit.record(progress.encoder_submit_us);
+        }
+        if progress.preprocessing_us > 0 {
+            self.preprocessing.record(progress.preprocessing_us);
+        }
+        if let Some(elapsed) = progress.gpu_processor_us {
+            self.gpu_processor.record(elapsed);
+        }
+        self.gpu_input_deferred = self
+            .gpu_input_deferred
+            .saturating_add(u64::from(progress.gpu_input_deferred));
+        self.gpu_output_rejected = self
+            .gpu_output_rejected
+            .saturating_add(u64::from(progress.gpu_encoder_busy));
+        if progress.owned_frame.is_some() {
+            self.frame_copy.record(progress.frame_copy_us);
+        }
+        self.encoder_poll.record(progress.encoder_poll_us);
+        if progress.transport_admission_count > 0 {
+            self.transport_admission
+                .record(progress.transport_admission_us);
+        }
+    }
+}
+
+/// Emit one bounded summary per interval through the host log transport. These
+/// are local video pipeline observations, not client delivery or encode latency.
+fn log_diagnostics(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mut Send<'_>) {
+    let now = Instant::now();
+    let Some(window) = stream
+        .diagnostics
+        .as_mut()
+        .and_then(|window| window.take_if_due(now))
+    else {
+        return;
+    };
+    let mut pacing = json!({});
+    stream.presentation.write_status(&mut pacing);
+    let summary = json!({
+        "event": "video_stage_window",
+        "stream": id,
+        "window_us": now.saturating_duration_since(window.started).as_micros().min(u64::MAX as u128) as u64,
+        "target_fps": stream.configuration.fps,
+        "capture_provider": stream.provider,
+        "encoder_provider": stream.encoder_provider,
+        "encoder_service": stream.encoder_service,
+        "encoder_session": stream.session,
+        "frame_path": stream.frame_path.name(),
+        "submitted_frames": stream.source_id.is_none().then_some(window.submitted),
+        "dropped_frames": stream.source_id.is_none().then_some(window.dropped),
+        "pacing": pacing["pacing"],
+        "presentation_pacing_cumulative": pacing["presentation_pacing"],
+        "stage_timing_us": window.timings,
+        "pump_interval_us": window.pump_interval,
+        "encoded_queue": queues.try_lock().ok().and_then(|mut queues| queues.take_timing(id)),
+        "percentiles": "histogram_upper_bounds_us",
+        "timing_scope": "overlapping_local_calls_not_encode_latency_or_delivery"
+    });
+    // Diagnostics are best-effort and must not interrupt the stream if the
+    // bounded host log queue is full or the logging transport is unavailable.
+    for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
+        let _ = send(Command::Log {
+            level: amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8,
+            target: "video.pipeline".into(),
+            message: part.to_string(),
+        });
+    }
+}
+
+impl Stream {
+    fn encoder_operation(&self) -> String {
+        format!(
+            "{}-encoder-attempt-{}",
+            self.operation, self.encoder_attempt
+        )
+    }
+
+    fn repeat_rate(&self) -> f64 {
+        if self.minimum_fps_target == 0.0 {
+            f64::from(self.configuration.effective_fps_millihz()) / 1000.0
+        } else {
+            self.minimum_fps_target
+        }
+    }
+    /// A repeat resubmits owned CPU pixels, or re-reads the latest DMA-BUF
+    /// presentation once the GPU path has delivered one.
+    fn has_repeat_source(&self) -> bool {
+        self.last_pixels.is_some()
+            || (self.frame_path == FramePath::DmaBuf && self.last_output_at.is_some())
+    }
+
+    fn record_repeat_deadline(&mut self, now: Instant, repeated: bool, submitted: bool) {
+        if !self.provider.uses_periodic_capture() {
+            return;
+        }
+        let period = Duration::from_secs_f64(1.0 / self.repeat_rate());
+        if repeated {
+            let previous = self.next_repeat_at.unwrap_or(now);
+            self.next_repeat_at = Some(periodic_deadline(previous, now, period));
+        } else if submitted {
+            self.next_repeat_at = now.checked_add(period);
+        }
+    }
+    fn repeat_due(&self, now: Instant) -> bool {
+        if self.provider.uses_periodic_capture() {
+            return self.has_repeat_source()
+                && self.next_repeat_at.is_some_and(|deadline| now >= deadline);
+        }
+        let target = if self.minimum_fps_target == 0.0 {
+            f64::from(self.configuration.effective_fps_millihz()) / 1000.0
+        } else {
+            self.minimum_fps_target
+        };
+        self.last_pixels.is_some()
+            && self
+                .last_output_at
+                .is_some_and(|last| elapsed_at_rate(now, last, target))
+            && self
+                .last_repeat_attempt_at
+                .is_none_or(|last| elapsed_at_rate(now, last, target))
+    }
+
+    /// Microseconds of the stream clock at `now`.
+    fn stream_clock_us(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.opened_at)
+            .as_micros()
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn next_frame_clock(&self, now: Instant) -> Option<(u64, u64)> {
+        self.frame_clock_at(self.stream_clock_us(now))
+    }
+
+    /// The next output timestamp and sequence for a frame stamped
+    /// `candidate_us`, kept strictly monotonic.
+    fn frame_clock_at(&self, candidate_us: u64) -> Option<(u64, u64)> {
+        let sequence = self.last_output_sequence.checked_add(1)?;
+        let timestamp_us = self
+            .last_output_timestamp_us
+            .map(|timestamp| timestamp.checked_add(1))
+            .unwrap_or(Some(1))?
+            .max(candidate_us);
+        Some((timestamp_us, sequence))
+    }
+
+    /// Asks the capture provider for its newest presentation on the DMA-BUF
+    /// path and reports whether this tick is presentation-paced.
+    fn observe_presentation(&mut self, plane: &mut dyn Plane) -> Result<bool, &'static str> {
+        if self.frame_path != FramePath::DmaBuf {
+            self.presentation.deactivate();
+            return Ok(false);
+        }
+        let capture = self.capture.expect("running streams retain their capture");
+        let query = plane.latest_presentation(self.provider, capture)?;
+        Ok(self.presentation.observe(query))
+    }
+
+    /// A presentation-paced read is due for new content: a newer presentation
+    /// the frame-rate cap admits, or, until the first frame is accepted, the
+    /// timer probe that also covers a source that has not presented yet.
+    fn presentation_capture_due(&self, now: Instant) -> CaptureTrigger {
+        if self.presentation.fresh_due(now) {
+            CaptureTrigger::Presentation
+        } else if self.last_output_at.is_none()
+            && now >= self.next_frame
+            && self.presentation.submit_allowed(now)
+        {
+            CaptureTrigger::Timer
+        } else {
+            CaptureTrigger::None
+        }
+    }
+
+    /// The keepalive rule decides repeats on a presentation-paced stream; a
+    /// pending keyframe request also repeats the latest presentation. Both
+    /// respect the frame-rate cap.
+    fn presentation_repeat_due(&self, now: Instant) -> bool {
+        (self.repeat_due(now) || (self.force_idr && self.has_repeat_source()))
+            && self.presentation.submit_allowed(now)
+    }
+
+    fn response(&self, id: u64) -> Value {
+        let state = match self.stage {
+            Stage::SelectEncoder
+            | Stage::InspectEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+            | Stage::RestartCloseEncoder
+            | Stage::ReplaceCapture
+            | Stage::X11Enumerate
+            | Stage::KmsEnumerate
+            | Stage::ProbeEncoder
+            | Stage::Activating => "opening",
+            Stage::Running => "running",
+            Stage::StopCapture | Stage::Draining => "draining",
+            Stage::Failed => "cleanup_failed",
+            _ => "closing",
+        };
+        let mut response = json!({
+            "ok": true,
+            "stream": id,
+            "state": state,
+            "stage": stage_name(self.stage),
+            "encoder": self.encoder,
+            "requested_encoder": self.requested_encoder,
+            "encoder_probe_attempts": self.encoder_probe_attempt,
+            "encoder_probe_reason": self.encoder_probe_reason,
+            "packet_boundaries": self.packet_boundaries,
+            "supports_packet_boundaries": true,
+            "output": self.output,
+            "capture_provider":self.provider,
+            "encoder_provider":self.encoder_provider,
+            "source_id":self.source_id,
+            "frame_path": self.frame_path.name(),
+            "constant_rate": self.constant_rate,
+            "wgc_pacing_smoothing": self.wgc_pacing_smoothing,
+            "minimum_fps_target": self.minimum_fps_target,
+            "force_idr_pending":self.force_idr,
+            "configuration": self.configuration,
+            "dropped_frames": self.dropped,
+            "submitted_frames": self.submitted,
+            "stage_timing_us": {
+                "capture_callback": {"calls":self.timing.capture_callback.calls,"total":self.timing.capture_callback.total_us,"max":self.timing.capture_callback.max_us,"frames":self.timing.captured_frames},
+                "encoder_submit": {"calls":self.timing.encoder_submit.calls,"total":self.timing.encoder_submit.total_us,"max":self.timing.encoder_submit.max_us},
+                "frame_copy": {"calls":self.timing.frame_copy.calls,"total":self.timing.frame_copy.total_us,"max":self.timing.frame_copy.max_us},
+                "preprocessing": {"calls":self.timing.preprocessing.calls,"total":self.timing.preprocessing.total_us,"max":self.timing.preprocessing.max_us},
+                "encoder_poll": {"calls":self.timing.encoder_poll.calls,"total":self.timing.encoder_poll.total_us,"max":self.timing.encoder_poll.max_us},
+                "transport_admission": {"calls":self.timing.transport_admission.calls,"total":self.timing.transport_admission.total_us,"max":self.timing.transport_admission.max_us}
+            },
+            "error": self.error,
+        });
+        if let Some(selection) = &self.capture_selection {
+            response["source_capture_context"] = json!(selection.context);
+        }
+        self.owned_capture.write_status(&mut response);
+        self.presentation.write_status(&mut response);
+        if let Some(encoder) = &self.encoder {
+            response["encoder"] = json!(encoder);
+        }
+        if let Some(geometry) = self.desktop_geometry {
+            response["desktop_geometry"] = json!(geometry);
+        }
+        if let Some(touch_port) = &self.touch_port {
+            response["touch_port"] = touch_port.clone();
+        }
+        if let Some(frame) = self.last_frame {
+            response["last_capture_frame"] = json!({
+                "width": frame.width,
+                "height": frame.height,
+                "stride": frame.stride,
+                "timestamp_us": frame.timestamp_us,
+                "sequence": frame.sequence,
+            });
+        }
+        response
+    }
+
+    fn cleanup(&mut self, code: &'static str) {
+        eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage);
+        if let Some(request) = self.pending.take() {
+            self.unsettled = Some(request);
+            self.unsettled_effect = stage_mutates_provider(self.stage);
+            self.unsettled_observed = self.completed_payload.is_some();
+        }
+        self.completed_payload = None;
+        if let Some(parent) = self.parent.take() {
+            self.ending_parent = Some(parent);
+        }
+        self.stage = Stage::FindEncoder;
+        self.error = Some(code);
+        self.last_pixels = None;
+        self.last_output_at = None;
+        self.last_repeat_attempt_at = None;
+        self.retries = 0;
+        self.unresolved = false;
+        self.settlement_attempts = 0;
+    }
+}
+
+pub struct Pipeline {
+    require_frame_lease: bool,
+    enabled: bool,
+    shutdown_deadline: Option<Instant>,
+    quiescing: bool,
+    pending_queue_closes: BTreeSet<u64>,
+    providers: BTreeSet<CaptureProvider>,
+    source_preflight_routes: BTreeMap<String, crate::model::SourcePreflightRoute>,
+    encoder_providers: BTreeMap<String, String>,
+    source_encoders: BTreeMap<String, crate::model::SourceEncoderRegistration>,
+    encoder_consumers: BTreeSet<String>,
+    drain_timeout: Duration,
+    recent: VecDeque<(String, Value)>,
+    epoch: String,
+    next_id: u64,
+    cursor: usize,
+    streams: BTreeMap<u64, Stream>,
+    operations: BTreeMap<(String, String), operations::Record>,
+    portal: portal::Control,
+    observations: observation::Control,
+    live_settings: live_settings::Control,
+    processing_lifecycle_service: Option<String>,
+    pub queues: Arc<Mutex<Queues>>,
+    processing_generation: Arc<AtomicU64>,
+    frame_trace: Option<crate::frame_trace::FrameTrace>,
+}
+
+impl Pipeline {
+    /// Traces frames from capture to the encoder. The packet queue marks the
+    /// encoder's output itself.
+    pub fn trace_frames(&mut self, trace: crate::frame_trace::FrameTrace) {
+        self.frame_trace = Some(trace);
+    }
+}
+
+fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
+    if provider == CaptureProvider::X11 {
+        Stage::X11Enumerate
+    } else if provider == CaptureProvider::Kms {
+        Stage::KmsEnumerate
+    } else if matches!(encoder, EncoderSelection::Identity(_)) {
+        Stage::Capture
+    } else {
+        Stage::SelectEncoder
+    }
+}
+
+impl Pipeline {
+    pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
+        let processing_generation = queues
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .processing_generation();
+        Self {
+            require_frame_lease: settings.require_frame_lease,
+            enabled: settings.enabled,
+            shutdown_deadline: None,
+            quiescing: false,
+            pending_queue_closes: BTreeSet::new(),
+            providers: settings.resolved_providers(),
+            source_preflight_routes: settings.resolved_source_preflight_routes(),
+            encoder_providers: settings.external_encoder_providers,
+            source_encoders: settings.source_encoder_providers,
+            encoder_consumers: settings
+                .external_encoder_consumers
+                .keys()
+                .cloned()
+                .collect(),
+            drain_timeout: Duration::from_millis(settings.drain_timeout_ms),
+            recent: VecDeque::new(),
+            epoch,
+            next_id: 0,
+            cursor: 0,
+            streams: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            portal: portal::Control::default(),
+            observations: observation::Control::default(),
+            live_settings: live_settings::Control::default(),
+            processing_lifecycle_service: settings.processing_lifecycle_service,
+            queues,
+            processing_generation,
+            frame_trace: None,
+        }
+    }
+
+    pub fn handle(
+        &mut self,
+        caller: &str,
+        request: u64,
+        operation: Operation,
+        send: &mut Send<'_>,
+    ) {
+        let shutdown_allowed = match operation {
+            Operation::Status { .. }
+            | Operation::Lookup { .. }
+            | Operation::Close { .. }
+            | Operation::Drain { .. } => true,
+            Operation::CancelPortalSelection { .. } => !self.quiescing,
+            _ => false,
+        };
+        if self.admission_closed() && !shutdown_allowed {
+            rpc::complete(send, request, error("shutting_down"));
+            return;
+        }
+        match operation {
+            Operation::SelectPortalSource {
+                source_type,
+                operation_id,
+            } => self.portal.select(
+                caller,
+                request,
+                source_type,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
+            Operation::PollPortalSelection { operation_id } => self.portal.poll(
+                caller,
+                request,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
+            Operation::CancelPortalSelection { operation_id } => self.portal.cancel(
+                caller,
+                request,
+                operation_id,
+                self.enabled && self.providers.contains(&CaptureProvider::Pipewire),
+                send,
+            ),
+            Operation::Open {
+                packet_boundaries,
+                operation_id,
+                capture_provider,
+                auto_capture,
+                constant_rate,
+                wgc_pacing_smoothing,
+                minimum_fps_target,
+                output,
+                encoder,
+                encoder_provider,
+                configuration,
+            } => self.open(
+                caller,
+                request,
+                OpenSpec {
+                    packet_boundaries,
+                    operation_id,
+                    provider: capture_provider,
+                    auto_capture,
+                    constant_rate,
+                    wgc_pacing_smoothing,
+                    minimum_fps_target,
+                    output,
+                    encoder,
+                    encoder_provider,
+                    source_id: None,
+                    encoder_options: None,
+                    source_capture_context: None,
+                    configuration: *configuration,
+                },
+                send,
+            ),
+            Operation::OpenWithOptions { specification } => {
+                self.open(caller, request, *specification, send)
+            }
+            Operation::OpenSource {
+                packet_boundaries,
+                operation_id,
+                source_id,
+                encoder_options,
+                encoder_provider,
+                encoder,
+                configuration,
+            } => self.open(
+                caller,
+                request,
+                OpenSpec {
+                    packet_boundaries,
+                    operation_id,
+                    provider: CaptureProvider::default(),
+                    auto_capture: false,
+                    constant_rate: false,
+                    wgc_pacing_smoothing: false,
+                    minimum_fps_target: 0.0,
+                    output: String::new(),
+                    encoder,
+                    encoder_provider: Some(encoder_provider),
+                    source_id: Some(source_id),
+                    encoder_options,
+                    source_capture_context: None,
+                    configuration: *configuration,
+                },
+                send,
+            ),
+            Operation::Lookup { operation_id } => self.lookup(caller, request, &operation_id, send),
+            Operation::ObserveCapture { stream } => {
+                self.observations
+                    .begin(caller, request, stream, &self.epoch, &self.streams, send)
+            }
+            Operation::ForceIdr { stream } => {
+                self.output_action(caller, request, stream, false, send)
+            }
+            Operation::Drain { stream } => self.output_action(caller, request, stream, true, send),
+            Operation::Status { stream } => {
+                let streams: Vec<_> = self
+                    .streams
+                    .iter()
+                    .filter(|(id, value)| {
+                        value.owner == caller && stream.is_none_or(|wanted| wanted == **id)
+                    })
+                    .map(|(id, value)| value.response(*id))
+                    .chain(
+                        self.recent
+                            .iter()
+                            .filter(|(owner, value)| {
+                                owner == caller
+                                    && stream.is_none_or(|wanted| {
+                                        value["stream"].as_u64() == Some(wanted)
+                                    })
+                            })
+                            .map(|(_, value)| value.clone()),
+                    )
+                    .collect();
+                rpc::complete(
+                    send,
+                    request,
+                    json!({"ok":true,"enabled":self.enabled,"streams":streams}),
+                );
+            }
+            Operation::Close { stream } => {
+                let Some(value) = self
+                    .streams
+                    .get_mut(&stream)
+                    .filter(|value| value.owner == caller)
+                else {
+                    rpc::complete(send, request, error("not_found"));
+                    return;
+                };
+                if matches!(
+                    value.stage,
+                    Stage::SelectEncoder
+                        | Stage::InspectEncoder
+                        | Stage::X11Enumerate
+                        | Stage::KmsEnumerate
+                        | Stage::ProbeEncoder
+                        | Stage::Capture
+                        | Stage::FallbackEnumerate
+                        | Stage::Encoder
+                        | Stage::RestartCloseEncoder
+                        | Stage::ReplaceCapture
+                        | Stage::Activating
+                        | Stage::Running
+                        | Stage::StopCapture
+                        | Stage::Draining
+                        | Stage::Failed
+                ) {
+                    value.cleanup("closed_by_caller");
+                }
+                close_queue(&self.queues, &mut self.pending_queue_closes, stream);
+                rpc::complete(send, request, value.response(stream));
+            }
+        }
+    }
+
+    fn open(
+        &mut self,
+        caller: &str,
+        request: u64,
+        mut specification: OpenSpec,
+        send: &mut Send<'_>,
+    ) {
+        if !self.enabled {
+            rpc::complete(send, request, error("disabled"));
+            return;
+        }
+        if let Err(code) = specification.configuration.normalize_codec() {
+            rpc::complete(send, request, error(code));
+            return;
+        }
+        if let Err(code) = specification.configuration.nvenc_settings.validate() {
+            rpc::complete(send, request, error(code));
+            return;
+        }
+        if specification.configuration.nvenc_settings
+            != amaterasu_module_sdk::NvencSettings::default()
+        {
+            rpc::complete(send, request, error("nvenc_settings_unsupported"));
+            return;
+        }
+        if specification.source_id.is_none()
+            && let CaptureProvider::External(external) = specification.provider
+        {
+            let requested = CaptureProvider::External(external);
+            if let Some(resolved) = self
+                .providers
+                .iter()
+                .copied()
+                .find(|candidate| candidate.identity() == requested.identity())
+            {
+                specification.provider = resolved;
+            }
+        }
+        if specification.source_id.is_none() && specification.provider == CaptureProvider::Pipewire
+        {
+            // A sentinel is resolved by the trusted provider, which may restore
+            // an earlier portal approval without a management selection RPC.
+            let named_owned_output = is_owned_kwin_output(&specification.output);
+            let output =
+                if specification.output == "portal-selected-session-source" || named_owned_output {
+                    Some(specification.output.clone())
+                } else {
+                    self.portal.resolve_output(&specification.output)
+                };
+            let Some(output) = output else {
+                rpc::complete(send, request, error("portal_source_selection_required"));
+                return;
+            };
+            specification.output = output;
+        }
+        if specification.configuration.amd_av1_latency_mode != AmdAv1LatencyMode::Auto {
+            rpc::complete(send, request, error("amd_av1_latency_mode_unsupported"));
+            return;
+        }
+        let encoder_service = if let Some(source_id) = specification.source_id {
+            let registration = specification
+                .encoder_provider
+                .as_deref()
+                .and_then(|alias| self.source_encoders.get(alias));
+            let Some(registration) =
+                registration.filter(|registration| registration.source_ids.contains(&source_id))
+            else {
+                rpc::complete(send, request, error("encoder_source_not_allowed"));
+                return;
+            };
+            if !matches!(specification.encoder, EncoderSelection::Identity(_)) {
+                rpc::complete(send, request, error("source_encoder_identity_required"));
+                return;
+            }
+            registration.control_service.clone()
+        } else {
+            match specification.encoder_provider.as_deref() {
+                None => ENCODE.to_owned(),
+                Some(alias) => match self.encoder_providers.get(alias) {
+                    Some(service) => service.clone(),
+                    None => {
+                        rpc::complete(send, request, error("encoder_provider_not_allowed"));
+                        return;
+                    }
+                },
+            }
+        };
+        if specification.encoder_options.is_some() && specification.encoder_provider.is_none() {
+            rpc::complete(
+                send,
+                request,
+                error("encoder_options_require_external_provider"),
+            );
+            return;
+        }
+        if specification
+            .encoder_options
+            .as_ref()
+            .is_some_and(|options| {
+                !options.is_object()
+                    || serde_json::to_vec(options).map_or(true, |bytes| bytes.len() > 64 * 1024)
+            })
+        {
+            rpc::complete(send, request, error("invalid_encoder_options"));
+            return;
+        }
+        let capture_selection = match capture_open::select(
+            specification.source_capture_context.as_ref(),
+            specification.provider,
+            &specification.output,
+            &self.source_preflight_routes,
+        ) {
+            Ok(selection) => selection,
+            Err(code) => {
+                rpc::complete(send, request, error(code));
+                return;
+            }
+        };
+        if !self.admit_operation(caller, request, &specification, send) {
+            return;
+        }
+        let generic_input = specification.source_id.is_none()
+            && specification
+                .encoder_provider
+                .as_ref()
+                .is_some_and(|alias| self.encoder_consumers.contains(alias));
+        let retained_specification = specification.clone();
+        let OpenSpec {
+            packet_boundaries,
+            operation_id,
+            provider,
+            auto_capture,
+            constant_rate,
+            wgc_pacing_smoothing,
+            minimum_fps_target,
+            output,
+            encoder,
+            encoder_provider,
+            source_id,
+            encoder_options,
+            source_capture_context: _,
+            configuration,
+        } = specification;
+        let failure = if source_id.is_none() && !self.providers.contains(&provider) {
+            Some("capture_provider_not_allowed")
+        } else if constant_rate && provider != CaptureProvider::Wgc {
+            Some("constant_rate_requires_wgc")
+        } else if !valid_minimum_fps_target(minimum_fps_target)
+            || !(if source_id.is_some() {
+                configuration.validate_source()
+            } else {
+                configuration.validate()
+            })
+            || encoder.validate().is_err()
+            || (source_id.is_none() && output.is_empty())
+            || output.len() > 512
+            || output.chars().any(char::is_control)
+        {
+            Some("invalid_request")
+        } else if configuration
+            .gpu_processing
+            .as_ref()
+            .and_then(|processing| processing.live_settings.as_ref())
+            .is_some()
+            && self.processing_lifecycle_service.is_none()
+        {
+            Some("processing_lifecycle_unavailable")
+        } else if self.streams.len() >= 2 {
+            Some("stream_limit")
+        } else {
+            None
+        };
+        if let Some(code) = failure {
+            rpc::complete(send, request, error(code));
+            return;
+        }
+        let mut clock_epoch = [0u8; 16];
+        if getrandom::fill(&mut clock_epoch).is_err() || clock_epoch == [0; 16] {
+            rpc::complete(send, request, error("encoder_clock_unavailable"));
+            return;
+        }
+        let Some(id) = self.next_id.checked_add(1) else {
+            rpc::complete(send, request, error("stream_limit"));
+            return;
+        };
+        self.next_id = id;
+        if let Some(operation_id) = operation_id {
+            self.operations.insert(
+                (caller.into(), operation_id),
+                operations::Record {
+                    stream: id,
+                    specification: retained_specification,
+                },
+            );
+        }
+        self.streams.insert(id, {
+            let opened_at = Instant::now();
+            let clock_origin_us = amaterasu_media::host_monotonic_micros();
+            let wgc_pacing = if configuration.fps_milli.is_some() {
+                pacing::WgcPacing::new_millihz(
+                    wgc_pacing_smoothing,
+                    configuration.effective_fps_millihz(),
+                )
+            } else {
+                pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps)
+            };
+            let operation = format!("video-{}-{id}", self.epoch);
+            let requested_encoder = encoder.clone();
+            let mut stage = if source_id.is_some() {
+                Stage::Encoder
+            } else {
+                initial_stage(provider, &encoder)
+            };
+            let (encoder, encoder_index, _) = match encoder {
+                EncoderSelection::Identity(identity) => (Some(identity), None, Stage::Capture),
+                EncoderSelection::Index(index) => (None, Some(index), Stage::SelectEncoder),
+                EncoderSelection::Backend(EncoderBackend::Auto | EncoderBackend::Software) => {
+                    (None, None, Stage::SelectEncoder)
+                }
+            };
+            let mut owned_capture = owned_capture::OwnedOutputCapture::new(
+                provider,
+                &output,
+                self.providers.contains(&CaptureProvider::Vkms),
+            );
+            if capture_selection.is_some() {
+                owned_capture.pin_provider(provider);
+            }
+            if self.require_frame_lease
+                || configuration.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Hdr
+            {
+                owned_capture.require_lease();
+            }
+            if stage == Stage::Capture
+                && matches!(requested_encoder, EncoderSelection::Identity(_))
+                && owned_capture.needs_encoder_inspection()
+            {
+                stage = Stage::InspectEncoder;
+            }
+            let fallback_provider = if capture_selection.is_none()
+                && auto_capture
+                && !constant_rate
+                && !self.require_frame_lease
+            {
+                alternate_provider(provider).filter(|candidate| self.providers.contains(candidate))
+            } else {
+                None
+            };
+            Stream {
+                packet_boundaries,
+                owner: caller.into(),
+                provider,
+                encoder_provider,
+                encoder_service,
+                source_id,
+                capture_selection,
+                capture_source_format: None,
+                capture_preflight_started: None,
+                encoder_options,
+                source_started: false,
+                generic_input,
+                frame_path: FramePath::Cpu,
+                owned_capture,
+                auto_capture,
+                fallback_provider,
+                fallback_device_name: None,
+                fallback_error: None,
+                fallback_attempted: false,
+                fallback_offset: 0,
+                fallback_pages: 0,
+                fallback_last_output: None,
+                fallback_match: None,
+                fallback_enumeration_id: None,
+                constant_rate,
+                minimum_fps_target,
+                wgc_pacing_smoothing,
+                wgc_pacing,
+                presentation: presentation::PresentationPacing::default(),
+                force_idr: false,
+                grace: None,
+                capture_output: output.clone(),
+                output,
+                requested_encoder,
+                encoder_candidates: VecDeque::new(),
+                encoder_probe_attempt: 0,
+                encoder_configuration_probed: false,
+                encoder_probe_reason: None,
+                encoder,
+                fallback_encoder: None,
+                restart_pending: false,
+                capture_swap_target: None,
+                capture_notifications: false,
+                capture_event_ready: false,
+                encoder_index,
+                encoder_attempt: 0,
+                configuration,
+                gpu_configured: false,
+                live_settings_next_poll: Instant::now(),
+                live_settings_rejected_revision: None,
+                parent: Some(request),
+                ending_parent: None,
+                pending: None,
+                completed_payload: None,
+                unsettled: None,
+                unsettled_effect: false,
+                unsettled_observed: false,
+                uncertain: None,
+                settlement_attempts: 0,
+                capture: None,
+                desktop_geometry: None,
+                source_observation: None,
+                touch_port: None,
+                session: None,
+                capture_operation: format!("{operation}-capture-0"),
+                operation,
+                capture_attempt: 0,
+                no_resources: matches!(
+                    stage,
+                    Stage::SelectEncoder
+                        | Stage::InspectEncoder
+                        | Stage::X11Enumerate
+                        | Stage::KmsEnumerate
+                ),
+                stage,
+                retries: 0,
+                error: None,
+                next_frame: Instant::now(),
+                opened_at,
+                clock_origin_us,
+                clock_epoch,
+                last_output_at: None,
+                last_repeat_attempt_at: None,
+                next_repeat_at: None,
+                last_output_timestamp_us: None,
+                last_output_sequence: 0,
+                last_pixels: None,
+                dropped: 0,
+                submitted: 0,
+                timing: StageTimings::default(),
+                diagnostics: None,
+                last_frame: None,
+                unresolved: false,
+                cleanup_complete: false,
+            }
+        });
+    }
+
+    pub fn stop_native(&self, plane: &mut dyn Plane) {
+        for id in self.streams.keys().copied() {
+            plane.finish_stream(id);
+        }
+    }
+
+    pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
+        if !self.pending_queue_closes.is_empty()
+            && let Ok(mut queues) = self.queues.try_lock()
+        {
+            for id in std::mem::take(&mut self.pending_queue_closes) {
+                queues.close(id);
+            }
+        }
+        if self.quiescing {
+            self.portal.quiesce(send);
+            self.observations.quiesce(send);
+            self.live_settings.quiesce(send);
+        } else {
+            self.portal.tick(send);
+            self.observations.tick(&self.streams, send);
+            self.live_settings.tick(
+                &mut self.streams,
+                &self.epoch,
+                self.processing_lifecycle_service.as_deref(),
+                plane,
+                send,
+            );
+        }
+        if self.streams.is_empty() {
+            return;
+        }
+        self.cursor %= self.streams.len();
+        let id = *self.streams.keys().nth(self.cursor).unwrap();
+        self.cursor += 1;
+        let stream = self.streams.get_mut(&id).unwrap();
+        if stream.cleanup_complete {
+            close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            if !self.pending_queue_closes.contains(&id)
+                && let Some(stream) = self.streams.remove(&id)
+            {
+                self.remember_failure(id, &stream);
+            }
+            return;
+        }
+        plane.select_encoder(&stream.encoder_service);
+        plane.set_stream_clock(id, stream.clock_origin_us, stream.clock_epoch);
+        if !stream.gpu_configured && !self.quiescing {
+            match plane.configure_gpu(id, stream.configuration.gpu_processing.as_ref()) {
+                Ok(()) => stream.gpu_configured = true,
+                Err(reason) => {
+                    stream.gpu_configured = true;
+                    stream.cleanup(reason);
+                }
+            }
+        }
+        if let Some(parent) = stream.parent
+            && !matches!(
+                send(Command::CheckRequest { request: parent }),
+                Ok(Response::Ok)
+            )
+        {
+            stream.cleanup("request_ended");
+        }
+        if stream.stage == Stage::InspectEncoder
+            && stream.opened_at.elapsed() >= Duration::from_secs(5)
+        {
+            // Enumeration cannot create a resource; settle its pending request before capture.
+            if let Some(request) = stream.pending.take() {
+                stream.unsettled = Some(request);
+            }
+            stream.stage = Stage::Capture;
+        }
+        if matches!(
+            stream.stage,
+            Stage::X11Enumerate | Stage::KmsEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
+        ) && stream.opened_at.elapsed() >= Duration::from_secs(5)
+        {
+            stream.cleanup(
+                if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
+                    "capture_provider_unavailable"
+                } else {
+                    "encoder_selection_timeout"
+                },
+            );
+        }
+        if stream.stage == Stage::Running && stream.source_id.is_none() && !stream.generic_input {
+            capture_events::observe(stream, id, &self.providers, plane);
+        }
+        if stream.stage != Stage::Running
+            && !((stream.source_id.is_some() || stream.generic_input)
+                && stream.stage == Stage::Draining)
+            && !(stream.source_started && stream.stage == Stage::Activating)
+        {
+            plane.release_stream(id);
+        }
+        if matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
+            output::tick(stream, id, &self.queues, plane);
+            if !matches!(stream.stage, Stage::StopCapture | Stage::Draining) {
+                close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            }
+            if stream.stage == Stage::Draining {
+                return;
+            }
+        }
+        if stream.stage == Stage::Running {
+            stream
+                .diagnostics
+                .get_or_insert_with(|| DiagnosticWindow::new(Instant::now()));
+            if let Some(source_id) = stream.source_id {
+                if !stream.source_started {
+                    match plane.start_source(
+                        id,
+                        stream.session.unwrap(),
+                        source_id,
+                        &stream.configuration,
+                        stream.clock_origin_us,
+                        stream.clock_epoch,
+                    ) {
+                        Ok(()) => stream.source_started = true,
+                        Err(code) => {
+                            stream.cleanup(code);
+                            return;
+                        }
+                    }
+                }
+                let started = Instant::now();
+                let result = plane.pump_source(id, stream.session.unwrap(), stream.force_idr);
+                let elapsed = amaterasu_module_sdk::diagnostics::elapsed_us(started);
+                stream.timing.source_pump.record(elapsed);
+                if let Some(window) = &mut stream.diagnostics {
+                    window.timings.source_pump.record(elapsed);
+                }
+                match result {
+                    Ok(completed) => {
+                        if completed {
+                            stream.force_idr = false;
+                        }
+                    }
+                    Err(code) => stream.cleanup(code),
+                }
+            } else {
+                pump(
+                    plane,
+                    stream,
+                    id,
+                    &self.queues,
+                    &self.processing_generation,
+                    self.frame_trace.as_ref(),
+                );
+            }
+            log_diagnostics(stream, id, &self.queues, send);
+            if let Ok(mut queues) = self.queues.try_lock() {
+                queues.set_geometry(id, stream.desktop_geometry);
+                if let Some(capture) = stream.capture {
+                    match plane.hdr_metadata(id, stream.provider, capture) {
+                        Ok(metadata) => queues.set_hdr(id, metadata),
+                        Err(code) => stream.cleanup(code),
+                    }
+                }
+            }
+            if !matches!(
+                stream.stage,
+                Stage::Running | Stage::RestartCloseEncoder | Stage::ReplaceCapture
+            ) {
+                close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            }
+            return;
+        }
+        if stream.stage == Stage::Activating {
+            let geometry = if stream.source_id.is_some() {
+                Ok(GeometryProgress::Ready)
+            } else {
+                verify_stream_geometry(plane, stream)
+            };
+            match geometry {
+                Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, &self.queues, send),
+                Ok(GeometryProgress::Busy) => return,
+                Err(code) => stream.cleanup(code),
+            }
+            return;
+        }
+        if stream.stage == Stage::Failed {
+            return;
+        }
+        if advance(stream, id, &self.queues, plane, send) {
+            plane.finish_stream(id);
+            stream.cleanup_complete = true;
+            close_queue(&self.queues, &mut self.pending_queue_closes, id);
+            // A consumer may still borrow an owned packet. Keep this bounded
+            // stream slot until that queue closes, without replaying native close.
+            if self.pending_queue_closes.contains(&id) {
+                return;
+            }
+            if let Some(stream) = self.streams.remove(&id) {
+                self.remember_failure(id, &stream);
+            }
+        }
+    }
+}
+
+fn stage_mutates_provider(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::Capture
+            | Stage::Encoder
+            | Stage::CloseEncoder
+            | Stage::RestartCloseEncoder
+            | Stage::CloseCapture
+            | Stage::StopCapture
+            | Stage::ReplaceCapture
+    )
+}
+
+fn close_queue(queues: &Arc<Mutex<Queues>>, pending: &mut BTreeSet<u64>, id: u64) {
+    if let Ok(mut queues) = queues.try_lock() {
+        queues.close(id);
+        pending.remove(&id);
+    } else {
+        pending.insert(id);
+    }
+}
+
+/// True when `pixels` maps onto the `logical` output rectangle with one scale
+/// in KWin's supported range on both axes, allowing for the compositor's
+/// rounding of logical sizes to whole units.
+fn consistent_output_scale(
+    logical_width: u32,
+    logical_height: u32,
+    pixel_width: u32,
+    pixel_height: u32,
+) -> bool {
+    if logical_width == 0 || logical_height == 0 {
+        return false;
+    }
+    let horizontal = f64::from(pixel_width) / f64::from(logical_width);
+    let vertical = f64::from(pixel_height) / f64::from(logical_height);
+    let in_range = |scale: f64| (0.99..=5.01).contains(&scale);
+    let rounding = 1.0 / f64::from(logical_width.min(logical_height)) + 0.001;
+    in_range(horizontal)
+        && in_range(vertical)
+        && (horizontal - vertical).abs() <= rounding * horizontal.max(vertical)
+}
+
+fn verify_stream_geometry(
+    plane: &mut dyn Plane,
+    stream: &mut Stream,
+) -> Result<GeometryProgress, &'static str> {
+    let capture = stream.capture.expect("geometry follows capture admission");
+    if matches!(
+        stream.provider,
+        CaptureProvider::Pipewire | CaptureProvider::Vkms
+    ) && stream.capture_output.starts_with("kwin:")
+    {
+        let Some(actual) = plane.geometry(stream.provider, capture)? else {
+            return Ok(GeometryProgress::Busy);
+        };
+        actual.validate().map_err(|_| "invalid_capture_geometry")?;
+        // Geometry is in logical desktop units. For PipeWire, the selected
+        // source's native observation establishes its pixels independently of
+        // each client's resized encoder image. A desktop move is harmless;
+        // geometry that breaks the source's uniform DPI scale is not.
+        let (pixel_width, pixel_height) = if stream.provider == CaptureProvider::Pipewire {
+            stream
+                .source_observation
+                .as_ref()
+                .map(|observed| (observed.width, observed.height))
+                .unwrap_or((stream.configuration.width, stream.configuration.height))
+        } else {
+            (stream.configuration.width, stream.configuration.height)
+        };
+        if !consistent_output_scale(
+            actual.output.width,
+            actual.output.height,
+            pixel_width,
+            pixel_height,
+        ) {
+            return Err("capture_geometry_changed");
+        }
+        stream.desktop_geometry = Some(actual);
+        Ok(GeometryProgress::Ready)
+    } else {
+        plane.verify_geometry(stream.provider, capture, stream.desktop_geometry)
+    }
+}
+
+fn elapsed_at_rate(now: Instant, anchor: Instant, frames_per_second: f64) -> bool {
+    now.saturating_duration_since(anchor).as_secs_f64() * frames_per_second >= 1.0
+}
+
+/// Why a pump tick reads the capture provider for new content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureTrigger {
+    None,
+    /// The 1/fps capture timer elapsed.
+    Timer,
+    /// A newer completed presentation is ready and the frame-rate cap admits it.
+    Presentation,
+}
+
+fn pump(
+    plane: &mut dyn Plane,
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+    frame_trace: Option<&crate::frame_trace::FrameTrace>,
+) {
+    let now = Instant::now();
+    // Notifications wake the consumer; presentation metadata still owns frame
+    // cadence and source timestamps when the selected provider offers both.
+    let presentation_paced = match stream.observe_presentation(plane) {
+        Ok(paced) => paced,
+        Err(code) => {
+            stream.cleanup(code);
+            return;
+        }
+    };
+    if presentation_paced {
+        stream.presentation.record_cap_hold(now);
+    }
+    let mut trigger = if presentation_paced {
+        stream.presentation_capture_due(now)
+    } else if now >= stream.next_frame
+        && (!stream.capture_notifications || stream.capture_event_ready)
+    {
+        CaptureTrigger::Timer
+    } else {
+        CaptureTrigger::None
+    };
+    let mut capture_slot = (trigger == CaptureTrigger::Timer).then_some(stream.next_frame);
+    if trigger != CaptureTrigger::None {
+        match verify_stream_geometry(plane, stream) {
+            Ok(GeometryProgress::Ready) => {}
+            Ok(GeometryProgress::Busy) => {
+                if stream.provider == CaptureProvider::Wgc && !stream.constant_rate {
+                    stream.wgc_pacing.capture_missed(
+                        stream
+                            .next_frame
+                            .saturating_duration_since(stream.opened_at),
+                    );
+                }
+                stream.next_frame = next_capture_deadline_for(now, &stream.configuration);
+                trigger = CaptureTrigger::None;
+                capture_slot = None;
+            }
+            Err(code) => {
+                stream.cleanup(code);
+                return;
+            }
+        }
+        if trigger != CaptureTrigger::None {
+            stream.capture_event_ready = false;
+        }
+        if trigger == CaptureTrigger::Timer
+            && (stream.provider != CaptureProvider::Wgc || stream.constant_rate)
+        {
+            stream.next_frame = if stream.provider.uses_periodic_capture() {
+                periodic_capture_deadline_for(stream.next_frame, now, &stream.configuration)
+            } else {
+                next_capture_deadline_for(now, &stream.configuration)
+            };
+        }
+    }
+    let capture_due = trigger != CaptureTrigger::None;
+    let frame_interval = if stream.configuration.fps_milli.is_some() {
+        presentation::frame_interval_millihz(stream.configuration.effective_fps_millihz())
+    } else {
+        presentation::frame_interval(stream.configuration.fps)
+    };
+    let repeat_due = if presentation_paced {
+        stream.presentation_repeat_due(now)
+    } else {
+        stream.repeat_due(now)
+    };
+    let frame_clock = if trigger == CaptureTrigger::Presentation {
+        let presented_us = stream
+            .presentation
+            .fresh_timestamp(stream.stream_clock_us(now), frame_interval);
+        stream.frame_clock_at(presented_us)
+    } else {
+        stream.next_frame_clock(now)
+    };
+    let Some((timestamp_us, sequence)) = frame_clock else {
+        stream.cleanup("frame_clock_exhausted");
+        return;
+    };
+    // Record before entering the capture callback: some encoders return output
+    // during this same pump. This clock is distinct from presentation pacing.
+    // Only the direct DMA-BUF path guarantees that capture and submission
+    // occur in this same pump. Deferred CPU preprocessing and source-owned
+    // providers need to supply their own timing rather than guessing here.
+    let capture_start_recorded =
+        stream.frame_path == FramePath::DmaBuf && (capture_due || repeat_due);
+    if capture_start_recorded {
+        record_processing_start(queues, generation, id, sequence);
+    }
+    // Read the trace clock only for pumps that may produce a frame.
+    let capture_started = frame_trace
+        .filter(|_| capture_due || repeat_due)
+        .map(|trace| (trace, trace.now()));
+    match plane.pump(Pump {
+        video: id,
+        provider: stream.provider,
+        frame_path: stream.frame_path,
+        capture: stream.capture.unwrap(),
+        encoder: stream.session.unwrap(),
+        configuration: &stream.configuration,
+        capture_due,
+        constant_rate: stream.constant_rate,
+        repeat_due,
+        repeat_frame: stream.last_pixels.as_ref(),
+        timestamp_us,
+        sequence,
+        force_idr: stream.force_idr,
+    }) {
+        Ok(progress) => {
+            let completed_at = Instant::now();
+            if capture_start_recorded && !progress.submitted {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
+            if progress.submitted
+                && let Some((trace, started)) = capture_started
+            {
+                trace.submitted(id, sequence, started);
+            }
+            if stream.capture_notifications
+                && capture_due
+                && !progress.submitted
+                && (progress.capture_deferred
+                    || progress.dropped
+                    || progress.capture_frame_count == 0)
+            {
+                stream.capture_event_ready = true;
+            }
+            stream.timing.record(&progress);
+            stream
+                .diagnostics
+                .get_or_insert_with(|| DiagnosticWindow::new(now))
+                .record(&progress);
+            stream.owned_capture.record_freshness(&progress);
+            if let Some(reason) = progress.dmabuf_fallback {
+                if !owned_capture::begin_cpu_capture_fallback(stream, reason) {
+                    stream.cleanup(reason);
+                }
+                return;
+            }
+            if presentation_paced {
+                // Pace capture starts. A synchronous GPU submission may spend
+                // most of a frame interval here; charging that time again
+                // delays the next fresh presentation after every encode.
+                stream.presentation.record(
+                    now,
+                    frame_interval,
+                    presentation::PresentationDelivery {
+                        pushed: trigger == CaptureTrigger::Presentation,
+                        repeat: progress.repeat_attempted,
+                        delivered: progress.dmabuf_presentation,
+                        submitted: progress.submitted,
+                    },
+                );
+            }
+            if stream.provider.uses_periodic_capture()
+                && progress.capture_deferred
+                && let Some(slot) = capture_slot
+            {
+                stream.next_frame = slot;
+            }
+            if capture_due
+                && stream.provider == CaptureProvider::Wgc
+                && (!stream.constant_rate
+                    || progress.capture_arrival.is_some()
+                    || progress.capture_reused)
+            {
+                if let Some(arrival) = progress.capture_arrival {
+                    let observed_offset = arrival
+                        .observed_at
+                        .saturating_duration_since(stream.opened_at);
+                    let Some(projected_slot) = stream
+                        .wgc_pacing
+                        .capture_arrived(arrival.timestamp_us, observed_offset)
+                    else {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    };
+                    if !schedule_wgc_after_completion(stream, projected_slot, completed_at) {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    }
+                } else if progress.capture_reused {
+                    if let Some(projected_slot) = stream.wgc_pacing.cached_reuse_slot()
+                        && !schedule_wgc_after_completion(stream, projected_slot, completed_at)
+                    {
+                        stream.cleanup("frame_clock_exhausted");
+                        return;
+                    }
+                } else {
+                    let capture_slot =
+                        capture_slot.expect("due WGC capture retains its target slot");
+                    stream
+                        .wgc_pacing
+                        .capture_missed(capture_slot.saturating_duration_since(stream.opened_at));
+                    stream.next_frame = next_capture_deadline_for(now, &stream.configuration);
+                }
+            }
+            stream.dropped = stream.dropped.saturating_add(u64::from(progress.dropped));
+            stream.submitted = stream
+                .submitted
+                .saturating_add(u64::from(progress.submitted));
+            stream.record_repeat_deadline(
+                completed_at,
+                progress.repeat_attempted,
+                progress.submitted,
+            );
+            if progress.repeat_attempted {
+                stream.last_repeat_attempt_at = Some(completed_at);
+            }
+            if progress.submitted {
+                stream.last_output_at = Some(completed_at);
+                stream.last_repeat_attempt_at = None;
+                stream.last_output_timestamp_us = Some(timestamp_us);
+                stream.last_output_sequence = sequence;
+                if let Some(frame) = progress.frame {
+                    stream.last_frame = Some(frame);
+                    stream.last_pixels = progress.owned_frame;
+                }
+                stream.force_idr = false;
+            }
+        }
+        Err(code) if begin_runtime_encoder_recovery(stream, code) => {
+            if capture_start_recorded {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
+        }
+        Err(code) => {
+            if capture_start_recorded {
+                cancel_processing_start(queues, generation, id, sequence);
+            }
+            stream.cleanup(code);
+        }
+    }
+}
+
+/// An unavailable queue must not turn a stale provisional timestamp into a
+/// falsely precise result. Invalidate all prior associations without waiting.
+fn invalidate_processing_generation(generation: &AtomicU64) {
+    let mut value = generation.load(Ordering::Relaxed);
+    while value != u64::MAX {
+        match generation.compare_exchange_weak(
+            value,
+            value + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => value = current,
+        }
+    }
+}
+
+fn record_processing_start(
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+    id: u64,
+    sequence: u64,
+) {
+    match queues.try_lock() {
+        Ok(mut queue) => {
+            queue.start_processing(id, sequence, amaterasu_media::host_monotonic_micros())
+        }
+        Err(_) => invalidate_processing_generation(generation),
+    }
+}
+
+fn cancel_processing_start(
+    queues: &Arc<Mutex<Queues>>,
+    generation: &AtomicU64,
+    id: u64,
+    sequence: u64,
+) {
+    match queues.try_lock() {
+        Ok(mut queue) => queue.cancel_processing(id, sequence),
+        Err(_) => invalidate_processing_generation(generation),
+    }
+}
+
+fn schedule_wgc_after_completion(
+    stream: &mut Stream,
+    projected_slot: Duration,
+    completed_at: Instant,
+) -> bool {
+    let completed_offset = completed_at.saturating_duration_since(stream.opened_at);
+    let next_slot = if stream.configuration.fps_milli.is_some() {
+        pacing::next_slot_after_completion_millihz(
+            projected_slot,
+            completed_offset,
+            stream.configuration.effective_fps_millihz(),
+        )
+    } else {
+        pacing::next_slot_after_completion(
+            projected_slot,
+            completed_offset,
+            stream.configuration.fps,
+        )
+    };
+    let Some((next_slot, missed_slot)) = next_slot else {
+        return false;
+    };
+    if missed_slot {
+        stream.wgc_pacing.capture_missed(projected_slot);
+    }
+    let Some(next_deadline) = stream.opened_at.checked_add(next_slot) else {
+        return false;
+    };
+    stream.next_frame = next_deadline;
+    true
+}
+
+fn next_capture_deadline(now: Instant, fps: u32) -> Instant {
+    now + Duration::from_micros(1_000_000 / u64::from(fps))
+}
+
+fn periodic_capture_deadline(previous: Instant, now: Instant, fps: u32) -> Instant {
+    periodic_deadline(previous, now, Duration::from_secs_f64(1.0 / f64::from(fps)))
+}
+
+fn next_capture_deadline_for(now: Instant, configuration: &Configuration) -> Instant {
+    configuration.fps_milli.map_or_else(
+        || next_capture_deadline(now, configuration.fps),
+        |fps_milli| now + Duration::from_nanos(1_000_000_000_000 / u64::from(fps_milli.max(1))),
+    )
+}
+
+fn periodic_capture_deadline_for(
+    previous: Instant,
+    now: Instant,
+    configuration: &Configuration,
+) -> Instant {
+    configuration.fps_milli.map_or_else(
+        || periodic_capture_deadline(previous, now, configuration.fps),
+        |fps_milli| {
+            periodic_deadline(
+                previous,
+                now,
+                Duration::from_nanos(1_000_000_000_000 / u64::from(fps_milli.max(1))),
+            )
+        },
+    )
+}
+
+fn periodic_deadline(previous: Instant, now: Instant, period: Duration) -> Instant {
+    let elapsed = now.saturating_duration_since(previous);
+    let periods = elapsed.as_nanos() / period.as_nanos() + 1;
+    u32::try_from(periods)
+        .ok()
+        .and_then(|count| period.checked_mul(count))
+        .and_then(|advance| previous.checked_add(advance))
+        .unwrap_or_else(|| now + period)
+}
+
+fn advance(
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    plane: &mut dyn Plane,
+    send: &mut Send<'_>,
+) -> bool {
+    if !lifecycle::settle(stream, send) {
+        return false;
+    }
+    if stream.no_resources
+        && matches!(
+            stream.stage,
+            Stage::FindEncoder | Stage::CloseEncoder | Stage::FindCapture | Stage::CloseCapture
+        )
+    {
+        return finish_cleanup(stream);
+    }
+    if let Some(request) = stream.pending {
+        let result = if let Some(payload) = stream.completed_payload.take() {
+            Ok(payload)
+        } else {
+            let Some(result) = rpc::result(send, request) else {
+                return false;
+            };
+            result
+        };
+        if result.is_err()
+            || matches!(
+                stream.stage,
+                Stage::X11Enumerate
+                    | Stage::KmsEnumerate
+                    | Stage::SelectEncoder
+                    | Stage::InspectEncoder
+                    | Stage::ProbeEncoder
+            )
+        {
+            // Selection children retain no codec session. Their result must be
+            // released before another probe, capture allocation or failure.
+            stream.unsettled = Some(request);
+            stream.unsettled_effect = result.is_err() && stage_mutates_provider(stream.stage);
+            stream.unsettled_observed = false;
+        } else if !rpc::release(send, request) {
+            // TakeResult retains the broker's payload and operation record.
+            // Keep both the exact request and its observed result until release
+            // is confirmed; only ledger settlement may retry, never the effect.
+            stream.completed_payload = result.ok();
+            return false;
+        }
+        stream.pending = None;
+        return apply_result(stream, id, queues, plane, result, send);
+    }
+    if stream.stage == Stage::Capture {
+        if requires_encoder_configuration_probe(&stream.configuration)
+            && !stream.encoder_configuration_probed
+        {
+            if stream.encoder.is_none() {
+                stream.cleanup("encoder_configuration_unverified");
+                return false;
+            }
+            stream.no_resources = stream.capture.is_none() && stream.session.is_none();
+            stream.encoder_probe_attempt += 1;
+            stream.stage = Stage::ProbeEncoder;
+            return false;
+        }
+        owned_capture::select_capture_provider(stream, id, plane);
+        if stream.stage != Stage::Capture {
+            return false;
+        }
+        let managed_preflight = stream.capture_selection.is_none()
+            && is_owned_kwin_output(&stream.capture_output)
+            && stream.configuration.video_stream_format.bit_depth > 8
+            && !stream
+                .configuration
+                .gpu_processing
+                .as_ref()
+                .is_some_and(|processing| processing.enabled && !processing.source_hdr_required);
+        if stream.capture_selection.is_some() || managed_preflight {
+            stream
+                .capture_preflight_started
+                .get_or_insert_with(Instant::now);
+        }
+        if capture_preflight_expired(stream) {
+            stream.cleanup("capture_source_preflight_timeout");
+            return false;
+        }
+        let preflight = if managed_preflight {
+            capture_open::managed_format(
+                stream.provider,
+                &stream.capture_output,
+                &stream.configuration,
+                plane,
+            )
+        } else {
+            capture_open::format(
+                stream.capture_selection.as_ref(),
+                stream.provider,
+                &stream.capture_output,
+                &stream.configuration,
+                plane,
+            )
+        };
+        // A provider's synchronous callback may have returned after the
+        // admission deadline. Do not create a capture from an expired result.
+        if capture_preflight_expired(stream) {
+            stream.cleanup("capture_source_preflight_timeout");
+            return false;
+        }
+        match preflight {
+            Ok(capture_open::FormatProgress::Ready(format)) => {
+                stream.capture_preflight_started = None;
+                stream.capture_source_format = format;
+            }
+            Ok(capture_open::FormatProgress::Pending) => {
+                return false;
+            }
+            Err(code) => {
+                stream.cleanup(code);
+                return false;
+            }
+        }
+    }
+    if stream.stage == Stage::Encoder && stream.source_id.is_none() {
+        match verify_stream_geometry(plane, stream) {
+            Ok(GeometryProgress::Ready) => {}
+            Ok(GeometryProgress::Busy) => return false,
+            Err(code) => {
+                stream.cleanup(code);
+                return false;
+            }
+        }
+    }
+    let (service, payload) = request(stream);
+    let operation = if stream.stage == Stage::Capture {
+        format!(
+            "{}-capture-attempt-{}",
+            stream.operation, stream.capture_attempt
+        )
+    } else if stream.stage == Stage::ProbeEncoder {
+        format!(
+            "{}-probe-encoder-{}",
+            stream.operation, stream.encoder_probe_attempt
+        )
+    } else if stream.stage == Stage::Encoder {
+        stream.encoder_operation()
+    } else if stream.stage == Stage::ReplaceCapture {
+        format!(
+            "{}-replace-capture-{}-{}",
+            stream.operation, stream.capture_attempt, stream.retries
+        )
+    } else if stream.stage == Stage::FallbackEnumerate {
+        format!(
+            "{}-fallback-enumerate-{}-{}",
+            stream.operation, stream.fallback_offset, stream.retries
+        )
+    } else {
+        format!(
+            "{}-{}-{}",
+            stream.operation,
+            stage_name(stream.stage),
+            stream.retries
+        )
+    };
+    let parent = if matches!(
+        stream.stage,
+        Stage::X11Enumerate
+            | Stage::KmsEnumerate
+            | Stage::SelectEncoder
+            | Stage::InspectEncoder
+            | Stage::ProbeEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+    ) {
+        stream.parent
+    } else {
+        None
+    };
+    let command = Command::Request {
+        service: service.into(),
+        payload,
+        timeout_ms: 5000,
+        operation_id: operation,
+        parent,
+    };
+    match rpc::deliver(send, command.clone()) {
+        rpc::Admission::Accepted(request) => {
+            if matches!(stream.stage, Stage::Capture | Stage::Encoder) {
+                stream.no_resources = false;
+            }
+            stream.pending = Some(request);
+        }
+        rpc::Admission::Rejected(code) => {
+            if stream.stage == Stage::Capture
+                && owned_capture::begin_vkms_open_fallback(stream, &code)
+            {
+                return false;
+            }
+            if stream.stage == Stage::Capture {
+                // A running stream reopening capture still owns its encoder.
+                stream.no_resources = stream.session.is_none();
+                if code == "unavailable" {
+                    if !begin_fallback(stream, "unavailable") {
+                        failed_step(stream, "unavailable");
+                    }
+                } else {
+                    failed_step(stream, "request_failed");
+                }
+            } else if stream.stage == Stage::InspectEncoder {
+                // A definite refusal has no child resource; retain unknown inputs.
+                stream.stage = Stage::Capture;
+            } else if stream.stage == Stage::FallbackEnumerate {
+                failed_step(stream, stream.fallback_error.unwrap_or("request_failed"));
+            } else {
+                failed_step(stream, "request_failed");
+            }
+        }
+        rpc::Admission::Uncertain => {
+            if stream.stage == Stage::Capture {
+                stream.no_resources = false;
+            } else if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
+                stream.no_resources = true;
+            }
+            stream.uncertain = Some(command);
+            failed_step(stream, "request_failed");
+        }
+    }
+    false
+}
+
+fn capture_preflight_expired(stream: &Stream) -> bool {
+    stream
+        .capture_preflight_started
+        .is_some_and(|started| started.elapsed() >= Duration::from_secs(5))
+}
+
+fn request(stream: &Stream) -> (&str, Value) {
+    match stream.stage {
+        Stage::X11Enumerate => (stream.provider.service(), json!({"action":"enumerate"})),
+        Stage::KmsEnumerate => (stream.provider.service(), json!({"action":"enumerate"})),
+        Stage::SelectEncoder | Stage::InspectEncoder => (
+            stream.encoder_service.as_str(),
+            json!({"action":"enumerate"}),
+        ),
+        Stage::ProbeEncoder => (
+            &stream.encoder_service,
+            json!({
+                "action":"probe", "encoder":stream.encoder,
+                "configuration":encoder::configuration_for_encoder(&stream.configuration),
+            }),
+        ),
+        Stage::Capture => {
+            let mut request = json!({
+                "action":"open",
+                "output":stream.capture_output,
+                "operation_id":stream.capture_operation,
+            });
+            if let Some(format) = stream.capture_source_format {
+                request["source_format"] = json!(format);
+            }
+            if stream.generic_input {
+                request["resource_capture_clock"] = resource_capture_clock(stream);
+                request["resource_callback_contract"] = json!("cross_service_safe");
+            }
+            if stream.constant_rate {
+                request["constant_rate"] = json!(true);
+            }
+            (stream.provider.service(), request)
+        }
+        Stage::FallbackEnumerate => {
+            let mut request = json!({"action":"enumerate"});
+            if stream.fallback_offset != 0 {
+                request["offset"] = json!(stream.fallback_offset);
+            }
+            (
+                stream
+                    .fallback_provider
+                    .as_ref()
+                    .expect("fallback enumeration has a provider")
+                    .service(),
+                request,
+            )
+        }
+        Stage::Encoder => (&stream.encoder_service, encoder_open_request(stream)),
+        Stage::FindEncoder => (
+            &stream.encoder_service,
+            json!({"action":"lookup","operation_id":stream.encoder_operation()}),
+        ),
+        Stage::CloseEncoder => (
+            &stream.encoder_service,
+            json!({"action":"close","session_id":stream.session}),
+        ),
+        Stage::RestartCloseEncoder => (
+            &stream.encoder_service,
+            json!({"action":"close","session_id":stream.session}),
+        ),
+        Stage::FindCapture => (
+            stream.provider.service(),
+            json!({"action":"lookup","operation_id":stream.capture_operation}),
+        ),
+        Stage::CloseCapture | Stage::StopCapture | Stage::ReplaceCapture => (
+            stream.provider.service(),
+            json!({"action":"close","stream":stream.capture}),
+        ),
+        _ => unreachable!("only pending control stages submit"),
+    }
+}
+
+fn resource_capture_clock(stream: &Stream) -> Value {
+    let epoch_id = stream
+        .clock_epoch
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    json!({"domain":"host_monotonic", "epoch_id":epoch_id})
+}
+
+fn resource_output_clock(stream: &Stream) -> Value {
+    let epoch_id = stream
+        .clock_epoch
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    json!({"domain":"stream_relative", "epoch_id":epoch_id, "host_origin_us":stream.clock_origin_us})
+}
+
+fn encoder_open_request(stream: &Stream) -> Value {
+    let mut request = json!({
+        "action": "open",
+        "encoder": stream
+            .encoder
+            .as_ref()
+            .expect("encoder stage follows encoder selection"),
+        "configuration": encoder::configuration_for_encoder(&stream.configuration),
+        "operation_id": stream.encoder_operation(),
+    });
+    if stream.generic_input {
+        request["resource_output_clock"] = resource_output_clock(stream);
+        request["resource_callback_contract"] = json!("cross_service_safe");
+    }
+    if let Some(options) = &stream.encoder_options {
+        request["encoder_options"] = options.clone();
+    }
+    if let Some(source_id) = stream.source_id {
+        request["mode"] = json!("source");
+        request["source_id"] = json!(source_id);
+    }
+    if stream.packet_boundaries {
+        request["packet_boundaries"] = json!(true);
+    }
+    request
+}
+
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::X11Enumerate => "x11-output-selection",
+        Stage::KmsEnumerate => "kms-output-selection",
+        Stage::SelectEncoder => "select-encoder",
+        Stage::InspectEncoder => "inspect-encoder",
+        Stage::ProbeEncoder => "probe-encoder",
+        Stage::Capture => "capture",
+        Stage::FallbackEnumerate => "fallback-enumerate",
+        Stage::Encoder => "encoder",
+        Stage::Activating => "activating",
+        Stage::FindEncoder => "find-encoder",
+        Stage::CloseEncoder => "close-encoder",
+        Stage::RestartCloseEncoder => "restart-close-encoder",
+        Stage::ReplaceCapture => "cpu-fallback-close-capture",
+        Stage::FindCapture => "find-capture",
+        Stage::CloseCapture => "close-capture",
+        Stage::StopCapture => "drain-close-capture",
+        Stage::Running => "running",
+        Stage::Draining => "draining",
+        Stage::Failed => "cleanup-failed",
+    }
+}
+
+fn failed_step(stream: &mut Stream, code: &'static str) {
+    if matches!(
+        stream.stage,
+        Stage::X11Enumerate
+            | Stage::KmsEnumerate
+            | Stage::SelectEncoder
+            | Stage::InspectEncoder
+            | Stage::ProbeEncoder
+            | Stage::Capture
+            | Stage::FallbackEnumerate
+            | Stage::Encoder
+            | Stage::RestartCloseEncoder
+            | Stage::ReplaceCapture
+            | Stage::Activating
+            | Stage::StopCapture
+    ) {
+        stream.cleanup(code);
+    } else {
+        stream.retries += 1;
+        if stream.retries >= 3 {
+            stream.error = Some("cleanup_failed");
+            stream.unresolved = true;
+            stream.stage = if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder)
+                && stream.source_id.is_none()
+            {
+                Stage::FindCapture
+            } else {
+                Stage::Failed
+            };
+            stream.retries = 0;
+        }
+    }
+}
+
+fn begin_runtime_encoder_recovery(stream: &mut Stream, code: &'static str) -> bool {
+    if !matches!(code, "encoder_failed" | "frame_rejected")
+        || stream.stage != Stage::Running
+        || stream.encoder_attempt != 0
+        || stream.fallback_encoder.is_none()
+        || stream.restart_pending
+    {
+        return false;
+    }
+    stream.restart_pending = true;
+    stream.force_idr = true;
+    stream.next_frame = Instant::now();
+    stream.retries = 0;
+    stream.stage = Stage::RestartCloseEncoder;
+    true
+}
+
+fn apply_result(
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    plane: &mut dyn Plane,
+    result: Result<Value, &'static str>,
+    send: &mut Send<'_>,
+) -> bool {
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(code) => {
+            if stream.stage == Stage::InspectEncoder {
+                stream.stage = Stage::Capture;
+            } else if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
+                stream.cleanup("capture_provider_unavailable");
+            } else {
+                failed_step(stream, code);
+            }
+            return false;
+        }
+    };
+    if stream.stage == Stage::InspectEncoder {
+        if let Some(identity) = stream.encoder.as_ref()
+            && let Some(accepts_dmabuf) = inspect_explicit_encoder(
+                identity,
+                &stream.configuration,
+                &payload,
+                stream.encoder_provider.is_some(),
+            )
+        {
+            stream.owned_capture.record_encoder_inputs(accepts_dmabuf);
+        }
+        stream.stage = Stage::Capture;
+        return false;
+    }
+    if stream.stage == Stage::X11Enumerate {
+        match x11_selection_output(&payload, &stream.capture_output, &stream.configuration) {
+            Ok(()) => {
+                stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
+                {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                };
+                stream.retries = 0;
+            }
+            Err(code) => {
+                stream.no_resources = true;
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
+    if stream.stage == Stage::KmsEnumerate {
+        match kms_selection_output(&payload, &stream.capture_output, &stream.configuration) {
+            Ok(()) => {
+                stream.stage = if matches!(stream.requested_encoder, EncoderSelection::Identity(_))
+                {
+                    Stage::Capture
+                } else {
+                    Stage::SelectEncoder
+                };
+                stream.retries = 0;
+            }
+            Err(code) => {
+                stream.no_resources = true;
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
+    if stream.stage == Stage::ProbeEncoder {
+        let Some(identity) = &stream.encoder else {
+            stream.cleanup("invalid_encoder_probe_reply");
+            return false;
+        };
+        match encoder::probe_result(
+            identity,
+            &encoder::configuration_for_encoder(&stream.configuration),
+            &payload,
+        ) {
+            Ok(None) => {
+                stream.encoder_configuration_probed = true;
+                // A software candidate selected by probing has already used
+                // the software fallback; never restart it as its own fallback.
+                if stream.encoder == stream.fallback_encoder {
+                    stream.fallback_encoder = None;
+                }
+                stream.stage = Stage::Capture;
+                stream.encoder_candidates.clear();
+                stream.retries = 0;
+            }
+            Ok(Some(reason)) => {
+                stream.encoder_probe_reason = Some(reason);
+                if !begin_encoder_probe(stream) {
+                    stream.cleanup("encoder_unavailable");
+                }
+            }
+            Err(code) => {
+                // Preserve the provider's rejection without exposing settings or
+                // identity payloads; the generic correlation error alone hides
+                // whether the provider rejected or returned malformed data.
+                let provider_code = payload
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .filter(|value| {
+                        value.len() <= 128
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    })
+                    .unwrap_or("unavailable");
+                eprintln!(
+                    "amaterasu encoder probe rejected: provider_code={provider_code} ok={:?} settled={:?}",
+                    payload.get("ok"),
+                    payload.get("settled")
+                );
+                stream.cleanup(code);
+            }
+        }
+        return false;
+    }
+    let success = payload.get("ok").and_then(Value::as_bool) == Some(true);
+    let missing = rpc::missing(&payload);
+    if stream.stage == Stage::Capture
+        && payload.get("ok").and_then(Value::as_bool) == Some(false)
+        && owned_capture::begin_vkms_open_fallback(
+            stream,
+            payload_error_code(&payload).unwrap_or("provider_failed"),
+        )
+    {
+        return false;
+    }
+    if stream.stage == Stage::Capture
+        && payload.get("ok").and_then(Value::as_bool) == Some(false)
+        && payload_error_code(&payload) == Some("unsupported_platform")
+    {
+        stream.no_resources = stream.session.is_none();
+        if !begin_fallback(stream, "unsupported_platform") {
+            failed_step(stream, "unsupported_platform");
+        }
+        return false;
+    }
+    if !success
+        && !(missing
+            && matches!(
+                stream.stage,
+                Stage::FindEncoder
+                    | Stage::CloseEncoder
+                    | Stage::RestartCloseEncoder
+                    | Stage::ReplaceCapture
+                    | Stage::FindCapture
+                    | Stage::CloseCapture
+                    | Stage::StopCapture
+            ))
+    {
+        if stream.stage == Stage::RestartCloseEncoder {
+            stream.cleanup("encoder_restart_failed");
+            return false;
+        }
+        if stream.stage == Stage::Encoder
+            && begin_encoder_fallback(stream, payload_error_code(&payload))
+        {
+            return false;
+        }
+        let code = if stream.stage == Stage::SelectEncoder {
+            encoder_selection_error(payload_error_code(&payload))
+        } else if stream.stage == Stage::Encoder {
+            encoder_failure_code(payload_error_code(&payload))
+        } else if stream.stage == Stage::FallbackEnumerate {
+            stream.fallback_error.unwrap_or("provider_failed")
+        } else {
+            "provider_failed"
+        };
+        // Status reports only the coarse code; the log names the stage and the
+        // provider's own short code so a failed open can be diagnosed.
+        eprintln!(
+            "amaterasu video step failed stage={:?} provider={} reported={} code={code}",
+            stream.stage,
+            stream.provider.service(),
+            owned_capture::retained_reason(payload_error_code(&payload).unwrap_or("none")),
+        );
+        failed_step(stream, code);
+        return false;
+    }
+    let next = match stream.stage {
+        Stage::SelectEncoder => {
+            let prefer_dmabuf = stream.owned_capture.prefers_dmabuf(id, plane);
+            let software_only = matches!(
+                stream.requested_encoder,
+                EncoderSelection::Backend(EncoderBackend::Software)
+            );
+            let mut candidates_payload = payload.clone();
+            if software_only && let Some(entries) = candidates_payload["encoders"].as_array_mut() {
+                entries.retain(|entry| entry["hardware"].as_bool() == Some(false));
+            }
+            match resolve_encoder_selection_for(
+                stream.encoder_index,
+                &stream.configuration,
+                &candidates_payload,
+                prefer_dmabuf,
+                stream.encoder_provider.is_some(),
+            ) {
+                Ok(choice) => {
+                    stream.fallback_encoder = x264_fallback_for_auto(
+                        stream.encoder_index,
+                        &stream.configuration,
+                        &choice.identity,
+                        &payload,
+                    );
+                    stream
+                        .owned_capture
+                        .record_encoder_inputs(choice.accepts_dmabuf);
+                    let probe_auto = matches!(
+                        stream.requested_encoder,
+                        EncoderSelection::Backend(EncoderBackend::Auto)
+                    );
+                    if probe_auto {
+                        stream.encoder_candidates.push_back(choice);
+                        while let Some(last) = stream.encoder_candidates.back() {
+                            if let Some(entries) = candidates_payload["encoders"].as_array_mut() {
+                                entries.retain(|entry| {
+                                    serde_json::from_value::<EncoderIdentity>(
+                                        entry["identity"].clone(),
+                                    )
+                                    .is_ok_and(|identity| identity != last.identity)
+                                });
+                            }
+                            match resolve_encoder_selection_for(
+                                None,
+                                &stream.configuration,
+                                &candidates_payload,
+                                prefer_dmabuf,
+                                stream.encoder_provider.is_some(),
+                            ) {
+                                Ok(next) => stream.encoder_candidates.push_back(next),
+                                Err(_) => break,
+                            }
+                        }
+                        begin_encoder_probe(stream);
+                        return false;
+                    }
+                    stream.encoder = Some(choice.identity);
+                    Stage::Capture
+                }
+                Err(code) => {
+                    let code = if software_only {
+                        match payload["software_encoder"]["reason"].as_str() {
+                            Some("x264_feature_disabled") => "x264_feature_disabled",
+                            Some("x264_headers_unavailable") => "x264_headers_unavailable",
+                            Some("x264_runtime_unavailable") => "x264_runtime_unavailable",
+                            _ => "software_encoder_unavailable",
+                        }
+                    } else {
+                        code
+                    };
+                    stream.cleanup(code);
+                    return false;
+                }
+            }
+        }
+        Stage::Capture => {
+            let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
+                stream.cleanup("invalid_capture_reply");
+                return false;
+            };
+            stream.capture = Some(capture);
+            stream.source_observation = match observed_capture(&payload) {
+                Ok(observation) => observation,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
+            if stream.provider == CaptureProvider::Pipewire
+                && stream.capture_output.starts_with("kwin:")
+                && stream.source_observation.as_ref().is_some_and(|observed| {
+                    stream.capture_output.strip_prefix("kwin:")
+                        != Some(observed.output_name.as_str())
+                })
+            {
+                stream.cleanup("capture_source_identity_mismatch");
+                return false;
+            }
+            if stream.generic_input
+                && (payload.get("resource_capture_clock") != Some(&resource_capture_clock(stream))
+                    || payload
+                        .get("resource_callback_contract")
+                        .and_then(Value::as_str)
+                        != Some("cross_service_safe"))
+            {
+                stream.cleanup("resource_capture_clock_unconfirmed");
+                return false;
+            }
+            let geometry = match capture_geometry(&payload) {
+                Ok(geometry) => geometry,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
+            stream.desktop_geometry = geometry;
+            stream.touch_port = match capture_touch_port(
+                &payload,
+                &stream.configuration,
+                stream.desktop_geometry,
+                stream.provider,
+                stream.source_observation.as_ref(),
+            ) {
+                Ok(touch_port) => touch_port,
+                Err(code) => {
+                    stream.cleanup(code);
+                    return false;
+                }
+            };
+            if stream.session.is_some() {
+                // A CPU capture fallback reopened capture under a running encoder.
+                match verify_stream_geometry(plane, stream) {
+                    Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
+                    Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
+                    Err(code) => stream.cleanup(code),
+                }
+                return false;
+            }
+            Stage::Encoder
+        }
+        Stage::FallbackEnumerate => {
+            let Some(device_name) = stream.fallback_device_name.clone() else {
+                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                return false;
+            };
+            let Some(provider) = stream.fallback_provider else {
+                stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                return false;
+            };
+            let target_output =
+                match accumulate_fallback_page(stream, &payload, provider, &device_name) {
+                    Ok(Some(output)) => output,
+                    Ok(None) => return false,
+                    Err(()) => {
+                        stream.cleanup(stream.fallback_error.unwrap_or("provider_failed"));
+                        return false;
+                    }
+                };
+            stream.provider = provider;
+            stream.capture_output = target_output;
+            stream.capture_operation = format!("{}-capture-1", stream.operation);
+            stream.capture_attempt = 1;
+            Stage::Capture
+        }
+        Stage::Encoder => {
+            if !accept_encoder(stream, &payload) {
+                return false;
+            }
+            if stream.generic_input {
+                stream.frame_path = FramePath::Generic;
+            }
+            if let Some(source_id) = stream.source_id {
+                if let Err(code) = plane.start_source(
+                    id,
+                    stream.session.unwrap(),
+                    source_id,
+                    &stream.configuration,
+                    stream.clock_origin_us,
+                    stream.clock_epoch,
+                ) {
+                    stream.cleanup(code);
+                    return false;
+                }
+                stream.source_started = true;
+                activate_or_resume(stream, id, queues, send);
+                return false;
+            }
+            match verify_stream_geometry(plane, stream) {
+                Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
+                Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
+                Err(code) => stream.cleanup(code),
+            }
+            return false;
+        }
+        Stage::FindEncoder => {
+            if missing && stream.source_id.is_some() {
+                return finish_cleanup(stream);
+            } else if missing {
+                if !stream.generic_input {
+                    // The exact owner-scoped lookup proves no encoder remains.
+                    plane.finish_stream(id);
+                }
+                Stage::FindCapture
+            } else {
+                let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
+                    failed_step(stream, "invalid_lookup");
+                    return false;
+                };
+                stream.session = Some(session);
+                Stage::CloseEncoder
+            }
+        }
+        Stage::CloseEncoder if stream.source_id.is_some() => return finish_cleanup(stream),
+        Stage::CloseEncoder => {
+            if !stream.generic_input {
+                // Broker Close acknowledged worker retirement. Entering the
+                // mandatory lease barrier earlier could block the host before
+                // it dispatched that asynchronous cleanup. Capture stays live.
+                plane.finish_stream(id);
+            }
+            Stage::FindCapture
+        }
+        Stage::RestartCloseEncoder => {
+            stream.session = None;
+            let Some(fallback) = stream.fallback_encoder.take() else {
+                stream.cleanup("encoder_restart_unavailable");
+                return false;
+            };
+            stream.encoder = Some(fallback);
+            stream.encoder_attempt = 1;
+            stream.retries = 0;
+            Stage::Encoder
+        }
+        Stage::FindCapture => {
+            if missing {
+                return finish_cleanup(stream);
+            } else {
+                let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
+                    failed_step(stream, "invalid_lookup");
+                    return false;
+                };
+                stream.capture = Some(capture);
+                Stage::CloseCapture
+            }
+        }
+        Stage::ReplaceCapture => {
+            if !capture_events::reopen_requested_capture(stream) {
+                owned_capture::reopen_cpu_capture(stream);
+            }
+            return false;
+        }
+        Stage::CloseCapture => return finish_cleanup(stream),
+        Stage::StopCapture => {
+            stream.capture = None;
+            Stage::Draining
+        }
+        _ => unreachable!("result belongs to submitted control stage"),
+    };
+    stream.stage = next;
+    stream.retries = 0;
+    false
+}
+
+fn begin_encoder_probe(stream: &mut Stream) -> bool {
+    let Some(choice) = stream.encoder_candidates.pop_front() else {
+        return false;
+    };
+    stream
+        .owned_capture
+        .record_encoder_inputs(choice.accepts_dmabuf);
+    stream.encoder = Some(choice.identity);
+    stream.encoder_configuration_probed = false;
+    stream.encoder_probe_attempt += 1;
+    stream.stage = Stage::ProbeEncoder;
+    stream.retries = 0;
+    true
+}
+
+fn requires_encoder_configuration_probe(configuration: &Configuration) -> bool {
+    configuration.video_stream_format != amaterasu_module_sdk::VideoStreamFormat::H264_SDR
+        || configuration.codec != amaterasu_media::VideoCodec::H264
+        || !configuration.color_mode.is_default()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CaptureOutputIdentity {
+    id: String,
+    device_name: String,
+    attached: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct X11OutputIdentity {
+    id: String,
+    adapter: String,
+    adapter_vendor_id: Option<u32>,
+    adapter_device_id: Option<u32>,
+    adapter_description: Option<String>,
+    device_name: String,
+    attached: bool,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rotation: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KmsOutputIdentity {
+    id: String,
+    adapter: String,
+    adapter_vendor_id: Option<u32>,
+    adapter_device_id: Option<u32>,
+    adapter_description: Option<String>,
+    device_name: String,
+    attached: bool,
+    framebuffer_export_supported: bool,
+    readback_reason: Option<String>,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rotation: u32,
+}
+
+fn x11_selection_output(
+    payload: &Value,
+    selected_id: &str,
+    configuration: &Configuration,
+) -> Result<(), &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("capture_provider_unavailable");
+    }
+    if payload
+        .get("next_offset")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("invalid_capture_selection");
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid_capture_selection")?;
+    let selected: Vec<_> = outputs
+        .iter()
+        .filter(|output| output.get("id").and_then(Value::as_str) == Some(selected_id))
+        .collect();
+    let selected = match selected.as_slice() {
+        [] => return Err("capture_output_unavailable"),
+        [selected] => selected,
+        _ => return Err("invalid_capture_selection"),
+    };
+    let output: X11OutputIdentity =
+        serde_json::from_value((*selected).clone()).map_err(|_| "invalid_capture_selection")?;
+    if output.id != selected_id
+        || output.adapter != "x11"
+        || output.adapter_vendor_id.is_some()
+        || output.adapter_device_id.is_some()
+        || output.adapter_description.is_some()
+        || output.device_name.is_empty()
+        || output.device_name.len() > 127
+        || output.device_name.chars().any(char::is_control)
+        || !output.attached
+        || output.left < 0
+        || output.top < 0
+        || output.rotation != 1
+        || output.width != configuration.width
+        || output.height != configuration.height
+    {
+        return Err(
+            if output.width != configuration.width || output.height != configuration.height {
+                "capture_dimensions_mismatch"
+            } else {
+                "invalid_capture_selection"
+            },
+        );
+    }
+    Ok(())
+}
+
+fn kms_selection_output(
+    payload: &Value,
+    selected_id: &str,
+    configuration: &Configuration,
+) -> Result<(), &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("capture_provider_unavailable");
+    }
+    if payload
+        .get("next_offset")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("invalid_capture_selection");
+    }
+    let outputs = payload
+        .get("outputs")
+        .and_then(Value::as_array)
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid_capture_selection")?;
+    let selected: Vec<_> = outputs
+        .iter()
+        .filter(|output| output.get("id").and_then(Value::as_str) == Some(selected_id))
+        .collect();
+    let selected = match selected.as_slice() {
+        [] => return Err("capture_output_unavailable"),
+        [selected] => selected,
+        _ => return Err("invalid_capture_selection"),
+    };
+    let output: KmsOutputIdentity =
+        serde_json::from_value((*selected).clone()).map_err(|_| "invalid_capture_selection")?;
+    if output.id != selected_id
+        || !valid_kms_output_id(&output.id)
+        || output.adapter
+            != format!(
+                "/dev/dri/{}",
+                output.id[4..].split('/').next().unwrap_or("")
+            )
+        || output.adapter_vendor_id.is_some()
+        || output.adapter_device_id.is_some()
+        || output.adapter_description.as_deref() != Some("DRM/KMS primary plane")
+        || output.device_name.is_empty()
+        || output.device_name.len() > 127
+        || output.device_name.chars().any(char::is_control)
+        || !output.attached
+        || !output.framebuffer_export_supported
+        || output.readback_reason.is_some()
+        || output.left < 0
+        || output.top < 0
+        || output.rotation != 1
+        || output.width != configuration.width
+        || output.height != configuration.height
+    {
+        return Err(
+            if output.width != configuration.width || output.height != configuration.height {
+                "capture_dimensions_mismatch"
+            } else {
+                "capture_output_unavailable"
+            },
+        );
+    }
+    Ok(())
+}
+
+fn valid_kms_output_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("kms:") else {
+        return false;
+    };
+    let Some((card, identity)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some(card_number) = card.strip_prefix("card") else {
+        return false;
+    };
+    if card_number.is_empty()
+        || !card_number.bytes().all(|byte| byte.is_ascii_digit())
+        || (card_number.len() > 1 && card_number.starts_with('0'))
+        || card_number.parse::<u32>().is_err()
+    {
+        return false;
+    }
+    let Some((connector, identity)) = identity
+        .strip_prefix("conn=")
+        .and_then(|rest| rest.split_once("/crtc="))
+    else {
+        return false;
+    };
+    let Some((crtc, plane)) = identity.split_once("/plane=") else {
+        return false;
+    };
+    [connector, crtc, plane].into_iter().all(|value| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0'))
+            && value.parse::<u32>().is_ok_and(|number| number > 0)
+    })
+}
+
+fn alternate_provider(provider: CaptureProvider) -> Option<CaptureProvider> {
+    match provider {
+        CaptureProvider::Dxgi => Some(CaptureProvider::Wgc),
+        CaptureProvider::Wgc => Some(CaptureProvider::Dxgi),
+        // Owned-output vkms fallback is handled separately, before activation.
+        CaptureProvider::Pipewire | CaptureProvider::Vkms => None,
+        CaptureProvider::X11 | CaptureProvider::Kms | CaptureProvider::External(_) => None,
+    }
+}
+
+fn begin_fallback(stream: &mut Stream, original_error: &'static str) -> bool {
+    let Some(provider) = stream.fallback_provider else {
+        return false;
+    };
+    if !stream.auto_capture || stream.constant_rate || stream.fallback_attempted {
+        return false;
+    }
+    let Some(device_name) = output_device_name(stream.provider, &stream.output) else {
+        return false;
+    };
+    stream.fallback_attempted = true;
+    stream.no_resources = true;
+    stream.fallback_error = Some(original_error);
+    stream.fallback_device_name = Some(device_name);
+    stream.fallback_offset = 0;
+    stream.fallback_pages = 0;
+    stream.fallback_last_output = None;
+    stream.fallback_match = None;
+    stream.fallback_enumeration_id = None;
+    stream.stage = Stage::FallbackEnumerate;
+    stream.retries = 0;
+    debug_assert_ne!(stream.provider, provider);
+    true
+}
+
+fn payload_error_code(payload: &Value) -> Option<&str> {
+    payload
+        .get("code")
+        .or_else(|| payload.get("error").and_then(|error| error.get("code")))
+        .and_then(Value::as_str)
+}
+
+const MAX_ENCODER_ENTRIES: usize = 64;
+const SOFTWARE_ENCODER_ID: &str = "amaterasu.software.x264";
+const SOFTWARE_HEVC_ENCODER_ID: &str = "amaterasu.software.linux.x265.hevc";
+const LINUX_FFMPEG_NVENC_ID: &str = "amaterasu.hardware.nvidia.nvenc.ffmpeg";
+const LINUX_FFMPEG_VAAPI_ID: &str = "amaterasu.hardware.vaapi.h264.ffmpeg";
+/// Native NVENC sessions, one identity per codec: `<prefix>h264|hevc|av1`.
+const NVENC_CUDA_ENCODER_PREFIX: &str = "amaterasu.hardware.nvenc-cuda.";
+
+/// The encoder chosen from an enumeration, with whether its description lists
+/// DMA-BUF among the frame inputs it accepts.
+struct EncoderChoice {
+    identity: EncoderIdentity,
+    accepts_dmabuf: bool,
+}
+
+/// `inputs` is optional and parsed tolerantly: an absent or malformed list
+/// means the legacy CPU-only input, and unknown input kinds are ignored.
+fn encoder_accepts_dmabuf(entry: &Value) -> bool {
+    entry
+        .get("inputs")
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("dmabuf")))
+}
+
+/// Find the exact explicit identity only after validating the bounded registry.
+/// An absent or malformed input list leaves the capability unknown.
+fn inspect_explicit_encoder(
+    identity: &EncoderIdentity,
+    configuration: &Configuration,
+    payload: &Value,
+    external: bool,
+) -> Option<bool> {
+    let entries = payload.get("encoders")?.as_array()?;
+    if entries.len() > MAX_ENCODER_ENTRIES {
+        return None;
+    }
+    let index = entries.iter().position(|entry| {
+        serde_json::from_value::<EncoderIdentity>(
+            entry.get("identity").cloned().unwrap_or(Value::Null),
+        )
+        .ok()
+        .as_ref()
+            == Some(identity)
+    })?;
+    let choice = resolve_encoder_selection_for(
+        Some(index.try_into().ok()?),
+        configuration,
+        payload,
+        false,
+        external,
+    )
+    .ok()?;
+    if &choice.identity != identity {
+        return None;
+    }
+    let inputs = entries[index].get("inputs")?.as_array()?;
+    if !inputs.iter().all(Value::is_string) {
+        return None;
+    }
+    Some(inputs.iter().any(|input| input.as_str() == Some("dmabuf")))
+}
+
+fn x264_fallback_for_auto(
+    index: Option<u32>,
+    configuration: &Configuration,
+    selected: &EncoderIdentity,
+    payload: &Value,
+) -> Option<EncoderIdentity> {
+    // x264 encodes only H.264; HEVC and AV1 never gain a software fallback here.
+    if index.is_some()
+        || configuration.codec != VideoCodec::H264
+        || !(matches!(
+            selected.clsid.as_str(),
+            LINUX_FFMPEG_NVENC_ID | LINUX_FFMPEG_VAAPI_ID
+        ) || selected.clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX))
+    {
+        return None;
+    }
+    payload
+        .get("encoders")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            let identity: EncoderIdentity =
+                serde_json::from_value(entry.get("identity")?.clone()).ok()?;
+            (identity.clsid == SOFTWARE_ENCODER_ID
+                && entry.get("hardware")?.as_bool() == Some(false))
+            .then_some(identity)
+        })
+}
+
+fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
+    let confirmed_open_failure = match stream
+        .encoder
+        .as_ref()
+        .map(|encoder| encoder.clsid.as_str())
+    {
+        Some(LINUX_FFMPEG_NVENC_ID) => matches!(
+            reason,
+            Some(
+                "nvenc_device_unavailable"
+                    | "nvenc_allocation_failed"
+                    | "nvenc_open_failed"
+                    | "nvenc_configuration_unsupported"
+                    | "nvenc_headers_unavailable"
+                    | "nvenc_headers_unsupported"
+            )
+        ),
+        Some(clsid) if clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX) => matches!(
+            reason,
+            Some(
+                "nvenc_cuda_library_unavailable"
+                    | "nvenc_cuda_driver_unavailable"
+                    | "nvenc_cuda_api_unsupported"
+                    | "nvenc_cuda_driver_too_old"
+                    | "nvenc_cuda_device_unavailable"
+                    | "nvenc_cuda_configuration_unsupported"
+                    | "nvenc_cuda_converter_unavailable"
+                    | "nvenc_cuda_allocation_failed"
+                    | "nvenc_cuda_headers_unavailable"
+                    | "nvenc_cuda_feature_disabled"
+            )
+        ),
+        Some(LINUX_FFMPEG_VAAPI_ID) => matches!(
+            reason,
+            Some(
+                "vaapi_device_unavailable"
+                    | "vaapi_allocation_failed"
+                    | "vaapi_open_failed"
+                    | "vaapi_configuration_unsupported"
+                    | "vaapi_headers_unavailable"
+                    | "vaapi_headers_unsupported"
+            )
+        ),
+        _ => false,
+    };
+    if !confirmed_open_failure || stream.encoder_attempt != 0 {
+        return false;
+    }
+    let Some(fallback) = stream.fallback_encoder.take() else {
+        return false;
+    };
+    stream.encoder = Some(fallback);
+    stream.encoder_attempt = 1;
+    stream.retries = 0;
+    true
+}
+
+fn encoder_supports_configuration(
+    identity: &EncoderIdentity,
+    configuration: &Configuration,
+) -> bool {
+    match identity.clsid.as_str() {
+        SOFTWARE_HEVC_ENCODER_ID => {
+            configuration.codec == VideoCodec::Hevc
+                && matches!(
+                    configuration.color_mode,
+                    ColorMode::Bt709Limited | ColorMode::Bt709Full
+                )
+                && configuration.max_reference_frames <= 1
+        }
+        LINUX_FFMPEG_NVENC_ID => {
+            configuration.codec == VideoCodec::H264
+                && matches!(
+                    configuration.color_mode,
+                    ColorMode::Bt709Limited | ColorMode::Bt709Full
+                )
+                && configuration.max_reference_frames <= 1
+        }
+        LINUX_FFMPEG_VAAPI_ID => {
+            configuration.codec == VideoCodec::H264
+                && configuration.color_mode == ColorMode::Bt709Limited
+                && configuration.max_reference_frames == 0
+        }
+        SOFTWARE_ENCODER_ID => configuration.codec == VideoCodec::H264,
+        // The CUDA backend converts every SDR color mode on the GPU and
+        // signals it in the bitstream; each clsid encodes exactly one codec.
+        clsid if clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX) => {
+            clsid.strip_prefix(NVENC_CUDA_ENCODER_PREFIX) == Some(codec_name(configuration.codec))
+                && (configuration.codec != VideoCodec::H264
+                    || configuration.max_reference_frames <= 1)
+        }
+        _ => configuration.codec == VideoCodec::H264,
+    }
+}
+
+/// Resolve profile indices against the current bounded codec registry before
+/// capture is opened. `None` means explicit `auto`: hardware first, then the
+/// registered software encoder. With `prefer_dmabuf`, auto ranks hardware that
+/// accepts DMA-BUF input ahead of other hardware. AV1 has no software encoder,
+/// so it never falls back past hardware. No missing/out-of-range selection is
+/// guessed.
+#[cfg(test)]
+fn resolve_encoder_selection(
+    index: Option<u32>,
+    configuration: &Configuration,
+    payload: &Value,
+    prefer_dmabuf: bool,
+) -> Result<EncoderChoice, &'static str> {
+    resolve_encoder_selection_for(index, configuration, payload, prefer_dmabuf, false)
+}
+
+fn resolve_encoder_selection_for(
+    index: Option<u32>,
+    configuration: &Configuration,
+    payload: &Value,
+    prefer_dmabuf: bool,
+    external: bool,
+) -> Result<EncoderChoice, &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(encoder_selection_error(payload_error_code(payload)));
+    }
+    if payload.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Err("encoder_disabled");
+    }
+    let entries = payload
+        .get("encoders")
+        .and_then(Value::as_array)
+        .ok_or("invalid_encoder_enumeration")?;
+    if entries.len() > MAX_ENCODER_ENTRIES {
+        return Err("invalid_encoder_enumeration");
+    }
+    if entries.is_empty() {
+        return Err(codec_unavailable(configuration.codec));
+    }
+
+    let mut identities = Vec::with_capacity(entries.len());
+    let mut hardware = Vec::new();
+    let mut software = Vec::new();
+    for entry in entries {
+        let identity: EncoderIdentity = serde_json::from_value(
+            entry
+                .get("identity")
+                .cloned()
+                .ok_or("invalid_encoder_enumeration")?,
+        )
+        .map_err(|_| "invalid_encoder_enumeration")?;
+        let codec = entry
+            .get("codec")
+            .and_then(Value::as_str)
+            .filter(|codec| matches!(*codec, "h264" | "hevc" | "av1"))
+            .ok_or("invalid_encoder_enumeration")?;
+        if !valid_encoder_identity(&identity) {
+            return Err("invalid_encoder_enumeration");
+        }
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("invalid_encoder_enumeration")?;
+        if name.is_empty()
+            || name.len() > 512
+            || name.chars().any(char::is_control)
+            || identities.contains(&identity)
+        {
+            return Err("invalid_encoder_enumeration");
+        }
+        let is_hardware = entry
+            .get("hardware")
+            .and_then(Value::as_bool)
+            .ok_or("invalid_encoder_enumeration")?;
+        if identity.clsid == SOFTWARE_ENCODER_ID && is_hardware {
+            return Err("invalid_encoder_enumeration");
+        }
+        let accepts_dmabuf = encoder_accepts_dmabuf(entry);
+        if is_hardware {
+            if codec == codec_name(configuration.codec) {
+                hardware.push((identity.clone(), accepts_dmabuf));
+            }
+        } else if (external || identity.clsid == software_encoder_id(configuration.codec))
+            && codec == codec_name(configuration.codec)
+        {
+            software.push((identity.clone(), accepts_dmabuf));
+        }
+        identities.push(identity);
+    }
+
+    if let Some(index) = index {
+        let selected = identities
+            .get(index as usize)
+            .ok_or("encoder_unavailable")?;
+        let selected_codec = entries[index as usize]
+            .get("codec")
+            .and_then(Value::as_str)
+            .ok_or("invalid_encoder_enumeration")?;
+        if selected_codec != codec_name(configuration.codec) {
+            return Err(codec_unavailable(configuration.codec));
+        }
+        if !external && !encoder_supports_configuration(selected, configuration) {
+            return Err("encoder_configuration_unsupported");
+        }
+        return Ok(EncoderChoice {
+            identity: selected.clone(),
+            accepts_dmabuf: encoder_accepts_dmabuf(&entries[index as usize]),
+        });
+    }
+    let supported = |(identity, _): &(EncoderIdentity, bool)| {
+        external || encoder_supports_configuration(identity, configuration)
+    };
+    let dmabuf_hardware = hardware
+        .iter()
+        .filter(|candidate| prefer_dmabuf && candidate.1)
+        .find(|candidate| supported(candidate));
+    dmabuf_hardware
+        .or_else(|| hardware.iter().find(|candidate| supported(candidate)))
+        .or_else(|| software.iter().find(|candidate| supported(candidate)))
+        .map(|(identity, accepts_dmabuf)| EncoderChoice {
+            identity: identity.clone(),
+            accepts_dmabuf: *accepts_dmabuf,
+        })
+        .ok_or_else(|| codec_unavailable(configuration.codec))
+}
+
+fn codec_name(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
+    }
+}
+
+fn software_encoder_id(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => SOFTWARE_ENCODER_ID,
+        VideoCodec::Hevc => SOFTWARE_HEVC_ENCODER_ID,
+        // There is no software AV1 backend; this id matches no encoder.
+        VideoCodec::Av1 => "amaterasu.software.av1-unavailable",
+    }
+}
+
+fn codec_unavailable(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264_encoder_unavailable",
+        VideoCodec::Hevc => "hevc_encoder_unavailable",
+        VideoCodec::Av1 => "av1_encoder_unavailable",
+    }
+}
+
+fn valid_encoder_identity(identity: &EncoderIdentity) -> bool {
+    let valid_text = |value: &str, maximum: usize| {
+        !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+    };
+    valid_text(&identity.clsid, 128)
+        && valid_text(&identity.friendly_name, 512)
+        && identity
+            .hardware_url
+            .as_deref()
+            .is_none_or(|value| valid_text(value, 2048))
+}
+
+fn encoder_selection_error(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("disabled") => "encoder_disabled",
+        Some("unsupported_platform") => "encoder_unavailable",
+        _ => "encoder_enumeration_failed",
+    }
+}
+
+fn encoder_failure_code(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(
+            "disabled"
+            | "unsupported_platform"
+            | "software_encoder_unavailable"
+            | "encoder_identity_changed"
+            | "x264_feature_disabled"
+            | "x264_headers_unavailable"
+            | "x264_runtime_unavailable",
+        ) => "h264_encoder_unavailable",
+        Some(
+            "hevc_feature_disabled"
+            | "hevc_configuration_unsupported"
+            | "hevc_x265_abi_unsupported"
+            | "hevc_allocation_failed"
+            | "hevc_profile_unsupported"
+            | "hevc_open_failed"
+            | "hevc_headers_unavailable"
+            | "hevc_headers_unsupported",
+        ) => "hevc_encoder_unavailable",
+        _ => "encoder_failed",
+    }
+}
+
+#[cfg(test)]
+mod integration_contract_tests {
+    use super::*;
+
+    fn select(
+        index: Option<u32>,
+        configuration: &Configuration,
+        payload: &Value,
+    ) -> Result<EncoderIdentity, &'static str> {
+        resolve_encoder_selection(index, configuration, payload, false)
+            .map(|choice| choice.identity)
+    }
+
+    fn default_configuration() -> Configuration {
+        serde_json::from_value(json!({
+            "width": 1920, "height": 1080, "fps": 60, "bitrate": 15_000_000
+        }))
+        .unwrap()
+    }
+
+    fn description(clsid: &str, name: &str, hardware: bool) -> Value {
+        description_for_codec(clsid, name, hardware, "h264")
+    }
+
+    fn description_for_codec(clsid: &str, name: &str, hardware: bool, codec: &str) -> Value {
+        json!({
+            "identity":{"clsid":clsid,"hardware_url":null,"friendly_name":name},
+            "name":name,
+            "codec":codec,
+            "hardware":hardware
+        })
+    }
+
+    #[test]
+    fn missing_linux_h264_backend_has_a_specific_pipeline_failure() {
+        for reason in [
+            "disabled",
+            "unsupported_platform",
+            "software_encoder_unavailable",
+            "encoder_identity_changed",
+            "x264_feature_disabled",
+            "x264_headers_unavailable",
+            "x264_runtime_unavailable",
+        ] {
+            assert_eq!(
+                encoder_failure_code(Some(reason)),
+                "h264_encoder_unavailable"
+            );
+        }
+        assert_eq!(encoder_failure_code(Some("driver_error")), "encoder_failed");
+    }
+
+    #[test]
+    fn registry_selection_preserves_ordinals_and_rejects_out_of_range() {
+        let payload = json!({
+            "ok":true,"enabled":true,"encoders":[
+                description("first-software", "First software", false),
+                description("second-hardware", "Second hardware", true)
+            ]
+        });
+        assert_eq!(
+            select(Some(0), &default_configuration(), &payload)
+                .unwrap()
+                .clsid,
+            "first-software"
+        );
+        assert!(matches!(
+            select(Some(2), &default_configuration(), &payload),
+            Err("encoder_unavailable")
+        ));
+    }
+
+    #[test]
+    fn enumeration_rejects_malformed_names_and_duplicate_identities() {
+        let overlong_name = "x".repeat(513);
+        for malformed_name in ["", overlong_name.as_str(), "bad\nname"] {
+            let payload = json!({
+                "ok":true,"enabled":true,
+                "encoders":[description("hardware", malformed_name, true)]
+            });
+            assert!(matches!(
+                select(Some(0), &default_configuration(), &payload),
+                Err("invalid_encoder_enumeration")
+            ));
+        }
+
+        let duplicate = description("hardware", "Hardware", true);
+        let payload = json!({
+            "ok":true,"enabled":true,
+            "encoders":[duplicate.clone(), duplicate]
+        });
+        assert!(matches!(
+            select(None, &default_configuration(), &payload),
+            Err("invalid_encoder_enumeration")
+        ));
+    }
+
+    #[test]
+    fn auto_uses_only_registered_x264_after_hardware_is_absent() {
+        let arbitrary_software = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description("other.software", "Other software", false)]
+        });
+        assert!(matches!(
+            select(None, &default_configuration(), &arbitrary_software),
+            Err("h264_encoder_unavailable")
+        ));
+
+        let x264 = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
+        });
+        assert_eq!(
+            select(None, &default_configuration(), &x264).unwrap().clsid,
+            SOFTWARE_ENCODER_ID
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_x264_when_nvenc_cannot_encode_selected_color() {
+        let payload = json!({
+            "ok": true, "enabled": true, "encoders": [
+                description(LINUX_FFMPEG_NVENC_ID, "NVENC", true),
+                description(SOFTWARE_ENCODER_ID, "x264", false)
+            ]
+        });
+        let mut configuration = default_configuration();
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            LINUX_FFMPEG_NVENC_ID
+        );
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            LINUX_FFMPEG_NVENC_ID
+        );
+        configuration.color_mode = ColorMode::Bt601Full;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            SOFTWARE_ENCODER_ID
+        );
+        assert!(matches!(
+            select(Some(0), &configuration, &payload),
+            Err("encoder_configuration_unsupported")
+        ));
+        configuration.color_mode = ColorMode::Bt709Limited;
+        configuration.max_reference_frames = 1;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            LINUX_FFMPEG_NVENC_ID
+        );
+    }
+
+    #[test]
+    fn vaapi_is_auto_selected_only_for_its_supported_limited_color() {
+        let payload = json!({
+            "ok": true, "enabled": true, "encoders": [
+                description(LINUX_FFMPEG_VAAPI_ID, "VAAPI", true),
+                description(SOFTWARE_ENCODER_ID, "x264", false)
+            ]
+        });
+        let mut configuration = default_configuration();
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            LINUX_FFMPEG_VAAPI_ID
+        );
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            SOFTWARE_ENCODER_ID
+        );
+        assert!(matches!(
+            select(Some(0), &configuration, &payload),
+            Err("encoder_configuration_unsupported")
+        ));
+    }
+
+    #[test]
+    fn hevc_auto_selection_requires_registered_x265_identity_and_supported_bt709_range() {
+        let payload = json!({
+            "ok":true,"enabled":true,"encoders":[
+                description(SOFTWARE_ENCODER_ID, "x264", false),
+                description_for_codec(SOFTWARE_HEVC_ENCODER_ID, "x265 Main", false, "hevc")
+            ]
+        });
+        let mut configuration = default_configuration();
+        configuration.codec = VideoCodec::Hevc;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            SOFTWARE_HEVC_ENCODER_ID
+        );
+
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert_eq!(
+            select(None, &configuration, &payload).unwrap().clsid,
+            SOFTWARE_HEVC_ENCODER_ID
+        );
+
+        configuration.color_mode = ColorMode::Bt601Full;
+        assert!(matches!(
+            select(None, &configuration, &payload),
+            Err("hevc_encoder_unavailable")
+        ));
+
+        configuration.color_mode = ColorMode::Bt709Limited;
+        let h264_only = json!({
+            "ok":true,"enabled":true,
+            "encoders":[description(SOFTWARE_ENCODER_ID, "x264", false)]
+        });
+        assert!(matches!(
+            select(None, &configuration, &h264_only),
+            Err("hevc_encoder_unavailable")
+        ));
+    }
+}
+
+fn output_device_name(provider: CaptureProvider, output_id: &str) -> Option<String> {
+    match provider {
+        CaptureProvider::Dxgi => {
+            let (adapter_id, device_name) = output_id.split_once('/')?;
+            let (high, low) = adapter_id.split_once(':')?;
+            let luid_is_valid = high.len() == 8
+                && low.len() == 8
+                && high.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && low.bytes().all(|byte| byte.is_ascii_hexdigit());
+            (luid_is_valid && !device_name.is_empty() && !device_name.contains('/'))
+                .then(|| device_name.to_owned())
+        }
+        CaptureProvider::Wgc => {
+            (!output_id.is_empty() && !output_id.contains('/')).then(|| output_id.to_owned())
+        }
+        // Portal IDs are scoped to a selected session and have no Windows alias.
+        CaptureProvider::Pipewire | CaptureProvider::Vkms => None,
+        CaptureProvider::X11 => output_id
+            .strip_prefix("x11:")
+            .and_then(|value| value.rsplit_once('/').map(|(name, _)| name.to_owned())),
+        CaptureProvider::Kms | CaptureProvider::External(_) => None,
+    }
+}
+
+const MAX_FALLBACK_ENUMERATION_PAGES: usize = 64;
+
+fn accumulate_fallback_page(
+    stream: &mut Stream,
+    payload: &Value,
+    provider: CaptureProvider,
+    device_name: &str,
+) -> Result<Option<String>, ()> {
+    let outputs: Vec<CaptureOutputIdentity> =
+        serde_json::from_value(payload.get("outputs").ok_or(())?.clone()).map_err(|_| ())?;
+    let next_offset = payload
+        .get("next_offset")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or(())
+        })
+        .transpose()?;
+    if stream.fallback_pages >= MAX_FALLBACK_ENUMERATION_PAGES {
+        return Err(());
+    }
+    let paged = stream.fallback_offset != 0 || next_offset.is_some();
+    if paged {
+        let enumeration_id = payload
+            .get("enumeration_id")
+            .and_then(Value::as_str)
+            .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(())?;
+        if let Some(previous) = stream.fallback_enumeration_id.as_deref() {
+            if previous != enumeration_id {
+                return Err(());
+            }
+        } else {
+            stream.fallback_enumeration_id = Some(enumeration_id.to_owned());
+        }
+    }
+    if paged && outputs.is_empty() {
+        return Err(());
+    }
+    let expected_next = stream
+        .fallback_offset
+        .checked_add(outputs.len())
+        .ok_or(())?;
+    if next_offset.is_some_and(|next| next != expected_next) {
+        return Err(());
+    }
+    for output in outputs {
+        if paged {
+            if stream
+                .fallback_last_output
+                .as_deref()
+                .is_some_and(|last| output.id.as_str() <= last)
+            {
+                return Err(());
+            }
+            stream.fallback_last_output = Some(output.id.clone());
+        }
+        let matches = output.attached
+            && output.device_name == device_name
+            && match provider {
+                CaptureProvider::Dxgi => {
+                    output_device_name(CaptureProvider::Dxgi, &output.id).as_deref()
+                        == Some(device_name)
+                }
+                CaptureProvider::Wgc => output.id == device_name,
+                CaptureProvider::Pipewire | CaptureProvider::Vkms => false,
+                CaptureProvider::X11 | CaptureProvider::Kms | CaptureProvider::External(_) => false,
+            };
+        if matches && stream.fallback_match.replace(output.id).is_some() {
+            return Err(());
+        }
+    }
+    stream.fallback_pages += 1;
+    if let Some(next) = next_offset {
+        stream.fallback_offset = next;
+        Ok(None)
+    } else {
+        stream.fallback_match.take().map(Some).ok_or(())
+    }
+}
+
+fn capture_geometry(payload: &Value) -> Result<Option<CaptureGeometry>, &'static str> {
+    let Some(value) = payload.get("desktop_geometry") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| "invalid_capture_geometry")
+}
+
+fn capture_touch_port(
+    payload: &Value,
+    configuration: &Configuration,
+    desktop_geometry: Option<CaptureGeometry>,
+    provider: CaptureProvider,
+    source_observation: Option<&ObservedCapture>,
+) -> Result<Option<Value>, &'static str> {
+    if provider == CaptureProvider::Pipewire
+        && let Some(source) = source_observation
+    {
+        return pipewire_touch_port(payload, configuration, desktop_geometry, source);
+    }
+    if payload["frame_transport"] == "dmabuf"
+        && let Some(geometry) = desktop_geometry
+    {
+        // Source pixel dimensions and desktop input units are independent
+        // provider observations. Geometry alone cannot establish image size.
+        let dimensions = payload["width"].as_u64().zip(payload["height"].as_u64());
+        if let Some((width, height)) = dimensions {
+            let width = u32::try_from(width).map_err(|_| "invalid_capture_touch_surface")?;
+            let height = u32::try_from(height).map_err(|_| "invalid_capture_touch_surface")?;
+            if !consistent_output_scale(
+                geometry.output.width,
+                geometry.output.height,
+                width,
+                height,
+            ) {
+                return Err("capture_geometry_changed");
+            }
+            let surface = match payload.get("touch_surface") {
+                Some(value) => serde_json::from_value::<TouchSurface>(value.clone())
+                    .map_err(|_| "invalid_capture_touch_surface")?,
+                None => TouchSurface {
+                    width,
+                    height,
+                    logical_width: geometry.output.width,
+                    logical_height: geometry.output.height,
+                },
+            };
+            if surface.width != width || surface.height != height {
+                return Err("invalid_capture_touch_surface");
+            }
+            return fitted_touch_port(configuration, &surface).map(Some);
+        }
+    }
+    let Some(value) = payload.get("touch_surface") else {
+        return Ok(None);
+    };
+    let surface: TouchSurface =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_touch_surface")?;
+    if !surface.validate() {
+        return Err("invalid_capture_touch_surface");
+    }
+    // Absolute input also needs the verified desktop rectangle. The current
+    // media plane accepts only unscaled frames of the requested size.
+    if !desktop_geometry.is_some_and(|geometry| {
+        surface.width == geometry.output.width && surface.height == geometry.output.height
+    }) || surface.width != configuration.width
+        || surface.height != configuration.height
+    {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "width": configuration.width,
+        "height": configuration.height,
+        "logical_width": surface.logical_width,
+        "logical_height": surface.logical_height,
+        "client_offset_x": 0.0_f32,
+        "client_offset_y": 0.0_f32,
+    })))
+}
+
+fn pipewire_touch_port(
+    payload: &Value,
+    configuration: &Configuration,
+    geometry: Option<CaptureGeometry>,
+    source: &ObservedCapture,
+) -> Result<Option<Value>, &'static str> {
+    let Some(geometry) = geometry else {
+        return Ok(None);
+    };
+    if !consistent_output_scale(
+        geometry.output.width,
+        geometry.output.height,
+        source.width,
+        source.height,
+    ) {
+        return Err("capture_geometry_changed");
+    }
+    let surface = match payload.get("touch_surface") {
+        Some(surface) => serde_json::from_value::<TouchSurface>(surface.clone())
+            .map_err(|_| "invalid_capture_touch_surface")?,
+        // Two native facts from the same selected PipeWire source establish
+        // physical source pixels and compositor input units independently.
+        // Desktop geometry alone is never used to infer image dimensions.
+        None => TouchSurface {
+            width: source.width,
+            height: source.height,
+            logical_width: geometry.output.width,
+            logical_height: geometry.output.height,
+        },
+    };
+    if !surface.validate() || surface.width != source.width || surface.height != source.height {
+        return Err("invalid_capture_touch_surface");
+    }
+    fitted_touch_port(configuration, &surface).map(Some)
+}
+
+fn fitted_touch_port(
+    configuration: &Configuration,
+    surface: &TouchSurface,
+) -> Result<Value, &'static str> {
+    if !surface.validate() {
+        return Err("invalid_capture_touch_surface");
+    }
+    let fit = crate::image_fit::ImageFit::new(
+        surface.width,
+        surface.height,
+        configuration.width,
+        configuration.height,
+    )
+    .ok_or("invalid_capture_touch_surface")?;
+    let mut port = json!({"width":configuration.width,"height":configuration.height,
+        "logical_width":surface.logical_width,"logical_height":surface.logical_height,
+        "client_offset_x":fit.left as f32,"client_offset_y":fit.top as f32});
+    if surface.width != configuration.width || surface.height != configuration.height {
+        port["content_width"] = json!(fit.width);
+        port["content_height"] = json!(fit.height);
+    }
+    Ok(port)
+}
+
+fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
+    if stream.generic_input
+        && (payload
+            .get("resource_callback_contract")
+            .and_then(Value::as_str)
+            != Some("cross_service_safe")
+            || payload.get("resource_output_clock") != Some(&resource_output_clock(stream))
+            || payload
+                .get("resource_sequence_policy")
+                .and_then(Value::as_str)
+                != Some("strict_source_echo"))
+    {
+        stream.cleanup("resource_clock_unconfirmed");
+        return false;
+    }
+    if payload.get("codec").and_then(Value::as_str) != Some(codec_name(stream.configuration.codec))
+    {
+        stream.cleanup("encoder_codec_mismatch");
+        return false;
+    }
+    if stream.packet_boundaries
+        && payload.get("packet_boundaries").and_then(Value::as_bool) != Some(true)
+    {
+        stream.cleanup("packet_boundaries_unavailable");
+        return false;
+    }
+    if stream.configuration.max_reference_frames != 0
+        && payload.get("max_reference_frames").and_then(Value::as_u64)
+            != Some(u64::from(stream.configuration.max_reference_frames))
+    {
+        stream.cleanup("reference_frame_constraint_unavailable");
+        return false;
+    }
+    let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
+        stream.cleanup("invalid_encoder_reply");
+        return false;
+    };
+    stream.session = Some(session);
+    true
+}
+
+fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mut Send<'_>) {
+    let mut guard = match queues.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            stream.stage = Stage::Activating;
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            stream.cleanup("queue_failed");
+            return;
+        }
+    };
+    guard.open(id, &stream.owner, stream.clock_origin_us);
+    guard.set_geometry(id, stream.desktop_geometry);
+    drop(guard);
+    stream.stage = Stage::Running;
+    if let Some(parent) = stream.parent.take()
+        && !rpc::complete(send, parent, stream.response(id))
+    {
+        stream.ending_parent = Some(parent);
+        stream.cleanup("completion_lost");
+        if let Ok(mut queues) = queues.try_lock() {
+            queues.close(id);
+        }
+    }
+}
+
+fn activate_or_resume(
+    stream: &mut Stream,
+    id: u64,
+    queues: &Arc<Mutex<Queues>>,
+    send: &mut Send<'_>,
+) {
+    if stream.restart_pending {
+        stream.restart_pending = false;
+        stream.stage = Stage::Running;
+        stream.force_idr = true;
+        stream.next_frame = Instant::now();
+    } else {
+        activate(stream, id, queues, send);
+    }
+}
+
+fn finish_cleanup(stream: &mut Stream) -> bool {
+    if stream.unresolved {
+        stream.stage = Stage::Failed;
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests;
