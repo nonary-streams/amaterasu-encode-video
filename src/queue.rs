@@ -207,6 +207,42 @@ impl Queues {
         }
     }
 
+    /// Replace a provisional start with the capture provider's earlier start
+    /// of the presentation actually submitted for `sequence`. Only an entry
+    /// recorded in the current generation and not yet frozen by encoded output
+    /// changes, and only within the host latency sanity window; otherwise the
+    /// provisional measurement stays. Returns whether the provider start applied.
+    pub fn adopt_processing_start(&mut self, id: u64, sequence: u64, provider_us: u64) -> bool {
+        let generation = self.processing_generation.load(Ordering::Relaxed);
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return false;
+        };
+        if stream.frozen_processing_starts.contains_key(&sequence) {
+            return false;
+        }
+        let Some((started, recorded_generation)) = stream.processing_starts.get_mut(&sequence)
+        else {
+            return false;
+        };
+        if generation == u64::MAX || *recorded_generation != generation {
+            return false;
+        }
+        let selected =
+            amaterasu_module_sdk::capture::select_processing_start(Some(provider_us), *started);
+        let adopted = selected != *started;
+        *started = selected;
+        adopted
+    }
+
+    #[cfg(test)]
+    pub fn processing_start(&self, id: u64, sequence: u64) -> Option<u64> {
+        self.streams
+            .get(&id)?
+            .processing_starts
+            .get(&sequence)
+            .map(|&(started, _)| started)
+    }
+
     /// A rejected or deferred submission does not own this sequence.
     pub fn cancel_processing(&mut self, id: u64, sequence: u64) {
         if let Some(stream) = self.streams.get_mut(&id) {
@@ -463,6 +499,40 @@ mod tests {
         assert_eq!(receipt.values, vec![(7, 1099, 5000); 3]);
         assert_eq!(queues.take_timing(1).unwrap()["queue_wait_us"]["calls"], 2);
         assert_eq!(queues.take_timing(1).unwrap()["queue_wait_us"]["calls"], 0);
+    }
+
+    #[test]
+    fn provider_start_replaces_only_a_live_provisional_start_inside_the_window() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 1000);
+        // No provisional start: the provider cannot invent one.
+        assert!(!queues.adopt_processing_start(1, 7, 4000));
+        queues.start_processing(1, 7, 9000);
+        // A start from the future is rejected; the provisional value stays.
+        assert!(!queues.adopt_processing_start(1, 7, 9001));
+        assert!(queues.adopt_processing_start(1, 7, 4000));
+        assert_eq!(queues.streams[&1].processing_starts[&7].0, 4000);
+        // A stale generation is never upgraded into a precise value.
+        queues.start_processing(1, 8, 9000);
+        queues
+            .processing_generation()
+            .fetch_add(1, Ordering::Relaxed);
+        assert!(!queues.adopt_processing_start(1, 8, 4000));
+        // Output already frozen with the provisional start keeps it.
+        queues.start_processing(1, 9, 9000);
+        let data = [1u8];
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: 0,
+            data: data.as_ptr(),
+            len: 1,
+            timestamp_us: 99,
+            sequence: 9,
+        };
+        // SAFETY: packet bytes remain live through this synchronous copy.
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        assert!(!queues.adopt_processing_start(1, 9, 4000));
+        assert_eq!(queues.streams[&1].frozen_processing_starts[&9], 9000);
     }
 
     #[test]

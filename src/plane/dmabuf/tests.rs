@@ -1351,3 +1351,127 @@ fn negotiated_resource_survives_temporary_incompatible_geometry() {
     assert!(initial.capture_deferred);
     assert_eq!(initial.dmabuf_fallback, None);
 }
+
+unsafe extern "C" fn no_hdr_metadata(_: *mut c_void, _: u64, _: *mut HdrMetadata) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn no_color_provenance(_: *mut c_void, _: u64, _: *mut u32) -> Status {
+    MEDIA_UNSUPPORTED
+}
+/// The provider began handling presentation 44 at host time 4 ms.
+unsafe extern "C" fn presentation_timing(
+    context: *mut c_void,
+    _: u64,
+    sequence: u64,
+    output: *mut CaptureFrameTimingV1,
+) -> Status {
+    // SAFETY: the harness outlives every binding in these tests.
+    let harness = unsafe { &*context.cast::<Harness>() };
+    if sequence != frame(harness).sequence {
+        return MEDIA_PENDING;
+    }
+    // SAFETY: the SDK adapter passes a live, writable record.
+    unsafe {
+        output.write(CaptureFrameTimingV1 {
+            sequence,
+            processing_started_host_us: 4_000,
+        })
+    };
+    STATUS_OK
+}
+
+unsafe extern "C" fn timing_preflight(
+    _: *mut c_void,
+    _: amaterasu_module_sdk::abi::BorrowedBytes,
+    _: amaterasu_module_sdk::abi::ReplySink,
+) -> i32 {
+    MEDIA_UNSUPPORTED
+}
+
+fn timed_capture_api(harness: &Harness) -> CaptureApiV1_12 {
+    let mut base = leased_capture_api(harness);
+    base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_12_SIZE,
+        major: INTERFACE_MAJOR,
+        minor: CAPTURE_FRAME_TIMING_INTERFACE_MINOR,
+    };
+    CaptureApiV1_12 {
+        base: CaptureApiV1_11 {
+            base: CaptureApiV1_10 {
+                base: CaptureApiV1_9 {
+                    base: CaptureApiV1_7 {
+                        base,
+                        subscribe_events: no_subscribe,
+                        unsubscribe_events: no_unsubscribe,
+                        resolve_swap: no_swap,
+                    },
+                    enumerate_resources: resource_enumerate,
+                    select_resource: resource_select,
+                    read_resource_frame: resource_read,
+                    hdr_metadata: no_hdr_metadata,
+                },
+                color_provenance: no_color_provenance,
+            },
+            source_preflight: timing_preflight,
+        },
+        frame_timing: presentation_timing,
+    }
+}
+
+#[test]
+fn native_plane_reports_the_provider_start_only_when_the_provider_supplies_it() {
+    use crate::plane::{NativePlane, Plane};
+    use amaterasu_module_sdk::RuntimeClient;
+    use std::sync::{Arc, Mutex};
+    // The same unchanged consumer runs against a v1.12 provider and against a
+    // replacement provider whose table predates per-presentation timing.
+    for timed in [true, false] {
+        let harness = Harness::default();
+        let timed_capture = timed_capture_api(&harness);
+        let legacy_capture = leased_capture_api(&harness);
+        let encoder = leased_encoder_api(&harness);
+        let fixture = RuntimeFixture {
+            harness: &harness,
+            capture: if timed {
+                std::ptr::from_ref(&timed_capture) as usize
+            } else {
+                std::ptr::from_ref(&legacy_capture) as usize
+            },
+            encoder: std::ptr::from_ref(&encoder) as usize,
+            external_encoder: 0,
+            processor: 0,
+        };
+        // SAFETY: the runtime endpoint and all tables outlive the plane.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(&fixture).cast_mut().cast(),
+                invoke: invoke_lifecycle_runtime,
+            })
+        };
+        let queues = Arc::new(Mutex::new(crate::queue::Queues::default()));
+        queues.lock().unwrap().open(1, "amaterasu.stream", 0);
+        // The pipeline's provisional start for video sequence 9.
+        queues.lock().unwrap().start_processing(1, 9, 9_000);
+        let mut plane = NativePlane::bind(
+            &runtime,
+            queues.clone(),
+            &[CaptureProvider::Vkms].into(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config = configuration();
+        let progress = plane.pump(pump(&config, true, false)).unwrap();
+        assert!(progress.submitted);
+        assert_eq!(progress.dmabuf_presentation, Some(44));
+        assert_eq!(
+            queues.lock().unwrap().processing_start(1, 9),
+            Some(if timed { 4_000 } else { 9_000 })
+        );
+        drop(plane);
+    }
+}

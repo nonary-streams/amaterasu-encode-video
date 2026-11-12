@@ -1161,11 +1161,13 @@ impl Plane for NativePlane {
             }
             .map_err(|_| "encoder_interface")?;
             let progress = processor.pump(capture, encoder, &input)?;
+            self.adopt_provider_processing_start(&input, &progress);
             return self.receive_packets(encoder, &input, progress);
         }
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::Generic {
             let progress = self.deliver_generic(&input)?;
+            self.adopt_provider_processing_start(&input, &progress);
             let encoder = unsafe {
                 self.encoders
                     .get(&self.active_encoder)
@@ -1180,6 +1182,7 @@ impl Plane for NativePlane {
                 return Err("processor_requires_cpu");
             }
             let progress = self.deliver_dmabuf(&input)?;
+            self.adopt_provider_processing_start(&input, &progress);
             let encoder_api = unsafe {
                 self.encoders
                     .get(&self.active_encoder)
@@ -1580,6 +1583,35 @@ impl NativePlane {
         let encoder = unsafe { encoder_binding.table::<EncoderApiV1_1>() }
             .map_err(|_| "encoder_interface")?;
         dmabuf::deliver(capture, encoder, input, !input.capture_due)
+    }
+
+    /// Report processing from when the capture provider began handling the
+    /// presentation actually submitted, when it supplies that time. Runs before
+    /// this pump polls encoded output, so the provider start precedes freezing.
+    /// Providers without capture v1.12 keep the pipeline's provisional start.
+    fn adopt_provider_processing_start(&self, input: &Pump<'_>, progress: &Progress) {
+        let (true, Some(presentation)) = (progress.submitted, progress.dmabuf_presentation) else {
+            return;
+        };
+        let Some(binding) = self.captures.get(&input.provider) else {
+            return;
+        };
+        // SAFETY: the binding retains its validated v1.0 prefix.
+        let Ok(prefix) = (unsafe { binding.table::<CaptureApiPrefix>() }) else {
+            return;
+        };
+        // SAFETY: the binding and capture stream stay live through this
+        // synchronous, non-blocking SDK query of the advertised table.
+        let provider = unsafe {
+            amaterasu_module_sdk::capture::frame_processing_start(
+                prefix,
+                input.capture,
+                presentation,
+            )
+        };
+        if let (Ok(Some(started)), Ok(mut queues)) = (provider, self.queues.try_lock()) {
+            queues.adopt_processing_start(input.video, input.sequence, started);
+        }
     }
 
     /// Moves every packet the encoder has finished into the stream's bounded
