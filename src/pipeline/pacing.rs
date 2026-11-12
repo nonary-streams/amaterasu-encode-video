@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const MAX_SNAP_WINDOW_NS: u128 = 2_000_000;
 const MAX_HOLD_NS: u128 = 200_000_000;
 const MAX_DURATION_NS: u128 = u64::MAX as u128;
@@ -15,7 +14,7 @@ struct SourceClock {
 /// Tracks WGC capture slots and retains a missed slot as a possible re-anchor.
 pub(super) struct WgcPacing {
     enabled: bool,
-    fps: u32,
+    fps_milli: u32,
     group_anchor: Option<Duration>,
     pub(super) group_frames: u64,
     last_missed_slot: Option<Duration>,
@@ -24,9 +23,13 @@ pub(super) struct WgcPacing {
 
 impl WgcPacing {
     pub(super) fn new(enabled: bool, fps: u32) -> Self {
+        Self::new_millihz(enabled, fps.saturating_mul(1000))
+    }
+
+    pub(super) fn new_millihz(enabled: bool, fps_milli: u32) -> Self {
         Self {
             enabled,
-            fps,
+            fps_milli,
             group_anchor: None,
             group_frames: 0,
             last_missed_slot: None,
@@ -42,8 +45,13 @@ impl WgcPacing {
         let raw_anchor = self.map_source_timestamp(source_timestamp_us, observed_at);
         if let Some(missed_slot) = self.last_missed_slot.take() {
             self.group_anchor = Some(
-                phase_preserving_anchor(missed_slot, raw_anchor, self.fps, self.enabled)
-                    .unwrap_or(raw_anchor),
+                phase_preserving_anchor_millihz(
+                    missed_slot,
+                    raw_anchor,
+                    self.fps_milli,
+                    self.enabled,
+                )
+                .unwrap_or(raw_anchor),
             );
             self.group_frames = 1;
         } else if self.group_anchor.is_some() {
@@ -71,7 +79,7 @@ impl WgcPacing {
                 .checked_add(Duration::from_micros(elapsed_us))?;
             // A capture timestamp may lag its callback, but a timestamp more
             // than one frame ahead cannot represent an already acquired frame.
-            let max_future_ns = NANOS_PER_SECOND / u128::from(self.fps.max(1));
+            let max_future_ns = 1_000_000_000_000 / u128::from(self.fps_milli.max(1));
             (mapped.as_nanos() <= MAX_DURATION_NS
                 && mapped.as_nanos().abs_diff(observed_at.as_nanos()) <= MAX_HOLD_NS
                 && mapped.as_nanos() <= observed_at.as_nanos().saturating_add(max_future_ns))
@@ -116,11 +124,11 @@ impl WgcPacing {
 
     fn next_slot(&self) -> Option<Duration> {
         let anchor = self.group_anchor?;
-        if self.fps == 0 {
+        if self.fps_milli == 0 {
             return None;
         }
         let frames = u128::from(self.group_frames);
-        let frame_offset_ns = frames.checked_mul(NANOS_PER_SECOND)? / u128::from(self.fps);
+        let frame_offset_ns = frames.checked_mul(1_000_000_000_000)? / u128::from(self.fps_milli);
         duration_from_nanos(anchor.as_nanos().checked_add(frame_offset_ns)?)
     }
 }
@@ -132,11 +140,19 @@ pub(super) fn next_slot_after_completion(
     completed_at: Duration,
     fps: u32,
 ) -> Option<(Duration, bool)> {
-    if fps == 0 {
+    next_slot_after_completion_millihz(projected_slot, completed_at, fps.saturating_mul(1000))
+}
+
+pub(super) fn next_slot_after_completion_millihz(
+    projected_slot: Duration,
+    completed_at: Duration,
+    fps_milli: u32,
+) -> Option<(Duration, bool)> {
+    if fps_milli == 0 {
         return None;
     }
     if projected_slot <= completed_at {
-        let interval_ns = NANOS_PER_SECOND / u128::from(fps);
+        let interval_ns = 1_000_000_000_000 / u128::from(fps_milli);
         let next_ns = completed_at.as_nanos().checked_add(interval_ns)?;
         Some((duration_from_nanos(next_ns)?, true))
     } else {
@@ -145,17 +161,27 @@ pub(super) fn next_slot_after_completion(
 }
 
 /// Returns the prior cadence grid's projected anchor when it is safe to keep.
+#[cfg(test)]
 fn phase_preserving_anchor(
     previous_slot: Duration,
     raw_anchor: Duration,
     fps: u32,
     enabled: bool,
 ) -> Option<Duration> {
-    if !enabled || fps == 0 {
+    phase_preserving_anchor_millihz(previous_slot, raw_anchor, fps.saturating_mul(1000), enabled)
+}
+
+fn phase_preserving_anchor_millihz(
+    previous_slot: Duration,
+    raw_anchor: Duration,
+    fps_milli: u32,
+    enabled: bool,
+) -> Option<Duration> {
+    if !enabled || fps_milli == 0 {
         return None;
     }
 
-    let interval_ns = NANOS_PER_SECOND / u128::from(fps);
+    let interval_ns = 1_000_000_000_000 / u128::from(fps_milli);
     if interval_ns == 0 {
         return None;
     }
@@ -166,8 +192,8 @@ fn phase_preserving_anchor(
         .checked_add(interval_ns / 2)?
         .checked_div(interval_ns)?;
     let projected_ns = intervals
-        .checked_mul(NANOS_PER_SECOND)?
-        .checked_div(u128::from(fps))?;
+        .checked_mul(1_000_000_000_000)?
+        .checked_div(u128::from(fps_milli))?;
     let grid_ns = previous_slot.as_nanos().checked_add(projected_ns)?;
     let phase_error_ns = grid_ns.abs_diff(raw_anchor.as_nanos());
     let snap_window_ns = MAX_SNAP_WINDOW_NS.min(interval_ns / 4);

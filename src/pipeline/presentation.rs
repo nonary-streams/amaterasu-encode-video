@@ -269,6 +269,11 @@ pub(super) fn frame_interval(fps: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
 }
 
+/// Frame interval for an exact millihertz cadence.
+pub(super) fn frame_interval_millihz(fps_milli: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000_000 / u64::from(fps_milli.max(1)))
+}
+
 #[cfg(test)]
 mod early_admission_tests {
     use super::*;

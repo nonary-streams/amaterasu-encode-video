@@ -567,6 +567,10 @@ pub struct Configuration {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Exact negotiated rate in millihertz. Omitted legacy payloads keep the
+    /// integer `fps` cadence and retain their original serialized shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_milli: Option<u32>,
     pub bitrate: u32,
     /// Client-requested H.264 slices per frame from Moonlight's ANNOUNCE.
     #[serde(
@@ -714,6 +718,20 @@ impl GpuProcessing {
 }
 
 impl Configuration {
+    /// Effective frame rate expressed in millihertz. Older payloads use their
+    /// nominal integer FPS without changing their wire representation.
+    pub fn effective_fps_millihz(&self) -> u32 {
+        self.fps_milli
+            .unwrap_or_else(|| self.fps.saturating_mul(1000))
+    }
+
+    fn valid_fps_milli(&self, maximum: u32) -> bool {
+        let fps_milli = self.effective_fps_millihz();
+        (1_000..=1_000_000).contains(&fps_milli)
+            && fps_milli.div_ceil(1000) == self.fps
+            && fps_milli <= maximum.saturating_mul(1000)
+    }
+
     /// Accept either public codec representation, while refusing contradictory
     /// explicit non-default selections before allocating capture resources.
     pub fn normalize_codec(&mut self) -> Result<(), &'static str> {
@@ -747,6 +765,7 @@ impl Configuration {
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
             && (1..=1000).contains(&self.fps)
+            && self.valid_fps_milli(1000)
             && (1..=1_000_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 16
             && self.slices_per_frame >= 1
@@ -770,6 +789,7 @@ impl Configuration {
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
+            && self.valid_fps_milli(120)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 16
             && self.slices_per_frame >= 1
@@ -1869,5 +1889,32 @@ mod tests {
                 .unwrap();
         configuration.video_stream_format.bit_depth = 10;
         assert!(!configuration.validate_source());
+    }
+
+    #[test]
+    fn fractional_fps_millihz_is_validated_and_obeys_capture_limits() {
+        let mut configuration: Configuration = serde_json::from_value(json!({
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "fps_milli": 59_940,
+            "bitrate": 5_000_000
+        }))
+        .unwrap();
+        assert!(configuration.validate());
+        assert_eq!(configuration.effective_fps_millihz(), 59_940);
+
+        configuration.fps_milli = Some(999);
+        assert!(!configuration.validate());
+        configuration.fps_milli = Some(1_000_001);
+        assert!(!configuration.validate());
+        configuration.fps_milli = Some(59_000);
+        assert!(!configuration.validate());
+        configuration.fps_milli = Some(59_940);
+        configuration.fps = 61;
+        assert!(!configuration.validate());
+        configuration.fps = 60;
+        configuration.fps_milli = Some(120_001);
+        assert!(!configuration.validate());
     }
 }

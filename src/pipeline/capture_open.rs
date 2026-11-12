@@ -131,7 +131,7 @@ pub(super) fn format(
     let mut mode = selection.context.source_mode.unwrap_or(SourceMode {
         width: configuration.width,
         height: configuration.height,
-        refresh_millihz: configuration.fps.saturating_mul(1000),
+        refresh_millihz: configuration.effective_fps_millihz(),
         hdr,
         bit_depth: Some(format.bit_depth),
     });

@@ -351,7 +351,7 @@ impl Stream {
 
     fn repeat_rate(&self) -> f64 {
         if self.minimum_fps_target == 0.0 {
-            f64::from(self.configuration.fps)
+            f64::from(self.configuration.effective_fps_millihz()) / 1000.0
         } else {
             self.minimum_fps_target
         }
@@ -381,7 +381,7 @@ impl Stream {
                 && self.next_repeat_at.is_some_and(|deadline| now >= deadline);
         }
         let target = if self.minimum_fps_target == 0.0 {
-            f64::from(self.configuration.fps)
+            f64::from(self.configuration.effective_fps_millihz()) / 1000.0
         } else {
             self.minimum_fps_target
         };
@@ -1015,7 +1015,14 @@ impl Pipeline {
         self.streams.insert(id, {
             let opened_at = Instant::now();
             let clock_origin_us = amaterasu_media::host_monotonic_micros();
-            let wgc_pacing = pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps);
+            let wgc_pacing = if configuration.fps_milli.is_some() {
+                pacing::WgcPacing::new_millihz(
+                    wgc_pacing_smoothing,
+                    configuration.effective_fps_millihz(),
+                )
+            } else {
+                pacing::WgcPacing::new(wgc_pacing_smoothing, configuration.fps)
+            };
             let operation = format!("video-{}-{id}", self.epoch);
             let requested_encoder = encoder.clone();
             let mut stage = if source_id.is_some() {
@@ -1500,7 +1507,7 @@ fn pump(
                             .saturating_duration_since(stream.opened_at),
                     );
                 }
-                stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+                stream.next_frame = next_capture_deadline_for(now, &stream.configuration);
                 trigger = CaptureTrigger::None;
                 capture_slot = None;
             }
@@ -1516,14 +1523,18 @@ fn pump(
             && (stream.provider != CaptureProvider::Wgc || stream.constant_rate)
         {
             stream.next_frame = if stream.provider.uses_periodic_capture() {
-                periodic_capture_deadline(stream.next_frame, now, stream.configuration.fps)
+                periodic_capture_deadline_for(stream.next_frame, now, &stream.configuration)
             } else {
-                next_capture_deadline(now, stream.configuration.fps)
+                next_capture_deadline_for(now, &stream.configuration)
             };
         }
     }
     let capture_due = trigger != CaptureTrigger::None;
-    let frame_interval = presentation::frame_interval(stream.configuration.fps);
+    let frame_interval = if stream.configuration.fps_milli.is_some() {
+        presentation::frame_interval_millihz(stream.configuration.effective_fps_millihz())
+    } else {
+        presentation::frame_interval(stream.configuration.fps)
+    };
     let repeat_due = if presentation_paced {
         stream.presentation_repeat_due(now)
     } else {
@@ -1656,7 +1667,7 @@ fn pump(
                     stream
                         .wgc_pacing
                         .capture_missed(capture_slot.saturating_duration_since(stream.opened_at));
-                    stream.next_frame = next_capture_deadline(now, stream.configuration.fps);
+                    stream.next_frame = next_capture_deadline_for(now, &stream.configuration);
                 }
             }
             stream.dropped = stream.dropped.saturating_add(u64::from(progress.dropped));
@@ -1745,11 +1756,21 @@ fn schedule_wgc_after_completion(
     projected_slot: Duration,
     completed_at: Instant,
 ) -> bool {
-    let Some((next_slot, missed_slot)) = pacing::next_slot_after_completion(
-        projected_slot,
-        completed_at.saturating_duration_since(stream.opened_at),
-        stream.configuration.fps,
-    ) else {
+    let completed_offset = completed_at.saturating_duration_since(stream.opened_at);
+    let next_slot = if stream.configuration.fps_milli.is_some() {
+        pacing::next_slot_after_completion_millihz(
+            projected_slot,
+            completed_offset,
+            stream.configuration.effective_fps_millihz(),
+        )
+    } else {
+        pacing::next_slot_after_completion(
+            projected_slot,
+            completed_offset,
+            stream.configuration.fps,
+        )
+    };
+    let Some((next_slot, missed_slot)) = next_slot else {
         return false;
     };
     if missed_slot {
@@ -1768,6 +1789,30 @@ fn next_capture_deadline(now: Instant, fps: u32) -> Instant {
 
 fn periodic_capture_deadline(previous: Instant, now: Instant, fps: u32) -> Instant {
     periodic_deadline(previous, now, Duration::from_secs_f64(1.0 / f64::from(fps)))
+}
+
+fn next_capture_deadline_for(now: Instant, configuration: &Configuration) -> Instant {
+    configuration.fps_milli.map_or_else(
+        || next_capture_deadline(now, configuration.fps),
+        |fps_milli| now + Duration::from_nanos(1_000_000_000_000 / u64::from(fps_milli.max(1))),
+    )
+}
+
+fn periodic_capture_deadline_for(
+    previous: Instant,
+    now: Instant,
+    configuration: &Configuration,
+) -> Instant {
+    configuration.fps_milli.map_or_else(
+        || periodic_capture_deadline(previous, now, configuration.fps),
+        |fps_milli| {
+            periodic_deadline(
+                previous,
+                now,
+                Duration::from_nanos(1_000_000_000_000 / u64::from(fps_milli.max(1))),
+            )
+        },
+    )
 }
 
 fn periodic_deadline(previous: Instant, now: Instant, period: Duration) -> Instant {

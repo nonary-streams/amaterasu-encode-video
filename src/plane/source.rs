@@ -9,6 +9,16 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+fn frame_cadence(
+    configuration: &Configuration,
+) -> Result<amaterasu_module_sdk::encode::FrameCadence, &'static str> {
+    match configuration.fps_milli {
+        Some(fps_milli) => amaterasu_module_sdk::encode::FrameCadence::from_millihz(fps_milli),
+        None => amaterasu_module_sdk::encode::FrameCadence::from_fps(configuration.fps),
+    }
+    .map_err(|_| "invalid_video_cadence")
+}
+
 fn id(value: u64) -> EncoderFormatId {
     EncoderFormatId {
         namespace_id: ENCODER_FORMAT_NAMESPACE_STANDARD,
@@ -85,6 +95,7 @@ impl Source {
         if epoch_id == [0; 16] || clock_origin_us == 0 {
             return Err("encoder_clock_unavailable");
         }
+        let cadence = frame_cadence(configuration)?;
         let common = EncoderCommonConfigV1 {
             version: 1,
             size: size_of::<EncoderCommonConfigV1>() as u32,
@@ -96,8 +107,8 @@ impl Source {
             crop_y: 0,
             visible_width: configuration.width,
             visible_height: configuration.height,
-            fps_numerator: configuration.fps,
-            fps_denominator: 1,
+            fps_numerator: cadence.numerator(),
+            fps_denominator: cadence.denominator(),
             bitrate_bps: u64::from(configuration.bitrate),
             profile: 0,
             level: 0,
@@ -268,6 +279,41 @@ impl Source {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_cadence_is_preserved_as_exact_millihertz() {
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "fps_milli": 59_940,
+            "bitrate": 5_000_000
+        }))
+        .unwrap();
+        let cadence = frame_cadence(&configuration).unwrap();
+        assert_eq!(cadence.numerator(), 59_940);
+        assert_eq!(cadence.denominator(), 1000);
+    }
+
+    #[test]
+    fn legacy_integer_cadence_keeps_its_original_ratio() {
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "bitrate": 5_000_000
+        }))
+        .unwrap();
+        let cadence = frame_cadence(&configuration).unwrap();
+        assert_eq!(cadence.numerator(), 60);
+        assert_eq!(cadence.denominator(), 1);
+        assert!(
+            serde_json::to_value(configuration)
+                .unwrap()
+                .get("fps_milli")
+                .is_none()
+        );
+    }
     use amaterasu_module_sdk::abi::{AbiHeader, NativeInterface};
 
     unsafe extern "C" fn probe(

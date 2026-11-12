@@ -884,6 +884,7 @@ fn open() -> Operation {
             width: 1920,
             height: 1080,
             fps: 60,
+            fps_milli: None,
             bitrate: 5_000_000,
             codec: amaterasu_media::VideoCodec::H264,
             color_mode: amaterasu_media::ColorMode::default(),
@@ -4362,6 +4363,24 @@ fn portal_capture_keeps_sixty_fps_phase_with_ten_millisecond_ticks() {
     let stalled = start + Duration::from_secs(20);
     let next = periodic_capture_deadline(deadline, stalled, 60);
     assert!(next > stalled && next - stalled <= Duration::from_secs_f64(1.0 / 60.0));
+}
+
+#[test]
+fn fractional_capture_deadline_uses_the_exact_millihertz_rate() {
+    let start = Instant::now();
+    let configuration: crate::model::Configuration = serde_json::from_value(json!({
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "fps_milli": 59_940,
+        "bitrate": 5_000_000
+    }))
+    .unwrap();
+    let deadline = next_capture_deadline_for(start, &configuration);
+    assert_eq!(
+        deadline.duration_since(start),
+        Duration::from_nanos(16_683_350)
+    );
 }
 
 #[test]

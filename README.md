@@ -340,8 +340,11 @@ failures persist after successful resource cleanup with state `failed`, allowing
 timeout/backend errors to remain visible. History is in-memory and may be evicted. Stream IDs and ownership last only for this module
 instance. At most two streams exist across all callers, matching the encoder's
 per-owner limit. Dimensions must be even, 16–3840 by 16–2160; fps 1–120; bitrate
-100000–100000000. Output IDs are nonempty, at most 512 UTF-8 bytes, without control
-characters. Unknown JSON fields are rejected.
+100000–100000000. Optional `fps_milli` preserves the exact negotiated cadence
+in millihertz (1,000–1,000,000) while `fps` remains its compatibility ceiling:
+`ceil(fps_milli / 1000) == fps`. Capture streams remain capped at 120 fps.
+Output IDs are nonempty, at most 512 UTF-8 bytes, without control characters.
+Unknown JSON fields are rejected.
 
 `configuration.max_reference_frames` accepts only `0` or `1` and defaults to
 `0`. Zero preserves the existing unconstrained encoder request and is omitted
