@@ -420,7 +420,10 @@ the control stream owner. A JSON call grant alone never permits native binding.
 
 The tick thread holds capture and encoder bindings. It processes one stream per
 tick, schedules capture at no more than its configured fps, and performs at most one
-capture and one encoder receive per selected tick. Host tick cadence and provider
+capture per selected tick. It then receives every packet the encoder already
+finished (at most four, the stream queue's bound) until the encoder has none,
+the queue reports `MEDIA_BUSY`, or EOS is queued, so a consumer ticking later in
+the same host pass admits all finished output. Host tick cadence and provider
 latency can reduce the achieved frame rate. The borrowed capture callback calls
 encoder submit immediately; `MEDIA_BUSY` drops that incoming frame. Busy capture
 simply skips that sample. Dimensions, format/stride and size validation precede

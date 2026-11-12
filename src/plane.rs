@@ -1,6 +1,7 @@
 //! Native bindings stay on the module tick thread. Only copied packet queues cross threads.
 mod capture_events;
 mod dmabuf;
+mod encoder_output;
 mod frame_processor;
 #[cfg(test)]
 mod freshness_tests;
@@ -753,30 +754,6 @@ unsafe fn submit_to_encoder(submission: &mut Submission<'_>, frame: &CpuFrame) -
             submission.frame_copy_us = elapsed_micros(started);
         }
     }
-    status
-}
-
-struct Destination<'a> {
-    queues: &'a Arc<Mutex<Queues>>,
-    video: u64,
-    transport_admission_us: u64,
-    transport_admission_count: u64,
-}
-
-unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) -> Status {
-    if packet.is_null() {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: encoder borrows packet; destination lives through synchronous receive.
-    let destination = unsafe { &mut *context.cast::<Destination<'_>>() };
-    let started = Instant::now();
-    destination.transport_admission_count = destination.transport_admission_count.saturating_add(1);
-    let status = if let Ok(mut queues) = destination.queues.try_lock() {
-        unsafe { queues.push(destination.video, &*packet) }
-    } else {
-        MEDIA_BUSY
-    };
-    destination.transport_admission_us = elapsed_micros(started);
     status
 }
 
@@ -1605,18 +1582,19 @@ impl NativePlane {
         dmabuf::deliver(capture, encoder, input, !input.capture_due)
     }
 
-    /// Polls at most one encoded packet into the stream's bounded queue.
+    /// Moves every packet the encoder has finished into the stream's bounded
+    /// queue, so the consumer admits it later in this same host pass.
     fn receive_packets(
         &self,
         encoder_api: &EncoderApi,
         input: &Pump<'_>,
         mut progress: Progress,
     ) -> Result<Progress, &'static str> {
-        let (encoder_poll_us, transport_admission_us, destination_count) =
-            receive(encoder_api, input.encoder, input.video, &self.queues)?;
-        progress.encoder_poll_us = encoder_poll_us;
-        progress.transport_admission_us = transport_admission_us;
-        progress.transport_admission_count = destination_count;
+        let received =
+            encoder_output::receive(encoder_api, input.encoder, input.video, &self.queues)?;
+        progress.encoder_poll_us = received.encoder_poll_us;
+        progress.transport_admission_us = received.admission_us;
+        progress.transport_admission_count = received.packets;
         // SAFETY: receive uses this same live typed encoder/session. Old tables
         // explicitly provide no timing; no default encoder is consulted.
         let timing =
@@ -1884,34 +1862,6 @@ fn verify_geometry_callback(
         MEDIA_UNSUPPORTED => Err("capture_geometry_unavailable"),
         MEDIA_CLOSED => Err("capture_closed"),
         _ => Err("capture_geometry_failed"),
-    }
-}
-
-fn receive(
-    api: &EncoderApi,
-    encoder: u64,
-    video: u64,
-    queues: &Arc<Mutex<Queues>>,
-) -> Result<(u64, u64, u64), &'static str> {
-    let mut destination = Destination {
-        queues,
-        video,
-        transport_admission_us: 0,
-        transport_admission_count: 0,
-    };
-    let sink = PacketSink {
-        context: (&mut destination as *mut Destination<'_>).cast(),
-        write: packet,
-    };
-    // SAFETY: stack sink copies at most one bounded borrowed packet.
-    let started = Instant::now();
-    match unsafe { (api.receive)(api.base.context, encoder, sink) } {
-        STATUS_OK | MEDIA_PENDING | MEDIA_BUSY => Ok((
-            elapsed_micros(started),
-            destination.transport_admission_us,
-            destination.transport_admission_count,
-        )),
-        _ => Err("encoder_failed"),
     }
 }
 
