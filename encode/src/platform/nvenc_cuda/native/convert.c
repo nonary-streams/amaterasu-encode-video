@@ -1,0 +1,826 @@
+/*
+ * GPU RGB -> NV12 conversion for the NVENC/CUDA encoder.
+ *
+ * A source RGB texture (an uploaded CPU BGRA frame, or a DMA-BUF imported as
+ * an EGLImage) is drawn twice: once into an R8 luma texture at full size and
+ * once into an RG8 chroma texture at half size. Both targets are registered
+ * with CUDA once at open; each frame maps them and copies their arrays into
+ * the encoder's pitched NV12 CUDA buffer.
+ *
+ * The colour matrix comes from Rust (color.rs), where it is checked against
+ * the CPU reference converter. Chroma is the box average of each 2x2 block,
+ * which is centre sited, exactly like the CPU reference.
+ */
+#include "internal.h"
+#include "image_fit.h"
+
+#include <errno.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define AM_FENCE_TIMEOUT_MS 500
+
+static const char vertex_source[] =
+    "#version 330 core\n"
+    "void main() {\n"
+    "    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+    "    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+/* Output row y reads source row y: GL texture row 0, framebuffer row 0 and
+ * CUDA array row 0 are all the first row in memory, so no flip is needed. */
+/* Sample output pixels through the complete fitted source rectangle. */
+#define AM_IMAGE_SAMPLE \
+    "uniform vec4 image_fit;\n" \
+    "vec3 image_rgb(ivec2 p) {\n" \
+    "    ivec2 q = p - ivec2(image_fit.xy);\n" \
+    "    ivec2 fit = ivec2(image_fit.zw), size = textureSize(source, 0);\n" \
+    "    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, fit))) return vec3(0);\n" \
+    "    if (all(equal(size, fit))) return texelFetch(source, q, 0).rgb;\n" \
+    "    vec2 at = vec2(q) * vec2(size - 1) / vec2(max(fit - 1, ivec2(1)));\n" \
+    "    if (fit.x == 1) at.x = float(size.x - 1) * 0.5;\n" \
+    "    if (fit.y == 1) at.y = float(size.y - 1) * 0.5;\n" \
+    "    ivec2 lo = ivec2(at), hi = min(lo + 1, size - 1);\n" \
+    "    vec2 weight = fract(at);\n" \
+    "    return mix(mix(texelFetch(source, lo, 0).rgb, texelFetch(source, ivec2(hi.x, lo.y), 0).rgb, weight.x),\n" \
+    "               mix(texelFetch(source, ivec2(lo.x, hi.y), 0).rgb, texelFetch(source, hi, 0).rgb, weight.x), weight.y);\n" \
+    "}\n"
+
+static const char luma_source[] =
+    "#version 330 core\n"
+    "uniform sampler2D source;\n"
+    AM_IMAGE_SAMPLE
+    "uniform int ten_bit;\n"
+    "uniform vec4 luma_row;\n"
+    "layout(location = 0) out float luma;\n"
+    "void main() {\n"
+    "    vec3 rgb = image_rgb(ivec2(gl_FragCoord.xy));\n"
+    "    float code = clamp(dot(luma_row.rgb, rgb) + luma_row.a, 0.0, 1.0);\n"
+    "    luma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
+    "}\n";
+
+static const char chroma_source[] =
+    "#version 330 core\n"
+    "uniform sampler2D source;\n"
+    AM_IMAGE_SAMPLE
+    "uniform int ten_bit;\n"
+    "uniform vec4 cb_row;\n"
+    "uniform vec4 cr_row;\n"
+    "layout(location = 0) out vec2 chroma;\n"
+    "void main() {\n"
+    "    ivec2 origin = ivec2(gl_FragCoord.xy) * 2;\n"
+    "    vec3 rgb = (image_rgb(origin) +\n"
+    "                image_rgb(origin + ivec2(1, 0)) +\n"
+    "                image_rgb(origin + ivec2(0, 1)) +\n"
+    "                image_rgb(origin + ivec2(1, 1))) * 0.25;\n"
+    "    vec2 code = clamp(vec2(dot(cb_row.rgb, rgb) + cb_row.a, dot(cr_row.rgb, rgb) + cr_row.a), 0.0, 1.0);\n"
+    "    chroma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
+    "}\n";
+
+static int load_gl_symbol(const struct am_egl_api *egl, const char *name, void *destination) {
+    __eglMustCastToProperFunctionPointerType symbol = egl->get_proc_address(name);
+    if (symbol == NULL) {
+        return 0;
+    }
+    memcpy(destination, &symbol, sizeof(symbol));
+    return 1;
+}
+
+#define AM_GL(field, name) load_gl_symbol(egl, name, &gl->field)
+
+/* Timing is diagnostic: a driver without these keeps converting untimed. */
+static int load_timer_queries(const struct am_egl_api *egl, struct am_gl_api *gl) {
+    if (!(AM_GL(gen_queries, "glGenQueries") && AM_GL(delete_queries, "glDeleteQueries") &&
+          AM_GL(query_counter, "glQueryCounter") &&
+          AM_GL(get_query_objectiv, "glGetQueryObjectiv") &&
+          AM_GL(get_query_objectui64v, "glGetQueryObjectui64v") &&
+          AM_GL(get_integer64v, "glGetInteger64v"))) {
+        gl->query_counter = NULL;
+    }
+    return 1;
+}
+
+static int timing_available(const struct am_converter *converter, uint32_t slot) {
+    return slot < AM_NVCUDA_SLOTS && converter->gl.query_counter != NULL &&
+           converter->timer_queries[slot][0] != 0;
+}
+
+static int load_gl(const struct am_egl_api *egl, struct am_gl_api *gl) {
+    return AM_GL(get_error, "glGetError") && AM_GL(gen_textures, "glGenTextures") &&
+           AM_GL(delete_textures, "glDeleteTextures") && AM_GL(bind_texture, "glBindTexture") &&
+           AM_GL(tex_parameteri, "glTexParameteri") && AM_GL(tex_image_2d, "glTexImage2D") &&
+           AM_GL(tex_sub_image_2d, "glTexSubImage2D") && AM_GL(pixel_storei, "glPixelStorei") &&
+           AM_GL(active_texture, "glActiveTexture") &&
+           AM_GL(gen_framebuffers, "glGenFramebuffers") &&
+           AM_GL(delete_framebuffers, "glDeleteFramebuffers") &&
+           AM_GL(bind_framebuffer, "glBindFramebuffer") &&
+           AM_GL(framebuffer_texture_2d, "glFramebufferTexture2D") &&
+           AM_GL(check_framebuffer_status, "glCheckFramebufferStatus") &&
+           AM_GL(viewport, "glViewport") && AM_GL(create_shader, "glCreateShader") &&
+           AM_GL(delete_shader, "glDeleteShader") && AM_GL(shader_source, "glShaderSource") &&
+           AM_GL(compile_shader, "glCompileShader") && AM_GL(get_shaderiv, "glGetShaderiv") &&
+           AM_GL(create_program, "glCreateProgram") && AM_GL(delete_program, "glDeleteProgram") &&
+           AM_GL(attach_shader, "glAttachShader") && AM_GL(link_program, "glLinkProgram") &&
+           AM_GL(get_programiv, "glGetProgramiv") && AM_GL(use_program, "glUseProgram") &&
+           AM_GL(get_uniform_location, "glGetUniformLocation") &&
+           AM_GL(uniform1i, "glUniform1i") && AM_GL(uniform4fv, "glUniform4fv") &&
+           AM_GL(gen_vertex_arrays, "glGenVertexArrays") &&
+           AM_GL(delete_vertex_arrays, "glDeleteVertexArrays") &&
+           AM_GL(bind_vertex_array, "glBindVertexArray") && AM_GL(draw_arrays, "glDrawArrays") &&
+           AM_GL(flush, "glFlush") && AM_GL(finish, "glFinish") &&
+           AM_GL(egl_image_target_texture_2d, "glEGLImageTargetTexture2DOES") &&
+           load_timer_queries(egl, gl);
+}
+
+/* Desktop OpenGL 3.3 core, surfaceless, made current on the calling thread. */
+static int create_context(struct am_converter *converter, struct am_nvcuda_status *status) {
+    const struct am_egl_api *egl = &converter->driver->egl;
+    EGLDisplay display = converter->display->display;
+    if (!egl->bind_api(EGL_OPENGL_API)) {
+        am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    /* The converter only renders into textures, so it needs no surface. NVIDIA's
+     * device platform exposes no window-capable configs, and eglChooseConfig
+     * defaults EGL_SURFACE_TYPE to EGL_WINDOW_BIT, so either create the context
+     * without a config or ask for one with any surface type. */
+    EGLConfig config = EGL_NO_CONFIG_KHR;
+    if (!converter->display->no_config_context) {
+        const EGLint config_attributes[] = {
+            EGL_SURFACE_TYPE, EGL_DONT_CARE,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_NONE,
+        };
+        EGLint config_count = 0;
+        if (!egl->choose_config(display, config_attributes, &config, 1, &config_count) ||
+            config_count < 1) {
+            am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
+            return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+        }
+    }
+    const EGLint context_attributes[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_NONE,
+    };
+    /* Every conversion sits between a game's frames on the GPU. A default
+     * priority context waits out the game's scheduling timeslice before each
+     * one runs. Request high priority; the driver may grant less, so query it.
+     * A refused request falls back to the ordinary context. */
+    const EGLint prioritized_attributes[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG,
+        EGL_NONE,
+    };
+    converter->context = EGL_NO_CONTEXT;
+    if (converter->display->context_priority) {
+        converter->context =
+            egl->create_context(display, config, EGL_NO_CONTEXT, prioritized_attributes);
+    }
+    if (converter->context == EGL_NO_CONTEXT) {
+        converter->context =
+            egl->create_context(display, config, EGL_NO_CONTEXT, context_attributes);
+    }
+    converter->context_priority = 0;
+    if (converter->context != EGL_NO_CONTEXT && converter->display->context_priority &&
+        egl->query_context != NULL) {
+        EGLint granted = 0;
+        if (egl->query_context(display, converter->context, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                               &granted)) {
+            converter->context_priority = granted;
+        }
+    }
+    if (converter->context == EGL_NO_CONTEXT) {
+        am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    if (!egl->make_current(display, EGL_NO_SURFACE, EGL_NO_SURFACE, converter->context)) {
+        am_set_status(status, AM_STAGE_GL_CONTEXT, (int32_t)egl->get_error());
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    /* Core GL entry points come from eglGetProcAddress as well, which EGL
+     * 1.5 and libglvnd provide for every client API function. */
+    if (!load_gl(egl, &converter->gl)) {
+        am_set_status(status, AM_STAGE_GL_CONTEXT, 0);
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    converter->gl_loaded = 1;
+    return AM_NVCUDA_OK;
+}
+
+static GLuint compile_shader(const struct am_gl_api *gl, GLenum kind, const char *source) {
+    GLuint shader = gl->create_shader(kind);
+    if (shader == 0) {
+        return 0;
+    }
+    gl->shader_source(shader, 1, &source, NULL);
+    gl->compile_shader(shader);
+    GLint compiled = GL_FALSE;
+    gl->get_shaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+        gl->delete_shader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static int build_pass(const struct am_gl_api *gl, const char *fragment_source,
+                      const char *first_row, const char *second_row, struct am_gl_pass *pass) {
+    GLuint vertex = compile_shader(gl, GL_VERTEX_SHADER, vertex_source);
+    GLuint fragment = compile_shader(gl, GL_FRAGMENT_SHADER, fragment_source);
+    GLuint program = vertex != 0 && fragment != 0 ? gl->create_program() : 0;
+    GLint linked = GL_FALSE;
+    if (program != 0) {
+        gl->attach_shader(program, vertex);
+        gl->attach_shader(program, fragment);
+        gl->link_program(program);
+        gl->get_programiv(program, GL_LINK_STATUS, &linked);
+    }
+    /* A linked program keeps its own copy of the shader code. */
+    if (vertex != 0) {
+        gl->delete_shader(vertex);
+    }
+    if (fragment != 0) {
+        gl->delete_shader(fragment);
+    }
+    if (linked != GL_TRUE) {
+        if (program != 0) {
+            gl->delete_program(program);
+        }
+        return 0;
+    }
+    pass->program = program;
+    pass->source = gl->get_uniform_location(program, "source");
+    pass->ten_bit = gl->get_uniform_location(program, "ten_bit");
+    pass->image_fit = gl->get_uniform_location(program, "image_fit");
+    pass->rows[0] = gl->get_uniform_location(program, first_row);
+    pass->rows[1] = second_row != NULL ? gl->get_uniform_location(program, second_row) : -1;
+    return pass->image_fit >= 0 && pass->ten_bit >= 0 && pass->source >= 0 && pass->rows[0] >= 0 && (second_row == NULL || pass->rows[1] >= 0);
+}
+
+static void set_sampling(const struct am_gl_api *gl) {
+    gl->tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl->tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl->tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static GLuint allocate_texture(const struct am_gl_api *gl, GLint internal_format, GLenum format,
+                               uint32_t width, uint32_t height) {
+    GLuint texture = 0;
+    gl->gen_textures(1, &texture);
+    gl->bind_texture(GL_TEXTURE_2D, texture);
+    set_sampling(gl);
+    gl->tex_image_2d(GL_TEXTURE_2D, 0, internal_format, (GLsizei)width, (GLsizei)height, 0,
+                     format, (internal_format == GL_R16 || internal_format == GL_RG16) ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, NULL);
+    gl->bind_texture(GL_TEXTURE_2D, 0);
+    return texture;
+}
+
+static GLuint attach_framebuffer(const struct am_gl_api *gl, GLuint texture) {
+    GLuint framebuffer = 0;
+    gl->gen_framebuffers(1, &framebuffer);
+    gl->bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+    gl->framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    GLenum complete = gl->check_framebuffer_status(GL_FRAMEBUFFER);
+    gl->bind_framebuffer(GL_FRAMEBUFFER, 0);
+    if (complete != GL_FRAMEBUFFER_COMPLETE) {
+        gl->delete_framebuffers(1, &framebuffer);
+        return 0;
+    }
+    return framebuffer;
+}
+
+static int create_gl_resources(struct am_converter *converter, struct am_nvcuda_status *status) {
+    const struct am_gl_api *gl = &converter->gl;
+    if (!build_pass(gl, luma_source, "luma_row", NULL, &converter->luma_pass) ||
+        !build_pass(gl, chroma_source, "cb_row", "cr_row", &converter->chroma_pass)) {
+        am_set_status(status, AM_STAGE_GL_RESOURCES, (int32_t)gl->get_error());
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    gl->gen_vertex_arrays(1, &converter->vertex_array);
+    if (gl->query_counter != NULL) {
+        for (uint32_t slot = 0; slot < AM_NVCUDA_SLOTS; ++slot) {
+            gl->gen_queries(2, converter->timer_queries[slot]);
+        }
+    }
+    converter->upload_texture =
+        allocate_texture(gl, GL_RGBA8, GL_BGRA, converter->width, converter->height);
+    converter->luma_texture =
+        allocate_texture(gl, converter->bit_depth == 10 ? GL_R16 : GL_R8, GL_RED, converter->width, converter->height);
+    converter->chroma_texture =
+        allocate_texture(gl, converter->bit_depth == 10 ? GL_RG16 : GL_RG8, GL_RG, converter->width / 2, converter->height / 2);
+    converter->luma_framebuffer = attach_framebuffer(gl, converter->luma_texture);
+    converter->chroma_framebuffer = attach_framebuffer(gl, converter->chroma_texture);
+    GLenum error = gl->get_error();
+    if (converter->vertex_array == 0 || converter->luma_framebuffer == 0 ||
+        converter->chroma_framebuffer == 0 || error != GL_NO_ERROR) {
+        am_set_status(status, AM_STAGE_GL_RESOURCES, (int32_t)error);
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+/* Registered once; the textures are never reallocated while registered. */
+static int register_with_cuda(struct am_converter *converter, struct am_nvcuda_status *status) {
+    const struct am_cuda_api *cuda = &converter->driver->cuda;
+    CUresult result = cuda->graphics_gl_register_image(
+        &converter->luma_resource, converter->luma_texture, GL_TEXTURE_2D,
+        CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY);
+    if (result == CUDA_SUCCESS) {
+        result = cuda->graphics_gl_register_image(&converter->chroma_resource,
+                                                  converter->chroma_texture, GL_TEXTURE_2D,
+                                                  CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY);
+    }
+    if (result != CUDA_SUCCESS) {
+        am_set_status(status, AM_STAGE_CUDA_INTEROP, (int32_t)result);
+        return AM_NVCUDA_CONVERTER_UNAVAILABLE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+/* Operators need the granted level: drivers may silently ignore the request. */
+static void report_context_priority(const struct am_converter *converter) {
+    const char *level = "unavailable";
+    switch (converter->context_priority) {
+    case EGL_CONTEXT_PRIORITY_HIGH_IMG: level = "high"; break;
+    case EGL_CONTEXT_PRIORITY_MEDIUM_IMG: level = "medium"; break;
+    case EGL_CONTEXT_PRIORITY_LOW_IMG: level = "low"; break;
+    default: break;
+    }
+    fprintf(stderr, "amaterasu nvenc: converter GPU priority=%s requested=high\n", level);
+}
+
+int am_converter_open(struct am_converter *converter, const struct am_driver *driver,
+                      CUdevice device, const struct am_nvcuda_settings *settings,
+                      struct am_nvcuda_status *status) {
+    memset(converter, 0, sizeof(*converter));
+    converter->driver = driver;
+    converter->width = settings->width;
+    converter->height = settings->height;
+    converter->bit_depth = settings->bit_depth;
+    memcpy(converter->luma_row, settings->luma_row, sizeof(converter->luma_row));
+    memcpy(converter->cb_row, settings->cb_row, sizeof(converter->cb_row));
+    memcpy(converter->cr_row, settings->cr_row, sizeof(converter->cr_row));
+    int result = am_egl_display_for_device(driver, device, &converter->display, status);
+    if (result == AM_NVCUDA_OK) {
+        result = create_context(converter, status);
+    }
+    if (result == AM_NVCUDA_OK) {
+        report_context_priority(converter);
+        result = create_gl_resources(converter, status);
+    }
+    if (result == AM_NVCUDA_OK) {
+        result = register_with_cuda(converter, status);
+    }
+    return result;
+}
+
+/* Safe on a partially opened converter. CUDA registrations are released
+ * before the textures they reference, while the context is still current. */
+int am_converter_take_gpu_timing(struct am_converter *converter, uint32_t slot,
+                                 uint64_t completed_ago_us, uint64_t *queue_us,
+                                 uint64_t *convert_us, uint64_t *encode_us) {
+    if (!timing_available(converter, slot) || !converter->timer_pending[slot]) {
+        return 0;
+    }
+    converter->timer_pending[slot] = 0;
+    const struct am_gl_api *gl = &converter->gl;
+    GLint ready = 0;
+    gl->get_query_objectiv(converter->timer_queries[slot][1], GL_QUERY_RESULT_AVAILABLE,
+                           &ready);
+    if (!ready) {
+        return 0;
+    }
+    GLuint64 started = 0, converted = 0;
+    GLint64 now = 0;
+    gl->get_query_objectui64v(converter->timer_queries[slot][0], GL_QUERY_RESULT, &started);
+    gl->get_query_objectui64v(converter->timer_queries[slot][1], GL_QUERY_RESULT, &converted);
+    gl->get_integer64v(GL_TIMESTAMP, &now);
+    /* The GPU and monotonic clocks advance together; step back to completion. */
+    const GLint64 completed = now - (GLint64)completed_ago_us * 1000;
+    const GLint64 submitted = converter->timer_submitted[slot];
+    if ((GLint64)started < submitted || converted < started || completed < (GLint64)converted) {
+        return 0;
+    }
+    *queue_us = (uint64_t)((GLint64)started - submitted) / 1000;
+    *convert_us = (uint64_t)(converted - started) / 1000;
+    *encode_us = (uint64_t)(completed - (GLint64)converted) / 1000;
+    return 1;
+}
+
+void am_converter_finish(struct am_converter *converter) {
+    if (converter->gl_loaded) {
+        converter->gl.finish();
+    }
+}
+
+void am_converter_close(struct am_converter *converter) {
+    if (converter->driver == NULL) {
+        return;
+    }
+    /* Retained sources may still be read by queued conversions; their leases
+     * are released only after close returns. */
+    am_converter_finish(converter);
+    const struct am_cuda_api *cuda = &converter->driver->cuda;
+    if (converter->chroma_resource != NULL) {
+        cuda->graphics_unregister(converter->chroma_resource);
+    }
+    if (converter->luma_resource != NULL) {
+        cuda->graphics_unregister(converter->luma_resource);
+    }
+    if (converter->gl_loaded) {
+        const struct am_gl_api *gl = &converter->gl;
+        GLuint framebuffers[] = {converter->luma_framebuffer, converter->chroma_framebuffer};
+        GLuint textures[] = {converter->upload_texture, converter->luma_texture,
+                             converter->chroma_texture};
+        gl->delete_framebuffers(2, framebuffers);
+        gl->delete_textures(3, textures);
+        gl->delete_vertex_arrays(1, &converter->vertex_array);
+        gl->delete_program(converter->luma_pass.program);
+        gl->delete_program(converter->chroma_pass.program);
+        for (uint32_t slot = 0; slot < AM_NVCUDA_SLOTS; ++slot) {
+            if (converter->timer_queries[slot][0] != 0) {
+                gl->delete_queries(2, converter->timer_queries[slot]);
+            }
+        }
+    }
+    if (converter->context != EGL_NO_CONTEXT) {
+        const struct am_egl_api *egl = &converter->driver->egl;
+        EGLDisplay display = converter->display->display;
+        egl->make_current(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        egl->destroy_context(display, converter->context);
+    }
+    memset(converter, 0, sizeof(*converter));
+}
+
+static void draw_pass(const struct am_converter *converter, const struct am_gl_pass *pass,
+                      GLuint framebuffer, uint32_t width, uint32_t height,
+                      const float *first_row, const float *second_row, GLuint source, const float fit[4]) {
+    const struct am_gl_api *gl = &converter->gl;
+    gl->bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+    gl->viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    gl->use_program(pass->program);
+    gl->active_texture(GL_TEXTURE0);
+    gl->bind_texture(GL_TEXTURE_2D, source);
+    gl->uniform1i(pass->source, 0);
+    gl->uniform1i(pass->ten_bit, converter->bit_depth == 10);
+    gl->uniform4fv(pass->image_fit, 1, fit);
+    gl->uniform4fv(pass->rows[0], 1, first_row);
+    if (second_row != NULL) {
+        gl->uniform4fv(pass->rows[1], 1, second_row);
+    }
+    gl->bind_vertex_array(converter->vertex_array);
+    gl->draw_arrays(GL_TRIANGLES, 0, 3);
+}
+
+static int convert_texture(struct am_converter *converter, GLuint source,
+                           uint32_t source_width, uint32_t source_height,
+                           struct am_nvcuda_status *status) {
+    const struct am_gl_api *gl = &converter->gl;
+    int rectangle[4];
+    am_image_fit(source_width, source_height, converter->width, converter->height, rectangle);
+    const float fit[4] = {(float)rectangle[0], (float)rectangle[1], (float)rectangle[2], (float)rectangle[3]};
+    draw_pass(converter, &converter->luma_pass, converter->luma_framebuffer, converter->width,
+              converter->height, converter->luma_row, NULL, source, fit);
+    draw_pass(converter, &converter->chroma_pass, converter->chroma_framebuffer,
+              converter->width / 2, converter->height / 2, converter->cb_row, converter->cr_row,
+              source, fit);
+    gl->bind_texture(GL_TEXTURE_2D, 0);
+    gl->bind_framebuffer(GL_FRAMEBUFFER, 0);
+    gl->flush();
+    GLenum error = gl->get_error();
+    if (error != GL_NO_ERROR) {
+        am_set_status(status, AM_STAGE_CONVERT, (int32_t)error);
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+int am_converter_upload_bgra(struct am_converter *converter, const uint8_t *bgra,
+                             struct am_nvcuda_status *status) {
+    const struct am_gl_api *gl = &converter->gl;
+    gl->bind_texture(GL_TEXTURE_2D, converter->upload_texture);
+    gl->pixel_storei(GL_UNPACK_ALIGNMENT, 4);
+    gl->pixel_storei(GL_UNPACK_ROW_LENGTH, 0);
+    gl->tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)converter->width,
+                         (GLsizei)converter->height, GL_BGRA, GL_UNSIGNED_BYTE, bgra);
+    gl->bind_texture(GL_TEXTURE_2D, 0);
+    GLenum error = gl->get_error();
+    if (error != GL_NO_ERROR) {
+        am_set_status(status, AM_STAGE_UPLOAD, (int32_t)error);
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return convert_texture(converter, converter->upload_texture, converter->width, converter->height, status);
+}
+
+/* Bounded CPU wait for a sync_file; used when EGL cannot wait on the GPU. */
+static int poll_fence(int fence_fd, struct am_nvcuda_status *status) {
+    struct pollfd descriptor = {.fd = fence_fd, .events = POLLIN, .revents = 0};
+    int ready;
+    do {
+        ready = poll(&descriptor, 1, AM_FENCE_TIMEOUT_MS);
+    } while (ready < 0 && errno == EINTR);
+    if (ready == 0) {
+        am_set_status(status, AM_STAGE_FENCE, 0);
+        return AM_NVCUDA_FENCE_TIMEOUT;
+    }
+    if (ready < 0 || (descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+        am_set_status(status, AM_STAGE_FENCE, ready < 0 ? errno : descriptor.revents);
+        return AM_NVCUDA_IMPORT_FAILED;
+    }
+    return AM_NVCUDA_OK;
+}
+
+/* Queue a GPU-side wait on the current context. On success EGL owns the fd,
+ * which is then cleared in the frame so the Rust caller does not close it. */
+static int queue_gpu_fence_wait(const struct am_converter *converter, int32_t *fence_fd) {
+    const struct am_egl_api *egl = &converter->driver->egl;
+    EGLDisplay display = converter->display->display;
+    const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, *fence_fd, EGL_NONE};
+    EGLSyncKHR sync = egl->create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+    if (sync == EGL_NO_SYNC_KHR) {
+        return 0;
+    }
+    *fence_fd = -1;
+    EGLint waited = egl->wait_sync(display, sync, 0);
+    /* A destroyed sync stays alive until the queued wait no longer needs it. */
+    egl->destroy_sync(display, sync);
+    return waited == EGL_TRUE;
+}
+
+static int wait_for_acquire_fences(const struct am_converter *converter,
+                                   struct am_nvcuda_dmabuf *frame,
+                                   struct am_nvcuda_status *status) {
+    int gpu_wait = converter->display->native_fence_sync && converter->display->wait_sync;
+    for (uint32_t plane = 0; plane < frame->plane_count; ++plane) {
+        if (frame->fence_fds[plane] < 0) {
+            continue;
+        }
+        if (gpu_wait && queue_gpu_fence_wait(converter, &frame->fence_fds[plane])) {
+            continue;
+        }
+        if (frame->fence_fds[plane] < 0) {
+            /* EGL took the fence but could not queue the wait. */
+            am_set_status(status, AM_STAGE_FENCE,
+                          (int32_t)converter->driver->egl.get_error());
+            return AM_NVCUDA_IMPORT_FAILED;
+        }
+        int result = poll_fence(frame->fence_fds[plane], status);
+        if (result != AM_NVCUDA_OK) {
+            return result;
+        }
+    }
+    return AM_NVCUDA_OK;
+}
+
+static const EGLint plane_attributes[AM_NVCUDA_MAX_PLANES][5] = {
+    {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+     EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT},
+    {EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT,
+     EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT},
+    {EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT,
+     EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT},
+    {EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT,
+     EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT},
+};
+
+#define AM_DRM_FORMAT_MOD_INVALID UINT64_C(0x00ffffffffffffff)
+
+/* EGL never takes ownership of plane fds; it references the buffers itself. */
+static EGLImageKHR create_dmabuf_image(const struct am_converter *converter,
+                                       const struct am_nvcuda_dmabuf *frame) {
+    EGLint attributes[6 + AM_NVCUDA_MAX_PLANES * 10 + 1];
+    size_t count = 0;
+    attributes[count++] = EGL_WIDTH;
+    attributes[count++] = (EGLint)frame->width;
+    attributes[count++] = EGL_HEIGHT;
+    attributes[count++] = (EGLint)frame->height;
+    attributes[count++] = EGL_LINUX_DRM_FOURCC_EXT;
+    attributes[count++] = (EGLint)frame->fourcc;
+    int explicit_modifier = frame->modifier != AM_DRM_FORMAT_MOD_INVALID;
+    for (uint32_t plane = 0; plane < frame->plane_count; ++plane) {
+        attributes[count++] = plane_attributes[plane][0];
+        attributes[count++] = frame->plane_fds[plane];
+        attributes[count++] = plane_attributes[plane][1];
+        attributes[count++] = (EGLint)frame->offsets[plane];
+        attributes[count++] = plane_attributes[plane][2];
+        attributes[count++] = (EGLint)frame->pitches[plane];
+        if (explicit_modifier) {
+            attributes[count++] = plane_attributes[plane][3];
+            attributes[count++] = (EGLint)(frame->modifier & 0xffffffffu);
+            attributes[count++] = plane_attributes[plane][4];
+            attributes[count++] = (EGLint)(frame->modifier >> 32);
+        }
+    }
+    attributes[count] = EGL_NONE;
+    return converter->driver->egl.create_image(converter->display->display, EGL_NO_CONTEXT,
+                                               EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
+}
+
+static int validate_dmabuf(const struct am_converter *converter,
+                           const struct am_nvcuda_dmabuf *frame) {
+    if (frame->width < 16 || frame->width > 8192 || frame->height < 16 || frame->height > 8192 ||
+        frame->plane_count == 0 || frame->plane_count > AM_NVCUDA_MAX_PLANES) {
+        return 0;
+    }
+    if (frame->modifier != AM_DRM_FORMAT_MOD_INVALID && !converter->display->dmabuf_modifiers) {
+        return 0;
+    }
+    for (uint32_t plane = 0; plane < frame->plane_count; ++plane) {
+        if (frame->plane_fds[plane] < 0 || frame->pitches[plane] == 0 ||
+            frame->offsets[plane] > INT32_MAX || frame->pitches[plane] > INT32_MAX) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int am_converter_import_dmabuf(struct am_converter *converter, uint32_t slot,
+                               struct am_nvcuda_dmabuf *frame,
+                               struct am_nvcuda_status *status) {
+    if (!converter->display->dmabuf_import) {
+        am_set_status(status, AM_STAGE_IMPORT, 0);
+        return AM_NVCUDA_UNSUPPORTED;
+    }
+    if (!validate_dmabuf(converter, frame)) {
+        am_set_status(status, AM_STAGE_IMPORT, 0);
+        return AM_NVCUDA_INVALID_ARGUMENT;
+    }
+    const struct am_gl_api *gl = &converter->gl;
+    const int timed = timing_available(converter, slot);
+    if (timed) {
+        converter->timer_pending[slot] = 0;
+        gl->get_integer64v(GL_TIMESTAMP, &converter->timer_submitted[slot]);
+    }
+    int result = wait_for_acquire_fences(converter, frame, status);
+    if (result != AM_NVCUDA_OK) {
+        return result;
+    }
+    /* Follows the queued producer-fence wait: marks when conversion executes. */
+    if (timed) {
+        gl->query_counter(converter->timer_queries[slot][0], GL_TIMESTAMP);
+    }
+    const struct am_egl_api *egl = &converter->driver->egl;
+    EGLImageKHR image = create_dmabuf_image(converter, frame);
+    if (image == EGL_NO_IMAGE_KHR) {
+        am_set_status(status, AM_STAGE_IMPORT, (int32_t)egl->get_error());
+        return AM_NVCUDA_IMPORT_FAILED;
+    }
+    /* A fresh texture per frame: deleting it drops the last GL reference to
+     * the producer's buffer once the conversion has been consumed. */
+    GLuint source = 0;
+    gl->gen_textures(1, &source);
+    gl->bind_texture(GL_TEXTURE_2D, source);
+    set_sampling(gl);
+    gl->egl_image_target_texture_2d(GL_TEXTURE_2D, image);
+    gl->bind_texture(GL_TEXTURE_2D, 0);
+    GLenum error = gl->get_error();
+    if (error != GL_NO_ERROR) {
+        am_set_status(status, AM_STAGE_IMPORT, (int32_t)error);
+        result = AM_NVCUDA_IMPORT_FAILED;
+    } else {
+        result = convert_texture(converter, source, frame->width, frame->height, status);
+        if (result == AM_NVCUDA_OK && timed) {
+            gl->query_counter(converter->timer_queries[slot][1], GL_TIMESTAMP);
+            converter->timer_pending[slot] = 1;
+        }
+    }
+    /* A borrowed source may be reused as soon as this import returns, so
+     * complete its reads; descriptor duplication alone cannot protect
+     * immutable pixels from producer reuse. A retained source stays
+     * referenced until its encoded output, which the CUDA map orders after
+     * this conversion. Queue it instead of blocking the encode worker while a
+     * game holds the GPU. Failed conversions always complete their reads.
+     * GL defers deleting the texture and image until queued reads finish. */
+    if (frame->source_retained && result == AM_NVCUDA_OK) {
+        gl->flush();
+    } else {
+        gl->finish();
+    }
+    gl->delete_textures(1, &source);
+    egl->destroy_image(converter->display->display, image);
+    return result;
+}
+
+static int copy_plane(const struct am_cuda_api *cuda, CUarray source, CUdeviceptr destination,
+                      size_t pitch, size_t width_bytes, size_t rows, CUstream stream) {
+    CUDA_MEMCPY2D copy;
+    memset(&copy, 0, sizeof(copy));
+    copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    copy.srcArray = source;
+    copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = destination;
+    copy.dstPitch = pitch;
+    copy.WidthInBytes = width_bytes;
+    copy.Height = rows;
+    return (stream != NULL ? cuda->memcpy_2d_async(&copy, stream) : cuda->memcpy_2d(&copy)) ==
+           CUDA_SUCCESS;
+}
+
+/* Mapping orders GL draws before CUDA copies. With a non-NULL stream, map,
+ * copies, and unmap are ordered there; NVENC consumes that same input stream.
+ * The caller must synchronize it on failure and before releasing resources. */
+int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destination,
+                           size_t pitch, CUstream stream, struct am_nvcuda_status *status) {
+    const struct am_cuda_api *cuda = &converter->driver->cuda;
+    CUgraphicsResource resources[] = {converter->luma_resource, converter->chroma_resource};
+    /* If map or unmap fails the driver has not proved that ownership returned
+     * to GL. The caller must quarantine the registration on that path. */
+    converter->mapping_outstanding = 1;
+    CUresult result = cuda->graphics_map(2, resources, stream);
+    if (result != CUDA_SUCCESS) {
+        am_set_status(status, AM_STAGE_CUDA_INTEROP, (int32_t)result);
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    CUarray luma = NULL;
+    CUarray chroma = NULL;
+    int copied =
+        cuda->graphics_mapped_array(&luma, converter->luma_resource, 0, 0) == CUDA_SUCCESS &&
+        cuda->graphics_mapped_array(&chroma, converter->chroma_resource, 0, 0) ==
+            CUDA_SUCCESS &&
+        copy_plane(cuda, luma, destination, pitch, converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height, stream) &&
+        copy_plane(cuda, chroma, destination + pitch * converter->height, pitch,
+                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height / 2, stream);
+    CUresult unmapped = cuda->graphics_unmap(2, resources, stream);
+    if (unmapped == CUDA_SUCCESS) converter->mapping_outstanding = 0;
+    CUresult synchronized = stream == NULL ? cuda->ctx_synchronize() : CUDA_SUCCESS;
+    if (synchronized != CUDA_SUCCESS) converter->retirement_unproven = 1;
+    if (!copied || unmapped != CUDA_SUCCESS || synchronized != CUDA_SUCCESS) {
+        am_set_status(status, AM_STAGE_CUDA_INTEROP,
+                      (int32_t)(unmapped != CUDA_SUCCESS ? unmapped : synchronized));
+        return AM_NVCUDA_NATIVE_FAILURE;
+    }
+    return AM_NVCUDA_OK;
+}
+
+static int format_listed(const struct am_egl_api *egl, EGLDisplay display, uint32_t fourcc) {
+    EGLint count = 0;
+    if (!egl->query_dmabuf_formats(display, 0, NULL, &count) || count <= 0 || count > 4096) {
+        return 0;
+    }
+    EGLint *formats = calloc((size_t)count, sizeof(*formats));
+    if (formats == NULL) {
+        return 0;
+    }
+    int listed = 0;
+    if (egl->query_dmabuf_formats(display, count, formats, &count)) {
+        for (EGLint index = 0; index < count; ++index) {
+            listed |= (uint32_t)formats[index] == fourcc;
+        }
+    }
+    free(formats);
+    return listed;
+}
+
+/* Lists only modifiers that may be bound to GL_TEXTURE_2D; external-only
+ * modifiers would need GL_TEXTURE_EXTERNAL_OES, which this converter lacks. */
+int am_converter_import_modifiers(const struct am_converter *converter, uint32_t fourcc,
+                                  uint64_t *modifiers, uint32_t capacity,
+                                  uint32_t *modifier_count, uint32_t *implicit) {
+    *modifier_count = 0;
+    *implicit = 0;
+    const struct am_egl_display *display = converter->display;
+    if (!display->dmabuf_import) {
+        return AM_NVCUDA_OK;
+    }
+    if (!display->dmabuf_modifiers) {
+        /* Without the query the format list is unknown; implicit layouts are
+         * attempted and a failed import fails that frame. */
+        *implicit = 1;
+        return AM_NVCUDA_OK;
+    }
+    const struct am_egl_api *egl = &converter->driver->egl;
+    *implicit = (uint32_t)format_listed(egl, display->display, fourcc);
+    EGLint count = 0;
+    if (!egl->query_dmabuf_modifiers(display->display, (EGLint)fourcc, 0, NULL, NULL, &count) ||
+        count <= 0) {
+        return AM_NVCUDA_OK;
+    }
+    if (count > 1024) {
+        count = 1024;
+    }
+    EGLuint64KHR *listed = calloc((size_t)count, sizeof(*listed));
+    EGLBoolean *external_only = calloc((size_t)count, sizeof(*external_only));
+    if (listed == NULL || external_only == NULL) {
+        free(listed);
+        free(external_only);
+        return AM_NVCUDA_ALLOCATION_FAILED;
+    }
+    if (egl->query_dmabuf_modifiers(display->display, (EGLint)fourcc, count, listed,
+                                    external_only, &count)) {
+        for (EGLint index = 0; index < count && *modifier_count < capacity; ++index) {
+            if (!external_only[index]) {
+                modifiers[(*modifier_count)++] = listed[index];
+            }
+        }
+    }
+    free(listed);
+    free(external_only);
+    return AM_NVCUDA_OK;
+}
