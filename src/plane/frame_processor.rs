@@ -111,7 +111,7 @@ impl Session {
             0
         };
         let started = Instant::now();
-        let status = match self.connection.forward(flags) {
+        let status = match self.connection.forward_latest(flags) {
             Ok(status) => status,
             Err(ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)) => {
                 return Ok(Progress {

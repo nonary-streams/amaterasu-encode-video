@@ -9,7 +9,12 @@ use amaterasu_module_sdk::{
         FrameProcessor, ProcessingFrame, ResourceOutputFrame, into_frame_processor_binding,
     },
 };
-use std::{cell::RefCell, ptr, rc::Rc};
+use std::{
+    cell::RefCell,
+    ptr,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 const KIND: u32 = FRAME_RESOURCE_VENDOR_BASE + 1;
 const NONE: FrameDescriptor = FrameDescriptor {
     kind: FRAME_SYNC_NONE,
@@ -64,14 +69,17 @@ fn offer(id: u64, kind: u32, data: *const c_void) -> CaptureResourceOffer {
         completion_sync: NONE,
     }
 }
-struct Source(Arc<Vec<u8>>);
+struct Source {
+    pixels: Arc<Vec<u8>>,
+    generation: Arc<AtomicU64>,
+}
 impl CpuSourceProvider for Source {
     fn describe(&self, caller: &str, stream: u64) -> Result<CpuSourceDescription, Status> {
         if caller != "amaterasu.video" || stream != 2 {
             return Err(MEDIA_CLOSED);
         }
         Ok(CpuSourceDescription {
-            generation: 1,
+            generation: self.generation.load(Ordering::Relaxed),
             width: 16,
             height: 16,
             formats: vec![CpuSourceFormat {
@@ -95,7 +103,7 @@ impl CpuSourceProvider for Source {
             stride: 64,
             pixel_format: PIXEL_BGRA8,
             color: color(),
-            bytes: self.0.clone().into(),
+            bytes: self.pixels.clone().into(),
             timestamp_us: 5,
             capture_pacing_timestamp_us: 111,
             sequence: 7,
@@ -336,7 +344,11 @@ fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_
     ] {
         let events = Rc::new(RefCell::new(Vec::new()));
         let pixels = Arc::new(vec![37; 16 * 16 * 4]);
-        let source = CpuSourceFactory::new(Arc::new(Source(pixels.clone())));
+        let generation = Arc::new(AtomicU64::new(1));
+        let source = CpuSourceFactory::new(Arc::new(Source {
+            pixels: pixels.clone(),
+            generation: generation.clone(),
+        }));
         let mut capture = ptr::null();
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
@@ -420,6 +432,34 @@ fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_
         assert!(progress.submitted);
         assert_eq!(source.retirement_ready(), Ok(false));
         assert!(state.held.is_some());
+        // Desktop unlock can replace capture storage/format without ending the
+        // selected desktop session. Keep the processor and its HDR policy alive.
+        generation.store(2, Ordering::Relaxed);
+        let pump = || Pump {
+            video: 1,
+            capture: 2,
+            encoder: 3,
+            provider,
+            configuration: &configuration,
+            frame_path: FramePath::Cpu,
+            capture_due: true,
+            constant_rate: false,
+            repeat_due: false,
+            repeat_frame: None,
+            timestamp_us: 1234,
+            sequence: 9,
+            force_idr: true,
+        };
+        assert!(plane.pump(pump()).unwrap().capture_deferred);
+        assert!(
+            state.held.is_some(),
+            "previous reader survives renegotiation"
+        );
+        assert!(events.borrow().is_empty(), "no cancellation during unlock");
+        assert!(plane.hdr_metadata(1, provider, 2).unwrap().is_some());
+        let previous = state.held.take().unwrap();
+        unsafe { (previous.release)(previous.context, &NONE) };
+        assert!(plane.pump(pump()).unwrap().submitted);
         drop(plane);
         assert!(state.held.is_none());
         assert_eq!(source.retirement_ready(), Ok(true));
