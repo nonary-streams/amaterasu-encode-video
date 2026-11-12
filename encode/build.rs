@@ -114,7 +114,7 @@ fn build_pyrowave_gpu() {
     let explicit = env::var_os("AMATERASU_PYROWAVE_INCLUDE_DIR");
     let include = explicit.map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-            .join("../../native-deps/pyrowave/source")
+            .join("../../../native-deps/pyrowave/source")
     });
     assert!(
         include.join("pyrowave.h").is_file(),

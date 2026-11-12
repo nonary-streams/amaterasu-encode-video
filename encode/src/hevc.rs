@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn parses_complete_checked_in_x265_main_sps_vui_and_trailing_bits() {
         let access_unit = include_bytes!(
-            "../../../crates/gamestream/src/video/fixtures/x265_shim_main_black_64.hevc"
+            "../../../../crates/gamestream/src/video/fixtures/x265_shim_main_black_64.hevc"
         );
         let units = annex_b_units(access_unit).unwrap();
         let sps = units

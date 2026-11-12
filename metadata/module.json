@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "family": "encoding",
+  "repository": "https://github.com/nonary-streams/amaterasu-encode-video",
+  "mount": "modules/encode-video",
+  "components": [
+    {
+      "id": "amaterasu.encode",
+      "package": "amaterasu-encode",
+      "path": "encode",
+      "name": "Video encoder",
+      "summary": "Encodes frames with the host's hardware or software encoders."
+    },
+    {
+      "id": "amaterasu.video",
+      "package": "amaterasu-video",
+      "path": "video",
+      "name": "Video pipeline",
+      "summary": "Moves captured frames through processing to the encoder."
+    }
+  ]
+}

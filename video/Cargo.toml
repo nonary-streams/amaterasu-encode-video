@@ -1,8 +1,10 @@
 [package]
 name = "amaterasu-video"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/nonary-streams/amaterasu-encode-video"
 [lib]
 crate-type = ["cdylib", "rlib"]
 [features]
@@ -17,6 +19,6 @@ getrandom.workspace = true
 cc = "1"
 pkg-config = "0.3"
 [dev-dependencies]
-amaterasu-runtime = { path = "../../crates/runtime" }
+amaterasu-runtime = { path = "../../../crates/runtime" }
 [lints]
 workspace = true
