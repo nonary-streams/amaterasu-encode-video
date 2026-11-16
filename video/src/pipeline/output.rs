@@ -119,7 +119,7 @@ pub(super) fn tick(
             }
         }
     }
-    if stream.source_id.is_some() {
+    if stream.source_id.is_some() && !stream.submitted_extension {
         if let Err(code) = plane.pump_source(id, stream.session.unwrap(), false) {
             stream.cleanup(code);
         }

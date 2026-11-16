@@ -185,6 +185,13 @@ impl State {
         owner: &str,
         payload: Value,
     ) -> Result<(Value, Option<u64>), &'static str> {
+        if let Some((normalized, echo)) = super::control::project(&payload)? {
+            let (mut reply, created) = self.control(owner, normalized)?;
+            for (key, value) in echo.as_object().expect("projection object") {
+                reply[key] = value.clone();
+            }
+            return Ok((reply, created));
+        }
         let operation = serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         match operation {
             Operation::Enumerate => Ok((
@@ -333,14 +340,23 @@ fn format_json(id: FormatId) -> Value {
 fn config(native: &encode::SessionConfig) -> Result<Configuration, Status> {
     if native.mode != SessionMode::Submitted
         || native.framing != RECORDS
-        || native.options_schema != OPTIONS
+        || (native.options_schema != OPTIONS
+            && native.options_schema
+                != FormatId {
+                    namespace_id: ENCODER_FORMAT_NAMESPACE_STANDARD,
+                    value: ENCODER_SCHEMA_COMMON_CONFIG,
+                    schema: ENCODER_FORMAT_SCHEMA_V1,
+                })
         || native.source_id == 0
         || native.config_generation != 1
     {
         return Err(MEDIA_UNSUPPORTED);
     }
-    let configuration: Configuration =
-        serde_json::from_slice(&native.options).map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    let configuration: Configuration = if native.options_schema == OPTIONS {
+        serde_json::from_slice(&native.options).map_err(|_| STATUS_INVALID_ARGUMENT)?
+    } else {
+        super::control::common(native)?
+    };
     configuration
         .validate()
         .map_err(|_| STATUS_INVALID_ARGUMENT)?;

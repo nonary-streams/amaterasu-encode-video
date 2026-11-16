@@ -9,6 +9,9 @@ mod queue;
 mod rpc;
 mod source_preflight;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::{Operation, Settings, error};
 use pipeline::Pipeline;
@@ -43,6 +46,7 @@ pub struct Video {
     plane: Box<dyn Plane>,
     _factory: Box<native::Factory>,
     source_preflight: source_preflight::SourcePreflight,
+    _unit_factory: Option<Box<native::unit::Factory>>,
 }
 
 impl ManagedModule for Video {
@@ -90,12 +94,16 @@ impl ManagedModule for Video {
         };
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|_| "video entropy unavailable")?;
+        let unit_service = settings.unit_service.clone();
         let mut pipeline = Pipeline::new(
             settings,
             format!("{:016x}", u64::from_le_bytes(random)),
             queues.clone(),
         );
         pipeline.trace_frames(frame_trace);
+        let unit_factory = unit_service
+            .as_ref()
+            .map(|_| native::unit::Factory::new(queues.clone()));
         let factory = native::Factory::new(queues);
         runtime.require_success(Command::Register {
             service: service.clone(),
@@ -103,12 +111,23 @@ impl ManagedModule for Video {
         // SAFETY: factory is boxed before registration and retained through module
         // lifetime. Signed dependency order stops consumers before destroying video.
         unsafe { amaterasu_module_sdk::video::register(&runtime, &service, &factory.api) }?;
+        if let (Some(service), Some(factory)) = (unit_service, &unit_factory) {
+            // SAFETY: the optional factory is boxed and retained until module unload.
+            unsafe {
+                amaterasu_module_sdk::video_framing::register_video(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             pipeline,
             plane,
             _factory: factory,
             source_preflight,
+            _unit_factory: unit_factory,
         })
     }
 
@@ -238,7 +257,12 @@ fn send_pipeline_command(runtime: &RuntimeClient, command: Command) -> ModuleRes
     runtime.send(command)
 }
 
+#[cfg(all(not(feature = "test-support"), not(feature = "submitted-extensions")))]
 amaterasu_module_sdk::export_module!(Video);
+// Native factories own independent queue state. Capture/encoder bindings are created
+// and retired on this worker; no borrowed native state moves between threads.
+#[cfg(all(not(feature = "test-support"), feature = "submitted-extensions"))]
+amaterasu_module_sdk::export_module!(amaterasu_module_sdk::service_worker::ServiceWorker<Video>);
 
 #[cfg(test)]
 mod lifecycle_tests;

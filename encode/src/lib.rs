@@ -97,11 +97,13 @@ impl ManagedModule for EncodeModule {
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
         self.log_worker_timings();
+        let transport_extensions = self.transport_extensions();
         self.preparation.advance(
             &self.runtime,
             &self.shared,
             &mut self.closing,
             self.shutting_down,
+            transport_extensions.clone(),
         )?;
         self.closing.advance(&self.runtime, &self.shared)?;
         match self.runtime.send(Command::Poll {})? {
@@ -146,6 +148,7 @@ impl ManagedModule for EncodeModule {
                                         &self.shared,
                                         &mut self.closing,
                                         false,
+                                        transport_extensions.clone(),
                                     );
                                 }
                                 Err(code) => Err(code),
@@ -221,7 +224,7 @@ impl ManagedModule for EncodeModule {
             }
         }
         self.preparation
-            .advance(&self.runtime, &self.shared, &mut self.closing, true)?;
+            .advance(&self.runtime, &self.shared, &mut self.closing, true, None)?;
         self.closing.advance(&self.runtime, &self.shared)?;
         match self.shared.try_lock() {
             Ok(sessions) => sessions
@@ -255,6 +258,18 @@ impl EncodeModule {
                 &summary,
             );
         }
+    }
+
+    fn transport_extensions(&self) -> Option<Value> {
+        #[cfg(feature = "pyrowave")]
+        if self
+            .pyrowave
+            .as_ref()
+            .is_some_and(|plugin| plugin.transport_enabled())
+        {
+            return Some(json!([{"codec_mode_mask":8388608,"bitstream":"186f0393"}]));
+        }
+        None
     }
 
     fn control(&self, caller: &str, payload: Value) -> Result<(Value, Option<u64>), &'static str> {

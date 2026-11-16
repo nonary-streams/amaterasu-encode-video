@@ -71,6 +71,7 @@ impl Pipeline {
         self.enabled = false;
         self.observations.shutdown(send);
         self.live_settings.shutdown(send);
+        self.source_probes.shutdown(send);
         if let Ok(mut queues) = self.queues.lock() {
             queues.clear();
         }

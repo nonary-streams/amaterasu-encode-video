@@ -10,6 +10,7 @@ mod owned_capture;
 mod pacing;
 mod portal;
 mod presentation;
+mod source_probe;
 
 use crate::{
     model::{
@@ -102,12 +103,14 @@ fn observed_capture(payload: &Value) -> Result<Option<ObservedCapture>, &'static
 }
 
 struct Stream {
+    startup_frame_ready: bool,
     packet_boundaries: bool,
     owner: String,
     provider: CaptureProvider,
     encoder_provider: Option<String>,
     encoder_service: String,
     source_id: Option<u64>,
+    submitted_extension: bool,
     capture_selection: Option<capture_open::Selection>,
     capture_source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
     capture_preflight_started: Option<Instant>,
@@ -482,6 +485,8 @@ impl Stream {
             "encoder_probe_reason": self.encoder_probe_reason,
             "packet_boundaries": self.packet_boundaries,
             "supports_packet_boundaries": true,
+            "startup_frame_readiness": self.packet_boundaries,
+            "startup_frame_ready": self.startup_frame_ready && self.stage == Stage::Running && self.error.is_none(),
             "output": self.output,
             "capture_provider":self.provider,
             "encoder_provider":self.encoder_provider,
@@ -517,6 +522,17 @@ impl Stream {
         }
         if let Some(touch_port) = &self.touch_port {
             response["touch_port"] = touch_port.clone();
+        }
+        if self.source_started
+            && let (Some(profile), Some(source_id)) =
+                (&self.configuration.extension_profile, self.source_id)
+        {
+            response["negotiated_unit"] = json!({
+                "stream": id, "generation": id, "offer_id": profile.wire_selector,
+                "source_id": source_id, "config_generation": 1,
+                "codec": profile.codec, "framing": profile.framing,
+                "clock_epoch": self.clock_epoch, "clock_origin_us": self.clock_origin_us,
+            });
         }
         if let Some(frame) = self.last_frame {
             response["last_capture_frame"] = json!({
@@ -554,6 +570,7 @@ impl Stream {
 
 pub struct Pipeline {
     require_frame_lease: bool,
+    unit_service_enabled: bool,
     enabled: bool,
     shutdown_deadline: Option<Instant>,
     quiescing: bool,
@@ -574,6 +591,7 @@ pub struct Pipeline {
     observations: observation::Control,
     live_settings: live_settings::Control,
     processing_lifecycle_service: Option<String>,
+    source_probes: source_probe::Control,
     pub queues: Arc<Mutex<Queues>>,
     processing_generation: Arc<AtomicU64>,
     frame_trace: Option<crate::frame_trace::FrameTrace>,
@@ -607,6 +625,7 @@ impl Pipeline {
             .processing_generation();
         Self {
             require_frame_lease: settings.require_frame_lease,
+            unit_service_enabled: settings.unit_service.is_some(),
             enabled: settings.enabled,
             shutdown_deadline: None,
             quiescing: false,
@@ -631,6 +650,7 @@ impl Pipeline {
             observations: observation::Control::default(),
             live_settings: live_settings::Control::default(),
             processing_lifecycle_service: settings.processing_lifecycle_service,
+            source_probes: source_probe::Control::default(),
             queues,
             processing_generation,
             frame_trace: None,
@@ -657,6 +677,50 @@ impl Pipeline {
             return;
         }
         match operation {
+            Operation::ProbeSource {
+                source_id,
+                encoder_provider,
+                encoder,
+                configuration,
+            } => {
+                let registration = self.source_encoders.get(&encoder_provider);
+                let allowed = self.enabled
+                    && self.unit_service_enabled
+                    && encoder.validate().is_ok()
+                    && configuration.validate_source()
+                    && registration.is_some_and(|registration| {
+                        registration.source_ids.contains(&source_id)
+                            && configuration
+                                .extension_profile
+                                .as_ref()
+                                .is_some_and(|profile| {
+                                    registration.extension_profiles.contains(profile)
+                                })
+                    });
+                if !allowed {
+                    rpc::complete(
+                        send,
+                        request,
+                        error("encoder_extension_profile_not_allowed"),
+                    );
+                } else {
+                    self.source_probes.begin(
+                        request,
+                        source_probe::Probe {
+                            submitted: registration.expect("checked registration").submitted,
+                            service: registration
+                                .expect("checked registration")
+                                .control_service
+                                .clone(),
+                            source_id,
+                            encoder,
+                            configuration: *configuration,
+                        },
+                        &self.epoch,
+                        send,
+                    );
+                }
+            }
             Operation::SelectPortalSource {
                 source_type,
                 operation_id,
@@ -842,7 +906,13 @@ impl Pipeline {
             rpc::complete(send, request, error("nvenc_settings_unsupported"));
             return;
         }
-        if specification.source_id.is_none()
+        let submitted_requested = specification.configuration.extension_profile.is_some()
+            && specification
+                .encoder_provider
+                .as_ref()
+                .and_then(|alias| self.source_encoders.get(alias))
+                .is_some_and(|p| p.submitted);
+        if (specification.source_id.is_none() || submitted_requested)
             && let CaptureProvider::External(external) = specification.provider
         {
             let requested = CaptureProvider::External(external);
@@ -855,7 +925,8 @@ impl Pipeline {
                 specification.provider = resolved;
             }
         }
-        if specification.source_id.is_none() && specification.provider == CaptureProvider::Pipewire
+        if (specification.source_id.is_none() || submitted_requested)
+            && specification.provider == CaptureProvider::Pipewire
         {
             // A sentinel is resolved by the trusted provider, which may restore
             // an earlier portal approval without a management selection RPC.
@@ -887,6 +958,17 @@ impl Pipeline {
                 rpc::complete(send, request, error("encoder_source_not_allowed"));
                 return;
             };
+            if let Some(profile) = &specification.configuration.extension_profile
+                && (!self.unit_service_enabled
+                    || !registration.extension_profiles.contains(profile))
+            {
+                rpc::complete(
+                    send,
+                    request,
+                    error("encoder_extension_profile_not_allowed"),
+                );
+                return;
+            }
             if !matches!(specification.encoder, EncoderSelection::Identity(_)) {
                 rpc::complete(send, request, error("source_encoder_identity_required"));
                 return;
@@ -938,7 +1020,19 @@ impl Pipeline {
         if !self.admit_operation(caller, request, &specification, send) {
             return;
         }
-        let generic_input = specification.source_id.is_none()
+        let submitted_extension = specification.configuration.extension_profile.is_some()
+            && specification
+                .encoder_provider
+                .as_ref()
+                .and_then(|alias| self.source_encoders.get(alias))
+                .is_some_and(|p| p.submitted);
+        if submitted_extension
+            && specification.provider == CaptureProvider::Pipewire
+            && is_owned_kwin_output(&specification.output)
+        {
+            specification.provider = CaptureProvider::Vkms;
+        }
+        let generic_input = (specification.source_id.is_none() || submitted_extension)
             && specification
                 .encoder_provider
                 .as_ref()
@@ -960,7 +1054,11 @@ impl Pipeline {
             source_capture_context: _,
             configuration,
         } = specification;
-        let failure = if source_id.is_none() && !self.providers.contains(&provider) {
+        let failure = if submitted_extension && !cfg!(feature = "submitted-extensions") {
+            Some("submitted_extensions_worker_required")
+        } else if (source_id.is_none() || submitted_extension)
+            && !self.providers.contains(&provider)
+        {
             Some("capture_provider_not_allowed")
         } else if constant_rate && provider != CaptureProvider::Wgc {
             Some("constant_rate_requires_wgc")
@@ -1025,7 +1123,7 @@ impl Pipeline {
             };
             let operation = format!("video-{}-{id}", self.epoch);
             let requested_encoder = encoder.clone();
-            let mut stage = if source_id.is_some() {
+            let mut stage = if source_id.is_some() && !submitted_extension {
                 Stage::Encoder
             } else {
                 initial_stage(provider, &encoder)
@@ -1053,6 +1151,7 @@ impl Pipeline {
             }
             if stage == Stage::Capture
                 && matches!(requested_encoder, EncoderSelection::Identity(_))
+                && !submitted_extension
                 && owned_capture.needs_encoder_inspection()
             {
                 stage = Stage::InspectEncoder;
@@ -1067,12 +1166,14 @@ impl Pipeline {
                 None
             };
             Stream {
+                startup_frame_ready: false,
                 packet_boundaries,
                 owner: caller.into(),
                 provider,
                 encoder_provider,
                 encoder_service,
                 source_id,
+                submitted_extension,
                 capture_selection,
                 capture_source_format: None,
                 capture_preflight_started: None,
@@ -1194,6 +1295,7 @@ impl Pipeline {
                 send,
             );
         }
+        self.source_probes.tick(plane, send);
         if self.streams.is_empty() {
             return;
         }
@@ -1274,7 +1376,7 @@ impl Pipeline {
             stream
                 .diagnostics
                 .get_or_insert_with(|| DiagnosticWindow::new(Instant::now()));
-            if let Some(source_id) = stream.source_id {
+            if let Some(source_id) = stream.source_id.filter(|_| !stream.submitted_extension) {
                 if !stream.source_started {
                     match plane.start_source(
                         id,
@@ -1284,7 +1386,17 @@ impl Pipeline {
                         stream.clock_origin_us,
                         stream.clock_epoch,
                     ) {
-                        Ok(()) => stream.source_started = true,
+                        Ok(()) => {
+                            stream.source_started = true;
+                            if stream.configuration.extension_profile.is_some()
+                                && let Some(parent) = stream.parent.take()
+                                && !rpc::complete(send, parent, stream.response(id))
+                            {
+                                stream.ending_parent = Some(parent);
+                                stream.cleanup("completion_lost");
+                                return;
+                            }
+                        }
                         Err(code) => {
                             stream.cleanup(code);
                             return;
@@ -1318,6 +1430,9 @@ impl Pipeline {
             }
             log_diagnostics(stream, id, &self.queues, send);
             if let Ok(mut queues) = self.queues.try_lock() {
+                stream.startup_frame_ready |= queues
+                    .startup_frame_ready(&stream.owner, id)
+                    .unwrap_or(false);
                 queues.set_geometry(id, stream.desktop_geometry);
                 if let Some(capture) = stream.capture {
                     match plane.hdr_metadata(id, stream.provider, capture) {
@@ -1335,7 +1450,7 @@ impl Pipeline {
             return;
         }
         if stream.stage == Stage::Activating {
-            let geometry = if stream.source_id.is_some() {
+            let geometry = if stream.source_id.is_some() && !stream.submitted_extension {
                 Ok(GeometryProgress::Ready)
             } else {
                 verify_stream_geometry(plane, stream)
@@ -1589,7 +1704,11 @@ fn pump(
             if progress.submitted
                 && let Some((trace, started)) = capture_started
             {
-                trace.submitted(id, sequence, started);
+                trace.submitted(
+                    id,
+                    progress.submitted_source_sequence.unwrap_or(sequence),
+                    started,
+                );
             }
             if stream.capture_notifications
                 && capture_due
@@ -1879,6 +1998,7 @@ fn advance(
     }
     if stream.stage == Stage::Capture {
         if requires_encoder_configuration_probe(&stream.configuration)
+            && !stream.submitted_extension
             && !stream.encoder_configuration_probed
         {
             if stream.encoder.is_none() {
@@ -1947,7 +2067,8 @@ fn advance(
             }
         }
     }
-    if stream.stage == Stage::Encoder && stream.source_id.is_none() {
+    if stream.stage == Stage::Encoder && (stream.source_id.is_none() || stream.submitted_extension)
+    {
         match verify_stream_geometry(plane, stream) {
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => return false,
@@ -2169,8 +2290,15 @@ fn encoder_open_request(stream: &Stream) -> Value {
         request["encoder_options"] = options.clone();
     }
     if let Some(source_id) = stream.source_id {
-        request["mode"] = json!("source");
+        request["mode"] = json!(if stream.submitted_extension {
+            "submitted"
+        } else {
+            "source"
+        });
         request["source_id"] = json!(source_id);
+    }
+    if stream.submitted_extension {
+        request["resource_output_clock"] = resource_output_clock(stream);
     }
     if stream.packet_boundaries {
         request["packet_boundaries"] = json!(true);
@@ -2611,7 +2739,21 @@ fn apply_result(
                 stream.frame_path = FramePath::Generic;
             }
             if let Some(source_id) = stream.source_id {
-                if let Err(code) = plane.start_source(
+                if stream.configuration.extension_profile.is_some() {
+                    let Ok(mut guard) = queues.lock() else {
+                        stream.cleanup("queue_failed");
+                        return false;
+                    };
+                    guard.open(id, &stream.owner, stream.clock_origin_us);
+                    guard.set_geometry(id, stream.desktop_geometry);
+                }
+                let start = if stream.submitted_extension {
+                    Plane::start_submitted
+                } else {
+                    Plane::start_source
+                };
+                if let Err(code) = start(
+                    plane,
                     id,
                     stream.session.unwrap(),
                     source_id,
@@ -2619,11 +2761,24 @@ fn apply_result(
                     stream.clock_origin_us,
                     stream.clock_epoch,
                 ) {
+                    if stream.configuration.extension_profile.is_some()
+                        && let Ok(mut guard) = queues.lock()
+                    {
+                        guard.close(id);
+                    }
                     stream.cleanup(code);
                     return false;
                 }
                 stream.source_started = true;
-                activate_or_resume(stream, id, queues, send);
+                if stream.submitted_extension {
+                    match verify_stream_geometry(plane, stream) {
+                        Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
+                        Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
+                        Err(code) => stream.cleanup(code),
+                    }
+                } else {
+                    activate_or_resume(stream, id, queues, send);
+                }
                 return false;
             }
             match verify_stream_geometry(plane, stream) {
@@ -2634,7 +2789,7 @@ fn apply_result(
             return false;
         }
         Stage::FindEncoder => {
-            if missing && stream.source_id.is_some() {
+            if missing && stream.source_id.is_some() && !stream.submitted_extension {
                 return finish_cleanup(stream);
             } else if missing {
                 if !stream.generic_input {
@@ -2651,7 +2806,9 @@ fn apply_result(
                 Stage::CloseEncoder
             }
         }
-        Stage::CloseEncoder if stream.source_id.is_some() => return finish_cleanup(stream),
+        Stage::CloseEncoder if stream.source_id.is_some() && !stream.submitted_extension => {
+            return finish_cleanup(stream);
+        }
         Stage::CloseEncoder => {
             if !stream.generic_input {
                 // Broker Close acknowledged worker retirement. Entering the
@@ -3808,6 +3965,7 @@ fn fitted_touch_port(
 
 fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
     if stream.generic_input
+        && !stream.submitted_extension
         && (payload
             .get("resource_callback_contract")
             .and_then(Value::as_str)
@@ -3821,8 +3979,12 @@ fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
         stream.cleanup("resource_clock_unconfirmed");
         return false;
     }
-    if payload.get("codec").and_then(Value::as_str) != Some(codec_name(stream.configuration.codec))
-    {
+    let codec_matches = if let Some(profile) = &stream.configuration.extension_profile {
+        payload.get("extension_profile") == Some(&json!(profile))
+    } else {
+        payload.get("codec").and_then(Value::as_str) == Some(codec_name(stream.configuration.codec))
+    };
+    if !codec_matches {
         stream.cleanup("encoder_codec_mismatch");
         return false;
     }
@@ -3859,8 +4021,13 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
             return;
         }
     };
-    guard.open(id, &stream.owner, stream.clock_origin_us);
-    guard.set_geometry(id, stream.desktop_geometry);
+    if stream.configuration.extension_profile.is_none() {
+        guard.open(id, &stream.owner, stream.clock_origin_us);
+        guard.set_geometry(id, stream.desktop_geometry);
+    }
+    if stream.packet_boundaries {
+        guard.enable_startup_readiness(id);
+    }
     drop(guard);
     stream.stage = Stage::Running;
     if let Some(parent) = stream.parent.take()

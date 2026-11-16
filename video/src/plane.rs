@@ -100,6 +100,8 @@ pub struct CaptureArrival {
 pub struct Progress {
     pub dropped: bool,
     pub submitted: bool,
+    /// Source sequence retained unchanged by a generic resource consumer.
+    pub submitted_source_sequence: Option<u64>,
     /// A bounded asynchronous processor is still busy; retain the due capture
     /// slot so the next available frame does not wait an additional period.
     pub capture_deferred: bool,
@@ -196,6 +198,9 @@ pub trait Plane {
     /// Select the trusted service for the stream currently being advanced.
     fn select_encoder(&mut self, _: &str) {}
     fn set_stream_clock(&mut self, _: u64, _: u64, _: [u8; 16]) {}
+    fn probe_source(&mut self, _: &str, _: u64, _: &Configuration) -> Result<(), &'static str> {
+        Err("encoder_source_unavailable")
+    }
     fn start_source(
         &mut self,
         _: u64,
@@ -206,6 +211,17 @@ pub trait Plane {
         _: [u8; 16],
     ) -> Result<(), &'static str> {
         Err("encoder_source_unavailable")
+    }
+    fn start_submitted(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        Err("submitted_encoder_unavailable")
     }
     fn pump_source(&mut self, _: u64, _: u64, _: bool) -> Result<bool, &'static str> {
         Err("encoder_source_unavailable")
@@ -397,6 +413,12 @@ impl NativePlane {
                 .into_iter()
                 .chain(encoder_providers.values().map(String::as_str))
             {
+                if source_providers
+                    .values()
+                    .any(|p| p.submitted && p.control_service == service)
+                {
+                    continue;
+                }
                 encoders.insert(
                     service.to_owned(),
                     runtime.bind_native_typed(
@@ -423,6 +445,7 @@ impl NativePlane {
             for (alias, service) in consumer_providers {
                 let control = encoder_providers
                     .get(alias)
+                    .or_else(|| source_providers.get(alias).map(|p| &p.control_service))
                     .ok_or("missing consumer encoder")?;
                 let binding = runtime.bind_native_typed(
                     service,
@@ -842,6 +865,25 @@ impl Plane for NativePlane {
             })
     }
 
+    fn probe_source(
+        &mut self,
+        service: &str,
+        source_id: u64,
+        configuration: &Configuration,
+    ) -> Result<(), &'static str> {
+        let binding = self
+            .source_encoders
+            .get(service)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: the runtime retains the provider table while the probe runs.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        if !encoder_provider_available(api.base.header) {
+            return Err("encoder_interface");
+        }
+        // SAFETY: the selected binding remains live through this synchronous probe.
+        unsafe { source::Source::probe(api, source_id, configuration) }
+    }
     fn select_encoder(&mut self, service: &str) {
         debug_assert!(
             self.encoders.contains_key(service) || self.source_encoders.contains_key(service)
@@ -872,9 +914,88 @@ impl Plane for NativePlane {
         if !encoder_provider_available(api.base.header) {
             return Err("encoder_interface");
         }
+        if let Some(profile) = &configuration.extension_profile {
+            let id = |format: amaterasu_contracts::media_profile::FormatId| EncoderFormatId {
+                namespace_id: format.namespace_id,
+                value: format.value,
+                schema: format.schema,
+            };
+            let selection = crate::queue::UnitSelection {
+                stream: video,
+                generation: video,
+                offer_id: u64::from(profile.wire_selector),
+                source_id,
+                config_generation: 1,
+                codec: id(profile.codec),
+                framing: id(profile.framing),
+                clock_epoch,
+            };
+            self.queues
+                .lock()
+                .map_err(|_| "queue_failed")?
+                .configure_units(video, selection)
+                .map_err(|_| "unit_queue_configuration_failed")?;
+        }
         // SAFETY: control service authorized this session and bindings outlive it.
         let source = unsafe {
             source::Source::open(
+                api,
+                video,
+                session,
+                source_id,
+                configuration,
+                clock_origin_us,
+                clock_epoch,
+            )
+        }?;
+        self.sources
+            .insert(video, (self.active_encoder.clone(), source));
+        Ok(())
+    }
+    fn start_submitted(
+        &mut self,
+        video: u64,
+        session: u64,
+        source_id: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        clock_epoch: [u8; 16],
+    ) -> Result<(), &'static str> {
+        let binding = self
+            .source_encoders
+            .get(&self.active_encoder)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: the signed service supplies this independently validated table.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        if !encoder_provider_available(api.base.header) {
+            return Err("encoder_interface");
+        }
+        if let Some(profile) = &configuration.extension_profile {
+            let id = |format: amaterasu_contracts::media_profile::FormatId| EncoderFormatId {
+                namespace_id: format.namespace_id,
+                value: format.value,
+                schema: format.schema,
+            };
+            let selection = crate::queue::UnitSelection {
+                stream: video,
+                generation: video,
+                offer_id: u64::from(profile.wire_selector),
+                source_id,
+                config_generation: 1,
+                codec: id(profile.codec),
+                framing: id(profile.framing),
+                clock_epoch,
+            };
+            self.queues
+                .lock()
+                .map_err(|_| "queue_failed")?
+                .configure_units(video, selection)
+                .map_err(|_| "unit_queue_configuration_failed")?;
+        }
+        // SAFETY: control service authorized this session and bindings outlive it.
+        let source = unsafe {
+            source::Source::open_submitted(
                 api,
                 video,
                 session,
@@ -1097,7 +1218,12 @@ impl Plane for NativePlane {
             }
         }
         let processing = self.gpu_processor.is_some() && !self.gpu_bypassed.contains(&input.video);
-        if self.require_frame_lease && input.frame_path != FramePath::DmaBuf && !processing {
+        if self.require_frame_lease
+            && input.frame_path != FramePath::DmaBuf
+            && !(input.frame_path == FramePath::Generic
+                && input.configuration.extension_profile.is_some())
+            && !processing
+        {
             return Err("capture_frame_lease_required");
         }
         if input.configuration.gpu_processing.is_some()
@@ -1167,6 +1293,10 @@ impl Plane for NativePlane {
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::Generic {
             let progress = self.deliver_generic(&input)?;
+            if input.configuration.extension_profile.is_some() {
+                self.pump_source(input.video, input.encoder, false)?;
+                return Ok(progress);
+            }
             self.adopt_provider_processing_start(&input, &progress);
             let encoder = unsafe {
                 self.encoders
@@ -1291,6 +1421,13 @@ impl Plane for NativePlane {
     }
 
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str> {
+        if let Some((&video, _)) = self
+            .sources
+            .iter()
+            .find(|(_, (_, source))| source.session() == encoder)
+        {
+            return self.drain_source(video);
+        }
         // SAFETY: exact encoder v1 binding stays live through the synchronous call.
         let api = unsafe {
             self.encoders
@@ -1409,8 +1546,17 @@ impl NativePlane {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
                 self.active_encoder.clone(),
-                resource_generic::ResourceBridge::new(input.capture, input.encoder, 0, epoch)
-                    .map_err(|_| "resource_negotiation_failed")?,
+                resource_generic::ResourceBridge::new(
+                    input.capture,
+                    input.encoder,
+                    if input.configuration.extension_profile.is_some() {
+                        FRAME_ACCESS_GPU
+                    } else {
+                        0
+                    },
+                    epoch,
+                )
+                .map_err(|_| "resource_negotiation_failed")?,
             )),
         };
         // SAFETY: both session-owned bindings remain live through cancellation.
@@ -1439,6 +1585,7 @@ impl NativePlane {
         match status {
             STATUS_OK => Ok(Progress {
                 submitted: true,
+                submitted_source_sequence: Some(bridge.last_accepted_sequence()),
                 capture_frame_count: 1,
                 ..Progress::default()
             }),
@@ -2091,6 +2238,7 @@ mod tests {
         };
         let configuration = Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2174,6 +2322,7 @@ mod tests {
         };
         let configuration = Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2295,6 +2444,7 @@ mod tests {
         };
         let configuration = Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2485,6 +2635,7 @@ mod tests {
         };
         let configuration = Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2556,6 +2707,7 @@ mod tests {
         };
         let configuration = Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,

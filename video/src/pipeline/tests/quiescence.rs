@@ -86,6 +86,8 @@ fn source_activation_keeps_its_native_connection_while_packet_queue_is_borrowed(
             control_service: "example.encode/1".into(),
             native_service: "example.encode-provider/1".into(),
             source_ids: [42].into(),
+            extension_profiles: Vec::new(),
+            submitted: false,
         },
     );
     pipeline.handle(

@@ -8,8 +8,11 @@ repository = "https://github.com/nonary-streams/amaterasu-encode-video"
 [lib]
 crate-type = ["cdylib", "rlib"]
 [features]
+test-support = []
+submitted-extensions = []
 linux-ffmpeg-convert = []
 [dependencies]
+amaterasu-contracts.workspace = true
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true
 serde.workspace = true

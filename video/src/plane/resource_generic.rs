@@ -246,6 +246,10 @@ impl ResourceBridge {
         })
     }
 
+    pub(super) fn last_accepted_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
     pub(super) fn is_retired(&self) -> bool {
         self.retired
     }
@@ -966,6 +970,7 @@ mod tests {
             Ok(STATUS_OK)
         );
         assert_eq!(consumer.submitted, 1);
+        assert_eq!(connection.last_accepted_sequence(), 1);
         assert_eq!(consumer.cancelled, 0);
         producer.stale = true;
         std::hint::black_box(&producer);

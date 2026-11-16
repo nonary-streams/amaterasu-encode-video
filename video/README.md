@@ -654,3 +654,14 @@ output path carrying those agreed schemas end to end. Adding a provider alias
 does not remove those constraints. The generic binary transfer API supplies a
 buffer primitive; migrating this output path and validating its transport is
 separate integration work.
+
+Packet-boundary video streams additionally expose `startup_frame_readiness:true`
+and `startup_frame_ready` in their owned status entry. Readiness means the normal
+bounded output queue retained a complete non-EOS keyframe access unit. A running
+capture/encoder allocation or `submitted_frames` alone is insufficient. The
+proof resets on reopen and is false outside healthy running state; it is not a
+claim of transport delivery or visible client playback. Legacy unframed streams
+do not advertise this capability. Before the first keyframe, contiguous framed
+fragments may coalesce into the existing queue tail to avoid exhausting its four
+slots while a client is waiting for PLAY. Total bytes, maximum packet size and
+fragment count remain bounded; codec/sequence/timestamp discontinuity is rejected.

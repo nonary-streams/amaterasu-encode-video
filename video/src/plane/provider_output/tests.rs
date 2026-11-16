@@ -127,6 +127,104 @@ fn pop(queues: &mut Queues) -> Status {
         )
     }
 }
+
+#[test]
+fn negotiated_provider_fragments_reach_owned_unit_queue_with_backpressure() {
+    use crate::queue::UnitSelection;
+    let codec = EncoderFormatId {
+        namespace_id: 9,
+        value: 10,
+        schema: 1,
+    };
+    let framing = EncoderFormatId {
+        namespace_id: 9,
+        value: 11,
+        schema: 1,
+    };
+    let selection = UnitSelection {
+        stream: 9,
+        generation: 9,
+        offer_id: 23,
+        source_id: 5,
+        config_generation: 7,
+        codec,
+        framing,
+        clock_epoch: [3; 16],
+    };
+    let mut cfg = config();
+    cfg.codec = codec;
+    cfg.framing = framing;
+    let mut output = ProviderOutput::new_negotiated(4, 9, &cfg).unwrap();
+    let mut queues = Queues::default();
+    queues.open(9, "alice", 100);
+    queues.configure_units(9, selection).unwrap();
+    let first = [1, 2];
+    let second = [3, 4];
+    let mut mock = Mock {
+        chunk: chunk(&first),
+        calls: 0,
+        repeat: false,
+        no_callback: false,
+    };
+    mock.chunk.codec = codec;
+    mock.chunk.framing = framing;
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_START | ENCODER_CHUNK_KEYFRAME;
+    let api = api(&mut mock);
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    unsafe extern "C" fn reject(_: *mut c_void, _: *const NegotiatedVideoUnit) -> Status {
+        MEDIA_BUSY
+    }
+    unsafe extern "C" fn accept(context: *mut c_void, unit: *const NegotiatedVideoUnit) -> Status {
+        let unit = unsafe { &*unit };
+        let output = unsafe { &mut *context.cast::<Vec<u8>>() };
+        assert_eq!(
+            (unit.stream, unit.generation, unit.offer_id, unit.source_id),
+            (9, 9, 23, 5)
+        );
+        assert_eq!(
+            (unit.timestamp_us, unit.clock.epoch_id, unit.flags),
+            (8, [3; 16], VIDEO_UNIT_KEYFRAME)
+        );
+        output.extend_from_slice(unsafe { unit.data.read() }.unwrap());
+        STATUS_OK
+    }
+    let mut bytes = Vec::<u8>::new();
+    let sink = NegotiatedVideoUnitSink {
+        context: (&mut bytes as *mut Vec<u8>).cast(),
+        write: accept,
+    };
+    assert_eq!(
+        unsafe { queues.receive_unit("alice", 9, sink) },
+        MEDIA_PENDING
+    );
+    mock.chunk.bytes = BorrowedBytes::new(&second);
+    mock.chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_END | ENCODER_CHUNK_KEYFRAME;
+    std::hint::black_box(&mock);
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    assert_eq!(
+        unsafe { queues.receive_unit("mallory", 9, sink) },
+        MEDIA_CLOSED
+    );
+    assert_eq!(
+        unsafe {
+            queues.receive_unit(
+                "alice",
+                9,
+                NegotiatedVideoUnitSink {
+                    context: ptr::null_mut(),
+                    write: reject,
+                },
+            )
+        },
+        MEDIA_BUSY
+    );
+    assert_eq!(unsafe { queues.receive_unit("alice", 9, sink) }, STATUS_OK);
+    assert_eq!(bytes, [1, 2, 3, 4]);
+    assert_eq!(
+        unsafe { queues.receive_unit("alice", 9, sink) },
+        MEDIA_PENDING
+    );
+}
 #[test]
 fn backpressure_retries_same_chunk_and_eos_is_once() {
     let data = [1];

@@ -24,8 +24,13 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         std::env::var_os("AMATERASU_PYROWAVE_LIBRARY").expect("pinned native library"),
     );
     let decoder = library::Runtime::load_gpu(&path).unwrap();
+    let provider_path = if cfg!(feature = "pyrowave-embedded") {
+        PathBuf::from("/embedded/pyrowave")
+    } else {
+        path.clone()
+    };
     let state = Box::new(Mutex::new(Endpoint {
-        settings: json!({"enabled":true,"pyrowave":{"library_path":path,"gpu_only":true}}),
+        settings: json!({"enabled":true,"pyrowave":{"library_path":provider_path,"gpu_only":true}}),
         ..Default::default()
     }));
     let endpoint = HostApi {
@@ -85,7 +90,41 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             json!({"action":"open","operation_id":format!("gpu-{iteration}"),"configuration":config}),
         );
         let id = open["session_id"].as_u64().unwrap();
-        let options = serde_json::to_vec(&config).unwrap();
+        let common = EncoderCommonConfigV1 {
+            version: 1,
+            size: size_of::<EncoderCommonConfigV1>() as u32,
+            flags: 0,
+            reserved: 0,
+            coded_width: config.width,
+            coded_height: config.height,
+            crop_x: 0,
+            crop_y: 0,
+            visible_width: config.width,
+            visible_height: config.height,
+            fps_numerator: config.fps,
+            fps_denominator: 1,
+            bitrate_bps: config.bitrate,
+            profile: 0,
+            level: 0,
+            chroma: ENCODER_CHROMA_420,
+            bit_depth: if hdr { 10 } else { 8 },
+            color: FrameColorMetadata::default(),
+            output_clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: config.clock_epoch,
+            },
+            output_clock_origin_us: config.clock_origin_us,
+        };
+        // SAFETY: the pointer-free common descriptor stays live through configure.
+        let options = unsafe {
+            std::slice::from_raw_parts(
+                (&common as *const EncoderCommonConfigV1).cast::<u8>(),
+                size_of::<EncoderCommonConfigV1>(),
+            )
+        };
         let native = EncoderSessionConfig {
             size: size_of::<EncoderSessionConfig>() as u32,
             mode: ENCODER_SESSION_SUBMITTED,
@@ -97,8 +136,12 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             framing: native_id(session::RECORDS),
             source_id: 6,
             config_generation: 1,
-            options_schema: native_id(session::OPTIONS),
-            options: BorrowedBytes::new(&options),
+            options_schema: EncoderFormatId {
+                namespace_id: ENCODER_FORMAT_NAMESPACE_STANDARD,
+                value: ENCODER_SCHEMA_COMMON_CONFIG,
+                schema: ENCODER_FORMAT_SCHEMA_V1,
+            },
+            options: BorrowedBytes::new(options),
         };
         // SAFETY: input options remain readable through configure.
         assert_eq!(
@@ -226,6 +269,47 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             receive(api, id, &mut received, library::MAX_FRAME_BYTES),
             STATUS_OK
         );
+        // The independently decoded bytes must also survive the selected wire framer.
+        use amaterasu_module_sdk::video_framing::FramingProvider;
+        let wire_unit = NegotiatedVideoUnit {
+            size: size_of::<NegotiatedVideoUnit>() as u32,
+            version: 1,
+            stream: id,
+            generation: 1,
+            offer_id: 3,
+            codec: native.codec,
+            framing: native.framing,
+            access_unit_id: 1,
+            submission_id: 1,
+            source_id: 6,
+            config_generation: 1,
+            timestamp_us: 100,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: [7; 16],
+            },
+            flags: VIDEO_UNIT_KEYFRAME,
+            reserved: 0,
+            data: BorrowedBytes::new(&received.bytes),
+        };
+        let limits = VideoFramingLimits {
+            size: size_of::<VideoFramingLimits>() as u32,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
+            packet_size: 1024,
+            max_datagrams: 64,
+            max_queue_bytes: 65536,
+            max_wire_bytes: 65536,
+            max_fec_blocks: 4,
+            max_fec_percentage: 255,
+            ..Default::default()
+        };
+        let framed = crate::pyrowave::framing::Framer
+            .plan("video", &wire_unit, &received.bytes, &limits)
+            .unwrap();
+        assert_eq!(framed.framed_bytes, received.bytes);
         let sequence_color = u32::from_le_bytes(received.bytes[12..16].try_into().unwrap());
         assert_eq!(
             sequence_color & (7 << 27),

@@ -1,4 +1,6 @@
 //! Optional built-in implementation of the same encoder SDK used by external plugins.
+mod control;
+mod framing;
 #[cfg(feature = "pyrowave-gpu")]
 mod gpu;
 mod input;
@@ -13,6 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
 
+pub const FRAMING_SERVICE: &str = "amaterasu.encode.pyrowave-framing/1";
 pub const CONTROL_SERVICE: &str = "amaterasu.encode.pyrowave/1";
 pub const PROVIDER_SERVICE: &str = "amaterasu.encode.pyrowave-provider/1";
 pub const CONSUMER_SERVICE: &str = "amaterasu.encode.pyrowave-consumer/1";
@@ -23,6 +26,8 @@ pub struct Settings {
     pub library_path: PathBuf,
     #[serde(default = "gpu_default")]
     pub gpu_only: bool,
+    #[serde(default)]
+    pub transport_enabled: bool,
 }
 
 fn gpu_default() -> bool {
@@ -32,12 +37,15 @@ fn gpu_default() -> bool {
 pub struct Plugin {
     shared: session::Shared,
     _registration: Box<native::Registration>,
+    transport_enabled: bool,
+    _framing: Box<amaterasu_module_sdk::video_framing::Factory<framing::Framer>>,
 }
 impl Plugin {
     pub fn register(runtime: &RuntimeClient, settings: Settings) -> ModuleResult<Self> {
         if !settings.library_path.is_absolute() {
             return Err("PyroWave requires a trusted absolute library path".into());
         }
+        let transport_enabled = settings.transport_enabled;
         let selected = if settings.gpu_only {
             #[cfg(feature = "pyrowave-gpu")]
             {
@@ -71,10 +79,23 @@ impl Plugin {
                 &registration.consumer,
             )?;
         }
+        let framing = amaterasu_module_sdk::video_framing::Factory::new(framing::Framer);
+        runtime.require_success(Command::Register {
+            service: FRAMING_SERVICE.into(),
+        })?;
+        // SAFETY: the boxed factory is retained for the complete plugin lifetime.
+        unsafe {
+            amaterasu_module_sdk::video_framing::register(runtime, FRAMING_SERVICE, &framing)
+        }?;
         Ok(Self {
+            transport_enabled,
+            _framing: framing,
             shared,
             _registration: registration,
         })
+    }
+    pub fn transport_enabled(&self) -> bool {
+        self.transport_enabled
     }
     pub fn control(
         &self,

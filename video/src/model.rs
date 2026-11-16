@@ -1,7 +1,7 @@
 use amaterasu_media::{ColorMode, VideoCodec};
 #[cfg(test)]
 use amaterasu_module_sdk::EncoderBackend;
-pub use amaterasu_module_sdk::EncoderSelection;
+pub use amaterasu_module_sdk::{EncoderIdentity, EncoderSelection};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,6 +253,11 @@ pub struct SourceEncoderRegistration {
     pub control_service: String,
     pub native_service: String,
     pub source_ids: BTreeSet<u64>,
+    /// Trusted startup allowlist; a provider claim alone does not add a profile.
+    #[serde(default)]
+    pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
+    #[serde(default)]
+    pub submitted: bool,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +280,9 @@ impl Copy for SourcePreflightRoute {}
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
+    /// Separately granted negotiated-unit service, absent in legacy deployments.
+    #[serde(default)]
+    pub unit_service: Option<String>,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default)]
@@ -329,6 +337,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            unit_service: None,
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
@@ -351,6 +360,13 @@ impl Settings {
     fn source_services_distinct(&self) -> bool {
         let mut occupied: BTreeSet<&str> = BTreeSet::new();
         occupied.insert("amaterasu.encode/1");
+        if self
+            .unit_service
+            .as_deref()
+            .is_some_and(|service| !occupied.insert(service))
+        {
+            return false;
+        }
         for provider in &self.capture_providers {
             if !occupied.insert(provider.service()) {
                 return false;
@@ -417,9 +433,13 @@ impl Settings {
         {
             return Err("invalid_preflight_only_principals");
         }
-        if (self.capture_providers.is_empty()
-            && self.external_capture_providers.is_empty()
-            && self.source_encoder_providers.is_empty())
+        if self
+            .unit_service
+            .as_deref()
+            .is_some_and(|name| !valid_external_service(name) || name == "amaterasu.video/1")
+            || (self.capture_providers.is_empty()
+                && self.external_capture_providers.is_empty()
+                && self.source_encoder_providers.is_empty())
             || !self.source_services_distinct()
             || self
                 .capture_providers
@@ -452,6 +472,10 @@ impl Settings {
                 .iter()
                 .any(|(alias, service)| {
                     !self.external_encoder_providers.contains_key(alias)
+                        && !self
+                            .source_encoder_providers
+                            .get(alias)
+                            .is_some_and(|p| p.submitted)
                         || !valid_external_service(service)
                 })
             || self.source_encoder_providers.len() > 16
@@ -465,6 +489,10 @@ impl Settings {
                         || !valid_external_service(&registration.control_service)
                         || !valid_external_service(&registration.native_service)
                         || registration.control_service == registration.native_service
+                        || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
+                            profiles: registration.extension_profiles.clone(),
+                        })
+                        .validate()
                         || registration.control_service == "amaterasu.encode/1"
                         || registration.source_ids.is_empty()
                         || registration.source_ids.contains(&0)
@@ -558,6 +586,9 @@ pub struct Configuration {
     /// Lifecycle-authorized selection and opaque provider-specific settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_processing: Option<GpuProcessing>,
+    /// Extension identity, only valid for an independently allowlisted source encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_profile: Option<amaterasu_contracts::media_profile::VideoProfile>,
     /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
     #[serde(
         default = "default_video_stream_format",
@@ -759,6 +790,14 @@ impl Configuration {
         // Source encoders bypass capture frame inspection, so they cannot be
         // used with an explicitly selected processing policy.
         self.gpu_processing.is_none()
+            && self.extension_profile.as_ref().is_none_or(|profile| {
+                profile.is_valid()
+                    && self.max_reference_frames == 0
+                    && self.min_threads == default_min_threads()
+                    && self.qp == default_qp()
+                    && self.video_stream_format == default_video_stream_format()
+                    && self.codec == VideoCodec::H264
+            })
             && self.video_stream_format.validate().is_ok()
             && (1..=16384).contains(&self.width)
             && (1..=16384).contains(&self.height)
@@ -863,6 +902,12 @@ pub enum Operation {
         encoder: EncoderSelection,
         configuration: Box<Configuration>,
     },
+    ProbeSource {
+        source_id: u64,
+        encoder_provider: String,
+        encoder: EncoderIdentity,
+        configuration: Box<Configuration>,
+    },
     Lookup {
         operation_id: String,
     },
@@ -896,6 +941,12 @@ enum OperationInput {
     },
     CancelPortalSelection {
         operation_id: String,
+    },
+    ProbeSource {
+        source_id: u64,
+        encoder_provider: String,
+        encoder: EncoderIdentity,
+        configuration: Box<Configuration>,
     },
     Open {
         #[serde(default)]
@@ -1015,6 +1066,17 @@ impl<'de> Deserialize<'de> for Operation {
             OperationInput::CancelPortalSelection { operation_id } => {
                 Self::CancelPortalSelection { operation_id }
             }
+            OperationInput::ProbeSource {
+                source_id,
+                encoder_provider,
+                encoder,
+                configuration,
+            } => Self::ProbeSource {
+                source_id,
+                encoder_provider,
+                encoder,
+                configuration,
+            },
             OperationInput::Open {
                 packet_boundaries,
                 operation_id,
@@ -1035,6 +1097,36 @@ impl<'de> Deserialize<'de> for Operation {
                     let Some(encoder_provider) = encoder_provider else {
                         return Err(serde::de::Error::custom("source encoder provider required"));
                     };
+                    if configuration.extension_profile.is_some() && !output.is_empty() {
+                        let (provider, auto_capture, constant_rate) =
+                            if let Some(capture) = capture.0 {
+                                capture.selection(capture_provider.0)
+                            } else {
+                                (
+                                    capture_provider.0.unwrap_or_default(),
+                                    false,
+                                    constant_rate.0.unwrap_or(false),
+                                )
+                            };
+                        return Ok(Self::OpenWithOptions {
+                            specification: Box::new(OpenSpec {
+                                packet_boundaries,
+                                operation_id,
+                                provider,
+                                auto_capture,
+                                constant_rate,
+                                wgc_pacing_smoothing,
+                                minimum_fps_target,
+                                output,
+                                encoder,
+                                encoder_provider: Some(encoder_provider),
+                                source_id: Some(source_id),
+                                encoder_options,
+                                source_capture_context,
+                                configuration: *configuration,
+                            }),
+                        });
+                    }
                     if capture_provider.0.is_some()
                         || capture.0.is_some()
                         || constant_rate.0.is_some()
@@ -1620,6 +1712,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            unit_service: None,
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
@@ -1651,6 +1744,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            unit_service: None,
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
             source_preflight_routes: BTreeMap::new(),
