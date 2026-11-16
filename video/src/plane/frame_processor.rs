@@ -3,9 +3,67 @@
 use super::*;
 use amaterasu_module_sdk::{
     capture::ConnectionError,
-    encode::{EncoderPresentation, EncoderResourceConsumer},
+    encode::{
+        EncoderPresentation, EncoderResourceConsumer, HostVideoPresentation,
+        PresentingResourceConsumer,
+    },
     frame_processing::{FrameProcessingSession, FrameProcessingStage},
 };
+
+/// The selected encoder at the end of a processing chain. A native encoder
+/// receives processed frames through its resource tail; an encoder supplied as
+/// a frame resource consumer receives them on the stream's host video timeline.
+pub(super) enum Downstream<'a> {
+    Encoder(&'a EncoderApi),
+    Consumer {
+        api: &'a FrameResourceConsumerApi,
+        presentation: HostVideoPresentation,
+    },
+}
+
+enum Edge {
+    Encoder(EncoderResourceConsumer),
+    Consumer(PresentingResourceConsumer),
+}
+
+impl Edge {
+    unsafe fn new(downstream: &Downstream<'_>) -> Result<Self, &'static str> {
+        match downstream {
+            Downstream::Encoder(api) => unsafe { EncoderResourceConsumer::new(api) }
+                .map(Self::Encoder)
+                .map_err(|_| "encoder_resource_interface_required"),
+            Downstream::Consumer { api, .. } => unsafe { PresentingResourceConsumer::new(api) }
+                .map(Self::Consumer)
+                .map_err(|_| "resource_consumer_interface"),
+        }
+    }
+    fn api(&self) -> &FrameResourceConsumerApi {
+        match self {
+            Self::Encoder(edge) => edge.api(),
+            Self::Consumer(edge) => edge.api(),
+        }
+    }
+    fn present(&mut self, downstream: &Downstream<'_>, input: &Pump<'_>) {
+        match (self, downstream) {
+            (Self::Encoder(edge), _) => edge.set_presentation(EncoderPresentation {
+                timestamp_us: input.timestamp_us,
+                sequence: input.sequence,
+            }),
+            (Self::Consumer(edge), Downstream::Consumer { presentation, .. }) => {
+                edge.set_presentation(*presentation)
+            }
+            (Self::Consumer(_), Downstream::Encoder(_)) => {
+                unreachable!("select_encoder replaces the edge with its downstream")
+            }
+        }
+    }
+    fn submit_us(&self) -> u64 {
+        match self {
+            Self::Encoder(edge) => edge.submit_us(),
+            Self::Consumer(edge) => edge.submit_us(),
+        }
+    }
+}
 
 pub(super) unsafe fn table(binding: &NativeBinding) -> Result<&FrameProcessorApi, &'static str> {
     // SAFETY: startup bound the exact FRAME_PROCESSOR contract identity.
@@ -35,7 +93,7 @@ pub(super) fn hdr_metadata(
 pub(super) struct Session {
     // Cancellation precedes destruction of the stable encoder adapter table.
     connection: FrameProcessingSession,
-    encoder: EncoderResourceConsumer,
+    encoder: Edge,
     provider: CaptureProvider,
     capture: u64,
     encoder_service: String,
@@ -45,12 +103,11 @@ impl Session {
     pub(super) unsafe fn new(
         capture: &CaptureApiV1_8,
         processor: &FrameProcessorApi,
-        encoder: &EncoderApi,
+        downstream: &Downstream<'_>,
         service: &str,
         input: &Pump<'_>,
     ) -> Result<Self, &'static str> {
-        let adapter = unsafe { EncoderResourceConsumer::new(encoder) }
-            .map_err(|_| "encoder_resource_interface_required")?;
+        let adapter = unsafe { Edge::new(downstream) }?;
         // NativePlane retains these exact bindings until this session cancels.
         // The adapter's boxed table stays at a stable address when moved here.
         let connection = unsafe {
@@ -81,15 +138,14 @@ impl Session {
     }
     pub(super) unsafe fn select_encoder(
         &mut self,
-        api: &EncoderApi,
+        downstream: &Downstream<'_>,
         service: &str,
         session: u64,
     ) -> Result<(), &'static str> {
         if self.encoder_service == service && self.encoder_session == session {
             return Ok(());
         }
-        let next = unsafe { EncoderResourceConsumer::new(api) }
-            .map_err(|_| "encoder_resource_interface_required")?;
+        let next = unsafe { Edge::new(downstream) }?;
         unsafe { self.connection.replace_consumer(next.api(), session) }
             .map_err(|_| "frame_processor_consumer_retired")?;
         self.encoder = next;
@@ -97,14 +153,15 @@ impl Session {
         self.encoder_session = session;
         Ok(())
     }
-    pub(super) fn pump(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+    pub(super) fn pump(
+        &mut self,
+        downstream: &Downstream<'_>,
+        input: &Pump<'_>,
+    ) -> Result<Progress, &'static str> {
         if !input.capture_due && !input.repeat_due {
             return Ok(Progress::default());
         }
-        self.encoder.set_presentation(EncoderPresentation {
-            timestamp_us: input.timestamp_us,
-            sequence: input.sequence,
-        });
+        self.encoder.present(downstream, input);
         let flags = if input.force_idr {
             FRAME_RESOURCE_SUBMIT_FORCE_IDR
         } else {

@@ -300,6 +300,8 @@ struct Runtime {
     capture: usize,
     processor: usize,
     encoder: usize,
+    /// A plugin encoder supplied as a frame resource consumer, if any.
+    consumer: usize,
     events: Rc<RefCell<Vec<&'static str>>>,
 }
 unsafe extern "C" fn invoke(context: *mut c_void, bytes: BorrowedBytes, sink: ReplySink) -> Status {
@@ -311,6 +313,12 @@ unsafe extern "C" fn invoke(context: *mut c_void, bytes: BorrowedBytes, sink: Re
         } => {
             let (binding, address, expected) = match service.as_str() {
                 ENCODE => (1, r.encoder, native_contracts::ENCODER),
+                // The submitted provider's control table is unused until a
+                // source session starts; only its consumer receives frames.
+                "fixture.plugin-provider/1" => (4, r.consumer, native_contracts::ENCODER_PROVIDER),
+                "fixture.plugin-consumer/1" => {
+                    (5, r.consumer, native_contracts::FRAME_RESOURCE_CONSUMER)
+                }
                 "fixture.effect/1" => (2, r.processor, native_contracts::FRAME_PROCESSOR),
                 "amaterasu.capture-pipewire/1" | "amaterasu.capture-x11/1" => {
                     (3, r.capture, native_contracts::CAPTURE)
@@ -325,6 +333,8 @@ unsafe extern "C" fn invoke(context: *mut c_void, bytes: BorrowedBytes, sink: Re
                 1 => "encoder_release",
                 2 => "processor_release",
                 3 => "capture_release",
+                4 => "provider_release",
+                5 => "consumer_release",
                 _ => panic!("binding"),
             });
             Response::Ok
@@ -381,6 +391,7 @@ fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_
             capture: capture as usize,
             processor: effect as usize,
             encoder: ptr::from_ref(&encoder) as usize,
+            consumer: 0,
             events: events.clone(),
         };
         let runtime = unsafe {
@@ -473,5 +484,307 @@ fn unchanged_video_consumer_uses_sdk_for_cpu_capture_and_retires_readers_before_
             (*effect).base.base.base.release.unwrap()((*effect).base.base.base.context);
             (*capture).release.unwrap()((*capture).context);
         }
+    }
+}
+
+/// A processor whose only output is a standard DMA-BUF, like RTX HDR's offer
+/// for consumers that cannot read CUDA memory.
+struct DmaBufEffect {
+    caps: Box<CpuResourceCapabilitiesV2>,
+    output: Box<DmaBufResourceCapabilities>,
+    pixels: Box<DmaBufFrame>,
+}
+impl FrameProcessor for DmaBufEffect {
+    fn configure_stream(&mut self, _: u64, _: &[u8]) -> Result<(), Status> {
+        Ok(())
+    }
+    fn update_stream(&mut self, _: u64, _: &[u8]) -> Result<(), Status> {
+        Ok(())
+    }
+    fn input_offers(&mut self, _: u64) -> Result<(u64, Vec<CaptureResourceOffer>), Status> {
+        Ok((
+            1,
+            vec![offer(
+                1,
+                FRAME_RESOURCE_CPU,
+                ptr::from_ref(&*self.caps).cast(),
+            )],
+        ))
+    }
+    fn configure_input(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: &CaptureResourceOffer,
+    ) -> Result<(), Status> {
+        Ok(())
+    }
+    fn output_offers(&mut self, _: u64) -> Result<(u64, Vec<CaptureResourceOffer>), Status> {
+        let mut output = offer(
+            1,
+            FRAME_RESOURCE_DMABUF,
+            ptr::from_ref(&*self.output).cast(),
+        );
+        output.accessibility = FRAME_ACCESS_GPU;
+        output.resource.size = size_of::<DmaBufResourceCapabilities>() as u32;
+        Ok((1, vec![output]))
+    }
+    fn select_output(&mut self, _: u64, _: u64, _: u64) -> Result<(), Status> {
+        Ok(())
+    }
+    fn process(
+        &mut self,
+        _: u64,
+        input: ProcessingFrame<'_>,
+    ) -> Result<ResourceOutputFrame, Status> {
+        let retained = input.retain()?;
+        let source = *retained.descriptor();
+        self.pixels.timestamp_us = source.timestamp_us;
+        self.pixels.sequence = source.sequence;
+        let frame = CaptureResourceFrame {
+            offer_generation: 1,
+            offer_id: 1,
+            resource: FrameDescriptor {
+                kind: FRAME_RESOURCE_DMABUF,
+                version: 1,
+                size: size_of::<DmaBufFrame>() as u32,
+                reserved: 0,
+                namespace: [0; 16],
+                data: ptr::from_ref(&*self.pixels).cast(),
+            },
+            ..source
+        };
+        Ok(unsafe { ResourceOutputFrame::from_owned(frame) })
+    }
+    fn hdr_metadata(&self, _: u64) -> Option<HdrMetadata> {
+        None
+    }
+    fn cancel(&mut self, _: u64) {}
+    fn shutdown(&mut self) {}
+}
+
+/// A plugin encoder's frame consumer: retains frames asynchronously and
+/// records the presentation it was given.
+struct PluginConsumer {
+    caps: DmaBufResourceCapabilities,
+    held: Vec<CaptureResourceFrame>,
+}
+unsafe extern "C" fn plugin_enumerate(
+    context: *mut c_void,
+    _: u64,
+    sink: CaptureResourceOfferSink,
+    generation: *mut u64,
+) -> Status {
+    let consumer = unsafe { &*context.cast::<PluginConsumer>() };
+    let mut accepted = offer(
+        100,
+        FRAME_RESOURCE_DMABUF,
+        ptr::from_ref(&consumer.caps).cast(),
+    );
+    accepted.accessibility = FRAME_ACCESS_GPU;
+    accepted.resource.size = size_of::<DmaBufResourceCapabilities>() as u32;
+    unsafe {
+        generation.write(1);
+        (sink.write)(sink.context, &accepted)
+    }
+}
+unsafe extern "C" fn plugin_configure(
+    _: *mut c_void,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    producer: *const CaptureResourceOffer,
+) -> Status {
+    if unsafe { (*producer).resource.kind } == FRAME_RESOURCE_DMABUF {
+        STATUS_OK
+    } else {
+        MEDIA_UNSUPPORTED
+    }
+}
+unsafe extern "C" fn plugin_submit(
+    context: *mut c_void,
+    _: u64,
+    frame: *const CaptureResourceFrame,
+    _: u32,
+) -> Status {
+    let consumer = unsafe { &mut *context.cast::<PluginConsumer>() };
+    let frame = unsafe { *frame };
+    let status = unsafe { (frame.retain)(frame.context) };
+    if status == STATUS_OK {
+        consumer.held.push(frame);
+    }
+    status
+}
+unsafe extern "C" fn plugin_cancel(context: *mut c_void, _: u64) {
+    let consumer = unsafe { &mut *context.cast::<PluginConsumer>() };
+    for frame in consumer.held.drain(..) {
+        unsafe { (frame.release)(frame.context, &NONE) };
+    }
+}
+
+#[test]
+fn processing_stacks_with_an_encoder_supplied_as_a_resource_consumer() {
+    let pixels = Arc::new(vec![37; 16 * 16 * 4]);
+    let source = CpuSourceFactory::new(Arc::new(Source {
+        pixels,
+        generation: Arc::new(AtomicU64::new(1)),
+    }));
+    let mut capture = ptr::null();
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: 8,
+        min_size: CAPTURE_API_V1_8_SIZE,
+    };
+    assert_eq!(
+        unsafe {
+            source.api.bind.unwrap()(
+                source.api.context,
+                BorrowedBytes::new(b"amaterasu.video"),
+                &query,
+                &mut capture,
+            )
+        },
+        STATUS_OK
+    );
+    let output = DmaBufResourceCapabilities {
+        fourcc: u32::from_le_bytes(*b"XB30"),
+        color: DMABUF_COLOR_BT2020_PQ,
+        modifier: 7,
+        min_width: 16,
+        max_width: 16,
+        min_height: 16,
+        max_height: 16,
+        device_id: [3; 16],
+    };
+    let mut planes = [DmaBufPlane::UNUSED; DMABUF_MAX_PLANES];
+    planes[0] = DmaBufPlane {
+        fd: 9,
+        acquire_fence_fd: -1,
+        offset: 0,
+        pitch: 64,
+    };
+    let effect = into_frame_processor_binding(DmaBufEffect {
+        caps: Box::new(caps()),
+        output: Box::new(output),
+        pixels: Box::new(DmaBufFrame {
+            width: 16,
+            height: 16,
+            fourcc: output.fourcc,
+            plane_count: 1,
+            modifier: 7,
+            planes,
+            color: DMABUF_COLOR_BT2020_PQ,
+            reserved: 0,
+            timestamp_us: 0,
+            sequence: 0,
+        }),
+    });
+    let mut plugin = PluginConsumer {
+        caps: output,
+        held: Vec::new(),
+    };
+    let consumer = FrameResourceConsumerApi {
+        base: NativeInterface {
+            header: AbiHeader::of::<FrameResourceConsumerApi>(),
+            context: ptr::from_mut(&mut plugin).cast(),
+            release: None,
+        },
+        enumerate_resources: plugin_enumerate,
+        configure: plugin_configure,
+        submit: plugin_submit,
+        cancel: plugin_cancel,
+    };
+    let mut state = Encoder {
+        held: None,
+        events: Rc::default(),
+    };
+    let native = encoder(&mut state);
+    let endpoint = Runtime {
+        capture: capture as usize,
+        processor: effect as usize,
+        encoder: ptr::from_ref(&native) as usize,
+        consumer: ptr::from_ref(&consumer) as usize,
+        events: Rc::default(),
+    };
+    let runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: ptr::from_ref(&endpoint).cast_mut().cast(),
+            invoke,
+        })
+    };
+    let registration: crate::model::SourceEncoderRegistration =
+        serde_json::from_value(serde_json::json!({
+            "control_service": "fixture.plugin/1",
+            "native_service": "fixture.plugin-provider/1",
+            "source_ids": [1],
+            "submitted": true,
+        }))
+        .unwrap();
+    let mut plane = NativePlane::bind(
+        &runtime,
+        Arc::new(Mutex::new(Queues::default())),
+        &[CaptureProvider::Pipewire].into(),
+        &BTreeMap::new(),
+        &[("plugin".to_owned(), registration)].into(),
+        &[("plugin".to_owned(), "fixture.plugin-consumer/1".to_owned())].into(),
+        None,
+        Some("fixture.effect/1"),
+    )
+    .unwrap();
+    let mut configuration: Configuration = serde_json::from_value(
+        serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100_000}),
+    )
+    .unwrap();
+    configuration.gpu_processing = Some(
+        serde_json::from_value(
+            serde_json::json!({"service":"fixture.effect/1","enabled":true,
+            "source_hdr_required":false,"settings":{}}),
+        )
+        .unwrap(),
+    );
+    plane.select_encoder("fixture.plugin/1");
+    plane.set_stream_clock(1, 10_000, [6; 16]);
+    plane
+        .configure_gpu(1, configuration.gpu_processing.as_ref())
+        .unwrap();
+    let result = plane.pump(Pump {
+        video: 1,
+        capture: 2,
+        encoder: 3,
+        provider: CaptureProvider::Pipewire,
+        configuration: &configuration,
+        frame_path: FramePath::Generic,
+        capture_due: true,
+        constant_rate: false,
+        repeat_due: false,
+        repeat_frame: None,
+        timestamp_us: 1234,
+        sequence: 9,
+        force_idr: false,
+    });
+    // Units are collected through the plugin's own source session, which
+    // this fixture does not start; the processed frame was already accepted.
+    assert_eq!(result.err(), Some("encoder_source_unavailable"));
+    assert_eq!(plugin.held.len(), 1);
+    let received = plugin.held[0];
+    assert_eq!(received.resource.kind, FRAME_RESOURCE_DMABUF);
+    assert_eq!(received.timestamp_us, 11_234);
+    assert_eq!(received.sequence, 9);
+    assert_eq!(received.clock.epoch_id, [6; 16]);
+    let dmabuf = unsafe { *received.resource.data.cast::<DmaBufFrame>() };
+    assert_eq!((dmabuf.modifier, dmabuf.planes[0].fd), (7, 9));
+    assert_eq!((dmabuf.timestamp_us, dmabuf.sequence), (11_234, 9));
+    assert!(state.held.is_none(), "the native encoder is not involved");
+    drop(plane);
+    assert!(plugin.held.is_empty(), "cancellation released the consumer");
+    assert_eq!(source.retirement_ready(), Ok(true));
+    unsafe {
+        (*effect).base.base.base.release.unwrap()((*effect).base.base.base.context);
+        (*capture).release.unwrap()((*capture).context);
     }
 }

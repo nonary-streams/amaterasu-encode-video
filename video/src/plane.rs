@@ -1257,13 +1257,14 @@ impl Plane for NativePlane {
         }
         if processing {
             let progress = self.deliver_processed(&input)?;
-            let encoder = unsafe {
-                self.encoders
-                    .get(&self.active_encoder)
-                    .ok_or("encoder_interface")?
-                    .table::<EncoderApi>()
-            }
-            .map_err(|_| "encoder_interface")?;
+            let Some(binding) = self.encoders.get(&self.active_encoder) else {
+                // A resource-consumer encoder publishes its own units through
+                // its source session, exactly as for unprocessed frames.
+                self.pump_source(input.video, input.encoder, false)?;
+                return Ok(progress);
+            };
+            let encoder =
+                unsafe { binding.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
             return self.receive_packets(encoder, &input, progress);
         }
         if let Some(processor) = self.resource_processor.as_mut()
@@ -1644,19 +1645,19 @@ impl NativePlane {
                     .ok_or("frame_processor_unavailable")?,
             )
         }?;
-        let encoder = unsafe {
-            self.encoders
-                .get(&self.active_encoder)
-                .ok_or("encoder_unavailable")?
-                .table::<EncoderApi>()
-        }
-        .map_err(|_| "encoder_interface")?;
+        let downstream = processing_downstream(
+            &self.encoders,
+            &self.resource_consumers,
+            &self.stream_clocks,
+            &self.active_encoder,
+            input,
+        )?;
         if !self.processing_sessions.contains_key(&input.video) {
             let session = unsafe {
                 frame_processor::Session::new(
                     capture,
                     processor,
-                    encoder,
+                    &downstream,
                     &self.active_encoder,
                     input,
                 )
@@ -1670,21 +1671,23 @@ impl NativePlane {
         if !session.source_matches(input) {
             return Err("frame_processor_source_changed");
         }
-        unsafe { session.select_encoder(encoder, &self.active_encoder, input.encoder) }?;
-        match unsafe {
-            amaterasu_module_sdk::media::encoder_gpu_input_ready(encoder, input.encoder)
-        } {
-            Ok(Some(false)) => {
-                return Ok(Progress {
-                    capture_deferred: true,
-                    gpu_input_deferred: true,
-                    ..Progress::default()
-                });
+        unsafe { session.select_encoder(&downstream, &self.active_encoder, input.encoder) }?;
+        if let frame_processor::Downstream::Encoder(encoder) = downstream {
+            match unsafe {
+                amaterasu_module_sdk::media::encoder_gpu_input_ready(encoder, input.encoder)
+            } {
+                Ok(Some(false)) => {
+                    return Ok(Progress {
+                        capture_deferred: true,
+                        gpu_input_deferred: true,
+                        ..Progress::default()
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => return Err("encoder_gpu_readiness_failed"),
             }
-            Ok(_) => {}
-            Err(_) => return Err("encoder_gpu_readiness_failed"),
         }
-        session.pump(input)
+        session.pump(&downstream, input)
     }
 
     /// Plain capture-to-encoder delivery; selected effects use only the SDK
@@ -2074,6 +2077,44 @@ fn verify_geometry_callback(
 
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+/// The selected encoder as the end of a processing chain. A native encoder
+/// and an encoder supplied as a frame resource consumer are equally valid
+/// destinations; processing stacks with either.
+fn processing_downstream<'a>(
+    encoders: &'a BTreeMap<String, NativeBinding>,
+    resource_consumers: &'a BTreeMap<String, NativeBinding>,
+    stream_clocks: &BTreeMap<u64, (u64, [u8; 16])>,
+    active_encoder: &str,
+    input: &Pump<'_>,
+) -> Result<frame_processor::Downstream<'a>, &'static str> {
+    if let Some(binding) = encoders.get(active_encoder) {
+        // SAFETY: startup bound the exact Encoder contract; the binding
+        // stays loaded until processing sessions for it are cancelled.
+        let encoder = unsafe { binding.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        return Ok(frame_processor::Downstream::Encoder(encoder));
+    }
+    let binding = resource_consumers
+        .get(active_encoder)
+        .ok_or("encoder_unavailable")?;
+    // SAFETY: startup bound the exact FrameResourceConsumer contract.
+    let api = unsafe { binding.table::<FrameResourceConsumerApi>() }
+        .map_err(|_| "resource_consumer_interface")?;
+    let (origin, epoch) = stream_clocks
+        .get(&input.video)
+        .copied()
+        .ok_or("resource_clock_unavailable")?;
+    Ok(frame_processor::Downstream::Consumer {
+        api,
+        presentation: amaterasu_module_sdk::encode::HostVideoPresentation {
+            timestamp_us: origin
+                .checked_add(input.timestamp_us)
+                .ok_or("resource_clock_overflow")?,
+            epoch_id: epoch,
+            sequence: input.sequence,
+        },
+    })
 }
 
 #[cfg(test)]
