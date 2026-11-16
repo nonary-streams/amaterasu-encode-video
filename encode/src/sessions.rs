@@ -1,7 +1,7 @@
 use crate::{
     factory::{Factory, LogForwardingFactory, NativeFactory},
     input::{GpuInput, InputSupport},
-    layout,
+    layout, lifecycle_issues,
     model::{AmdAv1LatencyMode, Configuration, EncoderIdentity, Packet},
     worker::Worker,
 };
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use amaterasu_module_sdk::diagnostics::LatencyMetric;
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 
 use crate::worker::{Metrics as WorkerMetrics, ReceiveResult, SubmitResult};
 
@@ -157,6 +158,11 @@ struct Metadata {
 pub struct Session {
     packet_boundaries: bool,
     owner: String,
+    /// The `operation_id` the consumer opened this session with; failures of
+    /// this session are reported under it.
+    operation: Option<String>,
+    backend_name: &'static str,
+    issues: StreamIssueOutbox,
     config: Configuration,
     backend: Box<dyn Backend>,
     input_support: InputSupport,
@@ -275,6 +281,15 @@ impl Drop for RetainedFrame {
     }
 }
 
+/// What a successful native open hands to session admission.
+struct OpenedSession {
+    operation: Option<String>,
+    backend_name: &'static str,
+    configuration: Configuration,
+    backend: Box<dyn Backend>,
+    packet_boundaries: bool,
+}
+
 struct OpenRecord {
     packet_boundaries: bool,
     id: u64,
@@ -296,6 +311,8 @@ pub struct Sessions {
     close_failures: BTreeMap<u64, CloseFailure>,
     closed: BTreeMap<u64, String>,
     accepting_new_sessions: bool,
+    /// Reports of sessions that have already been removed.
+    issues: StreamIssueOutbox,
 }
 
 impl Sessions {
@@ -309,6 +326,7 @@ impl Sessions {
             close_failures: BTreeMap::new(),
             closed: BTreeMap::new(),
             accepting_new_sessions: true,
+            issues: StreamIssueOutbox::default(),
         }
     }
     pub fn with_log_emitter(
@@ -440,11 +458,15 @@ impl Sessions {
         )? {
             return Ok(reply);
         }
-        let response = self.insert(
+        let response = self.insert_opened(
             owner,
-            configuration.clone(),
-            backend.take().ok_or("encoder_worker_failed")?,
-            packet_boundaries,
+            OpenedSession {
+                operation: operation.clone(),
+                backend_name: lifecycle_issues::backend_name(&encoder),
+                configuration: configuration.clone(),
+                backend: backend.take().ok_or("encoder_worker_failed")?,
+                packet_boundaries,
+            },
         )?;
         if let Some(operation) = operation {
             self.operations.insert(
@@ -495,6 +517,9 @@ impl Sessions {
         }
         Ok(())
     }
+    /// A session opened without a consumer operation; it has nothing to
+    /// report under.
+    #[cfg(test)]
     fn insert(
         &mut self,
         owner: &str,
@@ -502,6 +527,26 @@ impl Sessions {
         backend: Box<dyn Backend>,
         packet_boundaries: bool,
     ) -> Result<Value, &'static str> {
+        self.insert_opened(
+            owner,
+            OpenedSession {
+                operation: None,
+                backend_name: "encoder",
+                configuration,
+                backend,
+                packet_boundaries,
+            },
+        )
+    }
+
+    fn insert_opened(&mut self, owner: &str, opened: OpenedSession) -> Result<Value, &'static str> {
+        let OpenedSession {
+            operation,
+            backend_name,
+            configuration,
+            backend,
+            packet_boundaries,
+        } = opened;
         self.next_id = self.next_id.checked_add(1).ok_or("session_limit")?;
         let packet_boundaries = packet_boundaries || configuration.codec() != VideoCodec::H264;
         let response = open_reply(self.next_id, &configuration, packet_boundaries);
@@ -511,6 +556,9 @@ impl Sessions {
             Session {
                 packet_boundaries,
                 owner: owner.into(),
+                operation,
+                backend_name,
+                issues: StreamIssueOutbox::default(),
                 config: configuration,
                 backend,
                 input_support,
@@ -559,8 +607,8 @@ impl Sessions {
         let session = self.owned(owner, id)?;
         let encoder_metrics = match session.backend.metrics() {
             Ok(metrics) => metrics,
-            Err(_) => {
-                session.failed = true;
+            Err(code) => {
+                session.fail("metrics", code);
                 None
             }
         };
@@ -608,8 +656,21 @@ impl Sessions {
             return Ok(close_reply(id));
         }
         self.owned(owner, id)?;
-        let session = self.values.remove(&id).expect("validated owned session");
+        let mut session = self.values.remove(&id).expect("validated owned session");
+        lifecycle_issues::transfer(&mut session.issues, &mut self.issues);
+        let reporter = session
+            .operation
+            .take()
+            .map(|operation| (operation, session.backend_name));
         if let Err(code) = session.close() {
+            if let Some((operation, backend_name)) = reporter {
+                self.issues.push(lifecycle_issues::session_failure(
+                    &operation,
+                    backend_name,
+                    "close",
+                    code,
+                ));
+            }
             self.close_failures.insert(
                 id,
                 CloseFailure {
@@ -656,6 +717,15 @@ impl Sessions {
             None
         } else {
             Some(Err("session_not_found"))
+        }
+    }
+
+    /// Move every queued stream issue into `outbox`. The caller publishes
+    /// after releasing this lock so native clients never wait on the runtime.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
+        for session in self.values.values_mut() {
+            lifecycle_issues::transfer(&mut session.issues, outbox);
         }
     }
 
@@ -968,8 +1038,8 @@ impl Sessions {
         match session.backend.has_gpu_submit_capacity() {
             Ok(true) => STATUS_OK,
             Ok(false) => MEDIA_BUSY,
-            Err(_) => {
-                session.failed = true;
+            Err(code) => {
+                session.fail("gpu_capacity", code);
                 MEDIA_BACKEND_ERROR
             }
         }
@@ -989,8 +1059,8 @@ impl Sessions {
             match session.backend.drain() {
                 Ok(true) => {}
                 Ok(false) => return MEDIA_BUSY,
-                Err(_) => {
-                    session.failed = true;
+                Err(code) => {
+                    session.fail("drain", code);
                     return MEDIA_BACKEND_ERROR;
                 }
             }
@@ -1017,8 +1087,8 @@ impl Sessions {
             match session.backend.receive() {
                 Ok(ReceiveResult::Ready(packet)) => session.pending = packet,
                 Ok(ReceiveResult::Pending) => return MEDIA_PENDING,
-                Err(_) => {
-                    session.failed = true;
+                Err(code) => {
+                    session.fail("receive", code);
                     return MEDIA_BACKEND_ERROR;
                 }
             }
@@ -1047,11 +1117,11 @@ impl Sessions {
             .iter_mut()
             .find(|metadata| metadata.timestamp == packet.timestamp_100ns)
         else {
-            session.failed = true;
+            session.fail("receive", "packet_metadata_missing");
             return MEDIA_BACKEND_ERROR;
         };
         if metadata.force_keyframe && !packet.keyframe {
-            session.failed = true;
+            session.fail("receive", "forced_keyframe_missing");
             return MEDIA_BACKEND_ERROR;
         }
         if !metadata.timing_recorded {
@@ -1110,6 +1180,24 @@ fn close_reply(id: u64) -> Value {
 }
 
 impl Session {
+    /// Stop accepting work and report the first failure under the opening
+    /// operation. Later failures of an already failed session add nothing.
+    #[track_caller]
+    fn fail(&mut self, step: &str, code: &str) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        if let Some(operation) = &self.operation {
+            self.issues.push(lifecycle_issues::session_failure(
+                operation,
+                self.backend_name,
+                step,
+                code,
+            ));
+        }
+    }
+
     fn begin_close(&mut self) {
         if !self.closing {
             self.closing = true;
@@ -1297,8 +1385,8 @@ impl Session {
         match self.backend.has_gpu_submit_capacity() {
             Ok(true) => {}
             Ok(false) => return MEDIA_BUSY,
-            Err(_) => {
-                self.failed = true;
+            Err(code) => {
+                self.fail("gpu_capacity", code);
                 return MEDIA_BACKEND_ERROR;
             }
         }
@@ -1371,8 +1459,8 @@ impl Session {
         match self.backend.has_gpu_submit_capacity() {
             Ok(true) => {}
             Ok(false) => return MEDIA_BUSY,
-            Err(_) => {
-                self.failed = true;
+            Err(code) => {
+                self.fail("gpu_capacity", code);
                 return MEDIA_BACKEND_ERROR;
             }
         }
@@ -1436,8 +1524,8 @@ impl Session {
         match result {
             Ok(SubmitResult::Accepted) => {}
             Ok(SubmitResult::Busy) => return MEDIA_BUSY,
-            Err(_) => {
-                self.failed = true;
+            Err(code) => {
+                self.fail("submit", code);
                 return MEDIA_BACKEND_ERROR;
             }
         }

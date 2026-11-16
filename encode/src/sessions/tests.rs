@@ -1888,3 +1888,78 @@ fn reference_frame_limit_defaults_validates_and_participates_in_idempotency() {
         "operation_conflict"
     );
 }
+
+#[test]
+fn a_data_plane_failure_is_reported_once_under_the_session_operation() {
+    let mut sessions = Sessions::new(true);
+    sessions
+        .insert_opened(
+            "alice",
+            OpenedSession {
+                operation: Some("video-7-1-encoder-attempt-0".into()),
+                backend_name: "nvenc",
+                configuration: configuration(),
+                backend: Box::new(StreamingFake {
+                    packets: VecDeque::new(),
+                    submissions: Arc::new(AtomicUsize::new(0)),
+                    honor_force: false,
+                }),
+                packet_boundaries: false,
+            },
+        )
+        .unwrap();
+    let data = vec![0; 384];
+    let frame = CpuFrame {
+        width: 16,
+        height: 16,
+        format: PIXEL_NV12,
+        stride: 16,
+        data: data.as_ptr(),
+        len: data.len(),
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    let mut sink = Sink {
+        reject: false,
+        flags: Vec::new(),
+        sequences: Vec::new(),
+        codecs: Vec::new(),
+    };
+    let packet_sink = PacketSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // SAFETY: the frame and sink outlive these synchronous calls.
+    assert_eq!(unsafe { sessions.submit("alice", 1, &frame, 1) }, STATUS_OK);
+    assert_eq!(
+        unsafe { sessions.receive("alice", 1, packet_sink) },
+        MEDIA_BACKEND_ERROR
+    );
+    assert_eq!(sessions.drain("alice", 1), MEDIA_BACKEND_ERROR);
+    sessions.close("alice", 1).unwrap();
+
+    let mut outbox = StreamIssueOutbox::default();
+    sessions.take_stream_issues(&mut outbox);
+    let issues: Vec<_> = outbox
+        .drain()
+        .map(|report| match report {
+            amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue) => issue,
+            other => panic!("unexpected report {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        issues.len(),
+        1,
+        "a failed session reports its first failure"
+    );
+    let issue = &issues[0];
+    assert_eq!(issue.operation, "video-7-1-encoder-attempt-0");
+    assert_eq!(
+        issue.layer,
+        amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::EncodeVideo
+    );
+    assert_eq!(issue.phase, "nvenc.receive");
+    assert_eq!(issue.code, "forced_keyframe_missing");
+    assert!(issue.is_critical());
+    assert!(issue.site.contains("sessions.rs:"), "{}", issue.site);
+}

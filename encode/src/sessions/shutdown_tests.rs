@@ -611,6 +611,8 @@ pub(super) fn module(sessions: Sessions) -> crate::EncodeModule {
         last_timing_log: Instant::now(),
         shutting_down: false,
         closing: crate::closing::Closing::default(),
+        stream_issues: Default::default(),
+        report_stream_issues: false,
     }
 }
 

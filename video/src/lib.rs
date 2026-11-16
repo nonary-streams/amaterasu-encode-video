@@ -101,6 +101,7 @@ impl ManagedModule for Video {
             queues.clone(),
         );
         pipeline.trace_frames(frame_trace);
+        pipeline.enable_stream_issue_reports();
         let unit_factory = unit_service
             .as_ref()
             .map(|_| native::unit::Factory::new(queues.clone()));

@@ -4,6 +4,7 @@
 use crate::{
     closing::Closing,
     factory::Factory,
+    lifecycle_issues,
     model::{Configuration, EncoderIdentity, Operation},
     native::Shared,
     platform, probe,
@@ -11,6 +12,7 @@ use crate::{
 };
 use amaterasu_module_sdk::{
     Command, LogLevel, ModuleResult, Response, RuntimeClient, WorkNotifier,
+    stream_lifecycle::StreamIssueOutbox,
 };
 use serde_json::{Value, json};
 use std::{
@@ -28,6 +30,8 @@ struct Waiter {
     id: u64,
     owner: String,
     open_operation: Option<String>,
+    /// The backend an open asked for, named in its failure report.
+    open_backend: &'static str,
 }
 struct Request {
     waiter: Waiter,
@@ -84,6 +88,7 @@ pub(crate) struct Preparation {
     active: bool,
     active_open: Option<(String, String)>,
     ready: Option<Completion>,
+    issues: StreamIssueOutbox,
 }
 
 impl Preparation {
@@ -118,6 +123,7 @@ impl Preparation {
             active: false,
             active_open: None,
             ready: None,
+            issues: StreamIssueOutbox::default(),
         })
     }
 
@@ -135,15 +141,23 @@ impl Preparation {
         {
             return Err("encoder_preparation_limit");
         }
-        let open_operation = match &operation {
-            Operation::Open { operation_id, .. } => operation_id.clone(),
-            _ => None,
+        let (open_operation, open_backend) = match &operation {
+            Operation::Open {
+                operation_id,
+                encoder,
+                ..
+            } => (
+                operation_id.clone(),
+                lifecycle_issues::backend_name(encoder),
+            ),
+            _ => (None, ""),
         };
         self.queued.push_back(Request {
             waiter: Waiter {
                 id,
                 owner,
                 open_operation,
+                open_backend,
             },
             operation,
         });
@@ -255,6 +269,9 @@ impl Preparation {
             {
                 payload["transport_extensions"] = extensions;
             }
+            if valid {
+                self.report_open_failure(&completion.waiter, &payload);
+            }
             if completion.elapsed_us >= 100_000 {
                 let _ = runtime.log(
                     LogLevel::Info,
@@ -328,6 +345,29 @@ impl Preparation {
             }
         }
         Ok(())
+    }
+
+    /// An open the consumer still waits for was refused or failed natively.
+    /// Its own operation names the stream; a probe carries none to report.
+    fn report_open_failure(&mut self, waiter: &Waiter, payload: &Value) {
+        let Some(operation) = &waiter.open_operation else {
+            return;
+        };
+        if payload["ok"] != false {
+            return;
+        }
+        let code = payload["code"].as_str().unwrap_or("encoder_open_failed");
+        self.issues.push(lifecycle_issues::session_failure(
+            operation,
+            waiter.open_backend,
+            "open",
+            code,
+        ));
+    }
+
+    /// Hand queued reports to the module's tick for publication.
+    pub fn take_stream_issues(&mut self, outbox: &mut StreamIssueOutbox) {
+        lifecycle_issues::transfer(&mut self.issues, outbox);
     }
 
     /// A lookup for an admitted open must follow its preparation and native

@@ -147,6 +147,12 @@ pub(super) fn select_capture_provider(stream: &mut Stream, video: u64, plane: &d
             stream.cleanup(reason)
         }
         Some(reason) => {
+            stream.report_fallback(
+                LifecycleLayer::Capture,
+                "dmabuf_capture_unavailable",
+                Some(reason),
+                "cpu_capture",
+            );
             stream.owned_capture.cpu_provider = None;
             stream.owned_capture.fallback_reason = Some(reason.into());
         }
@@ -163,6 +169,12 @@ pub(super) fn begin_vkms_open_fallback(stream: &mut Stream, reason: &str) -> boo
     let Some(provider) = stream.owned_capture.cpu_provider.take() else {
         return false;
     };
+    stream.report_fallback(
+        LifecycleLayer::Capture,
+        "vkms_capture_open_failed",
+        Some(reason),
+        "cpu_capture",
+    );
     stream.owned_capture.fallback_reason = Some(retained_reason(reason));
     stream.frame_path = FramePath::Cpu;
     switch_capture_provider(stream, provider);
@@ -181,6 +193,12 @@ pub(super) fn begin_cpu_capture_fallback(stream: &mut Stream, reason: &'static s
     {
         return false;
     }
+    stream.report_fallback(
+        LifecycleLayer::Capture,
+        "dmabuf_frame_exchange_failed",
+        Some(reason),
+        "cpu_capture",
+    );
     stream.owned_capture.fallback_reason = Some(reason.into());
     stream.frame_path = FramePath::Cpu;
     stream.restart_pending = true;

@@ -14,6 +14,7 @@ struct HostState {
     live: std::collections::BTreeSet<u64>,
     registered_factory: usize,
     registrations: usize,
+    published: Vec<(String, Value)>,
 }
 
 pub(super) struct Host {
@@ -47,6 +48,10 @@ unsafe extern "C" fn dispatch(
             Response::Ok
         }
         Command::NotifyWorkReady {} | Command::Log { .. } => Response::Ok,
+        Command::Publish { topic, payload } => {
+            state.published.push((topic, payload));
+            Response::Ok
+        }
         Command::Poll {} => state.incoming.pop_front().unwrap_or(Response::Pending),
         Command::CheckRequest { request } => {
             if state.live.contains(&request) {
@@ -117,6 +122,11 @@ impl Host {
             payload,
         });
     }
+    /// Every event the module published, in order.
+    pub(super) fn published(&self) -> Vec<(String, Value)> {
+        self.state.lock().unwrap().published.clone()
+    }
+
     pub(super) fn take_reply(&self, id: u64) -> Option<Value> {
         self.state.lock().unwrap().completed.remove(&id)
     }

@@ -8,6 +8,7 @@ const CAPTURE: &str = "amaterasu.capture-dxgi/1";
 mod capture_preflight_retry;
 mod preflight_sdk;
 mod request_retirement;
+mod stream_issues;
 
 #[test]
 fn stage_timing_counters_distinguish_frame_arrival_encode_copy_poll_and_admission() {

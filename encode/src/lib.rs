@@ -7,6 +7,7 @@ mod hevc;
 #[cfg_attr(not(amaterasu_nvenc_cuda), allow(dead_code))]
 mod input;
 mod layout;
+mod lifecycle_issues;
 mod model;
 mod native;
 mod platform;
@@ -18,6 +19,7 @@ mod sessions;
 mod worker;
 use amaterasu_module_sdk::{
     Command, LogQueue, ManagedModule, ModuleResult, Response, RuntimeClient,
+    stream_lifecycle::StreamIssueOutbox,
 };
 use model::Operation;
 use serde::Deserialize;
@@ -44,6 +46,8 @@ struct EncodeModule {
     shutting_down: bool,
     closing: closing::Closing,
     preparation: preparation::Preparation,
+    stream_issues: StreamIssueOutbox,
+    report_stream_issues: bool,
     _registration: Box<native::Registration>,
     #[cfg(feature = "pyrowave")]
     pyrowave: Option<pyrowave::Plugin>,
@@ -89,6 +93,8 @@ impl ManagedModule for EncodeModule {
             last_timing_log: Instant::now(),
             shutting_down: false,
             closing: closing::Closing::default(),
+            stream_issues: StreamIssueOutbox::default(),
+            report_stream_issues: true,
             _registration: registration,
             #[cfg(feature = "pyrowave")]
             pyrowave,
@@ -96,6 +102,7 @@ impl ManagedModule for EncodeModule {
     }
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
+        self.publish_stream_issues();
         self.log_worker_timings();
         let transport_extensions = self.transport_extensions();
         self.preparation.advance(
@@ -170,10 +177,18 @@ impl ManagedModule for EncodeModule {
                         {
                             Err("encoder_shutting_down")
                         } else {
-                            self.pyrowave
+                            let operation = pyrowave_open_operation(&payload);
+                            let result = self
+                                .pyrowave
                                 .as_ref()
                                 .ok_or("pyrowave_disabled")
-                                .and_then(|plugin| plugin.control(&caller, payload))
+                                .and_then(|plugin| plugin.control(&caller, payload));
+                            if let (Err(code), Some(operation)) = (&result, operation) {
+                                self.stream_issues.push(lifecycle_issues::session_failure(
+                                    &operation, "pyrowave", "open", code,
+                                ));
+                            }
+                            result
                         }
                     } else {
                         Err("invalid_service")
@@ -238,6 +253,30 @@ impl ManagedModule for EncodeModule {
 }
 
 impl EncodeModule {
+    /// Publish what preparation and sessions reported since the last tick.
+    /// Native clients share the session lock, so a busy lock waits for the
+    /// next tick instead of stalling the host thread.
+    fn publish_stream_issues(&mut self) {
+        self.preparation.take_stream_issues(&mut self.stream_issues);
+        if let Ok(mut sessions) = self.shared.try_lock() {
+            sessions.take_stream_issues(&mut self.stream_issues);
+        }
+        if !self.report_stream_issues {
+            self.stream_issues.drain().for_each(drop);
+            return;
+        }
+        if self.stream_issues.is_empty() {
+            return;
+        }
+        if let Err(error) = self.stream_issues.flush(&self.runtime) {
+            let _ = self.runtime.log(
+                amaterasu_module_sdk::LogLevel::Warning,
+                "encoder.stream_issues",
+                &format!("stream issue report failed error={error}"),
+            );
+        }
+    }
+
     fn log_worker_timings(&mut self) {
         let now = Instant::now();
         if now.saturating_duration_since(self.last_timing_log) < TIMING_LOG_INTERVAL {
@@ -309,6 +348,15 @@ impl Drop for EncodeModule {
         let _ = sessions.clear();
         self.log_queue.flush(&self.runtime);
     }
+}
+
+/// The stream operation a PyroWave open names, reported if the open fails.
+#[cfg(feature = "pyrowave")]
+fn pyrowave_open_operation(payload: &Value) -> Option<String> {
+    if payload["action"] != "open" {
+        return None;
+    }
+    payload["operation_id"].as_str().map(str::to_owned)
 }
 
 #[cfg(not(feature = "pyrowave"))]

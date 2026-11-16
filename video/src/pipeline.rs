@@ -11,6 +11,7 @@ mod pacing;
 mod portal;
 mod presentation;
 mod source_probe;
+mod stream_issues;
 
 use crate::{
     model::{
@@ -25,6 +26,7 @@ use crate::{
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
 use amaterasu_module_sdk::diagnostics::LatencyMetric as TimingMetric;
+use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
 use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -195,6 +197,7 @@ struct Stream {
     last_frame: Option<FrameMetadata>,
     unresolved: bool,
     cleanup_complete: bool,
+    issues: stream_issues::StreamIssues,
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -549,8 +552,10 @@ impl Stream {
         response
     }
 
+    #[track_caller]
     fn cleanup(&mut self, code: &'static str) {
         eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage);
+        self.report_ending(code);
         if let Some(request) = self.pending.take() {
             self.unsettled = Some(request);
             self.unsettled_effect = stage_mutates_provider(self.stage);
@@ -598,6 +603,9 @@ pub struct Pipeline {
     pub queues: Arc<Mutex<Queues>>,
     processing_generation: Arc<AtomicU64>,
     frame_trace: Option<crate::frame_trace::FrameTrace>,
+    report_stream_issues: bool,
+    /// Reports of streams already removed, published on the next tick.
+    retired_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
 }
 
 impl Pipeline {
@@ -657,6 +665,8 @@ impl Pipeline {
             queues,
             processing_generation,
             frame_trace: None,
+            report_stream_issues: false,
+            retired_issues: Default::default(),
         }
     }
 
@@ -1104,6 +1114,7 @@ impl Pipeline {
             return;
         };
         self.next_id = id;
+        let caller_operation = operation_id.clone();
         if let Some(operation_id) = operation_id {
             self.operations.insert(
                 (caller.into(), operation_id),
@@ -1237,6 +1248,7 @@ impl Pipeline {
                 touch_port: None,
                 session: None,
                 capture_operation: format!("{operation}-capture-0"),
+                issues: stream_issues::StreamIssues::new(caller_operation, &operation),
                 operation,
                 capture_attempt: 0,
                 no_resources: matches!(
@@ -1277,6 +1289,11 @@ impl Pipeline {
     }
 
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
+        self.tick_streams(plane, send);
+        self.publish_stream_issues(send);
+    }
+
+    fn tick_streams(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         if !self.pending_queue_closes.is_empty()
             && let Ok(mut queues) = self.queues.try_lock()
         {
@@ -1310,8 +1327,9 @@ impl Pipeline {
         if stream.cleanup_complete {
             close_queue(&self.queues, &mut self.pending_queue_closes, id);
             if !self.pending_queue_closes.contains(&id)
-                && let Some(stream) = self.streams.remove(&id)
+                && let Some(mut stream) = self.streams.remove(&id)
             {
+                self.retire_stream_issues(&mut stream);
                 self.remember_failure(id, &stream);
             }
             return;
@@ -1478,7 +1496,8 @@ impl Pipeline {
             if self.pending_queue_closes.contains(&id) {
                 return;
             }
-            if let Some(stream) = self.streams.remove(&id) {
+            if let Some(mut stream) = self.streams.remove(&id) {
+                self.retire_stream_issues(&mut stream);
                 self.remember_failure(id, &stream);
             }
         }
@@ -2334,6 +2353,7 @@ fn stage_name(stage: Stage) -> &'static str {
     }
 }
 
+#[track_caller]
 fn failed_step(stream: &mut Stream, code: &'static str) {
     if matches!(
         stream.stage,
@@ -2352,8 +2372,10 @@ fn failed_step(stream: &mut Stream, code: &'static str) {
     ) {
         stream.cleanup(code);
     } else {
+        stream.issues.forget_provider_code();
         stream.retries += 1;
         if stream.retries >= 3 {
+            stream.report_cleanup_failure();
             stream.error = Some("cleanup_failed");
             stream.unresolved = true;
             stream.stage = if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder)
@@ -2377,6 +2399,12 @@ fn begin_runtime_encoder_recovery(stream: &mut Stream, code: &'static str) -> bo
     {
         return false;
     }
+    stream.report_fallback(
+        LifecycleLayer::EncodeVideo,
+        code,
+        None,
+        "software_encoder_restart",
+    );
     stream.restart_pending = true;
     stream.force_idr = true;
     stream.next_frame = Instant::now();
@@ -2478,6 +2506,15 @@ fn apply_result(
                 stream.retries = 0;
             }
             Ok(Some(reason)) => {
+                let next_candidate = !stream.encoder_candidates.is_empty();
+                if next_candidate {
+                    stream.report_fallback(
+                        LifecycleLayer::EncodeVideo,
+                        "encoder_probe_rejected",
+                        Some(&reason),
+                        "next_encoder_candidate",
+                    );
+                }
                 stream.encoder_probe_reason = Some(reason);
                 if !begin_encoder_probe(stream) {
                     stream.cleanup("encoder_unavailable");
@@ -2502,6 +2539,7 @@ fn apply_result(
                     payload.get("ok"),
                     payload.get("settled")
                 );
+                stream.note_provider_code(provider_code);
                 stream.cleanup(code);
             }
         }
@@ -2567,6 +2605,9 @@ fn apply_result(
             stream.provider.service(),
             owned_capture::retained_reason(payload_error_code(&payload).unwrap_or("none")),
         );
+        if let Some(provider_code) = payload_error_code(&payload) {
+            stream.note_provider_code(provider_code);
+        }
         failed_step(stream, code);
         return false;
     }
@@ -3120,6 +3161,12 @@ fn begin_fallback(stream: &mut Stream, original_error: &'static str) -> bool {
     let Some(device_name) = output_device_name(stream.provider, &stream.output) else {
         return false;
     };
+    stream.report_fallback(
+        LifecycleLayer::Capture,
+        "capture_provider_failed",
+        Some(original_error),
+        "alternate_capture_provider",
+    );
     stream.fallback_attempted = true;
     stream.no_resources = true;
     stream.fallback_error = Some(original_error);
@@ -3286,6 +3333,12 @@ fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
     let Some(fallback) = stream.fallback_encoder.take() else {
         return false;
     };
+    stream.report_fallback(
+        LifecycleLayer::EncodeVideo,
+        "encoder_open_failed",
+        reason,
+        "software_encoder",
+    );
     stream.encoder_fallback_reason = Some(reason.unwrap_or("encoder_open_failed").into());
     stream.encoder = Some(fallback);
     stream.encoder_attempt = 1;
