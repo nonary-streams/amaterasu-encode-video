@@ -5,6 +5,7 @@ use amaterasu_media::{
     MEDIA_UNSUPPORTED,
 };
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::encode::{HostVideoPresentation, PresentedDmaBufResource};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 
 const MAX_OFFERS: usize = 64;
@@ -164,6 +165,7 @@ struct Delivery<'a> {
     calls: u32,
     result: Status,
     invalid: bool,
+    presentation: Option<HostVideoPresentation>,
 }
 unsafe extern "C" fn deliver(context: *mut c_void, frame: *const CaptureResourceFrame) -> Status {
     if context.is_null() {
@@ -183,11 +185,35 @@ unsafe extern "C" fn deliver(context: *mut c_void, frame: *const CaptureResource
         || frame.reserved != 0
         || !valid_color_metadata(&frame.color)
         || !valid_clock_metadata(&frame.clock)
-        || frame.clock.version != 1
-        || frame.clock.domain != amaterasu_media::FRAME_CLOCK_HOST_MONOTONIC
-        || frame.clock.epoch_id != state.expected_epoch
-        || frame.sequence <= state.last_sequence
         || !valid_clock_metadata(&frame.pacing_clock)
+    {
+        state.invalid = true;
+        return STATUS_INVALID_ARGUMENT;
+    }
+    if state.presentation.is_none() && frame.sequence <= state.last_sequence {
+        state.invalid = true;
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let adapted = if let Some(presentation) = state.presentation {
+        // SAFETY: capture lends its existing immutable resource through this
+        // call. The stream retains both bindings until consumer cancellation.
+        match unsafe { PresentedDmaBufResource::new(frame, presentation) } {
+            Ok(adapted) => Some(adapted),
+            Err(status) => {
+                state.result = status;
+                return status;
+            }
+        }
+    } else {
+        None
+    };
+    let presented = adapted
+        .as_ref()
+        .map_or(frame, PresentedDmaBufResource::descriptor);
+    if presented.clock.version != 1
+        || presented.clock.domain != amaterasu_media::FRAME_CLOCK_HOST_MONOTONIC
+        || presented.clock.epoch_id != state.expected_epoch
+        || presented.sequence <= state.last_sequence
     {
         state.invalid = true;
         return STATUS_INVALID_ARGUMENT;
@@ -197,12 +223,12 @@ unsafe extern "C" fn deliver(context: *mut c_void, frame: *const CaptureResource
         (state.consumer.submit)(
             state.consumer.base.context,
             state.stream,
-            frame,
+            presented,
             state.flags,
         )
     };
     if state.result == STATUS_OK {
-        state.accepted_sequence = Some(frame.sequence);
+        state.accepted_sequence = Some(presented.sequence);
     }
     state.result
 }
@@ -244,6 +270,10 @@ impl ResourceBridge {
             last_sequence: 0,
             thread: PhantomData,
         })
+    }
+
+    pub(super) fn last_accepted_sequence(&self) -> u64 {
+        self.last_sequence
     }
 
     pub(super) fn is_retired(&self) -> bool {
@@ -413,6 +443,29 @@ impl ResourceBridge {
         consumer: &FrameResourceConsumerApi,
         flags: u32,
     ) -> Result<Status, ConnectionError> {
+        unsafe { self.forward_with_presentation(capture, consumer, flags, None) }
+    }
+
+    /// # Safety
+    /// The same binding and ownership requirements as `forward` apply. Video
+    /// owns this presentation; the original capture clock remains pacing data.
+    pub(super) unsafe fn forward_presented(
+        &mut self,
+        capture: &CaptureApiV1_8,
+        consumer: &FrameResourceConsumerApi,
+        flags: u32,
+        presentation: HostVideoPresentation,
+    ) -> Result<Status, ConnectionError> {
+        unsafe { self.forward_with_presentation(capture, consumer, flags, Some(presentation)) }
+    }
+
+    unsafe fn forward_with_presentation(
+        &mut self,
+        capture: &CaptureApiV1_8,
+        consumer: &FrameResourceConsumerApi,
+        flags: u32,
+        presentation: Option<HostVideoPresentation>,
+    ) -> Result<Status, ConnectionError> {
         if self.selected.is_none() {
             // SAFETY: caller supplies both live bindings.
             unsafe { self.negotiate(capture, consumer) }?;
@@ -430,6 +483,7 @@ impl ResourceBridge {
             calls: 0,
             result: STATUS_OK,
             invalid: false,
+            presentation,
         };
         let sink = CaptureResourceFrameSink {
             context: (&mut delivery as *mut Delivery<'_>).cast(),
@@ -482,6 +536,8 @@ mod tests {
         seen_generation: u64,
         seen_producer_generation: u64,
         namespace: Option<[u8; 16]>,
+        seen_sequence: u64,
+        seen_timestamp: u64,
     }
     unsafe extern "C" fn enumerate(
         _: *mut c_void,
@@ -531,6 +587,8 @@ mod tests {
             consumer.submitted += 1;
             consumer.transfer = (*frame).color.transfer;
             consumer.epoch = (*frame).pacing_clock.epoch_id;
+            consumer.seen_sequence = (*frame).sequence;
+            consumer.seen_timestamp = (*frame).timestamp_us;
         }
         STATUS_OK
     }
@@ -648,6 +706,7 @@ mod tests {
             calls: 0,
             result: STATUS_OK,
             invalid: false,
+            presentation: None,
         };
         assert_eq!(
             unsafe { deliver((&mut delivery as *mut Delivery<'_>).cast(), &frame) },
@@ -663,6 +722,95 @@ mod tests {
         );
         assert!(delivery.invalid);
     }
+    #[test]
+    fn captured_dmabuf_uses_video_presentations_including_cached_repeats() {
+        use amaterasu_media::*;
+        let mut consumer = Consumer::default();
+        let api = table(&mut consumer);
+        let mut planes = [DmaBufPlane::UNUSED; DMABUF_MAX_PLANES];
+        planes[0] = DmaBufPlane {
+            fd: 0,
+            acquire_fence_fd: -1,
+            offset: 0,
+            pitch: 8,
+        };
+        let payload = DmaBufFrame {
+            width: 2,
+            height: 2,
+            fourcc: u32::from_le_bytes(*b"XR24"),
+            plane_count: 1,
+            modifier: 0,
+            planes,
+            color: DMABUF_COLOR_SRGB,
+            reserved: 0,
+            timestamp_us: 37,
+            sequence: 91,
+        };
+        let clock = FrameClockMetadata {
+            version: 1,
+            size: size_of::<FrameClockMetadata>() as u32,
+            domain: FRAME_CLOCK_STREAM_RELATIVE,
+            ..Default::default()
+        };
+        let frame = CaptureResourceFrame {
+            offer_generation: 9,
+            offer_id: 5,
+            timestamp_us: 37,
+            capture_pacing_timestamp_us: 37,
+            sequence: 91,
+            width: 2,
+            height: 2,
+            freshness: CAPTURE_FRAME_CACHED_REUSE,
+            reserved: 0,
+            color: Default::default(),
+            clock,
+            pacing_clock: clock,
+            resource: FrameDescriptor {
+                kind: FRAME_RESOURCE_DMABUF,
+                version: 1,
+                size: size_of::<DmaBufFrame>() as u32,
+                data: ptr::from_ref(&payload).cast(),
+                ..descriptor(FRAME_RESOURCE_DMABUF)
+            },
+            acquire_sync: descriptor(FRAME_SYNC_NONE),
+            context: ptr::null_mut(),
+            retain,
+            release,
+        };
+        for sequence in [1, 2] {
+            let mut delivery = Delivery {
+                consumer: &api,
+                stream: 3,
+                generation: 9,
+                offer: 5,
+                flags: 0,
+                expected_epoch: [1; 16],
+                last_sequence: sequence - 1,
+                accepted_sequence: None,
+                calls: 0,
+                result: STATUS_OK,
+                invalid: false,
+                presentation: Some(HostVideoPresentation {
+                    timestamp_us: 1000 + sequence * 100,
+                    epoch_id: [1; 16],
+                    sequence,
+                }),
+            };
+            // SAFETY: capture's standard resource and consumer live through delivery.
+            assert_eq!(
+                unsafe { deliver((&mut delivery as *mut Delivery<'_>).cast(), &frame) },
+                STATUS_OK
+            );
+            assert_eq!(delivery.accepted_sequence, Some(sequence));
+            assert!(!delivery.invalid);
+            assert_eq!(consumer.seen_sequence, sequence);
+            assert_eq!(consumer.seen_timestamp, 1000 + sequence * 100);
+        }
+        assert_eq!(consumer.submitted, 2);
+        assert_eq!(frame.sequence, 91);
+        assert_eq!(payload.sequence, 91);
+    }
+
     #[test]
     fn rejects_duplicate_offers_and_incompatible_consumer() {
         let mut consumer = Consumer {
@@ -966,6 +1114,7 @@ mod tests {
             Ok(STATUS_OK)
         );
         assert_eq!(consumer.submitted, 1);
+        assert_eq!(connection.last_accepted_sequence(), 1);
         assert_eq!(consumer.cancelled, 0);
         producer.stale = true;
         std::hint::black_box(&producer);

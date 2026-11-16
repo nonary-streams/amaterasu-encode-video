@@ -337,5 +337,8 @@ unsafe extern "C" fn drain(context: *mut c_void, id: u64) -> Status {
 }
 
 fn guarded(operation: impl FnOnce() -> Status) -> Status {
-    catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
+    crate::sessions::release_completed_on_owner_thread();
+    let result = catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR);
+    crate::sessions::release_completed_on_owner_thread();
+    result
 }

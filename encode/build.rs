@@ -11,6 +11,10 @@ fn x264_build_version(header: &str) -> Option<u32> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=AMATERASU_PYROWAVE_EMBED_LIBRARY");
+    if let Some(path) = env::var_os("AMATERASU_PYROWAVE_EMBED_LIBRARY") {
+        println!("cargo:rerun-if-changed={}", PathBuf::from(path).display());
+    }
     build_pyrowave_gpu();
     let nvenc_abi = build_linux_ffmpeg_nvenc();
     let vaapi_abi = build_linux_ffmpeg_vaapi(nvenc_abi.is_none());
@@ -114,7 +118,7 @@ fn build_pyrowave_gpu() {
     let explicit = env::var_os("AMATERASU_PYROWAVE_INCLUDE_DIR");
     let include = explicit.map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-            .join("../../../native-deps/pyrowave/source")
+            .join("../../../../native-deps/pyrowave/source")
     });
     assert!(
         include.join("pyrowave.h").is_file(),

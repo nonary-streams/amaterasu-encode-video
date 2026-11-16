@@ -97,6 +97,8 @@ fn plane(host: &mut Host, queues: Arc<Mutex<Queues>>) -> NativePlane {
                 control_service: "fixture.encode/1".into(),
                 native_service: "fixture.source/1".into(),
                 source_ids: [42].into(),
+                extension_profiles: Vec::new(),
+                submitted: false,
             },
         )]
         .into(),

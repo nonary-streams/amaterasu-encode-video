@@ -67,6 +67,7 @@ unsafe extern "C" fn notify(context: *mut c_void, _: u64, event: u32) {
 
 pub(super) struct Source {
     session: u64,
+    submitted: bool,
     output: ProviderOutput,
     signal: Box<AtomicU32>,
     subscribed: bool,
@@ -74,6 +75,123 @@ pub(super) struct Source {
     next_control: u64,
     pending_idr: Option<u64>,
 }
+fn with_source_config<T>(
+    source: u64,
+    configuration: &Configuration,
+    clock_origin_us: u64,
+    epoch_id: [u8; 16],
+    operation: impl FnOnce(&EncoderSessionConfig) -> Result<T, &'static str>,
+) -> Result<T, &'static str> {
+    if !configuration.color_mode.is_default() {
+        return Err("encoder_source_format_unsupported");
+    }
+    if epoch_id == [0; 16] || clock_origin_us == 0 {
+        return Err("encoder_clock_unavailable");
+    }
+    let cadence = frame_cadence(configuration)?;
+    let common = EncoderCommonConfigV1 {
+        version: 1,
+        size: size_of::<EncoderCommonConfigV1>() as u32,
+        flags: ENCODER_CONFIG_HAS_COLOR,
+        reserved: 0,
+        coded_width: configuration.width,
+        coded_height: configuration.height,
+        crop_x: 0,
+        crop_y: 0,
+        visible_width: configuration.width,
+        visible_height: configuration.height,
+        fps_numerator: cadence.numerator(),
+        fps_denominator: cadence.denominator(),
+        bitrate_bps: u64::from(configuration.bitrate),
+        profile: 0,
+        level: 0,
+        chroma: ENCODER_CHROMA_420,
+        bit_depth: configuration
+            .extension_profile
+            .as_ref()
+            .and_then(|p| p.media_format)
+            .map_or(8, |f| u32::from(f.bit_depth)),
+        color: FrameColorMetadata {
+            version: 1,
+            size: size_of::<FrameColorMetadata>() as u32,
+            transfer: if configuration.video_stream_format.dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr
+            {
+                FRAME_TRANSFER_PQ
+            } else {
+                FRAME_TRANSFER_SRGB
+            },
+            ..Default::default()
+        },
+        output_clock: FrameClockMetadata {
+            version: 1,
+            size: size_of::<FrameClockMetadata>() as u32,
+            domain: FRAME_CLOCK_STREAM_RELATIVE,
+            reserved: 0,
+            epoch_id,
+        },
+        output_clock_origin_us: clock_origin_us,
+    };
+    // SAFETY: common is plain C data, borrowed only during the synchronous calls.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&common as *const EncoderCommonConfigV1).cast::<u8>(),
+            size_of::<EncoderCommonConfigV1>(),
+        )
+    };
+    let (codec, framing) = if let Some(profile) = &configuration.extension_profile {
+        (
+            EncoderFormatId {
+                namespace_id: profile.codec.namespace_id,
+                value: profile.codec.value,
+                schema: profile.codec.schema,
+            },
+            EncoderFormatId {
+                namespace_id: profile.framing.namespace_id,
+                value: profile.framing.value,
+                schema: profile.framing.schema,
+            },
+        )
+    } else {
+        (
+            id(u64::from(configuration.codec.abi_id())),
+            id(if configuration.codec == VideoCodec::Av1 {
+                ENCODER_FRAMING_AV1_OBU
+            } else {
+                ENCODER_FRAMING_ANNEX_B
+            }),
+        )
+    };
+    let config = EncoderSessionConfig {
+        size: size_of::<EncoderSessionConfig>() as u32,
+        mode: ENCODER_SESSION_SOURCE,
+        codec,
+        framing,
+        source_id: source,
+        config_generation: 1,
+        options_schema: id(ENCODER_SCHEMA_COMMON_CONFIG),
+        options: BorrowedBytes::new(bytes),
+    };
+    operation(&config)
+}
+
+unsafe fn probe_config(
+    api: &EncoderProviderApi,
+    config: &EncoderSessionConfig,
+) -> Result<(), &'static str> {
+    let mut probe = Reply {
+        calls: 0,
+        request: 0,
+        outcome: None,
+    };
+    // SAFETY: config and callback context remain live for the synchronous call.
+    let status = unsafe { (api.probe)(api.base.context, config, sink(&mut probe)) };
+    if status != STATUS_OK || probe.calls != 1 || probe.outcome != Some(ENCODER_OUTCOME_APPLIED) {
+        return Err("encoder_probe_failed");
+    }
+    Ok(())
+}
+
 impl Source {
     pub(super) fn session(&self) -> u64 {
         self.session
@@ -89,110 +207,129 @@ impl Source {
         clock_origin_us: u64,
         epoch_id: [u8; 16],
     ) -> Result<Self, &'static str> {
-        if !configuration.color_mode.is_default() {
-            return Err("encoder_source_format_unsupported");
-        }
-        if epoch_id == [0; 16] || clock_origin_us == 0 {
-            return Err("encoder_clock_unavailable");
-        }
-        let cadence = frame_cadence(configuration)?;
-        let common = EncoderCommonConfigV1 {
-            version: 1,
-            size: size_of::<EncoderCommonConfigV1>() as u32,
-            flags: 0,
-            reserved: 0,
-            coded_width: configuration.width,
-            coded_height: configuration.height,
-            crop_x: 0,
-            crop_y: 0,
-            visible_width: configuration.width,
-            visible_height: configuration.height,
-            fps_numerator: cadence.numerator(),
-            fps_denominator: cadence.denominator(),
-            bitrate_bps: u64::from(configuration.bitrate),
-            profile: 0,
-            level: 0,
-            chroma: ENCODER_CHROMA_420,
-            bit_depth: 8,
-            color: FrameColorMetadata::default(),
-            output_clock: FrameClockMetadata {
-                version: 1,
-                size: size_of::<FrameClockMetadata>() as u32,
-                domain: FRAME_CLOCK_STREAM_RELATIVE,
-                reserved: 0,
-                epoch_id,
-            },
-            output_clock_origin_us: clock_origin_us,
-        };
-        // SAFETY: common is plain C data, borrowed only during the synchronous calls.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&common as *const EncoderCommonConfigV1).cast::<u8>(),
-                size_of::<EncoderCommonConfigV1>(),
-            )
-        };
-        let config = EncoderSessionConfig {
-            size: size_of::<EncoderSessionConfig>() as u32,
-            mode: ENCODER_SESSION_SOURCE,
-            codec: id(u64::from(configuration.codec.abi_id())),
-            framing: id(if configuration.codec == VideoCodec::Av1 {
-                ENCODER_FRAMING_AV1_OBU
+        with_source_config(source, configuration, clock_origin_us, epoch_id, |config| {
+            let output = if configuration.extension_profile.is_some() {
+                ProviderOutput::new_negotiated(session, video, config)
             } else {
-                ENCODER_FRAMING_ANNEX_B
-            }),
-            source_id: source,
-            config_generation: 1,
-            options_schema: id(ENCODER_SCHEMA_COMMON_CONFIG),
-            options: BorrowedBytes::new(bytes),
-        };
-        let output = ProviderOutput::new(session, video, &config)
+                ProviderOutput::new(session, video, config)
+            }
             .map_err(|_| "encoder_format_unsupported")?;
-        let mut probe = Reply {
-            calls: 0,
-            request: 0,
-            outcome: None,
-        };
-        // SAFETY: config and sink remain borrowed for the call, binding remains live.
-        let status = unsafe { (api.probe)(api.base.context, &config, sink(&mut probe)) };
-        if status != STATUS_OK || probe.calls != 1 || probe.outcome != Some(ENCODER_OUTCOME_APPLIED)
-        {
-            return Err("encoder_probe_failed");
-        }
-        // SAFETY: authorized session is created by the matching control provider.
-        if unsafe { (api.configure_session)(api.base.context, session, &config) } != STATUS_OK {
-            // SAFETY: conservatively retire any provider state from failed configure.
-            unsafe { (api.destroy_session)(api.base.context, session) };
-            return Err("encoder_configure_failed");
-        }
-        let signal = Box::new(AtomicU32::new(0));
-        let subscribed = match (api.subscribe, api.unsubscribe) {
-            (Some(subscribe), Some(_)) => {
-                let event = EncoderEventSink {
-                    context: (&*signal as *const AtomicU32).cast_mut().cast(),
-                    notify,
-                };
-                // SAFETY: signal is boxed and kept alive until the unsubscribe barrier.
-                if unsafe { subscribe(api.base.context, session, event) } != STATUS_OK {
-                    unsafe { (api.destroy_session)(api.base.context, session) };
-                    return Err("encoder_subscribe_failed");
-                }
-                true
-            }
-            (None, None) => false,
-            _ => {
+            // SAFETY: caller retains the selected provider binding.
+            unsafe { probe_config(api, config) }?;
+            // SAFETY: authorized session is created by the matching control provider.
+            if unsafe { (api.configure_session)(api.base.context, session, config) } != STATUS_OK {
+                // SAFETY: conservatively retire any provider state from failed configure.
                 unsafe { (api.destroy_session)(api.base.context, session) };
-                return Err("encoder_notification_interface");
+                return Err("encoder_configure_failed");
             }
-        };
-        Ok(Self {
-            session,
-            output,
-            signal,
-            subscribed,
-            stopped: false,
-            next_control: 1,
-            pending_idr: None,
+            let signal = Box::new(AtomicU32::new(0));
+            let subscribed = match (api.subscribe, api.unsubscribe) {
+                (Some(subscribe), Some(_)) => {
+                    let event = EncoderEventSink {
+                        context: (&*signal as *const AtomicU32).cast_mut().cast(),
+                        notify,
+                    };
+                    // SAFETY: signal is boxed and kept alive until the unsubscribe barrier.
+                    if unsafe { subscribe(api.base.context, session, event) } != STATUS_OK {
+                        unsafe { (api.destroy_session)(api.base.context, session) };
+                        return Err("encoder_subscribe_failed");
+                    }
+                    true
+                }
+                (None, None) => false,
+                _ => {
+                    unsafe { (api.destroy_session)(api.base.context, session) };
+                    return Err("encoder_notification_interface");
+                }
+            };
+            Ok(Self {
+                session,
+                submitted: false,
+                output,
+                signal,
+                subscribed,
+                stopped: false,
+                next_control: 1,
+                pending_idr: None,
+            })
         })
+    }
+
+    pub(super) unsafe fn open_submitted(
+        api: &EncoderProviderApi,
+        video: u64,
+        session: u64,
+        source: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        epoch_id: [u8; 16],
+    ) -> Result<Self, &'static str> {
+        with_source_config(source, configuration, clock_origin_us, epoch_id, |config| {
+            let mut submitted = *config;
+            submitted.mode = ENCODER_SESSION_SUBMITTED;
+            let config = &submitted;
+            let output = if configuration.extension_profile.is_some() {
+                ProviderOutput::new_negotiated(session, video, config)
+            } else {
+                ProviderOutput::new(session, video, config)
+            }
+            .map_err(|_| "encoder_format_unsupported")?;
+            // SAFETY: caller retains the selected provider binding.
+            // The correlated broker probe already verified GPU support; do not encode again here.
+
+            // SAFETY: authorized session is created by the matching control provider.
+            if unsafe { (api.configure_session)(api.base.context, session, config) } != STATUS_OK {
+                // SAFETY: conservatively retire any provider state from failed configure.
+                unsafe { (api.destroy_session)(api.base.context, session) };
+                return Err("encoder_configure_failed");
+            }
+            let signal = Box::new(AtomicU32::new(0));
+            let subscribed = match (api.subscribe, api.unsubscribe) {
+                (Some(subscribe), Some(_)) => {
+                    let event = EncoderEventSink {
+                        context: (&*signal as *const AtomicU32).cast_mut().cast(),
+                        notify,
+                    };
+                    // SAFETY: signal is boxed and kept alive until the unsubscribe barrier.
+                    if unsafe { subscribe(api.base.context, session, event) } != STATUS_OK {
+                        unsafe { (api.destroy_session)(api.base.context, session) };
+                        return Err("encoder_subscribe_failed");
+                    }
+                    true
+                }
+                (None, None) => false,
+                _ => {
+                    unsafe { (api.destroy_session)(api.base.context, session) };
+                    return Err("encoder_notification_interface");
+                }
+            };
+            Ok(Self {
+                session,
+                submitted: true,
+                output,
+                signal,
+                subscribed,
+                stopped: false,
+                next_control: 1,
+                pending_idr: None,
+            })
+        })
+    }
+
+    /// # Safety
+    /// The authenticated provider binding remains live during the probe.
+    pub(super) unsafe fn probe(
+        api: &EncoderProviderApi,
+        source: u64,
+        configuration: &Configuration,
+    ) -> Result<(), &'static str> {
+        with_source_config(
+            source,
+            configuration,
+            host_monotonic_micros().max(1),
+            [1; 16],
+            |config| unsafe { probe_config(api, config) },
+        )
     }
     /// # Safety
     /// api is the same live binding used to open the session.
@@ -204,8 +341,8 @@ impl Source {
     ) -> Result<bool, &'static str> {
         let events = self.signal.swap(0, Ordering::AcqRel);
         self.stopped |= events & (1 << ENCODER_EVENT_STOPPED) != 0;
-        let mut completed = !force_idr;
-        if force_idr {
+        let mut completed = !force_idr || self.submitted;
+        if force_idr && !self.submitted {
             let request_id = *self.pending_idr.get_or_insert(self.next_control);
             let polling = request_id < self.next_control;
             let request = EncoderControlRequest {
@@ -390,6 +527,52 @@ mod tests {
         assert!(matches!(result, Err("encoder_configure_failed")));
         assert_eq!(calls, 11);
     }
+
+    #[test]
+    fn source_preflight_probes_the_custom_codec_without_configuring_a_session() {
+        unsafe extern "C" fn check(
+            context: *mut c_void,
+            config: *const EncoderSessionConfig,
+            sink: EncoderControlSink,
+        ) -> Status {
+            let config = unsafe { &*config };
+            assert_eq!(
+                (
+                    config.codec.namespace_id,
+                    config.codec.value,
+                    config.framing.value,
+                    config.source_id
+                ),
+                (7, 8, 9, 42)
+            );
+            let count = unsafe { &mut *context.cast::<u32>() };
+            *count += 1;
+            unsafe { probe(context, config, sink) }
+        }
+        let mut calls = 0u32;
+        let api = EncoderProviderApi {
+            base: NativeInterface {
+                header: AbiHeader::of::<EncoderProviderApi>(),
+                context: (&mut calls as *mut u32).cast(),
+                release: None,
+            },
+            probe: check,
+            configure_session: configure,
+            receive,
+            control,
+            subscribe: None,
+            unsubscribe: None,
+            drain,
+            destroy_session: destroy,
+        };
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "width":16,"height":16,"fps":60,"bitrate":1_000_000,
+            "extension_profile":{"codec":{"namespace_id":7,"value":8,"schema":1},
+                "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,"payload_type":100,"encoding_name":"EXAMPLE"}
+        })).unwrap();
+        assert!(unsafe { Source::probe(&api, 42, &configuration) }.is_ok());
+        assert_eq!(calls, 1);
+    }
     #[derive(Default)]
     struct BusyState {
         controls: Vec<u64>,
@@ -460,6 +643,7 @@ mod tests {
             options: BorrowedBytes::new(&[]),
         };
         let mut source = Source {
+            submitted: false,
             session: 2,
             output: ProviderOutput::new(2, 1, &config).unwrap(),
             signal: Box::new(AtomicU32::new(0)),

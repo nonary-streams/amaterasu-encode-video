@@ -287,6 +287,10 @@ impl Runtime {
                             .and_then(Value::as_str)
                             .unwrap_or("h264")
                             .into();
+                        if payload["configuration"]["extension_profile"].is_object() {
+                            result["extension_profile"] =
+                                payload["configuration"]["extension_profile"].clone();
+                        }
                         if !self.omit_reference_metadata {
                             result["max_reference_frames"] =
                                 payload["configuration"]["max_reference_frames"].clone();
@@ -308,6 +312,10 @@ impl Runtime {
                         .and_then(Value::as_str)
                         .unwrap_or("h264")
                         .into();
+                    if payload["configuration"]["extension_profile"].is_object() {
+                        result["extension_profile"] =
+                            payload["configuration"]["extension_profile"].clone();
+                    }
                     if !self.omit_reference_metadata {
                         result["max_reference_frames"] =
                             payload["configuration"]["max_reference_frames"].clone();
@@ -534,6 +542,18 @@ impl Plane for FakePlane {
         self.selected_encoders.push(service.to_owned());
     }
     fn start_source(
+        &mut self,
+        video: u64,
+        session: u64,
+        source: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        self.source_starts.push((video, session, source));
+        Ok(())
+    }
+    fn start_submitted(
         &mut self,
         video: u64,
         session: u64,
@@ -877,6 +897,7 @@ fn open() -> Operation {
         encoder_provider: None,
         configuration: Box::new(Configuration {
             gpu_processing: None,
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             slices_per_frame: 1,
             qp: 28,
@@ -5129,6 +5150,8 @@ fn source_open_owns_operation_without_opening_capture_and_routes_cleanup() {
     pipeline.source_encoders.insert(
         "fixture".into(),
         crate::model::SourceEncoderRegistration {
+            extension_profiles: Vec::new(),
+            submitted: false,
             control_service: "example.encode/1".into(),
             native_service: "example.encode-provider/1".into(),
             source_ids: [42].into(),
@@ -5177,6 +5200,77 @@ fn source_open_owns_operation_without_opening_capture_and_routes_cleanup() {
     assert!(!pipeline.streams.contains_key(&1));
     assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "example.encode/1" && payload["action"] == "close" && payload["session_id"] == 51)));
     assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if capture_provider_for_service(service).is_some() && matches!(payload["action"].as_str(), Some("lookup" | "close")))));
+}
+
+#[test]
+fn extension_source_requires_trusted_profile_and_configured_unit_service() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile};
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
+    };
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.encode-native/1".into(),
+            source_ids: [42].into(),
+            extension_profiles: vec![profile.clone()],
+            submitted: false,
+        },
+    );
+    let source = || {
+        let mut configuration = open_configuration();
+        configuration.extension_profile = Some(profile.clone());
+        Operation::OpenSource {
+            packet_boundaries: true,
+            operation_id: None,
+            source_id: 42,
+            encoder_options: None,
+            encoder_provider: "fixture".into(),
+            encoder: EncoderSelection::Identity(encoder_identity()),
+            configuration: Box::new(configuration),
+        }
+    };
+    pipeline.handle("alice", 91, source(), &mut |command| runtime.send(command));
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "encoder_extension_profile_not_allowed"
+    );
+    pipeline.unit_service_enabled = true;
+    pipeline.handle("alice", 92, source(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(plane.source_starts, [(1, 51, 42)]);
+    let response = &runtime
+        .completed
+        .iter()
+        .find(|(id, _)| *id == 92)
+        .unwrap_or_else(|| {
+            panic!(
+                "completed {:?}; parent {:?}; stage {:?}",
+                runtime.completed,
+                pipeline.streams[&1].parent,
+                stage_name(pipeline.streams[&1].stage)
+            )
+        })
+        .1;
+    assert_eq!(response["negotiated_unit"]["stream"], 1);
+    assert_eq!(response["negotiated_unit"]["offer_id"], 4);
+    assert_eq!(response["negotiated_unit"]["source_id"], 42);
 }
 
 #[test]
@@ -5272,6 +5366,8 @@ fn source_options_are_forwarded_and_part_of_operation_identity() {
     pipeline.source_encoders.insert(
         "fixture".into(),
         crate::model::SourceEncoderRegistration {
+            extension_profiles: Vec::new(),
+            submitted: false,
             control_service: "example.encode/1".into(),
             native_service: "example.encode-provider/1".into(),
             source_ids: [42].into(),
@@ -6656,4 +6752,166 @@ fn the_same_source_format_consumer_accepts_independently_selected_replacement_pr
         );
         assert_eq!(plane.source_queries.len(), 1);
     }
+}
+
+#[test]
+#[cfg(feature = "submitted-extensions")]
+fn submitted_extension_keeps_capture_and_closes_it_after_encoder_retirement() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile};
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
+    };
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    // Exercise a strict existing capture provider which never negotiated a
+    // replacement clock or callback agreement through its Open control schema.
+    runtime.omit_capture_contract = true;
+    pipeline.unit_service_enabled = true;
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.native/1".into(),
+            source_ids: [42].into(),
+            extension_profiles: vec![profile.clone()],
+            submitted: true,
+        },
+    );
+    pipeline.encoder_consumers.insert("fixture".into());
+    let mut configuration = open_configuration();
+    configuration.extension_profile = Some(profile);
+    pipeline.handle(
+        "alice",
+        91,
+        Operation::OpenWithOptions {
+            specification: Box::new(crate::model::OpenSpec {
+                packet_boundaries: true,
+                operation_id: None,
+                provider: CaptureProvider::Dxgi,
+                auto_capture: false,
+                constant_rate: false,
+                wgc_pacing_smoothing: false,
+                minimum_fps_target: 0.0,
+                output: "display-1".into(),
+                encoder: EncoderSelection::Identity(encoder_identity()),
+                encoder_provider: Some("fixture".into()),
+                source_id: Some(42),
+                encoder_options: None,
+                source_capture_context: None,
+                configuration,
+            }),
+        },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert!(runtime.commands.iter().any(|command| matches!(command,Command::Request{service,payload,..} if service==CAPTURE && payload["action"]=="open")));
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == CAPTURE && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .all(|payload| payload.get("resource_capture_clock").is_none()
+                && payload.get("resource_callback_contract").is_none())
+    );
+    assert_eq!(plane.source_starts, [(1, 51, 42)]);
+    assert!(plane.frame_paths.contains(&FramePath::Generic));
+    pipeline.handle(
+        "alice",
+        92,
+        Operation::Close { stream: 1 },
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert!(runtime.commands.iter().any(|command| matches!(command,Command::Request{service,payload,..} if service==CAPTURE && payload["action"]=="close")));
+}
+
+#[test]
+fn startup_status_waits_for_real_keyframe_output_and_rejects_later_failure() {
+    use amaterasu_media::{CODEC_H264, EncodedPacket, FLAG_END_OF_ACCESS_UNIT, FLAG_KEYFRAME};
+    use amaterasu_module_sdk::abi::STATUS_OK;
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    let mut operation = open();
+    if let Operation::Open {
+        packet_boundaries, ..
+    } = &mut operation
+    {
+        *packet_boundaries = true;
+    }
+    pipeline.handle("alice", 100, operation, &mut |command| {
+        runtime.send(command)
+    });
+    tick(&mut pipeline, &mut runtime, &mut plane, 20);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert!(
+        pipeline.streams[&1].submitted > 0,
+        "encoder admission is not output proof"
+    );
+    pipeline.handle(
+        "alice",
+        200,
+        Operation::Status { stream: Some(1) },
+        &mut |command| runtime.send(command),
+    );
+    let status = &runtime.completed.last().unwrap().1["streams"][0];
+    assert_eq!(status["startup_frame_readiness"], true);
+    assert_eq!(status["startup_frame_ready"], false);
+    let byte = [1];
+    let first = EncodedPacket {
+        codec: CODEC_H264,
+        flags: FLAG_KEYFRAME,
+        data: byte.as_ptr(),
+        len: 1,
+        timestamp_us: 1,
+        sequence: 1,
+    };
+    assert_eq!(
+        unsafe { pipeline.queues.lock().unwrap().push(1, &first) },
+        STATUS_OK
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(
+        pipeline.streams[&1].response(1)["startup_frame_ready"],
+        false
+    );
+    let last = EncodedPacket {
+        flags: FLAG_END_OF_ACCESS_UNIT,
+        ..first
+    };
+    assert_eq!(
+        unsafe { pipeline.queues.lock().unwrap().push(1, &last) },
+        STATUS_OK
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(
+        pipeline.streams[&1].response(1)["startup_frame_ready"],
+        true
+    );
+    plane.failure_code = Some("capture_closed");
+    tick(&mut pipeline, &mut runtime, &mut plane, 2);
+    assert_ne!(
+        pipeline
+            .streams
+            .get(&1)
+            .map(|stream| stream.response(1)["startup_frame_ready"].clone()),
+        Some(json!(true))
+    );
 }

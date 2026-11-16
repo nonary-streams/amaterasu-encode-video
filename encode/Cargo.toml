@@ -14,6 +14,8 @@ crate-type = ["cdylib", "rlib"]
 pyrowave = ["dep:libloading"]
 # Direct Linux DMA-BUF import and HDR conversion on the PyroWave Vulkan device.
 pyrowave-gpu = ["pyrowave"]
+# Keep the pinned native dependency inside the signed encoder artifact.
+pyrowave-embedded = ["pyrowave-gpu", "dep:libc"]
 # Render-node fixtures are compiled only for explicit GPU qualification.
 pyrowave-gpu-tests = ["pyrowave-gpu"]
 # x264 is GPL-2.0-or-later or commercially licensed. Distribution is explicit.
@@ -38,6 +40,7 @@ amaterasu-abi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libloading = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1"

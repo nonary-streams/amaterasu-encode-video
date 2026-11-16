@@ -160,7 +160,7 @@ int am_pyrowave_gpu_import(struct am_pyrowave_gpu *gpu, const struct am_pyrowave
     uint32_t count = 0;
     if (am_pyrowave_gpu_supports(gpu, frame->fourcc, frame->modifier, frame->width, frame->height, &count) != 0 || count != frame->plane_count) return -1;
     VkFormat format = pixel_format(frame->fourcc);
-    if (frame->hdr && format != VK_FORMAT_A2R10G10B10_UNORM_PACK32 && format != VK_FORMAT_A2B10G10R10_UNORM_PACK32) return -1;
+    if ((frame->hdr & 1u) && format != VK_FORMAT_A2R10G10B10_UNORM_PACK32 && format != VK_FORMAT_A2B10G10R10_UNORM_PACK32) return -1;
     struct stat backing;
     if (frame->fds[0] < 0 || fstat(frame->fds[0], &backing) != 0) return -1;
     VkSubresourceLayout planes[4] = {{0}};
@@ -182,10 +182,10 @@ int am_pyrowave_gpu_import(struct am_pyrowave_gpu *gpu, const struct am_pyrowave
      * fd only on success, including failures after Vulkan memory allocation. */
     if (gpu->api.image_create(&info, &image->image) != PYROWAVE_SUCCESS) { close(duplicate); free(image); return -1; }
     if (gpu->api.image_view(image->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_USAGE_SAMPLED_BIT, &image->scaling.view) != PYROWAVE_SUCCESS) { am_pyrowave_gpu_retire(image); return -1; }
-    image->scaling.input_color_space = frame->hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    image->scaling.input_color_space = (frame->hdr & 1u) ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     image->scaling.output_color_space = image->scaling.input_color_space;
-    image->scaling.intermediate_plane_format = frame->hdr ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
-    image->scaling.ycbcr_chroma_midpoint = frame->hdr ? 512.0f / 1023.0f : 128.0f / 255.0f;
+    image->scaling.intermediate_plane_format = (frame->hdr & 3u) ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+    image->scaling.ycbcr_chroma_midpoint = (frame->hdr & 3u) ? 512.0f / 1023.0f : 128.0f / 255.0f;
     image->scaling.skip_dither = true;
     *output = image;
     return 0;

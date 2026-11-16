@@ -27,7 +27,7 @@ pub struct ProviderOutput {
     generation: u64,
     codec: EncoderFormatId,
     framing: EncoderFormatId,
-    packet_codec: u32,
+    packet_codec: Option<u32>,
     current: Option<AccessUnit>,
     last: Option<AccessUnit>,
     eos: bool,
@@ -77,7 +77,32 @@ impl ProviderOutput {
             generation: config.config_generation,
             codec: config.codec,
             framing: config.framing,
-            packet_codec,
+            packet_codec: Some(packet_codec),
+            current: None,
+            last: None,
+            eos: false,
+            poisoned: false,
+        })
+    }
+
+    /// Caller must have authenticated this exact custom profile and configured
+    /// the destination unit queue with the same session selection.
+    pub fn new_negotiated(
+        session: u64,
+        queue_stream: u64,
+        config: &EncoderSessionConfig,
+    ) -> Result<Self, Status> {
+        if session == 0 || queue_stream == 0 || !encoder_session_config_valid(config) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(Self {
+            session,
+            queue_stream,
+            source: config.source_id,
+            generation: config.config_generation,
+            codec: config.codec,
+            framing: config.framing,
+            packet_codec: None,
             current: None,
             last: None,
             eos: false,
@@ -142,7 +167,7 @@ impl ProviderOutput {
     fn validate(
         &self,
         chunk: &EncoderOutputChunk,
-    ) -> Result<(EncodedPacket, Option<AccessUnit>, bool), Status> {
+    ) -> Result<(u32, Option<AccessUnit>, bool), Status> {
         const FLAGS: u32 = ENCODER_CHUNK_ACCESS_UNIT_START
             | ENCODER_CHUNK_ACCESS_UNIT_END
             | ENCODER_CHUNK_KEYFRAME
@@ -167,18 +192,7 @@ impl ProviderOutput {
             {
                 return Err(STATUS_INVALID_ARGUMENT);
             }
-            return Ok((
-                EncodedPacket {
-                    codec: self.packet_codec,
-                    flags: FLAG_END_OF_STREAM,
-                    data: chunk.bytes.ptr,
-                    len: 0,
-                    timestamp_us: chunk.timestamp_us,
-                    sequence: chunk.access_unit_id,
-                },
-                None,
-                true,
-            ));
+            return Ok((FLAG_END_OF_STREAM, None, true));
         }
         if chunk.bytes.len == 0 || chunk.access_unit_id == 0 {
             return Err(STATUS_INVALID_ARGUMENT);
@@ -226,18 +240,7 @@ impl ProviderOutput {
         } else {
             0
         } | if end { FLAG_END_OF_ACCESS_UNIT } else { 0 };
-        Ok((
-            EncodedPacket {
-                codec: self.packet_codec,
-                flags,
-                data: chunk.bytes.ptr,
-                len: chunk.bytes.len,
-                timestamp_us: chunk.timestamp_us,
-                sequence: chunk.access_unit_id,
-            },
-            Some(unit),
-            end,
-        ))
+        Ok((flags, Some(unit), end))
     }
 }
 
@@ -258,7 +261,10 @@ unsafe extern "C" fn receive_chunk(
     // SAFETY: receive supplies this context for the duration of the synchronous callback.
     let call = unsafe { &mut *context.cast::<ReceiveCall<'_>>() };
     call.calls += 1;
-    if call.calls != 1 || chunk.is_null() {
+    if call.calls != 1
+        || chunk.is_null()
+        || !(chunk as usize).is_multiple_of(align_of::<EncoderOutputChunk>())
+    {
         call.callback_status = Some(STATUS_INVALID_ARGUMENT);
         return STATUS_INVALID_ARGUMENT;
     }
@@ -266,9 +272,21 @@ unsafe extern "C" fn receive_chunk(
     let chunk = unsafe { &*chunk };
     let status = match call.output.validate(chunk) {
         Err(status) => status,
-        Ok((packet, unit, end)) => {
+        Ok((flags, unit, end)) => {
             // SAFETY: the provider retains packet bytes throughout this callback.
-            let status = unsafe { call.queues.push(call.output.queue_stream, &packet) };
+            let status = if let Some(codec) = call.output.packet_codec {
+                let packet = EncodedPacket {
+                    codec,
+                    flags,
+                    data: chunk.bytes.ptr,
+                    len: chunk.bytes.len,
+                    timestamp_us: chunk.timestamp_us,
+                    sequence: chunk.access_unit_id,
+                };
+                unsafe { call.queues.push(call.output.queue_stream, &packet) }
+            } else {
+                unsafe { call.queues.push_unit_chunk(call.output.queue_stream, chunk) }
+            };
             if status == STATUS_OK {
                 if let Some(unit) = unit {
                     if end {

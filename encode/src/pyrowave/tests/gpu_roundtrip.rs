@@ -24,8 +24,13 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         std::env::var_os("AMATERASU_PYROWAVE_LIBRARY").expect("pinned native library"),
     );
     let decoder = library::Runtime::load_gpu(&path).unwrap();
+    let provider_path = if cfg!(feature = "pyrowave-embedded") {
+        PathBuf::from("/embedded/pyrowave")
+    } else {
+        path.clone()
+    };
     let state = Box::new(Mutex::new(Endpoint {
-        settings: json!({"enabled":true,"pyrowave":{"library_path":path,"gpu_only":true}}),
+        settings: json!({"enabled":true,"pyrowave":{"library_path":provider_path,"gpu_only":true}}),
         ..Default::default()
     }));
     let endpoint = HostApi {
@@ -55,17 +60,26 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             &*consumer.0.cast::<FrameResourceConsumerApi>(),
         )
     };
-    for (iteration, hdr, intensity) in [
-        (0, false, 0.25f32),
-        (1, true, 767.0f32 / 1023.0),
-        (2, true, 768.0f32 / 1023.0),
-        (3, true, 940.0f32 / 1023.0),
+    for (iteration, hdr, sdr10, intensity) in [
+        (0, false, false, 0.25f32),
+        (1, true, false, 767.0f32 / 1023.0),
+        (2, true, false, 768.0f32 / 1023.0),
+        (3, true, false, 940.0f32 / 1023.0),
+        (4, false, true, 767.0f32 / 1023.0),
+        (5, false, true, 768.0f32 / 1023.0),
     ] {
-        let fixture =
-            Image::create(decoder.gpu_context().unwrap(), 64, 48, hdr, intensity).unwrap();
+        let ten_bit = hdr || sdr10;
+        let mut fixture =
+            Image::create(decoder.gpu_context().unwrap(), 64, 48, ten_bit, intensity).unwrap();
+        if sdr10 {
+            fixture.capability.color = DMABUF_COLOR_SRGB;
+            fixture.frame.color = DMABUF_COLOR_SRGB;
+        }
         let mut config = configuration();
         config.profile = if hdr {
             session::Profile::Hdr10
+        } else if sdr10 {
+            session::Profile::Sdr10
         } else {
             session::Profile::Sdr8
         };
@@ -85,11 +99,52 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             json!({"action":"open","operation_id":format!("gpu-{iteration}"),"configuration":config}),
         );
         let id = open["session_id"].as_u64().unwrap();
-        let options = serde_json::to_vec(&config).unwrap();
+        let common = EncoderCommonConfigV1 {
+            version: 1,
+            size: size_of::<EncoderCommonConfigV1>() as u32,
+            flags: ENCODER_CONFIG_HAS_COLOR,
+            reserved: 0,
+            coded_width: config.width,
+            coded_height: config.height,
+            crop_x: 0,
+            crop_y: 0,
+            visible_width: config.width,
+            visible_height: config.height,
+            fps_numerator: config.fps,
+            fps_denominator: 1,
+            bitrate_bps: config.bitrate,
+            profile: 0,
+            level: 0,
+            chroma: ENCODER_CHROMA_420,
+            bit_depth: if ten_bit { 10 } else { 8 },
+            color: FrameColorMetadata {
+                transfer: if hdr {
+                    FRAME_TRANSFER_PQ
+                } else {
+                    FRAME_TRANSFER_SRGB
+                },
+                ..Default::default()
+            },
+            output_clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: config.clock_epoch,
+            },
+            output_clock_origin_us: config.clock_origin_us,
+        };
+        // SAFETY: the pointer-free common descriptor stays live through configure.
+        let options = unsafe {
+            std::slice::from_raw_parts(
+                (&common as *const EncoderCommonConfigV1).cast::<u8>(),
+                size_of::<EncoderCommonConfigV1>(),
+            )
+        };
         let native = EncoderSessionConfig {
             size: size_of::<EncoderSessionConfig>() as u32,
             mode: ENCODER_SESSION_SUBMITTED,
-            codec: native_id(if hdr {
+            codec: native_id(if ten_bit {
                 session::CODEC_HDR10
             } else {
                 session::CODEC
@@ -97,8 +152,12 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             framing: native_id(session::RECORDS),
             source_id: 6,
             config_generation: 1,
-            options_schema: native_id(session::OPTIONS),
-            options: BorrowedBytes::new(&options),
+            options_schema: EncoderFormatId {
+                namespace_id: ENCODER_FORMAT_NAMESPACE_STANDARD,
+                value: ENCODER_SCHEMA_COMMON_CONFIG,
+                schema: ENCODER_FORMAT_SCHEMA_V1,
+            },
+            options: BorrowedBytes::new(options),
         };
         // SAFETY: input options remain readable through configure.
         assert_eq!(
@@ -202,18 +261,50 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             retain,
             release,
         };
+        // Use the same already captured resource as the standard encoder path:
+        // its producer-relative clock is independent of the video timeline.
+        let captured_payload = DmaBufFrame {
+            timestamp_us: 37,
+            ..fixture.frame
+        };
+        let captured = CaptureResourceFrame {
+            timestamp_us: 37,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                ..Default::default()
+            },
+            resource: FrameDescriptor {
+                data: (&captured_payload as *const DmaBufFrame).cast(),
+                ..frame.resource
+            },
+            ..frame
+        };
+        let presented = unsafe {
+            amaterasu_module_sdk::encode::PresentedDmaBufResource::new(
+                &captured,
+                amaterasu_module_sdk::encode::HostVideoPresentation {
+                    timestamp_us: 1100,
+                    epoch_id: [7; 16],
+                    sequence: 1,
+                },
+            )
+        }
+        .unwrap();
         // SAFETY: immutable GPU source and acquire fences live through submission.
         assert_eq!(
             unsafe {
                 (input.submit)(
                     input.base.context,
                     id,
-                    &frame,
+                    presented.descriptor(),
                     FRAME_RESOURCE_SUBMIT_FORCE_IDR,
                 )
             },
             STATUS_OK
         );
+        drop(presented);
         drop(fixture);
         let mut received = Received {
             bytes: Vec::new(),
@@ -226,6 +317,47 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             receive(api, id, &mut received, library::MAX_FRAME_BYTES),
             STATUS_OK
         );
+        // The independently decoded bytes must also survive the selected wire framer.
+        use amaterasu_module_sdk::video_framing::FramingProvider;
+        let wire_unit = NegotiatedVideoUnit {
+            size: size_of::<NegotiatedVideoUnit>() as u32,
+            version: 1,
+            stream: id,
+            generation: 1,
+            offer_id: 3,
+            codec: native.codec,
+            framing: native.framing,
+            access_unit_id: 1,
+            submission_id: 1,
+            source_id: 6,
+            config_generation: 1,
+            timestamp_us: 100,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: [7; 16],
+            },
+            flags: VIDEO_UNIT_KEYFRAME,
+            reserved: 0,
+            data: BorrowedBytes::new(&received.bytes),
+        };
+        let limits = VideoFramingLimits {
+            size: size_of::<VideoFramingLimits>() as u32,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
+            packet_size: 1024,
+            max_datagrams: 64,
+            max_queue_bytes: 65536,
+            max_wire_bytes: 65536,
+            max_fec_blocks: 4,
+            max_fec_percentage: 255,
+            ..Default::default()
+        };
+        let framed = crate::pyrowave::framing::Framer
+            .plan("video", &wire_unit, &received.bytes, &limits)
+            .unwrap();
+        assert_eq!(framed.framed_bytes, received.bytes);
         let sequence_color = u32::from_le_bytes(received.bytes[12..16].try_into().unwrap());
         assert_eq!(
             sequence_color & (7 << 27),
@@ -235,7 +367,7 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         let decoded = decoder.decode(&received.bytes, 64, 48).unwrap();
         let expected = (intensity * 255.0).round() as u8;
         let decoded16 = decoder.decode16(&received.bytes, 64, 48).unwrap();
-        if hdr {
+        if ten_bit {
             let expected16 = ((intensity * 1023.0).round() / 1023.0 * 65535.0).round() as u16;
             assert!(
                 decoded16[..64 * 48]
@@ -304,7 +436,7 @@ fn every_renderable_advertised_modifier_preserves_pixels_and_hdr_color() {
             let mut encoder = runtime.encoder(64, 48).unwrap();
             // SAFETY: fixture owns immutable rendered storage and all fences
             // through the complete native GPU import and retirement operation.
-            let bytes = unsafe { encoder.encode_gpu(&fixture.frame, hdr, 200_000) }.unwrap();
+            let bytes = unsafe { encoder.encode_gpu(&fixture.frame, hdr, hdr, 200_000) }.unwrap();
             drop(fixture);
             drop(encoder);
             let decoded = runtime.decode(&bytes, 64, 48).unwrap();
@@ -328,7 +460,7 @@ fn every_renderable_advertised_modifier_preserves_pixels_and_hdr_color() {
         .expect("renderable HDR color fixture");
     let mut encoder = runtime.encoder(64, 48).unwrap();
     // SAFETY: colored fixture storage and its acquire fences stay borrowed.
-    let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, 200_000) }.unwrap();
+    let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, true, 200_000) }.unwrap();
     drop(fixture);
     drop(encoder);
     let decoded = runtime.decode16(&bytes, 64, 48).unwrap();
@@ -376,14 +508,14 @@ fn gpu_import_preserves_hdr_at_stream_dimensions_and_rejects_non_fence_acquires(
         malformed.planes[0].acquire_fence_fd = not_a_fence.as_raw_fd();
         // SAFETY: the source is an immutable GPU allocation. The invalid sync
         // file must be rejected by validation before it can be sampled.
-        assert!(unsafe { encoder.encode_gpu(&malformed, true, 1_000_000) }.is_err());
+        assert!(unsafe { encoder.encode_gpu(&malformed, true, true, 1_000_000) }.is_err());
         assert!(
             not_a_fence.metadata().is_ok(),
             "borrowed fence fd was consumed"
         );
         // SAFETY: fixture and every real acquire fence remain live until all
         // import reads have retired; only encoded test output is read back.
-        let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, 1_000_000) }.unwrap();
+        let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, true, 1_000_000) }.unwrap();
         drop(fixture);
         drop(encoder);
         let decoded = runtime.decode16(&bytes, width, height).unwrap();

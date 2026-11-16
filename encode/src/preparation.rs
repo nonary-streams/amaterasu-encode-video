@@ -156,6 +156,7 @@ impl Preparation {
         shared: &Shared,
         closing: &mut Closing,
         shutting_down: bool,
+        transport_extensions: Option<Value>,
     ) -> ModuleResult<()> {
         if self.active {
             match self.completed.try_recv() {
@@ -170,7 +171,13 @@ impl Preparation {
                 }
             }
         }
-        self.finish_completed(runtime, shared, closing, shutting_down)?;
+        self.finish_completed(
+            runtime,
+            shared,
+            closing,
+            shutting_down,
+            transport_extensions,
+        )?;
         self.start_queued(runtime, shared, shutting_down)
     }
 
@@ -180,6 +187,7 @@ impl Preparation {
         shared: &Shared,
         closing: &mut Closing,
         shutting_down: bool,
+        transport_extensions: Option<Value>,
     ) -> ModuleResult<()> {
         if let Some(mut completion) = self.ready.take() {
             let valid = match request_live(runtime, completion.waiter.id) {
@@ -190,7 +198,7 @@ impl Preparation {
                 }
             };
             let mut created = None;
-            let payload = match completion.result {
+            let mut payload = match completion.result {
                 Ok(Prepared::Opened {
                     parameters,
                     backend,
@@ -242,6 +250,11 @@ impl Preparation {
                 Ok(Prepared::Reply(payload)) => payload,
                 Err(code) => error_reply(code),
             };
+            if payload.get("encoders").is_some()
+                && let Some(extensions) = transport_extensions
+            {
+                payload["transport_extensions"] = extensions;
+            }
             if completion.elapsed_us >= 100_000 {
                 let _ = runtime.log(
                     LogLevel::Info,

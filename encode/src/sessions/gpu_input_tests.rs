@@ -1477,3 +1477,24 @@ fn cuda_resource_input_is_negotiated_retained_and_released_at_close() {
     harness.sessions.close("alice", id).unwrap();
     assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn broker_worker_defers_frame_release_until_the_native_owner_reenters() {
+    use std::sync::atomic::Ordering;
+    let (reader, _writer) = std::io::pipe().unwrap();
+    let reader: OwnedFd = reader.into();
+    let callbacks = Box::<LeaseCallbacks>::default();
+    let lease = leased_frame(frame(&reader, None, 1), &callbacks);
+    // SAFETY: callback state and descriptor remain live through the explicit owner drain.
+    assert_eq!(unsafe { retain_test_lease(lease.context) }, STATUS_OK);
+    let retained = RetainedFrame {
+        reference: RetainedReference::Lease(lease),
+        owner: std::thread::current().id(),
+    };
+    std::thread::spawn(move || drop(retained)).join().unwrap();
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 0);
+    release_completed_on_owner_thread();
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+    release_completed_on_owner_thread();
+    assert_eq!(callbacks.released.load(Ordering::Relaxed), 1);
+}

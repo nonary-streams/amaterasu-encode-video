@@ -1,9 +1,14 @@
 //! Bounded encoded packet ownership shared with native consumer bindings.
 use amaterasu_media::{
-    EncodedPacket, FLAG_END_OF_STREAM, MAX_PACKET_BYTES, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
-    PacketSink, TimedEncodedPacket, TimedPacketSink,
+    ENCODER_CHUNK_ACCESS_UNIT_END, ENCODER_CHUNK_ACCESS_UNIT_START, ENCODER_CHUNK_END_OF_STREAM,
+    ENCODER_CHUNK_KEYFRAME, EncodedPacket, EncoderFormatId, EncoderOutputChunk,
+    FLAG_END_OF_ACCESS_UNIT, FLAG_END_OF_STREAM, FLAG_KEYFRAME, FRAME_CLOCK_STREAM_RELATIVE,
+    FrameClockMetadata, MAX_PACKET_BYTES, MAX_VIDEO_ACCESS_UNIT_BYTES,
+    MAX_VIDEO_ACCESS_UNIT_FRAGMENTS, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, NegotiatedVideoUnit,
+    NegotiatedVideoUnitSink, PacketSink, TimedEncodedPacket, TimedPacketSink,
+    VIDEO_UNIT_END_OF_STREAM, VIDEO_UNIT_KEYFRAME, VIDEO_UNIT_VERSION,
 };
-use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::abi::{BorrowedBytes, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_module_sdk::diagnostics::LatencyMetric;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
@@ -22,7 +27,61 @@ struct Packet {
     processing_started_host_us: u64,
 }
 
+// Startup proof tracks only bounded metadata. Encoded bytes remain owned by
+// the normal queue; no capture frame or provider memory is retained here.
+#[derive(Default)]
+struct StartupFrame {
+    access_unit: Option<StartupAccessUnit>,
+    ready: bool,
+}
+
+struct StartupAccessUnit {
+    codec: u32,
+    timestamp_us: u64,
+    sequence: u64,
+    fragments: usize,
+    keyframe: bool,
+}
+
+impl StartupFrame {
+    fn accepts(&self, packet: &EncodedPacket) -> bool {
+        if self.ready {
+            return true;
+        }
+        match &self.access_unit {
+            None => true,
+            Some(unit) => {
+                packet.flags != FLAG_END_OF_STREAM
+                    && unit.codec == packet.codec
+                    && unit.timestamp_us == packet.timestamp_us
+                    && unit.sequence == packet.sequence
+                    && unit.fragments < 1024
+            }
+        }
+    }
+
+    fn observe(&mut self, packet: &EncodedPacket) {
+        if self.ready || packet.flags == FLAG_END_OF_STREAM {
+            return;
+        }
+        let unit = self.access_unit.get_or_insert(StartupAccessUnit {
+            codec: packet.codec,
+            timestamp_us: packet.timestamp_us,
+            sequence: packet.sequence,
+            fragments: 0,
+            keyframe: false,
+        });
+        unit.fragments += 1;
+        unit.keyframe |= packet.flags & FLAG_KEYFRAME != 0;
+        if packet.flags & FLAG_END_OF_ACCESS_UNIT != 0 {
+            self.ready = unit.keyframe;
+            self.access_unit = None;
+        }
+    }
+}
+
 struct Stream {
+    startup_frame: Option<StartupFrame>,
     queue_wait_us: LatencyMetric,
     queue_high_water: usize,
     consumer_retries: u64,
@@ -49,6 +108,38 @@ struct Stream {
     /// Freeze the first fragment's choice so later fragments remain consistent
     /// even if a concurrent bookkeeping miss invalidates provisional starts.
     frozen_processing_starts: BTreeMap<u64, u64>,
+    negotiated: Option<UnitQueue>,
+}
+
+/// Authenticated session composition fixes these values before output begins.
+#[derive(Clone, Copy)]
+pub struct UnitSelection {
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub clock_epoch: [u8; 16],
+}
+
+struct Unit {
+    access_unit_id: u64,
+    submission_id: u64,
+    timestamp_us: u64,
+    flags: u32,
+    bytes: Vec<u8>,
+    fragments: usize,
+}
+
+struct UnitQueue {
+    selection: UnitSelection,
+    current: Option<Unit>,
+    ready: VecDeque<Unit>,
+    bytes: usize,
+    eos_queued: bool,
+    eos_accepted: bool,
 }
 
 #[derive(Default)]
@@ -75,6 +166,7 @@ impl Queues {
         self.streams.insert(
             id,
             Stream {
+                startup_frame: None,
                 queue_wait_us: LatencyMetric::default(),
                 queue_high_water: 0,
                 consumer_retries: 0,
@@ -92,6 +184,7 @@ impl Queues {
                 eos_accepted: false,
                 processing_starts: BTreeMap::new(),
                 frozen_processing_starts: BTreeMap::new(),
+                negotiated: None,
             },
         );
     }
@@ -181,16 +274,251 @@ impl Queues {
         self.streams.remove(&id);
     }
 
-    pub fn eos_queued(&self, id: u64) -> bool {
+    pub fn configure_units(&mut self, id: u64, selection: UnitSelection) -> Result<(), Status> {
+        let stream = self.streams.get_mut(&id).ok_or(MEDIA_CLOSED)?;
+        let valid = |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
+        if selection.stream != id
+            || selection.generation == 0
+            || selection.offer_id == 0
+            || selection.source_id == 0
+            || selection.config_generation == 0
+            || selection.clock_epoch == [0; 16]
+            || !valid(selection.codec)
+            || !valid(selection.framing)
+            || stream.negotiated.is_some()
+            || !stream.packets.is_empty()
+            || stream.eos_queued
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        stream.negotiated = Some(UnitQueue {
+            selection,
+            current: None,
+            ready: VecDeque::new(),
+            bytes: 0,
+            eos_queued: false,
+            eos_accepted: false,
+        });
+        Ok(())
+    }
+
+    /// # Safety
+    /// The encoder owns initialized chunk bytes throughout this synchronous call.
+    pub unsafe fn push_unit_chunk(&mut self, id: u64, chunk: &EncoderOutputChunk) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .and_then(|s| s.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        if queue.eos_queued {
+            return MEDIA_CLOSED;
+        }
+        let selection = queue.selection;
+        let same = |a: EncoderFormatId, b: EncoderFormatId| {
+            a.namespace_id == b.namespace_id && a.value == b.value && a.schema == b.schema
+        };
+        let flags = chunk.flags;
+        let eos = flags == ENCODER_CHUNK_END_OF_STREAM;
+        let start = flags & ENCODER_CHUNK_ACCESS_UNIT_START != 0;
+        let end = flags & ENCODER_CHUNK_ACCESS_UNIT_END != 0;
+        let picture = flags & ENCODER_CHUNK_KEYFRAME != 0;
+        if chunk.size < std::mem::size_of::<EncoderOutputChunk>() as u32
+            || chunk.source_id != selection.source_id
+            || chunk.config_generation != selection.config_generation
+            || !same(chunk.codec, selection.codec)
+            || !same(chunk.framing, selection.framing)
+            || flags
+                & !(ENCODER_CHUNK_ACCESS_UNIT_START
+                    | ENCODER_CHUNK_ACCESS_UNIT_END
+                    | ENCODER_CHUNK_KEYFRAME
+                    | ENCODER_CHUNK_END_OF_STREAM)
+                != 0
+            || (flags & ENCODER_CHUNK_END_OF_STREAM != 0 && !eos)
+            || (eos && (chunk.bytes.len != 0 || queue.current.is_some()))
+            || (!eos
+                && (chunk.access_unit_id == 0
+                    || chunk.bytes.len == 0
+                    || chunk.bytes.len > MAX_PACKET_BYTES
+                    || chunk.bytes.ptr.is_null()))
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        if queue
+            .current
+            .as_ref()
+            .map_or(0, |unit| unit.bytes.len())
+            .checked_add(chunk.bytes.len)
+            .is_none_or(|n| n > MAX_VIDEO_ACCESS_UNIT_BYTES)
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        if queue.ready.len() >= 4
+            || queue
+                .bytes
+                .checked_add(chunk.bytes.len)
+                .is_none_or(|n| n > MAX_VIDEO_ACCESS_UNIT_BYTES)
+        {
+            return MEDIA_BUSY;
+        }
+        match &queue.current {
+            Some(unit)
+                if eos
+                    || start
+                    || unit.access_unit_id != chunk.access_unit_id
+                    || unit.submission_id != chunk.submission_id
+                    || unit.timestamp_us != chunk.timestamp_us
+                    || (unit.flags == VIDEO_UNIT_KEYFRAME) != picture
+                    || unit.fragments >= MAX_VIDEO_ACCESS_UNIT_FRAGMENTS =>
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            None if !eos && !start => return STATUS_INVALID_ARGUMENT,
+            _ => {}
+        }
+        let bytes = if chunk.bytes.len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: caller guarantees this chunk allocation remains live.
+            unsafe { std::slice::from_raw_parts(chunk.bytes.ptr, chunk.bytes.len) }
+        };
+        if eos {
+            queue.eos_queued = true;
+            queue.ready.push_back(Unit {
+                access_unit_id: chunk.access_unit_id,
+                submission_id: chunk.submission_id,
+                timestamp_us: chunk.timestamp_us,
+                flags: VIDEO_UNIT_END_OF_STREAM,
+                bytes: Vec::new(),
+                fragments: 0,
+            });
+            return STATUS_OK;
+        }
+        let unit = queue.current.get_or_insert_with(|| Unit {
+            access_unit_id: chunk.access_unit_id,
+            submission_id: chunk.submission_id,
+            timestamp_us: chunk.timestamp_us,
+            flags: if picture { VIDEO_UNIT_KEYFRAME } else { 0 },
+            bytes: Vec::new(),
+            fragments: 0,
+        });
+        unit.bytes.extend_from_slice(bytes);
+        unit.fragments += 1;
+        queue.bytes += bytes.len();
+        if end {
+            queue
+                .ready
+                .push_back(queue.current.take().expect("unit initialized"));
+            if let Some(trace) = &self.frame_trace {
+                trace.packet_queued(id, chunk.access_unit_id);
+            }
+        }
+        STATUS_OK
+    }
+
+    /// # Safety
+    /// Sink must obey the synchronous borrowed-unit contract and not reenter.
+    pub unsafe fn receive_unit(
+        &mut self,
+        owner: &str,
+        id: u64,
+        sink: NegotiatedVideoUnitSink,
+    ) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .filter(|s| s.owner == owner)
+            .and_then(|s| s.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        let Some(unit) = queue.ready.front() else {
+            return if queue.eos_accepted {
+                MEDIA_CLOSED
+            } else {
+                MEDIA_PENDING
+            };
+        };
+        let s = queue.selection;
+        let header = NegotiatedVideoUnit {
+            size: std::mem::size_of::<NegotiatedVideoUnit>() as u32,
+            version: VIDEO_UNIT_VERSION,
+            stream: s.stream,
+            generation: s.generation,
+            offer_id: s.offer_id,
+            codec: s.codec,
+            framing: s.framing,
+            access_unit_id: unit.access_unit_id,
+            submission_id: unit.submission_id,
+            source_id: s.source_id,
+            config_generation: s.config_generation,
+            timestamp_us: unit.timestamp_us,
+            clock: FrameClockMetadata {
+                size: std::mem::size_of::<FrameClockMetadata>() as u32,
+                version: 1,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: s.clock_epoch,
+            },
+            flags: unit.flags,
+            reserved: 0,
+            data: BorrowedBytes::new(&unit.bytes),
+        };
+        // SAFETY: queue retains header and bytes during this synchronous callback.
+        let status = unsafe { (sink.write)(sink.context, &header) };
+        if status == STATUS_OK {
+            queue.eos_accepted = unit.flags == VIDEO_UNIT_END_OF_STREAM;
+            queue.bytes -= unit.bytes.len();
+            queue.ready.pop_front();
+        }
+        status
+    }
+
+    /// Opt in only when the encoder promised explicit AU boundaries. Legacy
+    /// packet consumers keep their existing fragment and EOS semantics.
+    pub fn enable_startup_readiness(&mut self, id: u64) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.startup_frame = Some(StartupFrame::default());
+        }
+    }
+
+    /// Local encoder output proof, never client receipt or presentation.
+    pub fn startup_frame_ready(&self, owner: &str, id: u64) -> Result<bool, Status> {
         self.streams
             .get(&id)
-            .is_some_and(|stream| stream.eos_queued)
+            .filter(|stream| stream.owner == owner)
+            .map(|stream| {
+                stream
+                    .startup_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.ready)
+                    || stream.negotiated.as_ref().is_some_and(|queue| {
+                        queue
+                            .ready
+                            .iter()
+                            .any(|unit| unit.flags & VIDEO_UNIT_KEYFRAME != 0)
+                    })
+            })
+            .ok_or(MEDIA_CLOSED)
+    }
+
+    pub fn eos_queued(&self, id: u64) -> bool {
+        self.streams.get(&id).is_some_and(|stream| {
+            stream
+                .negotiated
+                .as_ref()
+                .map_or(stream.eos_queued, |q| q.eos_queued)
+        })
     }
 
     pub fn eos_accepted(&self, id: u64) -> bool {
-        self.streams
-            .get(&id)
-            .is_some_and(|stream| stream.eos_accepted)
+        self.streams.get(&id).is_some_and(|stream| {
+            stream
+                .negotiated
+                .as_ref()
+                .map_or(stream.eos_accepted, |q| q.eos_accepted)
+        })
     }
 
     /// Record provisionally before a pump; output can arrive in the same pump.
@@ -256,6 +584,9 @@ impl Queues {
         let Some(stream) = self.streams.get_mut(&id) else {
             return MEDIA_CLOSED;
         };
+        if stream.negotiated.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         if stream.eos_queued {
             return MEDIA_CLOSED;
         }
@@ -269,12 +600,36 @@ impl Queues {
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        if stream.packets.len() >= 4 || stream.bytes.saturating_add(packet.len) > MAX_PACKET_BYTES {
+        if stream
+            .startup_frame
+            .as_ref()
+            .is_some_and(|frame| !frame.accepts(packet))
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // Before PLAY there is no consumer to free fragment slots. Coalesce
+        // only a contiguous unfinished startup AU into its existing queue tail
+        // when needed, retaining the same four slots and total byte bound.
+        let merge_startup_tail = stream.packets.len() >= 4
+            && stream
+                .startup_frame
+                .as_ref()
+                .is_some_and(|frame| !frame.ready)
+            && packet.flags != FLAG_END_OF_STREAM
+            && stream.packets.back().is_some_and(|tail| {
+                tail.codec == packet.codec
+                    && tail.sequence == packet.sequence
+                    && tail.timestamp_us == packet.timestamp_us
+                    && tail.flags & (FLAG_END_OF_ACCESS_UNIT | FLAG_END_OF_STREAM) == 0
+            });
+        if (stream.packets.len() >= 4 && !merge_startup_tail)
+            || stream.bytes.saturating_add(packet.len) > MAX_PACKET_BYTES
+        {
             return MEDIA_BUSY;
         }
         // SAFETY: provider retains packet for the whole sink invocation.
         let bytes = match unsafe { packet.bytes() } {
-            Ok(bytes) => bytes.to_vec(),
+            Ok(bytes) => bytes,
             Err(status) => return status,
         };
         stream.eos_queued = packet.flags == FLAG_END_OF_STREAM;
@@ -305,15 +660,24 @@ impl Queues {
                 }
                 value
             };
-        stream.packets.push_back(Packet {
-            queued_at: Instant::now(),
-            bytes,
-            codec: packet.codec,
-            flags: packet.flags,
-            timestamp_us: packet.timestamp_us,
-            sequence: packet.sequence,
-            processing_started_host_us,
-        });
+        if let Some(frame) = &mut stream.startup_frame {
+            frame.observe(packet);
+        }
+        if merge_startup_tail {
+            let tail = stream.packets.back_mut().expect("verified startup tail");
+            tail.bytes.extend_from_slice(bytes);
+            tail.flags |= packet.flags;
+        } else {
+            stream.packets.push_back(Packet {
+                queued_at: Instant::now(),
+                bytes: bytes.to_vec(),
+                codec: packet.codec,
+                flags: packet.flags,
+                timestamp_us: packet.timestamp_us,
+                sequence: packet.sequence,
+                processing_started_host_us,
+            });
+        }
         stream.queue_high_water = stream.queue_high_water.max(stream.packets.len());
         STATUS_OK
     }
@@ -341,6 +705,9 @@ impl Queues {
         else {
             return MEDIA_CLOSED;
         };
+        if stream.negotiated.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         let Some(packet) = stream.packets.front() else {
             return if stream.eos_accepted {
                 MEDIA_CLOSED
@@ -432,6 +799,162 @@ mod tests {
     use super::*;
     use amaterasu_media::CODEC_H264;
     use std::ffi::c_void;
+
+    #[test]
+    fn startup_frame_requires_a_complete_keyframe_and_survives_fragment_pressure() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 0);
+        queues.enable_startup_readiness(1);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+        assert_eq!(queues.startup_frame_ready("bob", 1), Err(MEDIA_CLOSED));
+        let byte = [3];
+        for fragment in 0..9 {
+            let packet = EncodedPacket {
+                codec: CODEC_H264,
+                flags: if fragment == 0 {
+                    FLAG_KEYFRAME
+                } else if fragment == 8 {
+                    FLAG_END_OF_ACCESS_UNIT
+                } else {
+                    0
+                },
+                data: byte.as_ptr(),
+                len: 1,
+                timestamp_us: 7,
+                sequence: 5,
+            };
+            // SAFETY: byte remains live through each synchronous copy.
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+            assert_eq!(queues.startup_frame_ready("alice", 1), Ok(fragment == 8));
+            assert!(queues.streams[&1].packets.len() <= 4);
+        }
+        assert_eq!(queues.streams[&1].bytes, 9);
+        assert_eq!(queues.streams[&1].packets.len(), 4);
+        assert_eq!(
+            queues.streams[&1].packets.back().unwrap().flags,
+            FLAG_END_OF_ACCESS_UNIT
+        );
+        unsafe extern "C" fn accept_startup(_: *mut c_void, _: *const EncodedPacket) -> Status {
+            STATUS_OK
+        }
+        let sink = PacketSink {
+            context: std::ptr::null_mut(),
+            write: accept_startup,
+        };
+        for _ in 0..4 {
+            // SAFETY: accept only borrows the queue-owned packet until return.
+            assert_eq!(unsafe { queues.receive("alice", 1, sink) }, STATUS_OK);
+        }
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(true));
+        queues.close(1);
+        queues.open(1, "alice", 0);
+        queues.enable_startup_readiness(1);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+    }
+
+    #[test]
+    fn startup_frame_rejects_broken_boundaries_and_never_accepts_eos_as_readiness() {
+        let byte = [1];
+        let first = EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_KEYFRAME,
+            data: byte.as_ptr(),
+            len: 1,
+            timestamp_us: 8,
+            sequence: 4,
+        };
+        for changed in [
+            EncodedPacket {
+                sequence: 5,
+                flags: FLAG_END_OF_ACCESS_UNIT,
+                ..first
+            },
+            EncodedPacket {
+                timestamp_us: 9,
+                flags: FLAG_END_OF_ACCESS_UNIT,
+                ..first
+            },
+            EncodedPacket {
+                codec: amaterasu_media::CODEC_HEVC,
+                flags: FLAG_END_OF_ACCESS_UNIT,
+                ..first
+            },
+            EncodedPacket {
+                flags: FLAG_END_OF_STREAM,
+                data: std::ptr::null(),
+                len: 0,
+                ..first
+            },
+        ] {
+            let mut queues = Queues::default();
+            queues.open(1, "alice", 0);
+            queues.enable_startup_readiness(1);
+            // SAFETY: byte is a live immutable allocation for both packets.
+            assert_eq!(unsafe { queues.push(1, &first) }, STATUS_OK);
+            assert_eq!(unsafe { queues.push(1, &changed) }, STATUS_INVALID_ARGUMENT);
+            assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+            assert_eq!(queues.streams[&1].bytes, 1);
+        }
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 0);
+        queues.enable_startup_readiness(1);
+        let non_keyframe = EncodedPacket {
+            flags: FLAG_END_OF_ACCESS_UNIT,
+            ..first
+        };
+        assert_eq!(unsafe { queues.push(1, &non_keyframe) }, STATUS_OK);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+        let eos = EncodedPacket {
+            flags: FLAG_END_OF_STREAM,
+            data: std::ptr::null(),
+            len: 0,
+            ..first
+        };
+        assert_eq!(unsafe { queues.push(1, &eos) }, STATUS_OK);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+    }
+
+    #[test]
+    fn startup_fragment_aggregation_keeps_byte_and_fragment_limits() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 0);
+        queues.enable_startup_readiness(1);
+        let byte = [1];
+        let packet = EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_KEYFRAME,
+            data: byte.as_ptr(),
+            len: 1,
+            timestamp_us: 8,
+            sequence: 4,
+        };
+        for _ in 0..1024 {
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        }
+        assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_INVALID_ARGUMENT);
+        assert_eq!(queues.streams[&1].packets.len(), 4);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+        let bytes = vec![1; MAX_PACKET_BYTES - 3];
+        queues.close(1);
+        queues.open(1, "alice", 0);
+        queues.enable_startup_readiness(1);
+        let large = EncodedPacket {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            ..packet
+        };
+        assert_eq!(unsafe { queues.push(1, &large) }, STATUS_OK);
+        for _ in 0..3 {
+            assert_eq!(unsafe { queues.push(1, &packet) }, STATUS_OK);
+        }
+        let last = EncodedPacket {
+            flags: FLAG_END_OF_ACCESS_UNIT,
+            ..packet
+        };
+        assert_eq!(unsafe { queues.push(1, &last) }, MEDIA_BUSY);
+        assert_eq!(queues.streams[&1].bytes, MAX_PACKET_BYTES);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+    }
 
     #[derive(Default)]
     struct TimedReceipt {
@@ -620,6 +1143,54 @@ mod tests {
         assert_eq!(unsafe { (*packet).bytes() }.unwrap(), &[1, 2, 3]);
         STATUS_OK
     }
+    #[test]
+    fn submitted_startup_requires_a_complete_keyframe_from_the_owned_queue() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 1000);
+        let format = EncoderFormatId {
+            namespace_id: 1,
+            value: 2,
+            schema: 3,
+        };
+        queues
+            .configure_units(
+                1,
+                UnitSelection {
+                    stream: 1,
+                    generation: 1,
+                    offer_id: 1,
+                    source_id: 1,
+                    config_generation: 1,
+                    codec: format,
+                    framing: format,
+                    clock_epoch: [1; 16],
+                },
+            )
+            .unwrap();
+        queues.enable_startup_readiness(1);
+        let bytes = [42];
+        let mut chunk = EncoderOutputChunk {
+            session_id: 1,
+            size: std::mem::size_of::<EncoderOutputChunk>() as u32,
+            codec: format,
+            framing: format,
+            source_id: 1,
+            config_generation: 1,
+            access_unit_id: 1,
+            submission_id: 1,
+            timestamp_us: 1,
+            flags: ENCODER_CHUNK_ACCESS_UNIT_START | ENCODER_CHUNK_KEYFRAME,
+            bytes: BorrowedBytes::new(&bytes),
+        };
+        // SAFETY: the descriptor and bytes remain live throughout the synchronous copies.
+        assert_eq!(unsafe { queues.push_unit_chunk(1, &chunk) }, STATUS_OK);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(false));
+        chunk.flags = ENCODER_CHUNK_ACCESS_UNIT_END | ENCODER_CHUNK_KEYFRAME;
+        assert_eq!(unsafe { queues.push_unit_chunk(1, &chunk) }, STATUS_OK);
+        assert_eq!(queues.startup_frame_ready("alice", 1), Ok(true));
+        assert_eq!(queues.startup_frame_ready("bob", 1), Err(MEDIA_CLOSED));
+    }
+
     #[test]
     fn rejects_timestamp_that_overflows_the_negotiated_host_epoch() {
         let mut queues = Queues::default();

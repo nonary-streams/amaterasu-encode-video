@@ -54,6 +54,8 @@ struct Api {
     packetize:
         unsafe extern "C" fn(Handle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> i32,
     _library: Library,
+    #[cfg(all(target_os = "linux", feature = "pyrowave-embedded"))]
+    _embedded_file: Option<std::fs::File>,
 }
 
 pub(super) struct Runtime {
@@ -75,6 +77,20 @@ impl Runtime {
         }
         // SAFETY: trusted startup selects the native library. Its code stays
         // loaded through all function pointers, device and encoder destructors.
+        #[cfg(all(target_os = "linux", feature = "pyrowave-embedded"))]
+        let embedded = if path == Path::new("/embedded/pyrowave") {
+            Some(embedded_library()?)
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "linux", feature = "pyrowave-embedded"))]
+        let path = embedded.as_ref().map_or_else(
+            || path.to_path_buf(),
+            |file| {
+                use std::os::fd::AsRawFd;
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            },
+        );
         let library = unsafe { Library::new(path) }.map_err(|_| "pyrowave_library_unavailable")?;
         unsafe {
             let version: libloading::Symbol<unsafe extern "C" fn(*mut u32, *mut u32, *mut u32)> =
@@ -103,6 +119,8 @@ impl Runtime {
                 raw_bitstream: symbol!("pyrowave_encoder_get_mapped_raw_bitstream"),
                 packetize: symbol!("pyrowave_encoder_packetize"),
                 _library: library,
+                #[cfg(all(target_os = "linux", feature = "pyrowave-embedded"))]
+                _embedded_file: embedded,
             };
             let mut device = ptr::null_mut();
             if (api.create_device)(&mut device) != 0 || device.is_null() {
@@ -240,6 +258,7 @@ impl Encoder {
         &mut self,
         frame: &amaterasu_media::DmaBufFrame,
         hdr: bool,
+        ten_bit: bool,
         budget: usize,
     ) -> Result<Vec<u8>, &'static str> {
         let _device = self
@@ -254,7 +273,7 @@ impl Encoder {
             .ok_or("pyrowave_gpu_unavailable")?;
         // SAFETY: caller keeps the immutable capture presentation borrowed until
         // the import's synchronous retirement, including every failure path.
-        let imported = unsafe { context.import(frame, hdr)? };
+        let imported = unsafe { context.import_precision(frame, hdr, ten_bit)? };
         unsafe { imported.encode(self.handle, budget)? };
         self.packetize(hdr)
     }
@@ -581,6 +600,43 @@ impl Runtime {
             Err("GPU decoder readback failed")
         }
     }
+}
+
+/// Load only the native dependency built into the signed component. Sealing
+/// prevents another descriptor from changing its bytes after verification.
+#[cfg(all(target_os = "linux", feature = "pyrowave-embedded"))]
+fn embedded_library() -> Result<std::fs::File, &'static str> {
+    use std::{
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    const BYTES: &[u8] = include_bytes!(env!("AMATERASU_PYROWAVE_EMBED_LIBRARY"));
+    // SAFETY: the name is NUL terminated; ownership of the new descriptor is
+    // transferred exactly once to File, retained until after dlclose.
+    let descriptor = unsafe {
+        libc::memfd_create(
+            c"amaterasu-pyrowave".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if descriptor < 0 {
+        return Err("pyrowave_embedded_file_failed");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(BYTES)
+        .map_err(|_| "pyrowave_embedded_write_failed")?;
+    // SAFETY: this operation applies immutable seals to our owned descriptor.
+    if unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+        )
+    } < 0
+    {
+        return Err("pyrowave_embedded_seal_failed");
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
