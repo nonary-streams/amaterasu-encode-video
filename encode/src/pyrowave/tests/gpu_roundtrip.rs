@@ -261,18 +261,50 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             retain,
             release,
         };
+        // Use the same already captured resource as the standard encoder path:
+        // its producer-relative clock is independent of the video timeline.
+        let captured_payload = DmaBufFrame {
+            timestamp_us: 37,
+            ..fixture.frame
+        };
+        let captured = CaptureResourceFrame {
+            timestamp_us: 37,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: size_of::<FrameClockMetadata>() as u32,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                ..Default::default()
+            },
+            resource: FrameDescriptor {
+                data: (&captured_payload as *const DmaBufFrame).cast(),
+                ..frame.resource
+            },
+            ..frame
+        };
+        let presented = unsafe {
+            amaterasu_module_sdk::encode::PresentedDmaBufResource::new(
+                &captured,
+                amaterasu_module_sdk::encode::HostVideoPresentation {
+                    timestamp_us: 1100,
+                    epoch_id: [7; 16],
+                    sequence: 1,
+                },
+            )
+        }
+        .unwrap();
         // SAFETY: immutable GPU source and acquire fences live through submission.
         assert_eq!(
             unsafe {
                 (input.submit)(
                     input.base.context,
                     id,
-                    &frame,
+                    presented.descriptor(),
                     FRAME_RESOURCE_SUBMIT_FORCE_IDR,
                 )
             },
             STATUS_OK
         );
+        drop(presented);
         drop(fixture);
         let mut received = Received {
             bytes: Vec::new(),

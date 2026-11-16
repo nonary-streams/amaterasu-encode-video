@@ -1529,7 +1529,9 @@ impl Plane for NativePlane {
 
 impl NativePlane {
     fn deliver_generic(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
-        if !input.capture_due {
+        if !input.capture_due
+            && !(input.configuration.extension_profile.is_some() && input.repeat_due)
+        {
             return Ok(Progress::default());
         }
         if self.processor.is_some()
@@ -1555,7 +1557,7 @@ impl NativePlane {
         // SAFETY: these distinct signed bindings are checked for their expected tables.
         let consumer = unsafe { consumer.table::<FrameResourceConsumerApi>() }
             .map_err(|_| "resource_consumer_interface")?;
-        let (_, epoch) = self
+        let (origin, epoch) = self
             .stream_clocks
             .get(&input.video)
             .copied()
@@ -1579,15 +1581,23 @@ impl NativePlane {
         };
         // SAFETY: both session-owned bindings remain live through cancellation.
         let status = match unsafe {
-            bridge.forward(
-                capture,
-                consumer,
-                if input.force_idr {
-                    FRAME_RESOURCE_SUBMIT_FORCE_IDR
-                } else {
-                    0
-                },
-            )
+            let flags = if input.force_idr {
+                FRAME_RESOURCE_SUBMIT_FORCE_IDR
+            } else {
+                0
+            };
+            if input.configuration.extension_profile.is_some() {
+                let presentation = amaterasu_module_sdk::encode::HostVideoPresentation {
+                    timestamp_us: origin
+                        .checked_add(input.timestamp_us)
+                        .ok_or("resource_clock_overflow")?,
+                    epoch_id: epoch,
+                    sequence: input.sequence,
+                };
+                bridge.forward_presented(capture, consumer, flags, presentation)
+            } else {
+                bridge.forward(capture, consumer, flags)
+            }
         } {
             Ok(status) => status,
             Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING))

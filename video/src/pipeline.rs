@@ -2206,7 +2206,7 @@ fn request(stream: &Stream) -> (&str, Value) {
             if let Some(format) = stream.capture_source_format {
                 request["source_format"] = json!(format);
             }
-            if stream.generic_input {
+            if stream.generic_input && !stream.submitted_extension {
                 request["resource_capture_clock"] = resource_capture_clock(stream);
                 request["resource_callback_contract"] = json!("cross_service_safe");
             }
@@ -2666,6 +2666,7 @@ fn apply_result(
                 return false;
             }
             if stream.generic_input
+                && !stream.submitted_extension
                 && (payload.get("resource_capture_clock") != Some(&resource_capture_clock(stream))
                     || payload
                         .get("resource_callback_contract")

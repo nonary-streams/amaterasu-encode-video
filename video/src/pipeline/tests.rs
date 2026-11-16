@@ -6768,6 +6768,9 @@ fn submitted_extension_keeps_capture_and_closes_it_after_encoder_retirement() {
         wire_attributes: Vec::new(),
     };
     let (mut pipeline, mut runtime, mut plane) = setup();
+    // Exercise a strict existing capture provider which never negotiated a
+    // replacement clock or callback agreement through its Open control schema.
+    runtime.omit_capture_contract = true;
     pipeline.unit_service_enabled = true;
     pipeline.source_encoders.insert(
         "fixture".into(),
@@ -6808,6 +6811,19 @@ fn submitted_extension_keeps_capture_and_closes_it_after_encoder_retirement() {
     tick(&mut pipeline, &mut runtime, &mut plane, 12);
     assert_eq!(pipeline.streams[&1].stage, Stage::Running);
     assert!(runtime.commands.iter().any(|command| matches!(command,Command::Request{service,payload,..} if service==CAPTURE && payload["action"]=="open")));
+    assert!(
+        runtime
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == CAPTURE && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .all(|payload| payload.get("resource_capture_clock").is_none()
+                && payload.get("resource_callback_contract").is_none())
+    );
     assert_eq!(plane.source_starts, [(1, 51, 42)]);
     assert!(plane.frame_paths.contains(&FramePath::Generic));
     pipeline.handle(
