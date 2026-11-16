@@ -172,6 +172,12 @@ impl Encoder {
         identity: &EncoderIdentity,
         configuration: &Configuration,
     ) -> Result<Self, &'static str> {
+        if configuration.video_stream_format.chroma_sampling
+            == amaterasu_module_sdk::ChromaSampling::Yuv444
+            && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.")
+        {
+            return Err("chroma_444_encoder_unsupported");
+        }
         if configuration.is_ten_bit()
             && !identity.clsid.starts_with("amaterasu.hardware.nvenc-cuda.")
         {

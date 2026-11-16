@@ -784,13 +784,13 @@ impl Configuration {
                         == (self.video_stream_format.dynamic_range
                             == amaterasu_module_sdk::DynamicRange::Hdr))
         }) && self.video_stream_format.validate().is_ok()
-            && (16..=3840).contains(&self.width)
-            && (16..=2160).contains(&self.height)
+            && (16..=8192).contains(&self.width)
+            && (16..=8192).contains(&self.height)
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
-            && (1..=120).contains(&self.fps)
-            && self.valid_fps_milli(120)
-            && (100_000..=100_000_000).contains(&self.bitrate)
+            && (1..=1000).contains(&self.fps)
+            && self.valid_fps_milli(1000)
+            && (100_000..=1_000_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 16
             && self.slices_per_frame >= 1
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
@@ -1226,6 +1226,7 @@ mod tests {
                 configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
                     codec,
                     bit_depth: 10,
+                    chroma_sampling: Default::default(),
                     dynamic_range,
                 };
                 configuration.normalize_codec().unwrap();

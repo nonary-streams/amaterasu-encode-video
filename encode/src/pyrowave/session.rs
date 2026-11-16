@@ -75,8 +75,8 @@ pub struct Configuration {
 }
 impl Configuration {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !(16..=3840).contains(&self.width)
-            || !(16..=2160).contains(&self.height)
+        if !(16..=8192).contains(&self.width)
+            || !(16..=8192).contains(&self.height)
             || !self.width.is_multiple_of(2)
             || !self.height.is_multiple_of(2)
             || !(1..=240).contains(&self.fps)

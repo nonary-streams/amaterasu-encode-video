@@ -38,7 +38,7 @@ static struct amaterasu_ffmpeg_nvenc *amaterasu_nvenc_open(
     if (error_code != NULL)
         *error_code = 1;
     if (width < 16 || height < 16 || (width & 1) != 0 || (height & 1) != 0 ||
-        fps < 1 || fps > 120 || bitrate < 100000 || bitrate > 100000000 ||
+        fps < 1 || fps > 1000 || bitrate < 100000 || bitrate > 1000000000 ||
         max_reference_frames < 0 || max_reference_frames > 1 || (full_range != 0 && full_range != 1))
         return NULL;
 

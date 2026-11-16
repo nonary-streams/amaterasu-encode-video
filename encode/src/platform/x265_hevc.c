@@ -141,9 +141,9 @@ void *amaterasu_x265_hevc_open(int width, int height, int fps, int bitrate,
                                int max_reference_frames, int full_range, int *error) {
     if (error)
         *error = 1;
-    if (width < 16 || width > 3840 || height < 16 || height > 2160 ||
-        (width & 1) || (height & 1) || fps < 1 || fps > 120 || bitrate < 100000 ||
-        bitrate > 100000000 || max_reference_frames < 0 || max_reference_frames > 1 ||
+    if (width < 16 || width > 8192 || height < 16 || height > 8192 ||
+        (width & 1) || (height & 1) || fps < 1 || fps > 1000 || bitrate < 100000 ||
+        bitrate > 1000000000 || max_reference_frames < 0 || max_reference_frames > 1 ||
         full_range < 0 || full_range > 1)
         return NULL;
 

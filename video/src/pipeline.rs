@@ -137,6 +137,7 @@ struct Stream {
     capture_output: String,
     encoder: Option<EncoderIdentity>,
     fallback_encoder: Option<EncoderIdentity>,
+    encoder_fallback_reason: Option<String>,
     restart_pending: bool,
     capture_swap_target: Option<(CaptureProvider, String)>,
     capture_notifications: bool,
@@ -480,6 +481,8 @@ impl Stream {
             "requested_encoder": self.requested_encoder,
             "encoder_probe_attempts": self.encoder_probe_attempt,
             "encoder_probe_reason": self.encoder_probe_reason,
+            "encoder_fallback_reason": self.encoder_fallback_reason,
+            "capture_fallback_reason": self.fallback_error.filter(|_| self.fallback_attempted),
             "packet_boundaries": self.packet_boundaries,
             "supports_packet_boundaries": true,
             "output": self.output,
@@ -1107,6 +1110,7 @@ impl Pipeline {
                 encoder_probe_reason: None,
                 encoder,
                 fallback_encoder: None,
+                encoder_fallback_reason: None,
                 restart_pending: false,
                 capture_swap_target: None,
                 capture_notifications: false,
@@ -2667,6 +2671,7 @@ fn apply_result(
                 stream.cleanup("encoder_restart_unavailable");
                 return false;
             };
+            stream.encoder_fallback_reason = Some("encoder_restart".into());
             stream.encoder = Some(fallback);
             stream.encoder_attempt = 1;
             stream.retries = 0;
@@ -3031,6 +3036,8 @@ fn x264_fallback_for_auto(
 ) -> Option<EncoderIdentity> {
     // x264 encodes only H.264; HEVC and AV1 never gain a software fallback here.
     if index.is_some()
+        || configuration.video_stream_format.chroma_sampling
+            != amaterasu_module_sdk::ChromaSampling::Yuv420
         || configuration.codec != VideoCodec::H264
         || !(matches!(
             selected.clsid.as_str(),
@@ -3103,6 +3110,7 @@ fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
     let Some(fallback) = stream.fallback_encoder.take() else {
         return false;
     };
+    stream.encoder_fallback_reason = Some(reason.unwrap_or("encoder_open_failed").into());
     stream.encoder = Some(fallback);
     stream.encoder_attempt = 1;
     stream.retries = 0;
@@ -3113,6 +3121,12 @@ fn encoder_supports_configuration(
     identity: &EncoderIdentity,
     configuration: &Configuration,
 ) -> bool {
+    if configuration.video_stream_format.chroma_sampling
+        == amaterasu_module_sdk::ChromaSampling::Yuv444
+        && !identity.clsid.starts_with(NVENC_CUDA_ENCODER_PREFIX)
+    {
+        return false;
+    }
     match identity.clsid.as_str() {
         SOFTWARE_HEVC_ENCODER_ID => {
             configuration.codec == VideoCodec::Hevc
@@ -3225,11 +3239,20 @@ fn resolve_encoder_selection_for(
             return Err("invalid_encoder_enumeration");
         }
         let accepts_dmabuf = encoder_accepts_dmabuf(entry);
-        if is_hardware {
+        let requested_444 = configuration.video_stream_format.chroma_sampling
+            == amaterasu_module_sdk::ChromaSampling::Yuv444;
+        let capability = if configuration.video_stream_format.bit_depth == 10 {
+            "yuv444_10bit"
+        } else {
+            "yuv444"
+        };
+        let sampling_supported = !requested_444 || external || entry[capability] == true;
+        if is_hardware && sampling_supported {
             if codec == codec_name(configuration.codec) {
                 hardware.push((identity.clone(), accepts_dmabuf));
             }
-        } else if (external || identity.clsid == software_encoder_id(configuration.codec))
+        } else if sampling_supported
+            && (external || identity.clsid == software_encoder_id(configuration.codec))
             && codec == codec_name(configuration.codec)
         {
             software.push((identity.clone(), accepts_dmabuf));
@@ -3247,6 +3270,18 @@ fn resolve_encoder_selection_for(
             .ok_or("invalid_encoder_enumeration")?;
         if selected_codec != codec_name(configuration.codec) {
             return Err(codec_unavailable(configuration.codec));
+        }
+        let capability = if configuration.video_stream_format.bit_depth == 10 {
+            "yuv444_10bit"
+        } else {
+            "yuv444"
+        };
+        if !external
+            && configuration.video_stream_format.chroma_sampling
+                == amaterasu_module_sdk::ChromaSampling::Yuv444
+            && entries[index as usize][capability] != true
+        {
+            return Err("encoder_configuration_unsupported");
         }
         if !external && !encoder_supports_configuration(selected, configuration) {
             return Err("encoder_configuration_unsupported");
@@ -3354,6 +3389,19 @@ mod integration_contract_tests {
     ) -> Result<EncoderIdentity, &'static str> {
         resolve_encoder_selection(index, configuration, payload, false)
             .map(|choice| choice.identity)
+    }
+
+    #[test]
+    fn yuv444_selection_requires_provider_capability() {
+        let mut configuration = default_configuration();
+        configuration.video_stream_format.chroma_sampling =
+            amaterasu_module_sdk::ChromaSampling::Yuv444;
+        let mut entry = description("amaterasu.hardware.nvenc-cuda.h264", "NVENC", true);
+        let unavailable = json!({"ok":true,"enabled":true,"encoders":[entry.clone()]});
+        assert!(select(None, &configuration, &unavailable).is_err());
+        entry["yuv444"] = json!(true);
+        let available = json!({"ok":true,"enabled":true,"encoders":[entry]});
+        assert!(select(None, &configuration, &available).is_ok());
     }
 
     fn default_configuration() -> Configuration {

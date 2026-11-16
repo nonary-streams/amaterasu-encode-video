@@ -25,7 +25,7 @@ int am_video_convert(void *pointer, const uint8_t *source, int source_width,
     struct am_video_converter *converter = pointer;
     if (!converter || !source || !destination || source_width <= 0 || source_height <= 0
         || source_width > 8192 || source_height > 8192 || source_stride < source_width * 4
-        || width < 16 || height < 16 || width > 3840 || height > 2160 || (width & 1) || (height & 1)) return -1;
+        || width < 16 || height < 16 || width > 8192 || height > 8192 || (width & 1) || (height & 1)) return -1;
     int fit_width = width, fit_height = height;
     if ((int64_t)width * source_height <= (int64_t)height * source_width)
         fit_height = (int)((int64_t)width * source_height / source_width);

@@ -428,6 +428,7 @@ fn p010_cpu_frames_preserve_codes_for_ten_bit_sdr_and_hdr_and_reject_bit_depth_m
         config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
             codec: amaterasu_module_sdk::VideoCodec::Hevc,
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             dynamic_range,
         };
         config.codec = VideoCodec::Hevc;

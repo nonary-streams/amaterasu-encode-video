@@ -54,7 +54,7 @@ static struct amaterasu_ffmpeg_vaapi *amaterasu_vaapi_open(
     if (error_code != NULL)
         *error_code = 1;
     if (width < 16 || height < 16 || (width & 1) != 0 || (height & 1) != 0 ||
-        fps < 1 || fps > 120 || bitrate < 100000 || bitrate > 100000000)
+        fps < 1 || fps > 1000 || bitrate < 100000 || bitrate > 1000000000)
         return NULL;
 
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");

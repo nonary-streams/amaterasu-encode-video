@@ -314,12 +314,12 @@ fn validate(
 ) -> Result<(), &'static str> {
     if width == 0
         || height == 0
-        || width > 3840
-        || height > 2160
+        || width > 8192
+        || height > 8192
         || !width.is_multiple_of(2)
         || !height.is_multiple_of(2)
         || stride < row_bytes
-        || stride > 16_384
+        || stride > 65_536
     {
         return Err("invalid_frame");
     }

@@ -696,6 +696,12 @@ impl Sessions {
         let Ok(session) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
         };
+        if session.config.video_stream_format.chroma_sampling
+            == amaterasu_module_sdk::ChromaSampling::Yuv444
+            && frame.format != PIXEL_BGRA8
+        {
+            return MEDIA_UNSUPPORTED;
+        }
         let timestamp = match session.admit(
             frame.width,
             frame.height,

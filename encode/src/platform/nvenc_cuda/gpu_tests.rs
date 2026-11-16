@@ -854,6 +854,7 @@ fn nvenc_cuda_gpu_encodes_ten_bit_sdr_cpu_input() {
                     amaterasu_module_sdk::VideoCodec::Av1
                 },
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
             };
             let packets = encode_cpu_configuration(codec, mode, false, config);
@@ -901,6 +902,7 @@ fn nvenc_cuda_gpu_p010_cpu_black_preserves_sdr_and_hdr_signal() {
                     Codec::H264 => unreachable!(),
                 },
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range,
             };
             let mut sessions = Sessions::new(true);
@@ -1078,6 +1080,7 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
                 amaterasu_module_sdk::VideoCodec::Av1
             },
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             dynamic_range,
         };
         let probe_result = crate::probe::run(
@@ -1237,17 +1240,17 @@ fn nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling() {
 #[test]
 #[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
 fn nvenc_cuda_gpu_cuda_input_encodes_identically_to_the_dmabuf_path() {
-    compare_cuda_and_dmabuf(WIDTH, HEIGHT);
+    compare_cuda_and_dmabuf(WIDTH, HEIGHT, false);
 }
 
 #[test]
 #[ignore = "requires NVIDIA NVENC and a ten-bit GBM render target"]
 fn nvenc_cuda_gpu_fits_shared_sources_to_independent_client_sizes() {
-    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 2);
-    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 4);
+    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 2, false);
+    compare_cuda_and_dmabuf(WIDTH * 2, HEIGHT * 4, false);
 }
 
-fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
+fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32, yuv444: bool) {
     // Same picture in both inputs: AR30 orders blue in the low bits, the CUDA
     // schema red; channel values are identical.
     let (red, green, blue) = (719u32, 321u32, 183u32);
@@ -1298,14 +1301,29 @@ fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
         )
     };
     assert_eq!(result, 0, "CUDA frame allocation failed");
-    for (codec, color_mode) in [Codec::Hevc, Codec::Av1]
+    let mut tested = 0;
+    for (codec, color_mode, range) in [Codec::Hevc, Codec::Av1]
         .into_iter()
-        .flat_map(|codec| [ColorMode::Bt709Limited, ColorMode::Bt709Full].map(|mode| (codec, mode)))
+        .flat_map(|codec| {
+            [ColorMode::Bt709Limited, ColorMode::Bt709Full].map(move |mode| (codec, mode))
+        })
+        .flat_map(|(codec, mode)| {
+            [
+                amaterasu_module_sdk::DynamicRange::Sdr,
+                amaterasu_module_sdk::DynamicRange::Hdr,
+            ]
+            .into_iter()
+            .filter(move |range| yuv444 || *range == amaterasu_module_sdk::DynamicRange::Hdr)
+            .map(move |range| (codec, mode, range))
+        })
     {
         let description = published()
             .into_iter()
             .find(|entry| entry.codec == codec.token())
             .unwrap();
+        if yuv444 && !description.capabilities.yuv444_10bit {
+            continue;
+        }
         let mut config = configuration(codec, color_mode);
         config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
             codec: if codec == Codec::Hevc {
@@ -1314,7 +1332,12 @@ fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
                 amaterasu_module_sdk::VideoCodec::Av1
             },
             bit_depth: 10,
-            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+            chroma_sampling: if yuv444 {
+                amaterasu_module_sdk::ChromaSampling::Yuv444
+            } else {
+                Default::default()
+            },
+            dynamic_range: range,
         };
         let encode = |cuda: bool| -> Vec<Vec<u8>> {
             let mut encoder = Encoder::open(&description.identity, &config)
@@ -1338,7 +1361,11 @@ fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
                     frame.width = source_width;
                     frame.height = source_height;
                     frame.fourcc = u32::from_le_bytes(*b"AR30");
-                    frame.color = DMABUF_COLOR_BT2020_PQ;
+                    frame.color = if range == amaterasu_module_sdk::DynamicRange::Hdr {
+                        DMABUF_COLOR_BT2020_PQ
+                    } else {
+                        DMABUF_COLOR_SRGB
+                    };
                     // SAFETY: allocation and descriptors outlive this duplication.
                     GpuInput::DmaBuf(
                         unsafe { crate::input::DmaBufInput::duplicate(&frame) }.unwrap(),
@@ -1353,9 +1380,38 @@ fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
             packets.extend(std::iter::from_fn(|| encoder.receive().unwrap()));
             packets.into_iter().map(|packet| packet.bytes).collect()
         };
+        let probe_result = crate::probe::run(
+            &crate::factory::NativeFactory,
+            description.identity.clone(),
+            config.clone(),
+        )
+        .unwrap();
+        assert_eq!(probe_result["usable"], true, "{probe_result}");
         let through_gl = encode(false);
         let through_cuda = encode(true);
         assert_eq!(through_gl.len() as u64, FRAMES);
+        if yuv444 {
+            let path = stream_file(codec, "444-ten-bit", through_gl.clone());
+            let info = probe(codec, &path);
+            assert_eq!(info["pix_fmt"], "yuv444p10le", "{info}");
+            assert_eq!(
+                info["color_primaries"],
+                if range == amaterasu_module_sdk::DynamicRange::Hdr {
+                    "bt2020"
+                } else {
+                    "bt709"
+                }
+            );
+            assert_eq!(
+                info["color_transfer"],
+                if range == amaterasu_module_sdk::DynamicRange::Hdr {
+                    "smpte2084"
+                } else {
+                    "bt709"
+                }
+            );
+            std::fs::remove_file(path).unwrap();
+        }
         // Identical P010 input makes NVENC's output byte-identical.
         if (source_width, source_height) == (WIDTH, HEIGHT) {
             assert!(
@@ -1400,7 +1456,106 @@ fn compare_cuda_and_dmabuf(source_width: u32, source_height: u32) {
                 );
             }
         }
+        tested += 1;
     }
+    assert!(tested > 0, "no matching ten-bit encoder tested");
     // SAFETY: every encoder using the frame has been closed.
     unsafe { amaterasu_nvcuda_test_release_cuda_frame(pointer, event) };
+}
+
+#[test]
+#[ignore = "requires idle NVIDIA NVENC with 4:4:4, ffmpeg and ffprobe"]
+fn nvenc_cuda_gpu_encodes_yuv444_without_subsampling() {
+    let descriptions = published();
+    let mut tested = 0;
+    for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
+        let Some(description) = descriptions
+            .iter()
+            .find(|entry| entry.codec == codec.token())
+        else {
+            continue;
+        };
+        if !description.capabilities.yuv444 {
+            continue;
+        }
+        let mut config = configuration(codec, ColorMode::Bt709Limited);
+        config.video_stream_format.codec = match codec {
+            Codec::H264 => amaterasu_module_sdk::VideoCodec::H264,
+            Codec::Hevc => amaterasu_module_sdk::VideoCodec::Hevc,
+            Codec::Av1 => amaterasu_module_sdk::VideoCodec::Av1,
+        };
+        config.video_stream_format.chroma_sampling = amaterasu_module_sdk::ChromaSampling::Yuv444;
+        let probe_result = crate::probe::run(
+            &crate::factory::NativeFactory,
+            description.identity.clone(),
+            config.clone(),
+        )
+        .unwrap();
+        assert_eq!(probe_result["usable"], true, "{probe_result}");
+        let packets = encode_cpu_configuration(codec, ColorMode::Bt709Limited, false, config);
+        let path = stream_file(codec, "444", packets.into_iter().map(|packet| packet.bytes));
+        let info = probe(codec, &path);
+        assert_eq!(info["pix_fmt"], "yuv444p", "{info}");
+        assert_decoded_colours(&decode(codec, &path), ColorMode::Bt709Limited);
+        std::fs::remove_file(path).unwrap();
+        tested += 1;
+    }
+    assert!(tested > 0, "no 4:4:4 encoder advertised");
+}
+
+#[test]
+#[ignore = "requires NVIDIA NVENC 10-bit 4:4:4 and a ten-bit GBM render target"]
+fn nvenc_cuda_gpu_yuv444_cuda_input_matches_dmabuf() {
+    compare_cuda_and_dmabuf(WIDTH, HEIGHT, true);
+}
+
+#[test]
+#[ignore = "requires NVIDIA NVENC 4:4:4 and ffmpeg"]
+fn nvenc_cuda_gpu_yuv444_retains_single_pixel_chroma_edges() {
+    let description = published()
+        .into_iter()
+        .find(|entry| entry.codec == "hevc" && entry.capabilities.yuv444)
+        .expect("HEVC 4:4:4");
+    let mut config = configuration(Codec::Hevc, ColorMode::Bt709Limited);
+    config.video_stream_format.codec = amaterasu_module_sdk::VideoCodec::Hevc;
+    config.video_stream_format.chroma_sampling = amaterasu_module_sdk::ChromaSampling::Yuv444;
+    let mut encoder = Encoder::open(&description.identity, &config).unwrap();
+    let pixels: Vec<u8> = (0..WIDTH * HEIGHT)
+        .flat_map(|index| {
+            if index % 2 == 0 {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            }
+        })
+        .collect();
+    encoder.submit_gpu(GpuInput::Bgra(pixels), 0, true).unwrap();
+    encoder.drain().unwrap();
+    let packets: Vec<_> = std::iter::from_fn(|| encoder.receive().unwrap()).collect();
+    let path = stream_file(
+        Codec::Hevc,
+        "444-chroma-edges",
+        packets.into_iter().map(|packet| packet.bytes),
+    );
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "hevc", "-i"])
+        .arg(&path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv444p",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let chroma = &output.stdout[(WIDTH * HEIGHT) as usize..];
+    assert!(
+        chroma[100].abs_diff(chroma[101]) > 60,
+        "adjacent chroma samples were averaged"
+    );
+    std::fs::remove_file(path).unwrap();
 }

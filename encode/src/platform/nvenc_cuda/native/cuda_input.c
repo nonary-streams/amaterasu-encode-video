@@ -44,6 +44,12 @@ int am_cuda_input_open(struct am_cuda_input *input, const struct am_driver *driv
         input->module = NULL;
         return 0;
     }
+    if (cuda->module_get_function(&input->to_yuv444, input->module,
+        "am_nvenc_x2b10g10r10_to_yuv444") != CUDA_SUCCESS) {
+        cuda->module_unload(input->module);
+        input->module = NULL;
+        return 0;
+    }
     memcpy(input->device_uuid, uuid.bytes, sizeof(input->device_uuid));
     input->available = 1;
     return 1;
@@ -86,9 +92,9 @@ int am_cuda_input_convert(const struct am_cuda_input *input, const struct am_dri
     am_image_fit(source_width, source_height, converter->width, converter->height, fit);
     void *arguments[] = {&source, &pitch_in, &target, &pitch_out, &width, &height,
                         &source_w, &source_h, &fit[0], &fit[1], &fit[2], &fit[3], &rows};
-    const unsigned int blocks_x = (converter->width / 2 + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
-    const unsigned int blocks_y = (converter->height / 2 + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
-    result = cuda->launch_kernel(input->to_p010, blocks_x, blocks_y, 1, AM_CUDA_INPUT_BLOCK,
+    const unsigned int blocks_x = (converter->width / (converter->chroma_444 ? 1 : 2) + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
+    const unsigned int blocks_y = (converter->height / (converter->chroma_444 ? 1 : 2) + AM_CUDA_INPUT_BLOCK - 1) / AM_CUDA_INPUT_BLOCK;
+    result = cuda->launch_kernel(converter->chroma_444 ? input->to_yuv444 : input->to_p010, blocks_x, blocks_y, 1, AM_CUDA_INPUT_BLOCK,
                                  AM_CUDA_INPUT_BLOCK, 1, 0, stream, arguments, NULL);
     if (result != CUDA_SUCCESS) {
         fprintf(stderr, "amaterasu nvenc: CUDA input conversion launch failed: %d\n", (int)result);

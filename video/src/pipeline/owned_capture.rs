@@ -114,9 +114,7 @@ impl OwnedOutputCapture {
         if !self.candidate {
             return;
         }
-        if self.dmabuf_provider == Some(CaptureProvider::Vkms) {
-            response["vkms_fallback_reason"] = json!(self.fallback_reason);
-        }
+        response["vkms_fallback_reason"] = json!(self.fallback_reason);
         response["dmabuf_frames"] = json!({
             "fresh": self.fresh_frames,
             "reused": self.reused_frames,

@@ -79,6 +79,27 @@ static const char chroma_source[] =
     "    chroma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
     "}\n";
 
+/* Full-resolution planar chroma. The texture stacks U then V vertically,
+ * matching NVENC's three-plane pitched CUDA layout without CPU readback. */
+static const char chroma444_source[] =
+    "#version 330 core\n"
+    "uniform sampler2D source;\n"
+    AM_IMAGE_SAMPLE
+    "uniform int ten_bit;\n"
+    "uniform vec4 cb_row;\n"
+    "uniform vec4 cr_row;\n"
+    "uniform int plane_height;\n"
+    "layout(location = 0) out float chroma;\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "    bool v = p.y >= plane_height;\n"
+    "    p.y = p.y % plane_height;\n"
+    "    vec3 rgb = image_rgb(p);\n"
+    "    vec4 row = v ? cr_row : cb_row;\n"
+    "    float code = clamp(dot(row.rgb, rgb) + row.a, 0.0, 1.0);\n"
+    "    chroma = ten_bit != 0 ? floor(code * 1023.0 + 0.5) * (64.0 / 65535.0) : code;\n"
+    "}\n";
+
 static int load_gl_symbol(const struct am_egl_api *egl, const char *name, void *destination) {
     __eglMustCastToProperFunctionPointerType symbol = egl->get_proc_address(name);
     if (symbol == NULL) {
@@ -299,7 +320,7 @@ static GLuint attach_framebuffer(const struct am_gl_api *gl, GLuint texture) {
 static int create_gl_resources(struct am_converter *converter, struct am_nvcuda_status *status) {
     const struct am_gl_api *gl = &converter->gl;
     if (!build_pass(gl, luma_source, "luma_row", NULL, &converter->luma_pass) ||
-        !build_pass(gl, chroma_source, "cb_row", "cr_row", &converter->chroma_pass)) {
+        !build_pass(gl, converter->chroma_444 ? chroma444_source : chroma_source, "cb_row", "cr_row", &converter->chroma_pass)) {
         am_set_status(status, AM_STAGE_GL_RESOURCES, (int32_t)gl->get_error());
         return AM_NVCUDA_CONVERTER_UNAVAILABLE;
     }
@@ -314,7 +335,12 @@ static int create_gl_resources(struct am_converter *converter, struct am_nvcuda_
     converter->luma_texture =
         allocate_texture(gl, converter->bit_depth == 10 ? GL_R16 : GL_R8, GL_RED, converter->width, converter->height);
     converter->chroma_texture =
-        allocate_texture(gl, converter->bit_depth == 10 ? GL_RG16 : GL_RG8, GL_RG, converter->width / 2, converter->height / 2);
+        allocate_texture(gl, converter->chroma_444
+            ? (converter->bit_depth == 10 ? GL_R16 : GL_R8)
+            : (converter->bit_depth == 10 ? GL_RG16 : GL_RG8),
+            converter->chroma_444 ? GL_RED : GL_RG,
+            converter->chroma_444 ? converter->width : converter->width / 2,
+            converter->chroma_444 ? converter->height * 2 : converter->height / 2);
     converter->luma_framebuffer = attach_framebuffer(gl, converter->luma_texture);
     converter->chroma_framebuffer = attach_framebuffer(gl, converter->chroma_texture);
     GLenum error = gl->get_error();
@@ -364,6 +390,7 @@ int am_converter_open(struct am_converter *converter, const struct am_driver *dr
     converter->width = settings->width;
     converter->height = settings->height;
     converter->bit_depth = settings->bit_depth;
+    converter->chroma_444 = settings->chroma_444;
     memcpy(converter->luma_row, settings->luma_row, sizeof(converter->luma_row));
     memcpy(converter->cb_row, settings->cb_row, sizeof(converter->cb_row));
     memcpy(converter->cr_row, settings->cr_row, sizeof(converter->cr_row));
@@ -470,6 +497,7 @@ static void draw_pass(const struct am_converter *converter, const struct am_gl_p
     gl->bind_texture(GL_TEXTURE_2D, source);
     gl->uniform1i(pass->source, 0);
     gl->uniform1i(pass->ten_bit, converter->bit_depth == 10);
+    gl->uniform1i(gl->get_uniform_location(pass->program, "plane_height"), (GLint)converter->height);
     gl->uniform4fv(pass->image_fit, 1, fit);
     gl->uniform4fv(pass->rows[0], 1, first_row);
     if (second_row != NULL) {
@@ -489,7 +517,8 @@ static int convert_texture(struct am_converter *converter, GLuint source,
     draw_pass(converter, &converter->luma_pass, converter->luma_framebuffer, converter->width,
               converter->height, converter->luma_row, NULL, source, fit);
     draw_pass(converter, &converter->chroma_pass, converter->chroma_framebuffer,
-              converter->width / 2, converter->height / 2, converter->cb_row, converter->cr_row,
+              converter->chroma_444 ? converter->width : converter->width / 2,
+              converter->chroma_444 ? converter->height * 2 : converter->height / 2, converter->cb_row, converter->cr_row,
               source, fit);
     gl->bind_texture(GL_TEXTURE_2D, 0);
     gl->bind_framebuffer(GL_FRAMEBUFFER, 0);
@@ -746,7 +775,7 @@ int am_converter_copy_nv12(struct am_converter *converter, CUdeviceptr destinati
             CUDA_SUCCESS &&
         copy_plane(cuda, luma, destination, pitch, converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height, stream) &&
         copy_plane(cuda, chroma, destination + pitch * converter->height, pitch,
-                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->height / 2, stream);
+                   converter->width * (converter->bit_depth == 10 ? 2 : 1), converter->chroma_444 ? converter->height * 2 : converter->height / 2, stream);
     CUresult unmapped = cuda->graphics_unmap(2, resources, stream);
     if (unmapped == CUDA_SUCCESS) converter->mapping_outstanding = 0;
     CUresult synchronized = stream == NULL ? cuda->ctx_synchronize() : CUDA_SUCCESS;

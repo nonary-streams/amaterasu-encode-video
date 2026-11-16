@@ -89,6 +89,8 @@ struct am_nvcuda_struct_versions {
 
 struct am_nvcuda_codec_caps {
     uint32_t hdr10;
+    uint32_t yuv444;
+    uint32_t yuv444_10bit;
     uint32_t supported;
     uint32_t max_width;
     uint32_t max_height;
@@ -108,6 +110,7 @@ struct am_nvcuda_device {
 struct am_nvcuda_settings {
     uint32_t codec;
     uint32_t bit_depth;
+    uint32_t chroma_444;
     uint32_t width;
     uint32_t height;
     uint32_t fps;

@@ -57,3 +57,31 @@ pub(super) fn probe_result(
     }
     Ok(Some(reason))
 }
+
+#[cfg(test)]
+mod chroma_tests {
+    use super::*;
+
+    #[test]
+    fn provider_probe_must_confirm_the_requested_chroma() {
+        let identity = EncoderIdentity {
+            clsid: "external".into(),
+            friendly_name: "External".into(),
+            hardware_url: None,
+        };
+        let mut configuration: Configuration = serde_json::from_value(
+            serde_json::json!({"width":1280,"height":720,"fps":60,"bitrate":10000000}),
+        )
+        .unwrap();
+        configuration.video_stream_format.chroma_sampling =
+            amaterasu_module_sdk::ChromaSampling::Yuv444;
+        let mut payload = serde_json::json!({"ok":true,"codec":"h264","encoder":identity,"configuration":configuration,"usable":true,"settled":true,"code":null,"reason":null});
+        assert_eq!(probe_result(&identity, &configuration, &payload), Ok(None));
+        payload["configuration"]["video_stream_format"]["chroma_sampling"] =
+            serde_json::json!("yuv420");
+        assert_eq!(
+            probe_result(&identity, &configuration, &payload),
+            Err("invalid_encoder_probe_reply")
+        );
+    }
+}

@@ -80,3 +80,21 @@ extern "C" __global__ void am_nvenc_x2b10g10r10_to_p010(const unsigned char *sou
     chroma[x] = p010(apply(rows.cb, mean));
     chroma[x + 1] = p010(apply(rows.cr, mean));
 }
+
+// One thread per output pixel: preserve independent chroma samples.
+extern "C" __global__ void am_nvenc_x2b10g10r10_to_yuv444(const unsigned char *source,
+    unsigned int source_pitch, unsigned char *target, unsigned int target_pitch,
+    int width, int height, int source_width, int source_height,
+    int left, int top, int fit_width, int fit_height, Rows rows) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float3 rgb = sample(source, source_pitch, source_width, source_height,
+        x, y, left, top, fit_width, fit_height);
+    const float4 matrix[3] = {rows.luma, rows.cb, rows.cr};
+    for (int plane = 0; plane < 3; ++plane) {
+        unsigned short *output = reinterpret_cast<unsigned short *>(target +
+            (size_t)(plane * height + y) * target_pitch);
+        output[x] = p010(apply(matrix[plane], rgb));
+    }
+}

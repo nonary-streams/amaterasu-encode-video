@@ -237,6 +237,7 @@ struct am_converter {
     uint32_t width;
     uint32_t height;
     uint32_t bit_depth;
+    uint32_t chroma_444;
     float luma_row[4];
     float cb_row[4];
     float cr_row[4];
@@ -254,6 +255,7 @@ struct am_cuda_input {
     int available;
     CUmodule module;
     CUfunction to_p010;
+    CUfunction to_yuv444;
     uint8_t device_uuid[16];
 };
 int am_cuda_input_open(struct am_cuda_input *input, const struct am_driver *driver,

@@ -12,6 +12,7 @@ use crate::model::Configuration;
 pub struct NativeSettings {
     pub codec: u32,
     pub bit_depth: u32,
+    pub chroma_444: u32,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -67,6 +68,10 @@ pub fn native_settings(configuration: &Configuration, codec: Codec) -> NativeSet
     NativeSettings {
         codec: codec.native_id(),
         bit_depth: configuration.video_stream_format.bit_depth.into(),
+        chroma_444: u32::from(
+            configuration.video_stream_format.chroma_sampling
+                == amaterasu_module_sdk::ChromaSampling::Yuv444,
+        ),
         width: configuration.width,
         height: configuration.height,
         fps: configuration.fps,
@@ -112,7 +117,7 @@ mod tests {
     #[test]
     fn generic_limits_and_unsupported_options_still_apply() {
         let mut too_wide = configuration(VideoCodec::Av1);
-        too_wide.width = 4096;
+        too_wide.width = 8194;
         assert_eq!(
             validate(&too_wide, Codec::Av1),
             Err("invalid_configuration")
@@ -194,6 +199,7 @@ mod tests {
         config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
             codec: amaterasu_module_sdk::VideoCodec::Hevc,
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
         };
         for (mode, full, black, white) in [

@@ -5,13 +5,15 @@ use crate::model::{DescriptionCapabilities, EncoderDescription, EncoderIdentity}
 
 const NVIDIA_VENDOR_ID: u32 = 0x10de;
 /// The generic configuration bounds (`Configuration::validate`).
-const CONFIGURATION_MAX_WIDTH: u32 = 3840;
-const CONFIGURATION_MAX_HEIGHT: u32 = 2160;
+const CONFIGURATION_MAX_WIDTH: u32 = 8192;
+const CONFIGURATION_MAX_HEIGHT: u32 = 8192;
 const HARDWARE_URL_PREFIX: &str = "pci:";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecCaps {
     pub hdr10: bool,
+    pub yuv444: bool,
+    pub yuv444_10bit: bool,
     pub supported: bool,
     pub max_width: u32,
     pub max_height: u32,
@@ -80,6 +82,8 @@ fn describe(device: &DeviceRecord, codec: Codec) -> Option<EncoderDescription> {
         vendor_id: Some(NVIDIA_VENDOR_ID),
         capabilities: DescriptionCapabilities {
             hdr10: codec != Codec::H264 && caps.hdr10 && device.dmabuf_import,
+            yuv444: caps.yuv444,
+            yuv444_10bit: caps.yuv444_10bit && device.dmabuf_import,
             inputs,
             max_width: Some(caps.max_width.min(CONFIGURATION_MAX_WIDTH)),
             max_height: Some(caps.max_height.min(CONFIGURATION_MAX_HEIGHT)),
@@ -94,6 +98,8 @@ mod tests {
     fn caps(max_width: u32, max_height: u32) -> CodecCaps {
         CodecCaps {
             hdr10: true,
+            yuv444: true,
+            yuv444_10bit: true,
             supported: true,
             max_width,
             max_height,
@@ -125,8 +131,8 @@ mod tests {
         assert!(av1.hardware);
         assert_eq!(av1.vendor_id, Some(0x10de));
         assert_eq!(av1.capabilities.inputs, ["cpu", "dmabuf"]);
-        assert_eq!(av1.capabilities.max_width, Some(3840));
-        assert_eq!(av1.capabilities.max_height, Some(2160));
+        assert_eq!(av1.capabilities.max_width, Some(8192));
+        assert_eq!(av1.capabilities.max_height, Some(8192));
         assert!(
             published
                 .iter()

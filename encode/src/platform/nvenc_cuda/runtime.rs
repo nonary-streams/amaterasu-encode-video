@@ -63,6 +63,8 @@ fn record_open_failure(status: NativeStatus) {
 #[derive(Clone, Copy, Default)]
 struct NativeCodecCaps {
     hdr10: u32,
+    yuv444: u32,
+    yuv444_10bit: u32,
     supported: u32,
     max_width: u32,
     max_height: u32,
@@ -84,6 +86,8 @@ impl NativeDevice {
         name: [0; 256],
         codecs: [NativeCodecCaps {
             hdr10: 0,
+            yuv444: 0,
+            yuv444_10bit: 0,
             supported: 0,
             max_width: 0,
             max_height: 0,
@@ -98,6 +102,8 @@ impl NativeDevice {
             name: c_string(&self.name),
             codecs: self.codecs.map(|caps| CodecCaps {
                 hdr10: caps.hdr10 != 0,
+                yuv444: caps.yuv444 != 0,
+                yuv444_10bit: caps.yuv444_10bit != 0,
                 supported: caps.supported != 0,
                 max_width: caps.max_width,
                 max_height: caps.max_height,
@@ -554,7 +560,7 @@ impl Encoder {
             dmabuf: encoder.import_support(configuration.is_hdr()),
             cuda_device: encoder
                 .cuda_input_device()
-                .filter(|_| configuration.is_hdr()),
+                .filter(|_| configuration.is_ten_bit()),
         };
         Ok(encoder)
     }
@@ -1075,6 +1081,8 @@ mod tests {
         }
         device.codecs[2] = NativeCodecCaps {
             hdr10: 0,
+            yuv444: 0,
+            yuv444_10bit: 0,
             supported: 1,
             max_width: 8192,
             max_height: 8192,

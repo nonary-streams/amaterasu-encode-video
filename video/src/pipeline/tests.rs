@@ -1927,6 +1927,7 @@ fn hdr_encoder_configuration_preserves_requested_range() {
     configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
     };
     let hdr = encoder::configuration_for_encoder(&configuration);
@@ -4643,6 +4644,7 @@ fn full_range_hdr_probe_accepts_real_encoder_reply_and_checks_correlation() {
     configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
     };
     configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
@@ -4721,6 +4723,7 @@ fn explicit_advanced_formats_are_probed_before_any_capture_effect() {
             configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
                 codec: amaterasu_module_sdk::VideoCodec::Hevc,
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range,
             };
             configuration.normalize_codec().unwrap();
@@ -6188,6 +6191,7 @@ fn capture_source_preflight_rejects_unknown_ten_bit_or_retargeted_and_unready_so
     config.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Sdr,
     };
     assert_eq!(
@@ -6242,6 +6246,7 @@ fn sdr_processing_source_does_not_inherit_hdr_output_depth() {
     configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
     };
     configuration.gpu_processing = Some(crate::model::GpuProcessing {
@@ -6330,6 +6335,7 @@ fn hdr_processing_opens_legacy_sdr_capture_after_encoder_probe() {
     configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
     };
     configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
@@ -6386,6 +6392,7 @@ fn hdr_processing_opens_owned_vkms_capture_with_legacy_source_contract() {
     configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
         codec: amaterasu_module_sdk::VideoCodec::Hevc,
         bit_depth: 10,
+        chroma_sampling: Default::default(),
         dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
     };
     configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;
@@ -6450,6 +6457,7 @@ fn managed_ten_bit_capture_preflights_without_auxiliary_route_context() {
         configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
             codec: amaterasu_module_sdk::VideoCodec::Hevc,
             bit_depth: 10,
+            chroma_sampling: Default::default(),
             dynamic_range,
         };
         configuration.color_mode = amaterasu_media::ColorMode::Bt709Full;

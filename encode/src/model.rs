@@ -237,12 +237,12 @@ impl Configuration {
         if self.nvenc_preset.is_some() {
             return Err("nvenc_preset_unsupported");
         }
-        if !(16..=3840).contains(&self.width)
-            || !(16..=2160).contains(&self.height)
+        if !(16..=8192).contains(&self.width)
+            || !(16..=8192).contains(&self.height)
             || !self.width.is_multiple_of(2)
             || !self.height.is_multiple_of(2)
-            || !(1..=120).contains(&self.fps)
-            || !(100_000..=100_000_000).contains(&self.bitrate)
+            || !(1..=1000).contains(&self.fps)
+            || !(100_000..=1_000_000_000).contains(&self.bitrate)
             || self.slices_per_frame < 1
             || self.max_reference_frames > 16
         {
@@ -327,6 +327,10 @@ pub struct EncoderDescription {
 pub struct DescriptionCapabilities {
     #[serde(skip_serializing_if = "is_false")]
     pub hdr10: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub yuv444: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub yuv444_10bit: bool,
     /// Accepted frame sources: `cpu` (CpuFrame) and `dmabuf` (DmaBufFrame).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<&'static str>,
@@ -408,6 +412,8 @@ mod tests {
         );
         description.capabilities = DescriptionCapabilities {
             hdr10: false,
+            yuv444: false,
+            yuv444_10bit: false,
             inputs: vec!["cpu", "dmabuf"],
             max_width: Some(4096),
             max_height: Some(2304),

@@ -59,6 +59,7 @@ fn open_retries_busy_and_pending_for_selected_replacement_providers_and_exact_fo
             let format = VideoStreamFormat {
                 codec: VideoCodec::Hevc,
                 bit_depth: 10,
+                chroma_sampling: Default::default(),
                 dynamic_range,
             };
             let (mut pipeline, mut runtime, mut plane) = setup_selected(provider, format);

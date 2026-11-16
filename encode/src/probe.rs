@@ -124,6 +124,13 @@ fn probe_frame(configuration: &Configuration) -> Result<Vec<u8>, &'static str> {
         .ok()
         .and_then(|width| width.checked_mul(configuration.height as usize))
         .ok_or("invalid_configuration")?;
+    let chroma_samples = if configuration.video_stream_format.chroma_sampling
+        == amaterasu_module_sdk::ChromaSampling::Yuv444
+    {
+        pixels * 2
+    } else {
+        pixels / 2
+    };
     if configuration.is_ten_bit() {
         let luma = if matches!(
             configuration.color_mode,
@@ -134,15 +141,15 @@ fn probe_frame(configuration: &Configuration) -> Result<Vec<u8>, &'static str> {
         } else {
             64u16
         };
-        let mut frame = Vec::with_capacity(pixels * 3);
-        for (samples, code) in [(pixels, luma), (pixels / 2, 512u16)] {
+        let mut frame = Vec::with_capacity((pixels + chroma_samples) * 2);
+        for (samples, code) in [(pixels, luma), (chroma_samples, 512u16)] {
             for _ in 0..samples {
                 frame.extend_from_slice(&(code << 6).to_le_bytes());
             }
         }
         Ok(frame)
     } else {
-        let mut frame = vec![128; pixels + pixels / 2];
+        let mut frame = vec![128; pixels + chroma_samples];
         frame[..pixels].fill(16);
         Ok(frame)
     }
