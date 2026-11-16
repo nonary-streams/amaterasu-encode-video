@@ -1063,7 +1063,7 @@ impl Pipeline {
         } else if constant_rate && provider != CaptureProvider::Wgc {
             Some("constant_rate_requires_wgc")
         } else if !valid_minimum_fps_target(minimum_fps_target)
-            || !(if source_id.is_some() {
+            || !(if source_id.is_some() && !submitted_extension {
                 configuration.validate_source()
             } else {
                 configuration.validate()
@@ -2792,6 +2792,12 @@ fn apply_result(
             if missing && stream.source_id.is_some() && !stream.submitted_extension {
                 return finish_cleanup(stream);
             } else if missing {
+                if let Some(encoder) = stream.session
+                    && let Err(code) = plane.retire_encoder_references(encoder)
+                {
+                    failed_step(stream, code);
+                    return false;
+                }
                 if !stream.generic_input {
                     // The exact owner-scoped lookup proves no encoder remains.
                     plane.finish_stream(id);
@@ -2810,6 +2816,12 @@ fn apply_result(
             return finish_cleanup(stream);
         }
         Stage::CloseEncoder => {
+            if let Some(encoder) = stream.session
+                && let Err(code) = plane.retire_encoder_references(encoder)
+            {
+                failed_step(stream, code);
+                return false;
+            }
             if !stream.generic_input {
                 // Broker Close acknowledged worker retirement. Entering the
                 // mandatory lease barrier earlier could block the host before
@@ -2819,6 +2831,12 @@ fn apply_result(
             Stage::FindCapture
         }
         Stage::RestartCloseEncoder => {
+            if let Some(encoder) = stream.session
+                && let Err(code) = plane.retire_encoder_references(encoder)
+            {
+                failed_step(stream, code);
+                return false;
+            }
             stream.session = None;
             let Some(fallback) = stream.fallback_encoder.take() else {
                 stream.cleanup("encoder_restart_unavailable");

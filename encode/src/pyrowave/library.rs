@@ -258,6 +258,7 @@ impl Encoder {
         &mut self,
         frame: &amaterasu_media::DmaBufFrame,
         hdr: bool,
+        ten_bit: bool,
         budget: usize,
     ) -> Result<Vec<u8>, &'static str> {
         let _device = self
@@ -272,7 +273,7 @@ impl Encoder {
             .ok_or("pyrowave_gpu_unavailable")?;
         // SAFETY: caller keeps the immutable capture presentation borrowed until
         // the import's synchronous retirement, including every failure path.
-        let imported = unsafe { context.import(frame, hdr)? };
+        let imported = unsafe { context.import_precision(frame, hdr, ten_bit)? };
         unsafe { imported.encode(self.handle, budget)? };
         self.packetize(hdr)
     }

@@ -42,17 +42,17 @@ pub enum Profile {
     #[default]
     Sdr8,
     Hdr10,
+    Sdr10,
 }
 impl Profile {
     fn is_sdr(&self) -> bool {
         *self == Self::Sdr8
     }
     fn codec(self) -> FormatId {
-        if self == Self::Hdr10 {
-            CODEC_HDR10
-        } else {
-            CODEC
-        }
+        if self.ten_bit() { CODEC_HDR10 } else { CODEC }
+    }
+    pub fn ten_bit(self) -> bool {
+        self != Self::Sdr8
     }
     pub fn hdr(self) -> bool {
         self == Self::Hdr10
@@ -241,7 +241,7 @@ impl State {
     }
     fn profiles(&self) -> Vec<Value> {
         let profiles = if self.runtime.gpu_only() {
-            vec![Profile::Sdr8, Profile::Hdr10]
+            vec![Profile::Sdr8, Profile::Sdr10, Profile::Hdr10]
         } else {
             vec![Profile::Sdr8]
         };
@@ -255,7 +255,7 @@ impl State {
                     "framing": format_json(RECORDS),
                     "options_schema": format_json(OPTIONS),
                     "bitstream": "186f0393",
-                    "bit_depth": if profile.hdr() { 10 } else { 8 },
+                    "bit_depth": if profile.ten_bit() { 10 } else { 8 },
                     "chroma": "420",
                     "range": "full",
                     "matrix": if profile.hdr() { "bt2020_ncl" } else { "bt709" },
@@ -279,7 +279,7 @@ impl State {
     ) -> Result<(Value, Option<u64>), &'static str> {
         validate_operation(&operation_id)?;
         configuration.validate()?;
-        if configuration.profile.hdr() && !self.runtime.gpu_only() {
+        if configuration.profile.ten_bit() && !self.runtime.gpu_only() {
             return Err("pyrowave_hdr_requires_gpu");
         }
         if let Some(record) = self
@@ -376,7 +376,7 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
                     !gpu.offers(
                         configuration.width,
                         configuration.height,
-                        configuration.profile.hdr(),
+                        configuration.profile.ten_bit(),
                     )
                     .is_empty()
                 })
@@ -663,6 +663,7 @@ impl Session {
                 .encode_gpu(
                     input,
                     self.configuration.profile.hdr(),
+                    self.configuration.profile.ten_bit(),
                     self.configuration.budget(),
                 )
         }
@@ -672,16 +673,23 @@ impl Session {
     }
     #[cfg(feature = "pyrowave-gpu")]
     pub fn gpu_offers(&self) -> Vec<DmaBufResourceCapabilities> {
-        self.runtime
-            .gpu_context()
-            .map(|gpu| {
-                gpu.offers(
-                    self.configuration.width,
-                    self.configuration.height,
-                    self.configuration.profile.hdr(),
-                )
-            })
-            .unwrap_or_default()
+        let Some(gpu) = self.runtime.gpu_context() else {
+            return Vec::new();
+        };
+        let mut offers = gpu.offers(
+            self.configuration.width,
+            self.configuration.height,
+            self.configuration.profile.ten_bit(),
+        );
+        if self.configuration.profile == Profile::Sdr10 {
+            offers.extend(gpu.offers(self.configuration.width, self.configuration.height, false));
+        }
+        if !self.configuration.profile.hdr() {
+            for offer in &mut offers {
+                offer.color = DMABUF_COLOR_SRGB;
+            }
+        }
+        offers
     }
     fn validate_frame(&self, descriptor: &CaptureResourceFrame) -> Result<u64, Status> {
         let selection = self.selection.ok_or(MEDIA_UNSUPPORTED)?;

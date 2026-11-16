@@ -766,6 +766,9 @@ impl Configuration {
     /// Accept either public codec representation, while refusing contradictory
     /// explicit non-default selections before allocating capture resources.
     pub fn normalize_codec(&mut self) -> Result<(), &'static str> {
+        if self.extension_profile.is_some() {
+            return Ok(());
+        }
         let negotiated = match self.video_stream_format.codec {
             amaterasu_module_sdk::VideoCodec::H264 => VideoCodec::H264,
             amaterasu_module_sdk::VideoCodec::Hevc => VideoCodec::Hevc,
@@ -795,7 +798,8 @@ impl Configuration {
                     && self.max_reference_frames == 0
                     && self.min_threads == default_min_threads()
                     && self.qp == default_qp()
-                    && self.video_stream_format == default_video_stream_format()
+                    && profile.media_format.unwrap_or_default().bit_depth
+                        == self.video_stream_format.bit_depth
                     && self.codec == VideoCodec::H264
             })
             && self.video_stream_format.validate().is_ok()

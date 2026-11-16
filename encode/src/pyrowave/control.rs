@@ -18,8 +18,9 @@ pub(super) fn project(payload: &Value) -> Result<Option<(Value, Value)>, &'stati
     let original = &payload["configuration"];
     let profile = &original["extension_profile"];
     let codec = &profile["codec"];
-    let hdr = codec["value"].as_u64() == Some(CODEC_HDR10.value);
-    let selected = if hdr { CODEC_HDR10 } else { CODEC };
+    let ten_bit = codec["value"].as_u64() == Some(CODEC_HDR10.value);
+    let hdr = ten_bit && original_range(payload);
+    let selected = if ten_bit { CODEC_HDR10 } else { CODEC };
     if codec
         != &json!({"namespace_id":selected.namespace_id,"value":selected.value,"schema":selected.schema})
         || profile["framing"]
@@ -70,7 +71,13 @@ pub(super) fn project(payload: &Value) -> Result<Option<(Value, Value)>, &'stati
     };
     let number = |key| original[key].as_u64().ok_or("invalid_configuration");
     let configuration = Configuration {
-        profile: if hdr { Profile::Hdr10 } else { Profile::Sdr8 },
+        profile: if hdr {
+            Profile::Hdr10
+        } else if ten_bit {
+            Profile::Sdr10
+        } else {
+            Profile::Sdr8
+        },
         width: u32::try_from(number("width")?).map_err(|_| "invalid_configuration")?,
         height: u32::try_from(number("height")?).map_err(|_| "invalid_configuration")?,
         fps: u32::try_from(number("fps")?).map_err(|_| "invalid_configuration")?,
@@ -112,7 +119,7 @@ pub(super) fn common(
     }
     if common.version != 1
         || common.size as usize != std::mem::size_of::<EncoderCommonConfigV1>()
-        || common.flags != 0
+        || common.flags & !ENCODER_CONFIG_HAS_COLOR != 0
         || common.reserved != 0
         || common.fps_denominator != 1
         || common.output_clock.domain != FRAME_CLOCK_STREAM_RELATIVE
@@ -121,12 +128,21 @@ pub(super) fn common(
     {
         return Err(STATUS_INVALID_ARGUMENT);
     }
-    let hdr = native.codec == CODEC_HDR10;
-    if common.bit_depth != if hdr { 10 } else { 8 } || common.chroma != ENCODER_CHROMA_420 {
+    let ten_bit = native.codec == CODEC_HDR10;
+    let hdr = ten_bit
+        && common.flags & ENCODER_CONFIG_HAS_COLOR != 0
+        && common.color.transfer == FRAME_TRANSFER_PQ;
+    if common.bit_depth != if ten_bit { 10 } else { 8 } || common.chroma != ENCODER_CHROMA_420 {
         return Err(MEDIA_UNSUPPORTED);
     }
     let configuration = Configuration {
-        profile: if hdr { Profile::Hdr10 } else { Profile::Sdr8 },
+        profile: if hdr {
+            Profile::Hdr10
+        } else if ten_bit {
+            Profile::Sdr10
+        } else {
+            Profile::Sdr8
+        },
         width: common.coded_width,
         height: common.coded_height,
         fps: common.fps_numerator,
@@ -138,6 +154,10 @@ pub(super) fn common(
         .validate()
         .map_err(|_| STATUS_INVALID_ARGUMENT)?;
     Ok(configuration)
+}
+
+fn original_range(payload: &Value) -> bool {
+    payload["configuration"]["video_stream_format"]["dynamic_range"] == "hdr"
 }
 
 #[cfg(test)]

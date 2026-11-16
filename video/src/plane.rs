@@ -238,6 +238,9 @@ pub trait Plane {
     ) -> Result<GeometryProgress, &'static str>;
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str>;
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str>;
+    fn retire_encoder_references(&mut self, _: u64) -> Result<(), &'static str> {
+        Ok(())
+    }
     fn release_stream(&mut self, _: u64) {}
     /// Retires ownership after control cleanup has finished for one stream.
     fn finish_stream(&mut self, _: u64) {}
@@ -1228,6 +1231,7 @@ impl Plane for NativePlane {
         }
         if input.configuration.gpu_processing.is_some()
             && input.frame_path != FramePath::DmaBuf
+            && input.frame_path != FramePath::Generic
             && self.resource_processor.is_none()
             && !processing
         {
@@ -1443,6 +1447,20 @@ impl Plane for NativePlane {
         }
     }
 
+    fn retire_encoder_references(&mut self, encoder: u64) -> Result<(), &'static str> {
+        let Some(binding) = self.encoders.get(&self.active_encoder) else {
+            return Ok(());
+        };
+        // SAFETY: binding remains live; the acknowledged broker close has joined
+        // GPU reads. A closed-session drain performs no encoder effect and returns
+        // completed provider references on this native caller's owning thread.
+        let api = unsafe { binding.table::<EncoderApi>() }.map_err(|_| "encoder_interface")?;
+        match unsafe { (api.drain)(api.base.context, encoder) } {
+            STATUS_OK | MEDIA_CLOSED => Ok(()),
+            MEDIA_BUSY | MEDIA_PENDING => Err("encoder_retirement_pending"),
+            _ => Err("encoder_retirement_failed"),
+        }
+    }
     fn finish_stream(&mut self, video: u64) {
         if let Some(processor) = self.resource_processor.as_mut() {
             processor.finish(video);

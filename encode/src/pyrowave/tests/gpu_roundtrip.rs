@@ -60,17 +60,26 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             &*consumer.0.cast::<FrameResourceConsumerApi>(),
         )
     };
-    for (iteration, hdr, intensity) in [
-        (0, false, 0.25f32),
-        (1, true, 767.0f32 / 1023.0),
-        (2, true, 768.0f32 / 1023.0),
-        (3, true, 940.0f32 / 1023.0),
+    for (iteration, hdr, sdr10, intensity) in [
+        (0, false, false, 0.25f32),
+        (1, true, false, 767.0f32 / 1023.0),
+        (2, true, false, 768.0f32 / 1023.0),
+        (3, true, false, 940.0f32 / 1023.0),
+        (4, false, true, 767.0f32 / 1023.0),
+        (5, false, true, 768.0f32 / 1023.0),
     ] {
-        let fixture =
-            Image::create(decoder.gpu_context().unwrap(), 64, 48, hdr, intensity).unwrap();
+        let ten_bit = hdr || sdr10;
+        let mut fixture =
+            Image::create(decoder.gpu_context().unwrap(), 64, 48, ten_bit, intensity).unwrap();
+        if sdr10 {
+            fixture.capability.color = DMABUF_COLOR_SRGB;
+            fixture.frame.color = DMABUF_COLOR_SRGB;
+        }
         let mut config = configuration();
         config.profile = if hdr {
             session::Profile::Hdr10
+        } else if sdr10 {
+            session::Profile::Sdr10
         } else {
             session::Profile::Sdr8
         };
@@ -93,7 +102,7 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         let common = EncoderCommonConfigV1 {
             version: 1,
             size: size_of::<EncoderCommonConfigV1>() as u32,
-            flags: 0,
+            flags: ENCODER_CONFIG_HAS_COLOR,
             reserved: 0,
             coded_width: config.width,
             coded_height: config.height,
@@ -107,8 +116,15 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             profile: 0,
             level: 0,
             chroma: ENCODER_CHROMA_420,
-            bit_depth: if hdr { 10 } else { 8 },
-            color: FrameColorMetadata::default(),
+            bit_depth: if ten_bit { 10 } else { 8 },
+            color: FrameColorMetadata {
+                transfer: if hdr {
+                    FRAME_TRANSFER_PQ
+                } else {
+                    FRAME_TRANSFER_SRGB
+                },
+                ..Default::default()
+            },
             output_clock: FrameClockMetadata {
                 version: 1,
                 size: size_of::<FrameClockMetadata>() as u32,
@@ -128,7 +144,7 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         let native = EncoderSessionConfig {
             size: size_of::<EncoderSessionConfig>() as u32,
             mode: ENCODER_SESSION_SUBMITTED,
-            codec: native_id(if hdr {
+            codec: native_id(if ten_bit {
                 session::CODEC_HDR10
             } else {
                 session::CODEC
@@ -319,7 +335,7 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
         let decoded = decoder.decode(&received.bytes, 64, 48).unwrap();
         let expected = (intensity * 255.0).round() as u8;
         let decoded16 = decoder.decode16(&received.bytes, 64, 48).unwrap();
-        if hdr {
+        if ten_bit {
             let expected16 = ((intensity * 1023.0).round() / 1023.0 * 65535.0).round() as u16;
             assert!(
                 decoded16[..64 * 48]
@@ -388,7 +404,7 @@ fn every_renderable_advertised_modifier_preserves_pixels_and_hdr_color() {
             let mut encoder = runtime.encoder(64, 48).unwrap();
             // SAFETY: fixture owns immutable rendered storage and all fences
             // through the complete native GPU import and retirement operation.
-            let bytes = unsafe { encoder.encode_gpu(&fixture.frame, hdr, 200_000) }.unwrap();
+            let bytes = unsafe { encoder.encode_gpu(&fixture.frame, hdr, hdr, 200_000) }.unwrap();
             drop(fixture);
             drop(encoder);
             let decoded = runtime.decode(&bytes, 64, 48).unwrap();
@@ -412,7 +428,7 @@ fn every_renderable_advertised_modifier_preserves_pixels_and_hdr_color() {
         .expect("renderable HDR color fixture");
     let mut encoder = runtime.encoder(64, 48).unwrap();
     // SAFETY: colored fixture storage and its acquire fences stay borrowed.
-    let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, 200_000) }.unwrap();
+    let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, true, 200_000) }.unwrap();
     drop(fixture);
     drop(encoder);
     let decoded = runtime.decode16(&bytes, 64, 48).unwrap();
@@ -460,14 +476,14 @@ fn gpu_import_preserves_hdr_at_stream_dimensions_and_rejects_non_fence_acquires(
         malformed.planes[0].acquire_fence_fd = not_a_fence.as_raw_fd();
         // SAFETY: the source is an immutable GPU allocation. The invalid sync
         // file must be rejected by validation before it can be sampled.
-        assert!(unsafe { encoder.encode_gpu(&malformed, true, 1_000_000) }.is_err());
+        assert!(unsafe { encoder.encode_gpu(&malformed, true, true, 1_000_000) }.is_err());
         assert!(
             not_a_fence.metadata().is_ok(),
             "borrowed fence fd was consumed"
         );
         // SAFETY: fixture and every real acquire fence remain live until all
         // import reads have retired; only encoded test output is read back.
-        let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, 1_000_000) }.unwrap();
+        let bytes = unsafe { encoder.encode_gpu(&fixture.frame, true, true, 1_000_000) }.unwrap();
         drop(fixture);
         drop(encoder);
         let decoded = runtime.decode16(&bytes, width, height).unwrap();

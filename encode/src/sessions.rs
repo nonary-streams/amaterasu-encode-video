@@ -190,6 +190,7 @@ struct RetainedFrame {
 }
 
 /// A DMA-BUF lease or a negotiated resource frame (encoder v1.5).
+#[derive(Clone, Copy)]
 enum RetainedReference {
     Lease(DmaBufFrameLease),
     Resource(CaptureResourceFrame),
@@ -210,23 +211,66 @@ const NO_COMPLETION: FrameDescriptor = FrameDescriptor {
 // affinity before invoking provider code; native entry points require calls on
 // the owning module thread. Worker requests never contain this record.
 unsafe impl Send for RetainedFrame {}
+// Native callbacks remain pinned until the consuming video module acknowledges
+// encoder close. Completion/close can run on the broker worker, but provider
+// releases must be returned to the thread that retained them.
+struct DeferredRelease(std::thread::ThreadId, RetainedReference);
+// SAFETY: moving the descriptor does not invoke it. Only its recorded owner may release it.
+unsafe impl Send for DeferredRelease {}
+static DEFERRED_RELEASES: std::sync::Mutex<Vec<DeferredRelease>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn provider_release_capacity_available() -> bool {
+    // At most 16 frame references per live encoder session can join this queue
+    // after admission closes. Backpressure prevents completed sessions from
+    // accumulating new references while an owning thread has stopped polling.
+    DEFERRED_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+        < 512
+}
+
+fn release_reference(reference: RetainedReference) {
+    match reference {
+        // SAFETY: successful retain owns this reference; backend completion/close joined all GPU reads.
+        RetainedReference::Lease(lease) => unsafe {
+            (lease.release.expect("validated lease"))(lease.context, -1)
+        },
+        RetainedReference::Resource(frame) => unsafe {
+            (frame.release)(frame.context, &NO_COMPLETION)
+        },
+    }
+}
+pub(crate) fn release_completed_on_owner_thread() {
+    let owner = std::thread::current().id();
+    let mut ready = Vec::new();
+    {
+        let mut pending = DEFERRED_RELEASES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].0 == owner {
+                ready.push(pending.swap_remove(index).1);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    for reference in ready {
+        release_reference(reference);
+    }
+}
 impl Drop for RetainedFrame {
     fn drop(&mut self) {
-        // SAFETY: a successful retain owns this reference. Encoded output or
-        // joined backend shutdown proves all GPU source reads have completed.
-        assert_eq!(
-            self.owner,
-            std::thread::current().id(),
-            "frame lease released off its module thread"
-        );
-        match &self.reference {
-            RetainedReference::Lease(lease) => unsafe {
-                (lease.release.expect("validated lease"))(lease.context, -1)
-            },
-            // SAFETY: as above; v1 CUDA completion is NONE after finished reads.
-            RetainedReference::Resource(frame) => unsafe {
-                (frame.release)(frame.context, &NO_COMPLETION)
-            },
+        if self.owner == std::thread::current().id() {
+            release_reference(self.reference);
+        } else {
+            DEFERRED_RELEASES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(DeferredRelease(self.owner, self.reference));
         }
     }
 }
@@ -663,7 +707,12 @@ impl Sessions {
     }
 
     pub fn shutdown_status(&self) -> Result<bool, &'static str> {
-        if !self.values.is_empty() {
+        if !self.values.is_empty()
+            || !DEFERRED_RELEASES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        {
             return Ok(false);
         }
         match self.close_failures.values().next() {
@@ -1249,6 +1298,9 @@ impl Session {
         }
         // SAFETY: the producer keeps its callbacks live; a failed retain
         // transfers nothing.
+        if !provider_release_capacity_available() {
+            return MEDIA_BUSY;
+        }
         let status = unsafe { (frame.retain)(frame.context) };
         if status != STATUS_OK {
             return status;
@@ -1330,6 +1382,9 @@ impl Session {
         // or after the backend joins shutdown, both after its GPU reads.
         input.source_retained = lease.is_some();
         let retained = if let Some(lease) = lease {
+            if !provider_release_capacity_available() {
+                return MEDIA_BUSY;
+            }
             // SAFETY: validated provider callbacks and initial reference remain
             // live during this call. Failed retain transfers no ownership.
             let status = unsafe { (lease.retain.expect("validated lease"))(lease.context) };

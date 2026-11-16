@@ -92,7 +92,7 @@ fn with_source_config<T>(
     let common = EncoderCommonConfigV1 {
         version: 1,
         size: size_of::<EncoderCommonConfigV1>() as u32,
-        flags: 0,
+        flags: ENCODER_CONFIG_HAS_COLOR,
         reserved: 0,
         coded_width: configuration.width,
         coded_height: configuration.height,
@@ -111,7 +111,18 @@ fn with_source_config<T>(
             .as_ref()
             .and_then(|p| p.media_format)
             .map_or(8, |f| u32::from(f.bit_depth)),
-        color: FrameColorMetadata::default(),
+        color: FrameColorMetadata {
+            version: 1,
+            size: size_of::<FrameColorMetadata>() as u32,
+            transfer: if configuration.video_stream_format.dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr
+            {
+                FRAME_TRANSFER_PQ
+            } else {
+                FRAME_TRANSFER_SRGB
+            },
+            ..Default::default()
+        },
         output_clock: FrameClockMetadata {
             version: 1,
             size: size_of::<FrameClockMetadata>() as u32,

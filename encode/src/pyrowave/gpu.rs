@@ -169,12 +169,12 @@ impl Context {
             .then_some(planes)
     }
     /// # Safety
-    /// Frame descriptors refer to one immutable allocation, lent through the
-    /// returned import's destruction. The runtime device mutex remains locked.
-    pub unsafe fn import<'a>(
+    /// The caller retains the immutable frame through import retirement.
+    pub unsafe fn import_precision<'a>(
         &'a self,
         frame: &'a DmaBufFrame,
         hdr: bool,
+        ten_bit: bool,
     ) -> Result<Import<'a>, &'static str> {
         let input = Frame {
             width: frame.width,
@@ -186,7 +186,7 @@ impl Context {
             fences: frame.planes.map(|plane| plane.acquire_fence_fd),
             offsets: frame.planes.map(|plane| plane.offset),
             pitches: frame.planes.map(|plane| plane.pitch),
-            hdr: u32::from(hdr),
+            hdr: u32::from(hdr) | (u32::from(ten_bit) << 1),
         };
         let mut image = ptr::null_mut();
         // SAFETY: C duplicates handles and finishes failure-path access before

@@ -267,7 +267,7 @@ impl EncodeModule {
             .as_ref()
             .is_some_and(|plugin| plugin.transport_enabled())
         {
-            return Some(json!([{"codec_mode_mask":8388608,"bitstream":"186f0393"}]));
+            return Some(json!([{"codec_mode_mask":41943040,"bitstream":"186f0393"}]));
         }
         None
     }
