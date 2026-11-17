@@ -274,7 +274,7 @@ impl Preparation {
             }
             if completion.elapsed_us >= 100_000 {
                 let _ = runtime.log(
-                    LogLevel::Info,
+                    LogLevel::Debug,
                     "encoder.preparation",
                     &format!(
                         "request={} elapsed_us={} scope=background_preparation_not_host_tick",
