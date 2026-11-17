@@ -9,7 +9,8 @@ use super::{Pipeline, Stage, Stream, stage_name};
 use crate::rpc::Send;
 use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamBinding, StreamIssue, StreamIssueOutbox, StreamReport,
+    LifecycleLayer, PROVIDER_FALLBACK_CONFIRMED, StreamBinding, StreamIssue, StreamIssueOutbox,
+    StreamReport,
 };
 
 /// Per-stream reporting state.
@@ -193,22 +194,28 @@ impl Stream {
     /// Report a `dependency` failure the stream survived by switching to
     /// `fallback`. `reason` is the dependency's own code.
     #[track_caller]
-    pub(super) fn report_fallback(
-        &mut self,
-        dependency: LifecycleLayer,
-        code: &str,
-        reason: Option<&str>,
-        fallback: &str,
-    ) {
-        let issue = StreamIssue::demoted(
-            self.issues.operation.clone(),
-            LifecycleLayer::EncodeVideo,
-            stage_name(self.stage),
-            code,
-            fallback,
-        )
-        .caused_by(dependency);
-        self.issues.push(with_reason(issue, reason));
+    pub(super) fn report_confirmed_fallback(&mut self, pending: super::PendingFallback) {
+        let issue = if let Some(operation) = pending.operation {
+            StreamIssue::demoted(
+                operation,
+                LifecycleLayer::EncodeVideo,
+                PROVIDER_FALLBACK_CONFIRMED,
+                pending.code,
+                pending.fallback,
+            )
+            .caused_by(pending.dependency)
+        } else {
+            // A skipped capability has no provider attempt to retire.
+            StreamIssue::demoted(
+                self.issues.operation.clone(),
+                LifecycleLayer::EncodeVideo,
+                stage_name(self.stage),
+                pending.code,
+                pending.fallback,
+            )
+        };
+        self.issues
+            .push(with_reason(issue, pending.reason.as_deref()));
     }
 }
 

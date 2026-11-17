@@ -105,6 +105,14 @@ fn observed_capture(payload: &Value) -> Result<Option<ObservedCapture>, &'static
     Ok(Some(observed))
 }
 
+struct PendingFallback {
+    dependency: LifecycleLayer,
+    code: &'static str,
+    reason: Option<String>,
+    fallback: &'static str,
+    operation: Option<String>,
+}
+
 struct Stream {
     startup_frame_ready: bool,
     packet_boundaries: bool,
@@ -127,6 +135,7 @@ struct Stream {
     fallback_device_name: Option<String>,
     fallback_error: Option<&'static str>,
     fallback_attempted: bool,
+    pending_fallbacks: Vec<PendingFallback>,
     fallback_offset: usize,
     fallback_pages: usize,
     fallback_last_output: Option<String>,
@@ -350,6 +359,13 @@ fn log_diagnostics(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, se
 }
 
 impl Stream {
+    fn encoder_probe_operation(&self) -> String {
+        format!(
+            "{}-probe-encoder-{}",
+            self.operation, self.encoder_probe_attempt
+        )
+    }
+
     fn encoder_operation(&self) -> String {
         format!(
             "{}-encoder-attempt-{}",
@@ -564,7 +580,9 @@ impl Stream {
                 self.record_terminal_issue(issue);
                 self.begin_cleanup(code);
             }),
-            StreamFailureDecision::Continue(issue) => self.record_nonterminal_issue(issue),
+            StreamFailureDecision::Continue(continuation) => {
+                self.record_nonterminal_issue(continuation.into_issue())
+            }
             StreamFailureDecision::Invalid(_) => {}
         }
     }
@@ -585,7 +603,8 @@ impl Stream {
             return;
         }
         let issue = self.failure_issue(StreamFailure::advisory(code));
-        if let StreamFailureDecision::Continue(issue) = StreamFailureHandler::decide(issue) {
+        if let StreamFailureDecision::Continue(continuation) = StreamFailureHandler::decide(issue) {
+            let issue = continuation.into_issue();
             self.record_nonterminal_issue(issue);
             self.begin_cleanup(code);
         }
@@ -607,7 +626,9 @@ impl Stream {
                 self.stage = Stage::Failed;
                 self.error = Some(code);
             }),
-            StreamFailureDecision::Continue(issue) => self.record_nonterminal_issue(issue),
+            StreamFailureDecision::Continue(continuation) => {
+                self.record_nonterminal_issue(continuation.into_issue())
+            }
             StreamFailureDecision::Invalid(_) => {}
         }
     }
@@ -1277,6 +1298,7 @@ impl Pipeline {
                 fallback_device_name: None,
                 fallback_error: None,
                 fallback_attempted: false,
+                pending_fallbacks: Vec::new(),
                 fallback_offset: 0,
                 fallback_pages: 0,
                 fallback_last_output: None,
@@ -2190,10 +2212,7 @@ fn advance(
             stream.operation, stream.capture_attempt
         )
     } else if stream.stage == Stage::ProbeEncoder {
-        format!(
-            "{}-probe-encoder-{}",
-            stream.operation, stream.encoder_probe_attempt
-        )
+        stream.encoder_probe_operation()
     } else if stream.stage == Stage::Encoder {
         stream.encoder_operation()
     } else if stream.stage == Stage::ReplaceCapture {
@@ -2483,7 +2502,9 @@ fn failed_step(stream: &mut Stream, failure: StreamFailure) {
                     stream.retries = 0;
                 }
             }),
-            StreamFailureDecision::Continue(issue) => stream.record_nonterminal_issue(issue),
+            StreamFailureDecision::Continue(continuation) => {
+                stream.record_nonterminal_issue(continuation.into_issue())
+            }
             StreamFailureDecision::Invalid(_) => {}
         }
     }
@@ -2498,12 +2519,13 @@ fn begin_runtime_encoder_recovery(stream: &mut Stream, code: &'static str) -> bo
     {
         return false;
     }
-    stream.report_fallback(
-        LifecycleLayer::EncodeVideo,
+    stream.pending_fallbacks.push(PendingFallback {
+        dependency: LifecycleLayer::EncodeVideo,
         code,
-        None,
-        "software_encoder_restart",
-    );
+        reason: None,
+        fallback: "software_encoder_restart",
+        operation: Some(stream.encoder_operation()),
+    });
     stream.restart_pending = true;
     stream.force_idr = true;
     stream.next_frame = Instant::now();
@@ -2607,12 +2629,13 @@ fn apply_result(
             Ok(Some(reason)) => {
                 let next_candidate = !stream.encoder_candidates.is_empty();
                 if next_candidate {
-                    stream.report_fallback(
-                        LifecycleLayer::EncodeVideo,
-                        "encoder_probe_rejected",
-                        Some(&reason),
-                        "next_encoder_candidate",
-                    );
+                    stream.pending_fallbacks.push(PendingFallback {
+                        dependency: LifecycleLayer::EncodeVideo,
+                        code: "encoder_probe_rejected",
+                        reason: Some(reason.clone()),
+                        fallback: "next_encoder_candidate",
+                        operation: Some(stream.encoder_probe_operation()),
+                    });
                 }
                 stream.encoder_probe_reason = Some(reason);
                 if !begin_encoder_probe(stream) {
@@ -3268,12 +3291,13 @@ fn begin_fallback(stream: &mut Stream, original_error: &'static str) -> bool {
     let Some(device_name) = output_device_name(stream.provider, &stream.output) else {
         return false;
     };
-    stream.report_fallback(
-        LifecycleLayer::Capture,
-        "capture_provider_failed",
-        Some(original_error),
-        "alternate_capture_provider",
-    );
+    stream.pending_fallbacks.push(PendingFallback {
+        dependency: LifecycleLayer::Capture,
+        code: "capture_provider_failed",
+        reason: Some(original_error.into()),
+        fallback: "alternate_capture_provider",
+        operation: Some(stream.capture_operation.clone()),
+    });
     stream.fallback_attempted = true;
     stream.no_resources = true;
     stream.fallback_error = Some(original_error);
@@ -3440,12 +3464,13 @@ fn begin_encoder_fallback(stream: &mut Stream, reason: Option<&str>) -> bool {
     let Some(fallback) = stream.fallback_encoder.take() else {
         return false;
     };
-    stream.report_fallback(
-        LifecycleLayer::EncodeVideo,
-        "encoder_open_failed",
-        reason,
-        "software_encoder",
-    );
+    stream.pending_fallbacks.push(PendingFallback {
+        dependency: LifecycleLayer::EncodeVideo,
+        code: "encoder_open_failed",
+        reason: reason.map(str::to_owned),
+        fallback: "software_encoder",
+        operation: Some(stream.encoder_operation()),
+    });
     stream.encoder_fallback_reason = Some(reason.unwrap_or("encoder_open_failed").into());
     stream.encoder = Some(fallback);
     stream.encoder_attempt = 1;
@@ -4268,6 +4293,15 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
             queues.close(id);
         }
     }
+    if stream.stage == Stage::Running {
+        report_confirmed_fallbacks(stream);
+    }
+}
+
+fn report_confirmed_fallbacks(stream: &mut Stream) {
+    for pending in std::mem::take(&mut stream.pending_fallbacks) {
+        stream.report_confirmed_fallback(pending);
+    }
 }
 
 fn activate_or_resume(
@@ -4281,6 +4315,7 @@ fn activate_or_resume(
         stream.stage = Stage::Running;
         stream.force_idr = true;
         stream.next_frame = Instant::now();
+        report_confirmed_fallbacks(stream);
     } else {
         activate(stream, id, queues, send);
     }
