@@ -434,9 +434,9 @@ fn noncritical_provider_reports_cannot_start_cleanup_or_release_live_video() {
     let capture = stream.capture;
     let encoder = stream.session;
     for report in [
-        StreamFailure::advisory("optional_metadata_unavailable"),
-        StreamFailure::demoted("optional_feedback_unavailable", "keep_video"),
-        StreamFailure::critical("invalid/code"),
+        StreamFailure::request_unchanged("optional_metadata_unavailable"),
+        StreamFailure::fallback_applied("optional_feedback_unavailable", "keep_video"),
+        StreamFailure::requirement_failed("invalid/code"),
     ] {
         stream.cleanup(report);
         assert_eq!(stream.stage, Stage::Running);
@@ -448,7 +448,7 @@ fn noncritical_provider_reports_cannot_start_cleanup_or_release_live_video() {
     // A drain warning has continuation authority only after an owner drain.
     stream.drain_failed("drain_timeout");
     assert_eq!(stream.stage, Stage::Running);
-    stream.cleanup(StreamFailure::critical("capture_source_lost"));
+    stream.cleanup(StreamFailure::requirement_failed("capture_source_lost"));
     assert_eq!(stream.stage, Stage::FindEncoder);
     assert_eq!(stream.error, Some("capture_source_lost"));
     assert_eq!(
@@ -485,19 +485,27 @@ fn noncritical_reports_cannot_install_a_video_cleanup_barrier() {
     );
     tick(&mut pipeline, &mut runtime, &mut plane, 12);
     let stream = pipeline.streams.get_mut(&1).unwrap();
-    stream.cleanup(StreamFailure::critical("native_encoder_lost"));
-    stream.fail_retirement(StreamFailure::advisory("optional_cleanup_diagnostic_lost"));
+    stream.cleanup(StreamFailure::requirement_failed("native_encoder_lost"));
+    stream.fail_retirement(StreamFailure::request_unchanged(
+        "optional_cleanup_diagnostic_lost",
+    ));
     assert_eq!(stream.stage, Stage::FindEncoder);
     assert_eq!(stream.error, Some("native_encoder_lost"));
     for _ in 0..4 {
-        failed_step(stream, StreamFailure::advisory("optional_diagnostic_lost"));
+        failed_step(
+            stream,
+            StreamFailure::request_unchanged("optional_diagnostic_lost"),
+        );
     }
     assert_eq!(stream.stage, Stage::FindEncoder);
     assert_eq!(stream.retries, 0);
     assert!(!stream.unresolved);
     assert_eq!(stream.error, Some("native_encoder_lost"));
     for _ in 0..3 {
-        failed_step(stream, StreamFailure::critical("native_close_unconfirmed"));
+        failed_step(
+            stream,
+            StreamFailure::requirement_failed("native_close_unconfirmed"),
+        );
     }
     assert!(
         stream.unresolved,

@@ -569,21 +569,22 @@ impl Stream {
         response
     }
 
-    /// A failure report cannot retire video before the SDK grants authority.
+    /// Fence the failed video resource locally. Stream-session owns what this
+    /// means for delivery; a video diagnostic carries no teardown authority.
     #[track_caller]
     fn cleanup(&mut self, failure: StreamFailure) {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
         let code = failure.code();
-        let issue = self.failure_issue(failure);
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|issue| {
-                self.record_terminal_issue(issue);
-                self.begin_cleanup(code);
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                self.record_nonterminal_issue(continuation.into_issue())
-            }
-            StreamFailureDecision::Invalid(_) => {}
+        let report = self.failure_report(failure);
+        let needs_fence = report.requires_containment();
+        let issue = report.into_diagnostic();
+        if !issue.valid() {
+            return;
+        }
+        if needs_fence {
+            self.record_terminal_issue(issue);
+            self.begin_cleanup(code);
+        } else {
+            self.record_nonterminal_issue(issue);
         }
     }
 
@@ -592,44 +593,36 @@ impl Stream {
         self.begin_cleanup(ending.code());
     }
 
-    /// Continue an already authorized drain. Failure here cannot turn a live
-    /// stream into teardown or assert that native retirement is complete.
+    /// Continue an already authorized drain and report the incomplete step.
     #[track_caller]
     fn drain_failed(&mut self, code: &'static str) {
-        use amaterasu_module_sdk::stream_lifecycle::{
-            StreamFailure, StreamFailureDecision, StreamFailureHandler,
-        };
         if !matches!(self.stage, Stage::StopCapture | Stage::Draining) {
             return;
         }
-        let issue = self.failure_issue(StreamFailure::advisory(code));
-        if let StreamFailureDecision::Continue(continuation) = StreamFailureHandler::decide(issue) {
-            let issue = continuation.into_issue();
-            self.record_nonterminal_issue(issue);
-            self.begin_cleanup(code);
-        }
+        let issue = self
+            .failure_report(StreamFailure::request_unchanged(code))
+            .into_diagnostic();
+        self.record_nonterminal_issue(issue);
+        self.begin_cleanup(code);
     }
 
-    /// A lost native retirement proof must stay fenced, but a diagnostic
-    /// warning cannot install a terminal cleanup state.
+    /// Keep unresolved native retirement fenced.
     #[track_caller]
     fn fail_retirement(&mut self, failure: StreamFailure) {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
         let code = failure.code();
         let repeated = self.stage == Stage::Failed && self.error == Some(code);
-        let issue = self.failure_issue(failure);
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|issue| {
-                if !repeated {
-                    self.record_nonterminal_issue(issue);
-                }
-                self.stage = Stage::Failed;
-                self.error = Some(code);
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                self.record_nonterminal_issue(continuation.into_issue())
-            }
-            StreamFailureDecision::Invalid(_) => {}
+        let report = self.failure_report(failure);
+        let unconfirmed = report.requires_containment();
+        let issue = report.into_diagnostic();
+        if !issue.valid() {
+            return;
+        }
+        if !unconfirmed || !repeated {
+            self.record_nonterminal_issue(issue);
+        }
+        if unconfirmed {
+            self.stage = Stage::Failed;
+            self.error = Some(code);
         }
     }
 
@@ -1444,7 +1437,7 @@ impl Pipeline {
                 Ok(()) => stream.gpu_configured = true,
                 Err(reason) => {
                     stream.gpu_configured = true;
-                    stream.cleanup(StreamFailure::critical(reason));
+                    stream.cleanup(StreamFailure::requirement_failed(reason));
                 }
             }
         }
@@ -1457,7 +1450,9 @@ impl Pipeline {
                     stream.requested_cleanup(RequestedEnding::RequestEnded);
                 }
                 Ok(Response::Error { code, .. }) if code == "permission_denied" => {
-                    stream.cleanup(StreamFailure::critical("parent_authorization_lost"));
+                    stream.cleanup(StreamFailure::requirement_failed(
+                        "parent_authorization_lost",
+                    ));
                 }
                 _ => return, // Uncertain liveness authorizes neither new work nor an invented stop.
             }
@@ -1476,7 +1471,7 @@ impl Pipeline {
             Stage::X11Enumerate | Stage::KmsEnumerate | Stage::SelectEncoder | Stage::ProbeEncoder
         ) && stream.opened_at.elapsed() >= Duration::from_secs(5)
         {
-            stream.cleanup(StreamFailure::critical(
+            stream.cleanup(StreamFailure::requirement_failed(
                 if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
                     "capture_provider_unavailable"
                 } else {
@@ -1524,12 +1519,13 @@ impl Pipeline {
                                 && !rpc::complete(send, parent, stream.response(id))
                             {
                                 stream.ending_parent = Some(parent);
-                                stream.cleanup(StreamFailure::critical("completion_lost"));
+                                stream
+                                    .cleanup(StreamFailure::requirement_failed("completion_lost"));
                                 return;
                             }
                         }
                         Err(code) => {
-                            stream.cleanup(StreamFailure::critical(code));
+                            stream.cleanup(StreamFailure::requirement_failed(code));
                             return;
                         }
                     }
@@ -1547,7 +1543,7 @@ impl Pipeline {
                             stream.force_idr = false;
                         }
                     }
-                    Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                    Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
                 }
             } else {
                 pump(
@@ -1568,7 +1564,7 @@ impl Pipeline {
                 if let Some(capture) = stream.capture {
                     match plane.hdr_metadata(id, stream.provider, capture) {
                         Ok(metadata) => queues.set_hdr(id, metadata),
-                        Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                        Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
                     }
                 }
             }
@@ -1589,7 +1585,7 @@ impl Pipeline {
             match geometry {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, &self.queues, send),
                 Ok(GeometryProgress::Busy) => return,
-                Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
             }
             return;
         }
@@ -1731,7 +1727,7 @@ fn pump(
         match stream.observe_presentation(plane) {
             Ok(paced) => paced,
             Err(code) => {
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
                 return;
             }
         }
@@ -1765,7 +1761,7 @@ fn pump(
                 capture_slot = None;
             }
             Err(code) => {
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
                 return;
             }
         }
@@ -1805,7 +1801,7 @@ fn pump(
         stream.next_frame_clock(now)
     };
     let Some((timestamp_us, sequence)) = frame_clock else {
-        stream.cleanup(StreamFailure::critical("frame_clock_exhausted"));
+        stream.cleanup(StreamFailure::requirement_failed("frame_clock_exhausted"));
         return;
     };
     // Record before entering the capture callback: some encoders return output
@@ -1868,7 +1864,7 @@ fn pump(
             stream.owned_capture.record_freshness(&progress);
             if let Some(reason) = progress.dmabuf_fallback {
                 if !owned_capture::begin_cpu_capture_fallback(stream, reason) {
-                    stream.cleanup(StreamFailure::critical(reason));
+                    stream.cleanup(StreamFailure::requirement_failed(reason));
                 }
                 return;
             }
@@ -1907,18 +1903,18 @@ fn pump(
                         .wgc_pacing
                         .capture_arrived(arrival.timestamp_us, observed_offset)
                     else {
-                        stream.cleanup(StreamFailure::critical("frame_clock_exhausted"));
+                        stream.cleanup(StreamFailure::requirement_failed("frame_clock_exhausted"));
                         return;
                     };
                     if !schedule_wgc_after_completion(stream, projected_slot, completed_at) {
-                        stream.cleanup(StreamFailure::critical("frame_clock_exhausted"));
+                        stream.cleanup(StreamFailure::requirement_failed("frame_clock_exhausted"));
                         return;
                     }
                 } else if progress.capture_reused {
                     if let Some(projected_slot) = stream.wgc_pacing.cached_reuse_slot()
                         && !schedule_wgc_after_completion(stream, projected_slot, completed_at)
                     {
-                        stream.cleanup(StreamFailure::critical("frame_clock_exhausted"));
+                        stream.cleanup(StreamFailure::requirement_failed("frame_clock_exhausted"));
                         return;
                     }
                 } else {
@@ -1963,7 +1959,7 @@ fn pump(
             if capture_start_recorded {
                 cancel_processing_start(queues, generation, id, sequence);
             }
-            stream.cleanup(StreamFailure::critical(code));
+            stream.cleanup(StreamFailure::requirement_failed(code));
         }
     }
 }
@@ -2143,7 +2139,9 @@ fn advance(
             && !stream.encoder_configuration_probed
         {
             if stream.encoder.is_none() {
-                stream.cleanup(StreamFailure::critical("encoder_configuration_unverified"));
+                stream.cleanup(StreamFailure::requirement_failed(
+                    "encoder_configuration_unverified",
+                ));
                 return false;
             }
             stream.no_resources = stream.capture.is_none() && stream.session.is_none();
@@ -2169,7 +2167,9 @@ fn advance(
                 .get_or_insert_with(Instant::now);
         }
         if capture_preflight_expired(stream) {
-            stream.cleanup(StreamFailure::critical("capture_source_preflight_timeout"));
+            stream.cleanup(StreamFailure::requirement_failed(
+                "capture_source_preflight_timeout",
+            ));
             return false;
         }
         let preflight = if managed_preflight {
@@ -2191,7 +2191,9 @@ fn advance(
         // A provider's synchronous callback may have returned after the
         // admission deadline. Do not create a capture from an expired result.
         if capture_preflight_expired(stream) {
-            stream.cleanup(StreamFailure::critical("capture_source_preflight_timeout"));
+            stream.cleanup(StreamFailure::requirement_failed(
+                "capture_source_preflight_timeout",
+            ));
             return false;
         }
         match preflight {
@@ -2203,7 +2205,7 @@ fn advance(
                 return false;
             }
             Err(code) => {
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
                 return false;
             }
         }
@@ -2214,7 +2216,7 @@ fn advance(
             Ok(GeometryProgress::Ready) => {}
             Ok(GeometryProgress::Busy) => return false,
             Err(code) => {
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
                 return false;
             }
         }
@@ -2287,10 +2289,10 @@ fn advance(
                 stream.no_resources = stream.session.is_none();
                 if code == "unavailable" {
                     if !begin_fallback(stream, "unavailable") {
-                        failed_step(stream, StreamFailure::critical("unavailable"));
+                        failed_step(stream, StreamFailure::requirement_failed("unavailable"));
                     }
                 } else {
-                    failed_step(stream, StreamFailure::critical("request_failed"));
+                    failed_step(stream, StreamFailure::requirement_failed("request_failed"));
                 }
             } else if stream.stage == Stage::InspectEncoder {
                 // A definite refusal has no child resource; retain unknown inputs.
@@ -2298,10 +2300,12 @@ fn advance(
             } else if stream.stage == Stage::FallbackEnumerate {
                 failed_step(
                     stream,
-                    StreamFailure::critical(stream.fallback_error.unwrap_or("request_failed")),
+                    StreamFailure::requirement_failed(
+                        stream.fallback_error.unwrap_or("request_failed"),
+                    ),
                 );
             } else {
-                failed_step(stream, StreamFailure::critical("request_failed"));
+                failed_step(stream, StreamFailure::requirement_failed("request_failed"));
             }
         }
         rpc::Admission::Uncertain => {
@@ -2311,7 +2315,7 @@ fn advance(
                 stream.no_resources = true;
             }
             stream.uncertain = Some(command);
-            failed_step(stream, StreamFailure::critical("request_failed"));
+            failed_step(stream, StreamFailure::requirement_failed("request_failed"));
         }
     }
     false
@@ -2499,31 +2503,30 @@ fn failed_step(stream: &mut Stream, failure: StreamFailure) {
     ) {
         stream.cleanup(failure);
     } else {
-        use amaterasu_module_sdk::stream_lifecycle::{StreamFailureDecision, StreamFailureHandler};
-        let issue = stream.failure_issue(failure);
-        match StreamFailureHandler::decide(issue) {
-            StreamFailureDecision::Terminate(permit) => permit.terminate(|_| {
-                stream.issues.forget_provider_code();
-                stream.retries += 1;
-                if stream.retries >= 3 {
-                    stream.report_cleanup_failure();
-                    stream.error = Some("cleanup_failed");
-                    stream.unresolved = true;
-                    stream.stage =
-                        if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder)
-                            && stream.source_id.is_none()
-                        {
-                            Stage::FindCapture
-                        } else {
-                            Stage::Failed
-                        };
-                    stream.retries = 0;
-                }
-            }),
-            StreamFailureDecision::Continue(continuation) => {
-                stream.record_nonterminal_issue(continuation.into_issue())
-            }
-            StreamFailureDecision::Invalid(_) => {}
+        let report = stream.failure_report(failure);
+        let needs_fence = report.requires_containment();
+        let issue = report.into_diagnostic();
+        if !issue.valid() {
+            return;
+        }
+        if !needs_fence {
+            stream.record_nonterminal_issue(issue);
+            return;
+        }
+        stream.issues.forget_provider_code();
+        stream.retries += 1;
+        if stream.retries >= 3 {
+            stream.report_cleanup_failure();
+            stream.error = Some("cleanup_failed");
+            stream.unresolved = true;
+            stream.stage = if matches!(stream.stage, Stage::FindEncoder | Stage::CloseEncoder)
+                && stream.source_id.is_none()
+            {
+                Stage::FindCapture
+            } else {
+                Stage::Failed
+            };
+            stream.retries = 0;
         }
     }
 }
@@ -2566,9 +2569,11 @@ fn apply_result(
             if stream.stage == Stage::InspectEncoder {
                 stream.stage = Stage::Capture;
             } else if matches!(stream.stage, Stage::X11Enumerate | Stage::KmsEnumerate) {
-                stream.cleanup(StreamFailure::critical("capture_provider_unavailable"));
+                stream.cleanup(StreamFailure::requirement_failed(
+                    "capture_provider_unavailable",
+                ));
             } else {
-                failed_step(stream, StreamFailure::critical(code));
+                failed_step(stream, StreamFailure::requirement_failed(code));
             }
             return false;
         }
@@ -2600,7 +2605,7 @@ fn apply_result(
             }
             Err(code) => {
                 stream.no_resources = true;
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
             }
         }
         return false;
@@ -2618,14 +2623,16 @@ fn apply_result(
             }
             Err(code) => {
                 stream.no_resources = true;
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
             }
         }
         return false;
     }
     if stream.stage == Stage::ProbeEncoder {
         let Some(identity) = &stream.encoder else {
-            stream.cleanup(StreamFailure::critical("invalid_encoder_probe_reply"));
+            stream.cleanup(StreamFailure::requirement_failed(
+                "invalid_encoder_probe_reply",
+            ));
             return false;
         };
         match encoder::probe_result(
@@ -2657,7 +2664,7 @@ fn apply_result(
                 }
                 stream.encoder_probe_reason = Some(reason);
                 if !begin_encoder_probe(stream) {
-                    stream.cleanup(StreamFailure::critical("encoder_unavailable"));
+                    stream.cleanup(StreamFailure::requirement_failed("encoder_unavailable"));
                 }
             }
             Err(code) => {
@@ -2680,7 +2687,7 @@ fn apply_result(
                     payload.get("settled")
                 );
                 stream.note_provider_code(provider_code);
-                stream.cleanup(StreamFailure::critical(code));
+                stream.cleanup(StreamFailure::requirement_failed(code));
             }
         }
         return false;
@@ -2702,7 +2709,10 @@ fn apply_result(
     {
         stream.no_resources = stream.session.is_none();
         if !begin_fallback(stream, "unsupported_platform") {
-            failed_step(stream, StreamFailure::critical("unsupported_platform"));
+            failed_step(
+                stream,
+                StreamFailure::requirement_failed("unsupported_platform"),
+            );
         }
         return false;
     }
@@ -2720,7 +2730,7 @@ fn apply_result(
             ))
     {
         if stream.stage == Stage::RestartCloseEncoder {
-            stream.cleanup(StreamFailure::critical("encoder_restart_failed"));
+            stream.cleanup(StreamFailure::requirement_failed("encoder_restart_failed"));
             return false;
         }
         if stream.stage == Stage::Encoder
@@ -2748,7 +2758,7 @@ fn apply_result(
         if let Some(provider_code) = payload_error_code(&payload) {
             stream.note_provider_code(provider_code);
         }
-        failed_step(stream, StreamFailure::critical(code));
+        failed_step(stream, StreamFailure::requirement_failed(code));
         return false;
     }
     let next = match stream.stage {
@@ -2822,14 +2832,14 @@ fn apply_result(
                     } else {
                         code
                     };
-                    stream.cleanup(StreamFailure::critical(code));
+                    stream.cleanup(StreamFailure::requirement_failed(code));
                     return false;
                 }
             }
         }
         Stage::Capture => {
             let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
-                stream.cleanup(StreamFailure::critical("invalid_capture_reply"));
+                stream.cleanup(StreamFailure::requirement_failed("invalid_capture_reply"));
                 return false;
             };
             stream.capture = Some(capture);
@@ -2840,13 +2850,15 @@ fn apply_result(
                     stream.configuration.effective_fps_millihz(),
                 )
             {
-                stream.cleanup(StreamFailure::critical("capture_constant_rate_unconfirmed"));
+                stream.cleanup(StreamFailure::requirement_failed(
+                    "capture_constant_rate_unconfirmed",
+                ));
                 return false;
             }
             stream.source_observation = match observed_capture(&payload) {
                 Ok(observation) => observation,
                 Err(code) => {
-                    stream.cleanup(StreamFailure::critical(code));
+                    stream.cleanup(StreamFailure::requirement_failed(code));
                     return false;
                 }
             };
@@ -2857,7 +2869,9 @@ fn apply_result(
                         != Some(observed.output_name.as_str())
                 })
             {
-                stream.cleanup(StreamFailure::critical("capture_source_identity_mismatch"));
+                stream.cleanup(StreamFailure::requirement_failed(
+                    "capture_source_identity_mismatch",
+                ));
                 return false;
             }
             if stream.generic_input
@@ -2868,7 +2882,7 @@ fn apply_result(
                         .and_then(Value::as_str)
                         != Some("cross_service_safe"))
             {
-                stream.cleanup(StreamFailure::critical(
+                stream.cleanup(StreamFailure::requirement_failed(
                     "resource_capture_clock_unconfirmed",
                 ));
                 return false;
@@ -2876,7 +2890,7 @@ fn apply_result(
             let geometry = match capture_geometry(&payload) {
                 Ok(geometry) => geometry,
                 Err(code) => {
-                    stream.cleanup(StreamFailure::critical(code));
+                    stream.cleanup(StreamFailure::requirement_failed(code));
                     return false;
                 }
             };
@@ -2890,7 +2904,7 @@ fn apply_result(
             ) {
                 Ok(touch_port) => touch_port,
                 Err(code) => {
-                    stream.cleanup(StreamFailure::critical(code));
+                    stream.cleanup(StreamFailure::requirement_failed(code));
                     return false;
                 }
             };
@@ -2899,7 +2913,7 @@ fn apply_result(
                 match verify_stream_geometry(plane, stream) {
                     Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                     Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
-                    Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                    Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
                 }
                 return false;
             }
@@ -2907,13 +2921,13 @@ fn apply_result(
         }
         Stage::FallbackEnumerate => {
             let Some(device_name) = stream.fallback_device_name.clone() else {
-                stream.cleanup(StreamFailure::critical(
+                stream.cleanup(StreamFailure::requirement_failed(
                     stream.fallback_error.unwrap_or("provider_failed"),
                 ));
                 return false;
             };
             let Some(provider) = stream.fallback_provider else {
-                stream.cleanup(StreamFailure::critical(
+                stream.cleanup(StreamFailure::requirement_failed(
                     stream.fallback_error.unwrap_or("provider_failed"),
                 ));
                 return false;
@@ -2923,7 +2937,7 @@ fn apply_result(
                     Ok(Some(output)) => output,
                     Ok(None) => return false,
                     Err(()) => {
-                        stream.cleanup(StreamFailure::critical(
+                        stream.cleanup(StreamFailure::requirement_failed(
                             stream.fallback_error.unwrap_or("provider_failed"),
                         ));
                         return false;
@@ -2945,7 +2959,7 @@ fn apply_result(
             if let Some(source_id) = stream.source_id {
                 if stream.configuration.extension_profile.is_some() {
                     let Ok(mut guard) = queues.lock() else {
-                        stream.cleanup(StreamFailure::critical("queue_failed"));
+                        stream.cleanup(StreamFailure::requirement_failed("queue_failed"));
                         return false;
                     };
                     guard.open(id, &stream.owner, stream.clock_origin_us);
@@ -2970,7 +2984,7 @@ fn apply_result(
                     {
                         guard.close(id);
                     }
-                    stream.cleanup(StreamFailure::critical(code));
+                    stream.cleanup(StreamFailure::requirement_failed(code));
                     return false;
                 }
                 stream.source_started = true;
@@ -2978,7 +2992,7 @@ fn apply_result(
                     match verify_stream_geometry(plane, stream) {
                         Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                         Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
-                        Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                        Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
                     }
                 } else {
                     activate_or_resume(stream, id, queues, send);
@@ -2988,7 +3002,7 @@ fn apply_result(
             match verify_stream_geometry(plane, stream) {
                 Ok(GeometryProgress::Ready) => activate_or_resume(stream, id, queues, send),
                 Ok(GeometryProgress::Busy) => stream.stage = Stage::Activating,
-                Err(code) => stream.cleanup(StreamFailure::critical(code)),
+                Err(code) => stream.cleanup(StreamFailure::requirement_failed(code)),
             }
             return false;
         }
@@ -2999,7 +3013,7 @@ fn apply_result(
                 if let Some(encoder) = stream.session
                     && let Err(code) = plane.retire_encoder_references(encoder)
                 {
-                    failed_step(stream, StreamFailure::critical(code));
+                    failed_step(stream, StreamFailure::requirement_failed(code));
                     return false;
                 }
                 if !stream.generic_input {
@@ -3009,7 +3023,7 @@ fn apply_result(
                 Stage::FindCapture
             } else {
                 let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
-                    failed_step(stream, StreamFailure::critical("invalid_lookup"));
+                    failed_step(stream, StreamFailure::requirement_failed("invalid_lookup"));
                     return false;
                 };
                 stream.session = Some(session);
@@ -3023,7 +3037,7 @@ fn apply_result(
             if let Some(encoder) = stream.session
                 && let Err(code) = plane.retire_encoder_references(encoder)
             {
-                failed_step(stream, StreamFailure::critical(code));
+                failed_step(stream, StreamFailure::requirement_failed(code));
                 return false;
             }
             if !stream.generic_input {
@@ -3038,12 +3052,14 @@ fn apply_result(
             if let Some(encoder) = stream.session
                 && let Err(code) = plane.retire_encoder_references(encoder)
             {
-                failed_step(stream, StreamFailure::critical(code));
+                failed_step(stream, StreamFailure::requirement_failed(code));
                 return false;
             }
             stream.session = None;
             let Some(fallback) = stream.fallback_encoder.take() else {
-                stream.cleanup(StreamFailure::critical("encoder_restart_unavailable"));
+                stream.cleanup(StreamFailure::requirement_failed(
+                    "encoder_restart_unavailable",
+                ));
                 return false;
             };
             stream.encoder_fallback_reason = Some("encoder_restart".into());
@@ -3057,7 +3073,7 @@ fn apply_result(
                 return finish_cleanup(stream);
             } else {
                 let Some(capture) = payload.get("stream").and_then(Value::as_u64) else {
-                    failed_step(stream, StreamFailure::critical("invalid_lookup"));
+                    failed_step(stream, StreamFailure::requirement_failed("invalid_lookup"));
                     return false;
                 };
                 stream.capture = Some(capture);
@@ -4256,7 +4272,9 @@ fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
                 .and_then(Value::as_str)
                 != Some("strict_source_echo"))
     {
-        stream.cleanup(StreamFailure::critical("resource_clock_unconfirmed"));
+        stream.cleanup(StreamFailure::requirement_failed(
+            "resource_clock_unconfirmed",
+        ));
         return false;
     }
     let codec_matches = if let Some(profile) = &stream.configuration.extension_profile {
@@ -4265,26 +4283,28 @@ fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
         payload.get("codec").and_then(Value::as_str) == Some(codec_name(stream.configuration.codec))
     };
     if !codec_matches {
-        stream.cleanup(StreamFailure::critical("encoder_codec_mismatch"));
+        stream.cleanup(StreamFailure::requirement_failed("encoder_codec_mismatch"));
         return false;
     }
     if stream.packet_boundaries
         && payload.get("packet_boundaries").and_then(Value::as_bool) != Some(true)
     {
-        stream.cleanup(StreamFailure::critical("packet_boundaries_unavailable"));
+        stream.cleanup(StreamFailure::requirement_failed(
+            "packet_boundaries_unavailable",
+        ));
         return false;
     }
     if stream.configuration.max_reference_frames != 0
         && payload.get("max_reference_frames").and_then(Value::as_u64)
             != Some(u64::from(stream.configuration.max_reference_frames))
     {
-        stream.cleanup(StreamFailure::critical(
+        stream.cleanup(StreamFailure::requirement_failed(
             "reference_frame_constraint_unavailable",
         ));
         return false;
     }
     let Some(session) = payload.get("session_id").and_then(Value::as_u64) else {
-        stream.cleanup(StreamFailure::critical("invalid_encoder_reply"));
+        stream.cleanup(StreamFailure::requirement_failed("invalid_encoder_reply"));
         return false;
     };
     stream.session = Some(session);
@@ -4299,7 +4319,7 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
             return;
         }
         Err(std::sync::TryLockError::Poisoned(_)) => {
-            stream.cleanup(StreamFailure::critical("queue_failed"));
+            stream.cleanup(StreamFailure::requirement_failed("queue_failed"));
             return;
         }
     };
@@ -4316,7 +4336,7 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
         && !rpc::complete(send, parent, stream.response(id))
     {
         stream.ending_parent = Some(parent);
-        stream.cleanup(StreamFailure::critical("completion_lost"));
+        stream.cleanup(StreamFailure::requirement_failed("completion_lost"));
         if let Ok(mut queues) = queues.try_lock() {
             queues.close(id);
         }
@@ -4351,7 +4371,7 @@ fn activate_or_resume(
 
 fn finish_cleanup(stream: &mut Stream) -> bool {
     if stream.unresolved {
-        stream.fail_retirement(StreamFailure::critical(
+        stream.fail_retirement(StreamFailure::requirement_failed(
             stream.error.unwrap_or("cleanup_failed"),
         ));
         false

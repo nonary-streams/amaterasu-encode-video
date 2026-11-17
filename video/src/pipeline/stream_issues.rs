@@ -7,11 +7,11 @@
 //! publishes them on the SDK's stream-report topic.
 use super::{Pipeline, Stage, Stream, stage_name};
 use crate::rpc::Send;
-use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, PROVIDER_FALLBACK_CONFIRMED, StreamBinding, StreamIssue, StreamIssueOutbox,
     StreamReport,
 };
+use amaterasu_module_sdk::stream_lifecycle::{StreamFailure, StreamFailureReport};
 
 /// Per-stream reporting state.
 #[derive(Debug)]
@@ -149,9 +149,9 @@ impl Stream {
         self.issues.provider_code = reason_label(code).map(str::to_owned);
     }
 
-    /// Attribute the original typed report without changing its disposition.
+    /// Attach the native operation and dependency to the observed failure.
     #[track_caller]
-    pub(super) fn failure_issue(&mut self, failure: StreamFailure) -> StreamIssue {
+    pub(super) fn failure_report(&mut self, failure: StreamFailure) -> StreamFailureReport {
         let code = failure.code();
         let mut issue = failure.at(
             self.issues.operation.clone(),
@@ -163,8 +163,13 @@ impl Stream {
                 .then(|| self.encoder_probe_reason.clone())
                 .flatten()
         });
-        issue = with_cause(issue, dependency_for(self.stage, code));
-        with_reason(issue, reason.as_deref())
+        if let Some(dependency) = dependency_for(self.stage, code) {
+            issue = issue.caused_by(dependency);
+        }
+        if let Some(reason) = reason.as_deref().and_then(reason_label) {
+            issue = issue.because(reason);
+        }
+        issue
     }
 
     pub(super) fn record_terminal_issue(&mut self, issue: StreamIssue) {

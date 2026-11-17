@@ -19,13 +19,13 @@ pub(super) fn observe(
         Ok(Some(notice)) => notice,
         Ok(None) => return,
         Err(code) => {
-            stream.cleanup(StreamFailure::critical(code));
+            stream.cleanup(StreamFailure::requirement_failed(code));
             return;
         }
     };
     stream.capture_notifications = true;
     if notice.closed {
-        stream.cleanup(StreamFailure::critical("capture_source_stopped"));
+        stream.cleanup(StreamFailure::requirement_failed("capture_source_stopped"));
         return;
     }
     stream.capture_event_ready |= notice.frame_ready;
@@ -40,7 +40,7 @@ pub(super) fn observe(
         },
     };
     if let Err(code) = plane.resolve_capture_swap(id, request.id, decision) {
-        stream.cleanup(StreamFailure::critical(code));
+        stream.cleanup(StreamFailure::requirement_failed(code));
         return;
     }
     if let Ok(target) = target {

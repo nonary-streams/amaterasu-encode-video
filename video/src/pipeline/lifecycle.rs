@@ -126,7 +126,7 @@ pub(super) fn settle(stream: &mut Stream, send: &mut Send<'_>) -> bool {
                     Ok(Response::Result { .. }) => stream.unsettled_observed = true,
                     Ok(Response::Pending) => return false,
                     Ok(Response::Error { .. }) => {
-                        stream.fail_retirement(StreamFailure::critical(
+                        stream.fail_retirement(StreamFailure::requirement_failed(
                             "effect_retirement_unconfirmed",
                         ));
                         return false;
@@ -168,7 +168,9 @@ pub(super) fn settle(stream: &mut Stream, send: &mut Send<'_>) -> bool {
                 stream.uncertain = None;
             }
             Ok(Response::Error { code, .. }) if code == "not_found" => {
-                stream.fail_retirement(StreamFailure::critical("effect_retirement_unconfirmed"));
+                stream.fail_retirement(StreamFailure::requirement_failed(
+                    "effect_retirement_unconfirmed",
+                ));
             }
             _ => {}
         }
@@ -206,7 +208,9 @@ pub(super) fn settle(stream: &mut Stream, send: &mut Send<'_>) -> bool {
 fn unsettled(stream: &mut Stream) -> bool {
     stream.settlement_attempts += 1;
     if stream.settlement_attempts >= 3 {
-        stream.fail_retirement(StreamFailure::critical("request_cancellation_unconfirmed"));
+        stream.fail_retirement(StreamFailure::requirement_failed(
+            "request_cancellation_unconfirmed",
+        ));
     }
     false
 }

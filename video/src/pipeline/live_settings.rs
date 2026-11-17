@@ -159,9 +159,9 @@ impl Control {
                         reference.revision = update.revision;
                         stream.live_settings_rejected_revision = None;
                     }
-                    Err("gpu_processor_update_internal") => {
-                        stream.cleanup(StreamFailure::critical("gpu_processor_update_internal"))
-                    }
+                    Err("gpu_processor_update_internal") => stream.cleanup(
+                        StreamFailure::requirement_failed("gpu_processor_update_internal"),
+                    ),
                     Err(reason) => {
                         let revision = update.revision.as_str();
                         if stream.live_settings_rejected_revision.as_deref() != Some(revision) {

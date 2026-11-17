@@ -145,7 +145,7 @@ pub(super) fn select_capture_provider(stream: &mut Stream, video: u64, plane: &d
                 || stream.provider == CaptureProvider::Vkms
                 || stream.provider.uses_external_dmabuf() =>
         {
-            stream.cleanup(StreamFailure::critical(reason))
+            stream.cleanup(StreamFailure::requirement_failed(reason))
         }
         Some(reason) => {
             stream.pending_fallbacks.push(super::PendingFallback {
@@ -218,7 +218,9 @@ pub(super) fn begin_cpu_capture_fallback(stream: &mut Stream, reason: &'static s
 pub(super) fn reopen_cpu_capture(stream: &mut Stream) {
     match stream.owned_capture.cpu_provider.take() {
         Some(provider) => switch_capture_provider(stream, provider),
-        None => stream.cleanup(StreamFailure::critical("capture_fallback_unavailable")),
+        None => stream.cleanup(StreamFailure::requirement_failed(
+            "capture_fallback_unavailable",
+        )),
     }
 }
 
