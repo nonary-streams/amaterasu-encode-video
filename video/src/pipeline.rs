@@ -1170,8 +1170,13 @@ impl Pipeline {
             && !self.providers.contains(&provider)
         {
             Some("capture_provider_not_allowed")
-        } else if constant_rate && provider != CaptureProvider::Wgc {
-            Some("constant_rate_requires_wgc")
+        } else if constant_rate
+            && !matches!(
+                provider,
+                CaptureProvider::Wgc | CaptureProvider::External(_)
+            )
+        {
+            Some("capture_constant_rate_unsupported")
         } else if !valid_minimum_fps_target(minimum_fps_target)
             || !(if source_id.is_some() && !submitted_extension {
                 configuration.validate_source()
@@ -1718,11 +1723,17 @@ fn pump(
     let now = Instant::now();
     // Notifications wake the consumer; presentation metadata still owns frame
     // cadence and source timestamps when the selected provider offers both.
-    let presentation_paced = match stream.observe_presentation(plane) {
-        Ok(paced) => paced,
-        Err(code) => {
-            stream.cleanup(StreamFailure::critical(code));
-            return;
+    let external_constant_rate =
+        stream.constant_rate && matches!(stream.provider, CaptureProvider::External(_));
+    let presentation_paced = if external_constant_rate {
+        false
+    } else {
+        match stream.observe_presentation(plane) {
+            Ok(paced) => paced,
+            Err(code) => {
+                stream.cleanup(StreamFailure::critical(code));
+                return;
+            }
         }
     };
     if presentation_paced {
@@ -1731,7 +1742,7 @@ fn pump(
     let mut trigger = if presentation_paced {
         stream.presentation_capture_due(now)
     } else if now >= stream.next_frame
-        && (!stream.capture_notifications || stream.capture_event_ready)
+        && (external_constant_rate || !stream.capture_notifications || stream.capture_event_ready)
     {
         CaptureTrigger::Timer
     } else {
@@ -1764,7 +1775,8 @@ fn pump(
         if trigger == CaptureTrigger::Timer
             && (stream.provider != CaptureProvider::Wgc || stream.constant_rate)
         {
-            stream.next_frame = if stream.provider.uses_periodic_capture() {
+            stream.next_frame = if external_constant_rate || stream.provider.uses_periodic_capture()
+            {
                 periodic_capture_deadline_for(stream.next_frame, now, &stream.configuration)
             } else {
                 next_capture_deadline_for(now, &stream.configuration)
@@ -1777,7 +1789,9 @@ fn pump(
     } else {
         presentation::frame_interval(stream.configuration.fps)
     };
-    let repeat_due = if presentation_paced {
+    let repeat_due = if external_constant_rate {
+        false // The provider supplies cached frames on its timer reads.
+    } else if presentation_paced {
         stream.presentation_repeat_due(now)
     } else {
         stream.repeat_due(now)
@@ -2339,6 +2353,10 @@ fn request(stream: &Stream) -> (&str, Value) {
             }
             if stream.constant_rate {
                 request["constant_rate"] = json!(true);
+                if matches!(stream.provider, CaptureProvider::External(_)) {
+                    request["capture_cadence_millihz"] =
+                        json!(stream.configuration.effective_fps_millihz());
+                }
             }
             (stream.provider.service(), request)
         }
@@ -2815,6 +2833,16 @@ fn apply_result(
                 return false;
             };
             stream.capture = Some(capture);
+            if stream.constant_rate
+                && matches!(stream.provider, CaptureProvider::External(_))
+                && !amaterasu_module_sdk::capture::constant_rate_confirmed(
+                    &payload,
+                    stream.configuration.effective_fps_millihz(),
+                )
+            {
+                stream.cleanup(StreamFailure::critical("capture_constant_rate_unconfirmed"));
+                return false;
+            }
             stream.source_observation = match observed_capture(&payload) {
                 Ok(observation) => observation,
                 Err(code) => {

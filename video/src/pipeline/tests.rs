@@ -110,6 +110,7 @@ struct Runtime {
     capture_outputs_after_first_page: Option<Vec<Value>>,
     capture_enumeration_override: Option<Value>,
     omit_capture_contract: bool,
+    confirm_constant_rate: bool,
     omit_encoder_contract: bool,
     encoder_open_error: Option<&'static str>,
     encoder_open_error_once: Option<&'static str>,
@@ -238,6 +239,11 @@ impl Runtime {
                             error(code)
                         } else {
                             let mut result = json!({"ok":true,"stream":41});
+                            if self.confirm_constant_rate && payload["constant_rate"] == true {
+                                result["constant_rate"] = json!(true);
+                                result["capture_cadence_millihz"] =
+                                    payload["capture_cadence_millihz"].clone();
+                            }
                             if let Some(clock) = payload.get("resource_capture_clock") {
                                 result["resource_capture_clock"] = clock.clone();
                                 if !self.omit_capture_contract {
@@ -1045,7 +1051,7 @@ fn unsupported_amd_av1_latency_modes_fail_before_opening_lower_resources() {
 }
 
 #[test]
-fn constant_rate_delivery_is_opt_in_and_only_forwards_for_wgc() {
+fn constant_rate_delivery_is_opt_in_for_builtin_capture() {
     let (mut pipeline, mut runtime, mut plane) = setup();
     let mut request = open();
     let Operation::Open {
@@ -1081,7 +1087,10 @@ fn constant_rate_delivery_is_opt_in_and_only_forwards_for_wgc() {
     };
     *constant_rate = true;
     pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
-    assert_eq!(runtime.completed[0].1["code"], "constant_rate_requires_wgc");
+    assert_eq!(
+        runtime.completed[0].1["code"],
+        "capture_constant_rate_unsupported"
+    );
     assert_eq!(runtime.open_effects, 0);
 }
 
@@ -4997,6 +5006,70 @@ fn unsupported_nvenc_policies_fail_before_capture_or_encoder_allocation() {
                 "nvenc_settings_unsupported"
             }
         );
+    }
+}
+
+#[test]
+fn external_constant_rate_capture_requires_acknowledgment_before_encoding() {
+    for confirmed in [false, true] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled": true, "capture_providers": [],
+            "external_capture_providers": {"acme":"acme.capture/1"}
+        }))
+        .unwrap();
+        let mut pipeline = Pipeline::new(
+            settings,
+            "test".into(),
+            Arc::new(Mutex::new(Queues::default())),
+        );
+        let mut runtime = Runtime {
+            confirm_constant_rate: confirmed,
+            ..Runtime::default()
+        };
+        let mut plane = FakePlane::default();
+        let mut operation = open();
+        let Operation::Open {
+            capture_provider,
+            constant_rate,
+            ..
+        } = &mut operation
+        else {
+            panic!("expected video open");
+        };
+        *capture_provider = serde_json::from_value(json!("acme")).unwrap();
+        *constant_rate = true;
+        pipeline.handle("alice", 1, operation, &mut |command| runtime.send(command));
+        tick(&mut pipeline, &mut runtime, &mut plane, 18);
+        assert!(runtime.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. } if service == "acme.capture/1"
+                && payload["action"] == "open" && payload["constant_rate"] == true
+                && payload["capture_cadence_millihz"] == 60_000)));
+        assert_eq!(!plane.inputs.is_empty(), confirmed);
+        if confirmed {
+            plane.capture_reused = true;
+            plane.presentation_api = true;
+            let prior_queries = plane.presentation_queries;
+            for _ in 0..3 {
+                let stream = pipeline.streams.get_mut(&1).unwrap();
+                stream.capture_notifications = true;
+                stream.capture_event_ready = false;
+                stream.next_frame = Instant::now() - Duration::from_millis(1);
+                tick(&mut pipeline, &mut runtime, &mut plane, 1);
+                assert!(
+                    plane.inputs.last().unwrap().1,
+                    "timer must read without a notification"
+                );
+                assert!(
+                    !plane.inputs.last().unwrap().3,
+                    "provider owns cadence repeats"
+                );
+            }
+            assert_eq!(plane.presentation_queries, prior_queries);
+        } else {
+            assert!(runtime.commands.iter().any(|command| matches!(command,
+                Command::Request { service, payload, .. } if service == "acme.capture/1"
+                    && payload["action"] == "close")));
+        }
     }
 }
 
