@@ -7,18 +7,10 @@
 //! publishes them on the SDK's stream-report topic.
 use super::{Pipeline, Stage, Stream, stage_name};
 use crate::rpc::Send;
+use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 use amaterasu_module_sdk::stream_lifecycle::{
     LifecycleLayer, StreamBinding, StreamIssue, StreamIssueOutbox, StreamReport,
 };
-
-/// Endings a caller or the host asked for. They are not stream failures.
-const REQUESTED_ENDINGS: &[&str] = &[
-    "drained",
-    "closed_by_caller",
-    "request_ended",
-    "completion_lost",
-    "video_shutdown",
-];
 
 /// Per-stream reporting state.
 #[derive(Debug)]
@@ -156,30 +148,33 @@ impl Stream {
         self.issues.provider_code = reason_label(code).map(str::to_owned);
     }
 
-    /// Report why the stream is ending. A drain that fails is a cleanup
-    /// failure beside whatever ended the stream, so it is advisory.
+    /// Attribute the original typed report without changing its disposition.
     #[track_caller]
-    pub(super) fn report_ending(&mut self, code: &'static str) {
-        let provider_code = self.issues.provider_code.take();
-        if self.issues.ending_reported || REQUESTED_ENDINGS.contains(&code) {
-            return;
-        }
-        self.issues.ending_reported = true;
-        let operation = self.issues.operation.clone();
-        let layer = LifecycleLayer::EncodeVideo;
-        let phase = stage_name(self.stage);
-        let issue = if matches!(self.stage, Stage::StopCapture | Stage::Draining) {
-            StreamIssue::advisory(operation, layer, phase, code)
-        } else {
-            StreamIssue::critical(operation, layer, phase, code)
-        };
-        let reason = provider_code.or_else(|| {
+    pub(super) fn failure_issue(&mut self, failure: StreamFailure) -> StreamIssue {
+        let code = failure.code();
+        let mut issue = failure.at(
+            self.issues.operation.clone(),
+            LifecycleLayer::EncodeVideo,
+            stage_name(self.stage),
+        );
+        let reason = self.issues.provider_code.take().or_else(|| {
             (code == "encoder_unavailable")
                 .then(|| self.encoder_probe_reason.clone())
                 .flatten()
         });
-        let issue = with_cause(issue, dependency_for(self.stage, code));
-        self.issues.push(with_reason(issue, reason.as_deref()));
+        issue = with_cause(issue, dependency_for(self.stage, code));
+        with_reason(issue, reason.as_deref())
+    }
+
+    pub(super) fn record_terminal_issue(&mut self, issue: StreamIssue) {
+        if !self.issues.ending_reported {
+            self.issues.ending_reported = true;
+            self.issues.push(issue);
+        }
+    }
+
+    pub(super) fn record_nonterminal_issue(&mut self, issue: StreamIssue) {
+        self.issues.push(issue);
     }
 
     /// Report a resource the stream could not release after retries.

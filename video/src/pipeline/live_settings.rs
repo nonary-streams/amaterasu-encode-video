@@ -4,6 +4,7 @@ use crate::{model::LiveProcessingSettings, plane::Plane, rpc::Send};
 use amaterasu_module_sdk::requests::{
     RequestOptions, live_provider_settings_command, validate_live_provider_settings,
 };
+use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 use amaterasu_module_sdk::{Command, LogLevel, Response};
 use serde_json::{Value, json};
 use std::{
@@ -159,7 +160,7 @@ impl Control {
                         stream.live_settings_rejected_revision = None;
                     }
                     Err("gpu_processor_update_internal") => {
-                        stream.cleanup("gpu_processor_update_internal")
+                        stream.cleanup(StreamFailure::critical("gpu_processor_update_internal"))
                     }
                     Err(reason) => {
                         let revision = update.revision.as_str();

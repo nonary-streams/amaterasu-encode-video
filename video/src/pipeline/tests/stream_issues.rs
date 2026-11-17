@@ -133,3 +133,131 @@ fn reports_are_off_until_enabled_and_requested_endings_are_not_failures() {
         "a caller's close is not a failure"
     );
 }
+
+#[test]
+fn noncritical_provider_reports_cannot_start_cleanup_or_release_live_video() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.enable_stream_issue_reports();
+    pipeline.handle(
+        "alice",
+        101,
+        open_from_session(EncoderSelection::Identity(encoder_identity())),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    assert_eq!(stream.stage, Stage::Running);
+    let capture = stream.capture;
+    let encoder = stream.session;
+    for report in [
+        StreamFailure::advisory("optional_metadata_unavailable"),
+        StreamFailure::demoted("optional_feedback_unavailable", "keep_video"),
+        StreamFailure::critical("invalid/code"),
+    ] {
+        stream.cleanup(report);
+        assert_eq!(stream.stage, Stage::Running);
+        assert_eq!(stream.capture, capture);
+        assert_eq!(stream.session, encoder);
+        assert_eq!(stream.error, None);
+        assert!(!stream.unresolved);
+    }
+    // A drain warning has continuation authority only after an owner drain.
+    stream.drain_failed("drain_timeout");
+    assert_eq!(stream.stage, Stage::Running);
+    stream.cleanup(StreamFailure::critical("capture_source_lost"));
+    assert_eq!(stream.stage, Stage::FindEncoder);
+    assert_eq!(stream.error, Some("capture_source_lost"));
+    assert_eq!(
+        stream.capture, capture,
+        "retirement still needs exact capture proof"
+    );
+    assert_eq!(
+        stream.session, encoder,
+        "retirement still needs exact encoder proof"
+    );
+    pipeline.publish_stream_issues(&mut |command| runtime.send(command));
+    let reports = issues(&runtime.commands);
+    assert!(
+        reports
+            .iter()
+            .any(|issue| issue.code == "optional_metadata_unavailable" && !issue.is_critical())
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|issue| issue.code == "capture_source_lost" && issue.is_critical())
+    );
+}
+
+#[test]
+fn noncritical_reports_cannot_install_a_video_cleanup_barrier() {
+    use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.handle(
+        "alice",
+        101,
+        open_from_session(EncoderSelection::Identity(encoder_identity())),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    let stream = pipeline.streams.get_mut(&1).unwrap();
+    stream.cleanup(StreamFailure::critical("native_encoder_lost"));
+    stream.fail_retirement(StreamFailure::advisory("optional_cleanup_diagnostic_lost"));
+    assert_eq!(stream.stage, Stage::FindEncoder);
+    assert_eq!(stream.error, Some("native_encoder_lost"));
+    for _ in 0..4 {
+        failed_step(stream, StreamFailure::advisory("optional_diagnostic_lost"));
+    }
+    assert_eq!(stream.stage, Stage::FindEncoder);
+    assert_eq!(stream.retries, 0);
+    assert!(!stream.unresolved);
+    assert_eq!(stream.error, Some("native_encoder_lost"));
+    for _ in 0..3 {
+        failed_step(stream, StreamFailure::critical("native_close_unconfirmed"));
+    }
+    assert!(
+        stream.unresolved,
+        "critical native retirement failures retain the cleanup fence"
+    );
+    assert_eq!(stream.error, Some("cleanup_failed"));
+}
+
+#[test]
+fn uncertain_parent_liveness_does_not_invent_an_owner_stop() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.enable_stream_issue_reports();
+    pipeline.handle(
+        "alice",
+        101,
+        open_from_session(EncoderSelection::Identity(encoder_identity())),
+        &mut |command| runtime.send(command),
+    );
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    pipeline.streams.get_mut(&1).unwrap().parent = Some(999);
+    pipeline.tick(&mut plane, &mut |command| {
+        if matches!(command, Command::CheckRequest { request: 999 }) {
+            Err("lost broker reply".into())
+        } else {
+            runtime.send(command)
+        }
+    });
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert_eq!(pipeline.streams[&1].parent, Some(999));
+    assert_eq!(pipeline.streams[&1].error, None);
+    pipeline.tick(&mut plane, &mut |command| {
+        if matches!(command, Command::CheckRequest { request: 999 }) {
+            Ok(Response::error("cancelled", ""))
+        } else {
+            runtime.send(command)
+        }
+    });
+    assert_ne!(pipeline.streams[&1].stage, Stage::Running);
+    assert_eq!(pipeline.streams[&1].error, Some("request_ended"));
+    pipeline.publish_stream_issues(&mut |command| runtime.send(command));
+    assert!(
+        !issues(&runtime.commands)
+            .iter()
+            .any(StreamIssue::is_critical)
+    );
+}

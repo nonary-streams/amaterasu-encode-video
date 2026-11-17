@@ -79,7 +79,7 @@ pub(super) fn tick(
             .as_ref()
             .is_some_and(|grace| Instant::now() >= grace.deadline)
         {
-            stream.cleanup("drain_timeout");
+            stream.drain_failed("drain_timeout");
         }
         return;
     };
@@ -87,15 +87,15 @@ pub(super) fn tick(
     let eos_queued = queue.eos_queued(id);
     drop(queue);
     if eos {
-        stream.cleanup("drained");
+        stream.requested_cleanup(super::RequestedEnding::Drained);
         return;
     }
     let Some(grace) = stream.grace.as_mut() else {
-        stream.cleanup("invalid_drain_state");
+        stream.drain_failed("invalid_drain_state");
         return;
     };
     if Instant::now() >= grace.deadline {
-        stream.cleanup("drain_timeout");
+        stream.drain_failed("drain_timeout");
         return;
     }
     if stream.stage == Stage::StopCapture {
@@ -114,14 +114,14 @@ pub(super) fn tick(
         } {
             Ok(accepted) => grace.drain_sent = accepted,
             Err(code) => {
-                stream.cleanup(code);
+                stream.drain_failed(code);
                 return;
             }
         }
     }
     if stream.source_id.is_some() && !stream.submitted_extension {
         if let Err(code) = plane.pump_source(id, stream.session.unwrap(), false) {
-            stream.cleanup(code);
+            stream.drain_failed(code);
         }
         return;
     }
@@ -141,7 +141,7 @@ pub(super) fn tick(
         force_idr: false,
     };
     if let Err(code) = plane.pump(input) {
-        stream.cleanup(code);
+        stream.drain_failed(code);
     }
 }
 

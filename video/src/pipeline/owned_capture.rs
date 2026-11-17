@@ -4,6 +4,7 @@
 //! why in stream status.
 use super::*;
 use crate::plane::FramePath;
+use amaterasu_module_sdk::stream_lifecycle::StreamFailure;
 
 /// Longest provider-reported failure code retained in status.
 const MAX_REASON_BYTES: usize = 64;
@@ -144,7 +145,7 @@ pub(super) fn select_capture_provider(stream: &mut Stream, video: u64, plane: &d
                 || stream.provider == CaptureProvider::Vkms
                 || stream.provider.uses_external_dmabuf() =>
         {
-            stream.cleanup(reason)
+            stream.cleanup(StreamFailure::critical(reason))
         }
         Some(reason) => {
             stream.report_fallback(
@@ -214,7 +215,7 @@ pub(super) fn begin_cpu_capture_fallback(stream: &mut Stream, reason: &'static s
 pub(super) fn reopen_cpu_capture(stream: &mut Stream) {
     match stream.owned_capture.cpu_provider.take() {
         Some(provider) => switch_capture_provider(stream, provider),
-        None => stream.cleanup("capture_fallback_unavailable"),
+        None => stream.cleanup(StreamFailure::critical("capture_fallback_unavailable")),
     }
 }
 
