@@ -4,7 +4,9 @@ use super::*;
 use amaterasu_module_sdk::capture::ResourceConnection;
 use libloading::Library;
 use std::{
-    ptr, thread,
+    ptr,
+    sync::OnceLock,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -14,7 +16,6 @@ struct CapturePlugin {
     context: *mut c_void,
     api: ModuleApi,
     state: Box<Mutex<Endpoint>>,
-    _library: Library,
 }
 impl CapturePlugin {
     fn load(settings: Value) -> Self {
@@ -29,9 +30,11 @@ impl CapturePlugin {
             context: (&*state as *const Mutex<Endpoint>).cast_mut().cast(),
             invoke: dispatch,
         };
-        // SAFETY: the operator-selected library is trusted native code. This
-        // object pins it and the endpoint until all module callbacks retire.
-        let library = unsafe { Library::new(path) }.unwrap();
+        // Keep the selected test library mapped through thread exit. Its
+        // callbacks can register thread-local destructors after module teardown.
+        static CAPTURE_LIBRARY: OnceLock<Library> = OnceLock::new();
+        // SAFETY: the operator-selected library is trusted native code.
+        let library = CAPTURE_LIBRARY.get_or_init(|| unsafe { Library::new(path) }.unwrap());
         let entry = unsafe { library.get::<ModuleEntry>(b"amaterasu_module_v1\0") }.unwrap();
         let table = unsafe { entry().as_ref() }.expect("module table");
         assert!(table.header.supports::<ModuleApi>());
@@ -43,7 +46,6 @@ impl CapturePlugin {
             context,
             api,
             state,
-            _library: library,
         }
     }
     fn request(&self, payload: Value) -> Value {

@@ -60,18 +60,25 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             &*consumer.0.cast::<FrameResourceConsumerApi>(),
         )
     };
-    for (iteration, hdr, sdr10, intensity) in [
-        (0, false, false, 0.25f32),
-        (1, true, false, 767.0f32 / 1023.0),
-        (2, true, false, 768.0f32 / 1023.0),
-        (3, true, false, 940.0f32 / 1023.0),
-        (4, false, true, 767.0f32 / 1023.0),
-        (5, false, true, 768.0f32 / 1023.0),
+    for (iteration, hdr, sdr10, capture_rgb10, intensity) in [
+        (0, false, false, false, 0.25f32),
+        (1, true, false, true, 767.0f32 / 1023.0),
+        (2, true, false, true, 768.0f32 / 1023.0),
+        (3, true, false, true, 940.0f32 / 1023.0),
+        (4, false, true, true, 767.0f32 / 1023.0),
+        (5, false, true, true, 768.0f32 / 1023.0),
+        (6, false, false, true, 0.25f32),
     ] {
         let ten_bit = hdr || sdr10;
-        let mut fixture =
-            Image::create(decoder.gpu_context().unwrap(), 64, 48, ten_bit, intensity).unwrap();
-        if sdr10 {
+        let mut fixture = Image::create(
+            decoder.gpu_context().unwrap(),
+            64,
+            48,
+            capture_rgb10,
+            intensity,
+        )
+        .unwrap();
+        if !hdr && capture_rgb10 {
             fixture.capability.color = DMABUF_COLOR_SRGB;
             fixture.frame.color = DMABUF_COLOR_SRGB;
         }
@@ -186,6 +193,7 @@ fn gpu_rendered_dmabufs_encode_through_the_registered_sdk_without_cpu_frames() {
             .find(|(_, caps)| {
                 caps.fourcc == fixture.capability.fourcc
                     && caps.modifier == fixture.capability.modifier
+                    && caps.color == fixture.capability.color
             })
             .expect("same actual GPU import offer");
         let offer = CaptureResourceOffer {

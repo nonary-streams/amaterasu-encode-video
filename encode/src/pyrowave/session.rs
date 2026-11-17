@@ -121,6 +121,8 @@ pub(super) struct Session {
     configuration: Configuration,
     encoder: Option<library::Encoder>,
     runtime: Arc<Runtime>,
+    #[cfg(feature = "pyrowave-gpu")]
+    gpu_offers: Arc<[DmaBufResourceCapabilities]>,
     queue: OutputQueue,
     source: Option<u64>,
     pub selection: Option<Selection>,
@@ -309,6 +311,13 @@ impl State {
             configuration: configuration.clone(),
             encoder: Some(encoder),
             runtime: self.runtime.clone(),
+            #[cfg(feature = "pyrowave-gpu")]
+            gpu_offers: self
+                .runtime
+                .gpu_context()
+                .map(|gpu| gpu_input_offers(gpu, &configuration))
+                .unwrap_or_default()
+                .into(),
             queue: OutputQueue::new(SessionMode::Submitted, 2, library::MAX_FRAME_BYTES)
                 .map_err(|_| "encoder_state_failed")?,
             source: None,
@@ -372,14 +381,7 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
         {
             runtime
                 .gpu_context()
-                .filter(|gpu| {
-                    !gpu.offers(
-                        configuration.width,
-                        configuration.height,
-                        configuration.profile.ten_bit(),
-                    )
-                    .is_empty()
-                })
+                .filter(|gpu| !gpu_input_offers(gpu, configuration).is_empty())
                 .map(|_| ())
                 .ok_or("pyrowave_gpu_format_unavailable")?;
             let mut encoder = runtime.encoder(configuration.width, configuration.height)?;
@@ -672,24 +674,8 @@ impl Session {
         self.runtime.gpu_only()
     }
     #[cfg(feature = "pyrowave-gpu")]
-    pub fn gpu_offers(&self) -> Vec<DmaBufResourceCapabilities> {
-        let Some(gpu) = self.runtime.gpu_context() else {
-            return Vec::new();
-        };
-        let mut offers = gpu.offers(
-            self.configuration.width,
-            self.configuration.height,
-            self.configuration.profile.ten_bit(),
-        );
-        if self.configuration.profile == Profile::Sdr10 {
-            offers.extend(gpu.offers(self.configuration.width, self.configuration.height, false));
-        }
-        if !self.configuration.profile.hdr() {
-            for offer in &mut offers {
-                offer.color = DMABUF_COLOR_SRGB;
-            }
-        }
-        offers
+    pub fn gpu_offers(&self) -> &Arc<[DmaBufResourceCapabilities]> {
+        &self.gpu_offers
     }
     fn validate_frame(&self, descriptor: &CaptureResourceFrame) -> Result<u64, Status> {
         let selection = self.selection.ok_or(MEDIA_UNSUPPORTED)?;
@@ -748,6 +734,33 @@ impl Drop for Session {
         self.encoder.take();
     }
 }
+/// Input precision is independent of the PyroWave bitstream profile. Both SDR
+/// profiles can sample either RGB storage depth. HDR requires RGB10 with PQ.
+#[cfg(feature = "pyrowave-gpu")]
+fn gpu_input_offers(
+    gpu: &super::gpu::Context,
+    configuration: &Configuration,
+) -> Vec<DmaBufResourceCapabilities> {
+    let (width, height) = (configuration.width, configuration.height);
+    let ten_bit = configuration.profile.ten_bit();
+    let mut offers = gpu.offers(width, height, ten_bit);
+    if !configuration.profile.hdr() {
+        // Keep the full set for the preferred precision and use the remaining
+        // slots for the other SDR input depth. Resource negotiation is bounded.
+        let remaining = amaterasu_module_sdk::frame_processing::MAX_PROCESSING_OFFERS
+            .saturating_sub(offers.len());
+        offers.extend(
+            gpu.offers(width, height, !ten_bit)
+                .into_iter()
+                .take(remaining),
+        );
+        for offer in &mut offers {
+            offer.color = DMABUF_COLOR_SRGB;
+        }
+    }
+    offers
+}
+
 fn nv12(bytes: &[u8], width: u32, height: u32, stride: u32) -> CpuBuffer {
     let y_size = (stride * height) as usize;
     CpuBuffer {

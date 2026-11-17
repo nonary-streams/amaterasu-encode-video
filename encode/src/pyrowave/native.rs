@@ -218,7 +218,7 @@ unsafe extern "C" fn enumerate(
         if session.gpu_only() {
             #[cfg(feature = "pyrowave-gpu")]
             {
-                let offers = session.gpu_offers();
+                let offers = session.gpu_offers().clone();
                 drop(state);
                 unsafe {
                     *generation = 1;
