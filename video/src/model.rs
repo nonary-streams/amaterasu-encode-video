@@ -1387,15 +1387,15 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_rejects_nondefault_color_mode_before_open() {
+    fn negotiated_color_is_available_for_encoder_selection() {
         let mut request = open_request();
         request["configuration"]["color_mode"] = json!("bt709_full");
         let Operation::Open { configuration, .. } = serde_json::from_value(request).unwrap() else {
             unreachable!();
         };
-        assert!(!configuration.validate());
+        assert!(configuration.validate());
+        assert_eq!(configuration.color_mode, ColorMode::Bt709Full);
     }
 
     #[test]

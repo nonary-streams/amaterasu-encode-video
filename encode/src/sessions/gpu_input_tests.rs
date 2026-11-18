@@ -159,13 +159,10 @@ fn submit(harness: &mut Harness, frame: &DmaBufFrame, force: u32) -> Status {
 }
 
 fn close_on_exec(descriptor: i32) -> bool {
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{descriptor}")).unwrap();
-    let flags = info
-        .lines()
-        .find_map(|line| line.strip_prefix("flags:"))
-        .map(|value| u32::from_str_radix(value.trim(), 8).unwrap())
-        .unwrap();
-    flags & 0o2_000_000 != 0
+    // SAFETY: this fixture still owns the accepted descriptor during the check.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    assert!(flags >= 0, "could not read descriptor flags");
+    flags & libc::FD_CLOEXEC != 0
 }
 
 #[test]
