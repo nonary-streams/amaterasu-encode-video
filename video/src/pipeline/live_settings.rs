@@ -4,8 +4,8 @@ use crate::{model::LiveProcessingSettings, plane::Plane, rpc::Send};
 use amaterasu_module_sdk::requests::{
     RequestOptions, live_provider_settings_command, validate_live_provider_settings,
 };
-use amaterasu_module_sdk::{Command, LogLevel, Response};
-use serde_json::{Value, json};
+use amaterasu_module_sdk::{Command, Response};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -164,11 +164,11 @@ impl Control {
                     Err(reason) => {
                         let revision = update.revision.as_str();
                         if stream.live_settings_rejected_revision.as_deref() != Some(revision) {
-                            let _ = send(Command::Log {
-                                level: LogLevel::Warning as u8,
-                                target: "video.processing".into(),
-                                message: json!({"event":"gpu_processor_update_rejected", "stream":pending.stream, "revision":revision, "reason":reason}).to_string(),
-                            });
+                            stream.report_selection_fallback(
+                                "gpu_processor_update_rejected",
+                                reason,
+                                "previous_settings",
+                            );
                             stream.live_settings_rejected_revision = Some(revision.to_owned());
                         }
                     }

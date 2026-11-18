@@ -8,7 +8,7 @@
 use super::{Pipeline, Stage, Stream, stage_name};
 use crate::rpc::Send;
 use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamBinding, StreamIssue, StreamIssueOutbox, StreamReport,
+    LifecycleLayer, StreamBinding, StreamIssue, StreamIssueOutbox,
 };
 
 /// Endings a caller or the host asked for. They are not stream failures.
@@ -71,12 +71,7 @@ impl StreamIssues {
     }
 
     fn take_into(&mut self, retired: &mut StreamIssueOutbox) {
-        for report in self.outbox.drain() {
-            match report {
-                StreamReport::Issue(issue) => retired.push(issue),
-                StreamReport::Binding(binding) => retired.push_binding(binding),
-            }
-        }
+        self.outbox.transfer_to(retired);
     }
 }
 
@@ -214,6 +209,20 @@ impl Stream {
         )
         .caused_by(dependency);
         self.issues.push(with_reason(issue, reason));
+    }
+
+    /// A skipped capability is a local choice, not a retired provider attempt.
+    #[track_caller]
+    pub(super) fn report_selection_fallback(&mut self, code: &str, reason: &str, fallback: &str) {
+        let issue = StreamIssue::demoted(
+            self.issues.operation.clone(),
+            LifecycleLayer::EncodeVideo,
+            stage_name(self.stage),
+            code,
+            fallback,
+        )
+        .because(reason);
+        self.issues.push(issue);
     }
 }
 

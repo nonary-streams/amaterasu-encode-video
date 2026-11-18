@@ -5,9 +5,7 @@
 //! that open, and later data-plane failures of the session it created, are
 //! reported under that operation with this module as the publisher.
 use crate::model::EncoderIdentity;
-use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamIssue, StreamIssueOutbox, StreamReport,
-};
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue, StreamIssueOutbox};
 
 /// A short identifier for the backend an encoder identity selects.
 pub(crate) fn backend_name(encoder: &EncoderIdentity) -> &'static str {
@@ -49,10 +47,5 @@ pub(crate) fn session_failure(
 
 /// Move queued reports between outboxes, keeping their order.
 pub(crate) fn transfer(from: &mut StreamIssueOutbox, to: &mut StreamIssueOutbox) {
-    for report in from.drain() {
-        match report {
-            StreamReport::Issue(issue) => to.push(issue),
-            StreamReport::Binding(binding) => to.push_binding(binding),
-        }
-    }
+    from.transfer_to(to);
 }

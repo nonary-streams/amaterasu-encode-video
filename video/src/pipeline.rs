@@ -342,7 +342,7 @@ fn log_diagnostics(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, se
     for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
         let _ = send(Command::Log {
             level: amaterasu_module_sdk::diagnostics::WINDOW_LOG_LEVEL as u8,
-            target: "video.pipeline".into(),
+            target: "timing/video.pipeline".into(),
             message: part.to_string(),
         });
     }
@@ -2534,11 +2534,6 @@ fn apply_result(
                                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                     })
                     .unwrap_or("unavailable");
-                eprintln!(
-                    "amaterasu encoder probe rejected: provider_code={provider_code} ok={:?} settled={:?}",
-                    payload.get("ok"),
-                    payload.get("settled")
-                );
                 stream.note_provider_code(provider_code);
                 stream.cleanup(code);
             }

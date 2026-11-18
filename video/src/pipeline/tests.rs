@@ -2108,7 +2108,7 @@ fn running_video_emits_one_interval_summary_and_keeps_stream_running() {
                 level,
                 target,
                 message,
-            } if target == "video.pipeline" => {
+            } if target == "timing/video.pipeline" => {
                 Some((*level, serde_json::from_str::<Value>(message).unwrap()))
             }
             _ => None,
