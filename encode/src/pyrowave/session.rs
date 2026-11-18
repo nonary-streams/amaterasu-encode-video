@@ -1,5 +1,8 @@
 //! Caller-owned PyroWave sessions. No capture, transport or socket policy lives here.
-use super::library::{self, CpuBuffer, Runtime};
+use super::{
+    color::OutputColor,
+    library::{self, CpuBuffer, Runtime},
+};
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
     abi::*,
@@ -66,6 +69,8 @@ const MAX_OPERATIONS: usize = 128;
 pub struct Configuration {
     #[serde(default, skip_serializing_if = "Profile::is_sdr")]
     pub profile: Profile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_mode: Option<ColorMode>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -74,6 +79,10 @@ pub struct Configuration {
     pub clock_origin_us: u64,
 }
 impl Configuration {
+    pub(super) fn output_color(&self) -> OutputColor {
+        OutputColor::new(self.profile.hdr(), self.color_mode)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !(16..=8192).contains(&self.width)
             || !(16..=8192).contains(&self.height)
@@ -259,7 +268,8 @@ impl State {
                     "bitstream": "186f0393",
                     "bit_depth": if profile.ten_bit() { 10 } else { 8 },
                     "chroma": "420",
-                    "range": "full",
+                    "range": "full", // Default for callers without a negotiated color mode.
+                    "ranges": ["limited", "full"],
                     "matrix": if profile.hdr() { "bt2020_ncl" } else { "bt709" },
                     "inputs": if self.runtime.gpu_only() {
                         vec!["dmabuf"]
@@ -385,7 +395,7 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
                 .map(|_| ())
                 .ok_or("pyrowave_gpu_format_unavailable")?;
             let mut encoder = runtime.encoder(configuration.width, configuration.height)?;
-            return encoder.probe_gpu(configuration.profile.hdr(), configuration.budget());
+            return encoder.probe_gpu(configuration);
         }
     }
     if configuration.profile.hdr() {
@@ -400,7 +410,13 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
         configuration.width,
     );
     // SAFETY: owned NV12 planes remain readable through synchronous encoding.
-    unsafe { encoder.encode(&buffer, configuration.budget()) }?;
+    unsafe {
+        encoder.encode(
+            &buffer,
+            configuration.budget(),
+            configuration.output_color(),
+        )
+    }?;
     Ok(())
 }
 pub(super) struct Provider {
@@ -607,6 +623,7 @@ impl Session {
                 configuration.width,
                 configuration.height,
                 cpu.descriptor().stride,
+                configuration.output_color(),
             );
             (converted.as_slice(), configuration.width)
         } else {
@@ -619,7 +636,11 @@ impl Session {
             self.encoder
                 .as_mut()
                 .ok_or("pyrowave_session_closed")?
-                .encode(&buffer, configuration.budget())
+                .encode(
+                    &buffer,
+                    configuration.budget(),
+                    configuration.output_color(),
+                )
         }
     }
     #[cfg(feature = "pyrowave-gpu")]
@@ -662,16 +683,18 @@ impl Session {
             self.encoder
                 .as_mut()
                 .ok_or("pyrowave_session_closed")?
-                .encode_gpu(
-                    input,
-                    self.configuration.profile.hdr(),
-                    self.configuration.profile.ten_bit(),
-                    self.configuration.budget(),
-                )
+                .encode_gpu(input, &self.configuration)
         }
     }
     pub fn gpu_only(&self) -> bool {
         self.runtime.gpu_only()
+    }
+    pub(super) fn accepts_cpu_format(&self, format: u32) -> bool {
+        format != PIXEL_NV12
+            || self
+                .configuration
+                .output_color()
+                .accepts_full_range_bt709_nv12()
     }
     #[cfg(feature = "pyrowave-gpu")]
     pub fn gpu_offers(&self) -> &Arc<[DmaBufResourceCapabilities]> {

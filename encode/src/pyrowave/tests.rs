@@ -13,6 +13,7 @@ use std::{
 fn configuration() -> session::Configuration {
     session::Configuration {
         profile: session::Profile::Sdr8,
+        color_mode: None,
         width: 64,
         height: 48,
         fps: 60,

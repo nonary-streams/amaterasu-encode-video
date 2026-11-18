@@ -13,7 +13,7 @@ struct am_pyrowave_gpu_functions {
     pyrowave_result (*image_view)(pyrowave_image, VkImageAspectFlagBits, VkImageUsageFlagBits, pyrowave_image_view *);
     void (*image_destroy)(pyrowave_image);
     void (*wait_idle)(pyrowave_device);
-    pyrowave_result (*encode_scaled)(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *, const pyrowave_rate_control *);
+    pyrowave_result (*encode_scaled)(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *, const pyrowave_rate_control *, const float *);
 };
 struct am_pyrowave_gpu_frame {
     uint32_t width, height, fourcc, plane_count;
@@ -38,6 +38,6 @@ int am_pyrowave_gpu_supports(struct am_pyrowave_gpu *, uint32_t fourcc, uint64_t
 /* Borrowed fds are never consumed. Returned import owns private duplicates.
  * Every native GPU access completes before image retirement returns. */
 int am_pyrowave_gpu_import(struct am_pyrowave_gpu *, const struct am_pyrowave_gpu_frame *, struct am_pyrowave_gpu_image **);
-int am_pyrowave_gpu_encode(struct am_pyrowave_gpu_image *, void *encoder, size_t budget);
+int am_pyrowave_gpu_encode(struct am_pyrowave_gpu_image *, void *encoder, size_t budget, const float *transform);
 void am_pyrowave_gpu_retire(struct am_pyrowave_gpu_image *);
 #endif

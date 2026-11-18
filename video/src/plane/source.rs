@@ -82,13 +82,35 @@ fn with_source_config<T>(
     epoch_id: [u8; 16],
     operation: impl FnOnce(&EncoderSessionConfig) -> Result<T, &'static str>,
 ) -> Result<T, &'static str> {
-    if !configuration.color_mode.is_default() {
+    if configuration.extension_profile.is_none() && !configuration.color_mode.is_default() {
         return Err("encoder_source_format_unsupported");
     }
     if epoch_id == [0; 16] || clock_origin_us == 0 {
         return Err("encoder_clock_unavailable");
     }
     let cadence = frame_cadence(configuration)?;
+    let hdr =
+        configuration.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
+    let color = if configuration.extension_profile.is_some() {
+        let mode = configuration.color_mode;
+        FrameColorMetadata {
+            matrix: if hdr {
+                FRAME_MATRIX_BT2020_NCL
+            } else if matches!(mode, ColorMode::Bt601Limited | ColorMode::Bt601Full) {
+                FRAME_MATRIX_BT601
+            } else {
+                FRAME_MATRIX_BT709
+            },
+            range: if matches!(mode, ColorMode::Bt601Full | ColorMode::Bt709Full) {
+                FRAME_RANGE_FULL
+            } else {
+                FRAME_RANGE_LIMITED
+            },
+            ..Default::default()
+        }
+    } else {
+        FrameColorMetadata::default()
+    };
     let common = EncoderCommonConfigV1 {
         version: 1,
         size: size_of::<EncoderCommonConfigV1>() as u32,
@@ -114,14 +136,12 @@ fn with_source_config<T>(
         color: FrameColorMetadata {
             version: 1,
             size: size_of::<FrameColorMetadata>() as u32,
-            transfer: if configuration.video_stream_format.dynamic_range
-                == amaterasu_module_sdk::DynamicRange::Hdr
-            {
+            transfer: if hdr {
                 FRAME_TRANSFER_PQ
             } else {
                 FRAME_TRANSFER_SRGB
             },
-            ..Default::default()
+            ..color
         },
         output_clock: FrameClockMetadata {
             version: 1,

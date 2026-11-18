@@ -1,18 +1,27 @@
-//! Full-range BT.709 conversion of sRGB BGRA, with centered 4:2:0 chroma.
-pub(super) fn bgra_to_nv12(bytes: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+//! Convert sRGB BGRA to NV12 with centered 4:2:0 chroma.
+use super::color::OutputColor;
+
+pub(super) fn bgra_to_nv12(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    color: OutputColor,
+) -> Vec<u8> {
     let (width, height, stride) = (width as usize, height as usize, stride as usize);
     let mut output = vec![0; width * height * 3 / 2];
+    let [cr, luma, cb] = color.coefficients(false);
     let sample = |x: usize, y: usize| {
         let pixel = &bytes[y * stride + x * 4..][..3];
-        let (b, g, r) = (pixel[0] as f64, pixel[1] as f64, pixel[2] as f64);
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        (
-            luma,
-            128.0 + (b - luma) / 1.8556,
-            128.0 + (r - luma) / 1.5748,
-        )
+        let (b, g, r) = (
+            f32::from(pixel[0]),
+            f32::from(pixel[1]),
+            f32::from(pixel[2]),
+        );
+        let apply = |row: [f32; 4]| row[0] * r + row[1] * g + row[2] * b + 255.0 * row[3];
+        (apply(luma), apply(cb), apply(cr))
     };
-    let quantize = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+    let quantize = |value: f32| value.round().clamp(0.0, 255.0) as u8;
     for y in (0..height).step_by(2) {
         for x in (0..width).step_by(2) {
             let (mut cb, mut cr) = (0.0, 0.0);
@@ -49,7 +58,7 @@ mod tests {
                     input[y * 12 + x * 4..y * 12 + x * 4 + 4].copy_from_slice(&bgra);
                 }
             }
-            let output = bgra_to_nv12(&input, 2, 2, 12);
+            let output = bgra_to_nv12(&input, 2, 2, 12, OutputColor::new(false, None));
             assert_eq!(&output[..4], &[expected[0]; 4]);
             assert_eq!(&output[4..], &expected[1..]);
         }

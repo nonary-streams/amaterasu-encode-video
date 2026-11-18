@@ -1,4 +1,5 @@
 //! Optional built-in implementation of the same encoder SDK used by external plugins.
+mod color;
 mod control;
 mod framing;
 #[cfg(feature = "pyrowave-gpu")]

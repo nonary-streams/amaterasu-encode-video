@@ -56,7 +56,12 @@ unsafe extern "C" {
         frame: *const Frame,
         image: *mut *mut c_void,
     ) -> i32;
-    fn am_pyrowave_gpu_encode(image: *mut c_void, encoder: *mut c_void, budget: usize) -> i32;
+    fn am_pyrowave_gpu_encode(
+        image: *mut c_void,
+        encoder: *mut c_void,
+        budget: usize,
+        transform: *const f32,
+    ) -> i32;
     fn am_pyrowave_gpu_retire(image: *mut c_void);
 }
 pub(super) struct Context {
@@ -95,7 +100,7 @@ impl Context {
             image_view: function!("pyrowave_image_get_image_view"),
             image_destroy: function!("pyrowave_image_destroy"),
             wait_idle: function!("pyrowave_amaterasu_wait_idle_v1"),
-            encode_scaled: function!("pyrowave_encoder_encode_gpu_scaled_synchronous"),
+            encode_scaled: function!("pyrowave_amaterasu_encode_scaled_color_v1"),
         };
         // SAFETY: C copies the function table and only borrows the pinned device.
         let native = unsafe { am_pyrowave_gpu_create(&functions, device) };
@@ -213,9 +218,18 @@ pub(super) struct Import<'a> {
 impl Import<'_> {
     /// # Safety
     /// Encoder belongs to this import's runtime device, which stays serialized.
-    pub unsafe fn encode(&self, encoder: *mut c_void, budget: usize) -> Result<(), &'static str> {
+    pub unsafe fn encode(
+        &self,
+        encoder: *mut c_void,
+        budget: usize,
+        transform: &[[f32; 4]; 3],
+    ) -> Result<(), &'static str> {
         // SAFETY: caller pins the encoder and device; self pins imported storage.
-        if unsafe { am_pyrowave_gpu_encode(self.native, encoder, budget) } == 0 {
+        // The native scaler copies these rows before returning.
+        if unsafe {
+            am_pyrowave_gpu_encode(self.native, encoder, budget, transform.as_ptr().cast())
+        } == 0
+        {
             Ok(())
         } else {
             Err("pyrowave_gpu_encode_failed")
