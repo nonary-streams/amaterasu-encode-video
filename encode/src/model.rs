@@ -543,7 +543,13 @@ mod tests {
             "codec":"hevc", "bit_depth":8, "dynamic_range":"sdr"
         });
         let hevc: Configuration = serde_json::from_value(request).unwrap();
-        assert!(hevc.validate().is_ok());
+        assert_eq!(hevc.codec(), VideoCodec::Hevc);
+        let expected = if cfg!(target_os = "linux") {
+            Ok(())
+        } else {
+            Err("codec_unsupported")
+        };
+        assert_eq!(hevc.validate(), expected);
     }
 
     #[test]
