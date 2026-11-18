@@ -78,6 +78,10 @@ pub(super) fn project(payload: &Value) -> Result<Option<(Value, Value)>, &'stati
         } else {
             Profile::Sdr8
         },
+        color_mode: original
+            .get("color_mode")
+            .map(|mode| serde_json::from_value(mode.clone()).map_err(|_| "invalid_color_mode"))
+            .transpose()?,
         width: u32::try_from(number("width")?).map_err(|_| "invalid_configuration")?,
         height: u32::try_from(number("height")?).map_err(|_| "invalid_configuration")?,
         fps: u32::try_from(number("fps")?).map_err(|_| "invalid_configuration")?,
@@ -143,6 +147,11 @@ pub(super) fn common(
         } else {
             Profile::Sdr8
         },
+        color_mode: if common.flags & ENCODER_CONFIG_HAS_COLOR != 0 {
+            native_color_mode(common.color, hdr)?
+        } else {
+            None
+        },
         width: common.coded_width,
         height: common.coded_height,
         fps: common.fps_numerator,
@@ -154,6 +163,32 @@ pub(super) fn common(
         .validate()
         .map_err(|_| STATUS_INVALID_ARGUMENT)?;
     Ok(configuration)
+}
+
+fn native_color_mode(
+    color: FrameColorMetadata,
+    hdr: bool,
+) -> Result<Option<ColorMode>, amaterasu_module_sdk::abi::Status> {
+    if color.range == FRAME_COLOR_UNKNOWN && color.matrix == FRAME_COLOR_UNKNOWN {
+        return Ok(None);
+    }
+    let full = match color.range {
+        FRAME_RANGE_FULL => true,
+        FRAME_RANGE_LIMITED => false,
+        _ => return Err(MEDIA_UNSUPPORTED),
+    };
+    let bt601 = match color.matrix {
+        FRAME_MATRIX_BT2020_NCL if hdr => false,
+        FRAME_MATRIX_BT601 if !hdr => true,
+        FRAME_MATRIX_BT709 if !hdr => false,
+        _ => return Err(MEDIA_UNSUPPORTED),
+    };
+    Ok(Some(match (bt601, full) {
+        (true, true) => ColorMode::Bt601Full,
+        (true, false) => ColorMode::Bt601Limited,
+        (false, true) => ColorMode::Bt709Full,
+        (false, false) => ColorMode::Bt709Limited,
+    }))
 }
 
 fn original_range(payload: &Value) -> bool {

@@ -1,5 +1,8 @@
 //! Caller-owned PyroWave sessions. No capture, transport or socket policy lives here.
-use super::library::{self, CpuBuffer, Runtime};
+use super::{
+    color::OutputColor,
+    library::{self, CpuBuffer, Runtime},
+};
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
     abi::*,
@@ -66,6 +69,8 @@ const MAX_OPERATIONS: usize = 128;
 pub struct Configuration {
     #[serde(default, skip_serializing_if = "Profile::is_sdr")]
     pub profile: Profile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_mode: Option<ColorMode>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -74,6 +79,10 @@ pub struct Configuration {
     pub clock_origin_us: u64,
 }
 impl Configuration {
+    pub(super) fn output_color(&self) -> OutputColor {
+        OutputColor::new(self.profile.hdr(), self.color_mode)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !(16..=8192).contains(&self.width)
             || !(16..=8192).contains(&self.height)
@@ -121,6 +130,8 @@ pub(super) struct Session {
     configuration: Configuration,
     encoder: Option<library::Encoder>,
     runtime: Arc<Runtime>,
+    #[cfg(feature = "pyrowave-gpu")]
+    gpu_offers: Arc<[DmaBufResourceCapabilities]>,
     queue: OutputQueue,
     source: Option<u64>,
     pub selection: Option<Selection>,
@@ -257,7 +268,8 @@ impl State {
                     "bitstream": "186f0393",
                     "bit_depth": if profile.ten_bit() { 10 } else { 8 },
                     "chroma": "420",
-                    "range": "full",
+                    "range": "full", // Default for callers without a negotiated color mode.
+                    "ranges": ["limited", "full"],
                     "matrix": if profile.hdr() { "bt2020_ncl" } else { "bt709" },
                     "inputs": if self.runtime.gpu_only() {
                         vec!["dmabuf"]
@@ -309,6 +321,13 @@ impl State {
             configuration: configuration.clone(),
             encoder: Some(encoder),
             runtime: self.runtime.clone(),
+            #[cfg(feature = "pyrowave-gpu")]
+            gpu_offers: self
+                .runtime
+                .gpu_context()
+                .map(|gpu| gpu_input_offers(gpu, &configuration))
+                .unwrap_or_default()
+                .into(),
             queue: OutputQueue::new(SessionMode::Submitted, 2, library::MAX_FRAME_BYTES)
                 .map_err(|_| "encoder_state_failed")?,
             source: None,
@@ -372,18 +391,11 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
         {
             runtime
                 .gpu_context()
-                .filter(|gpu| {
-                    !gpu.offers(
-                        configuration.width,
-                        configuration.height,
-                        configuration.profile.ten_bit(),
-                    )
-                    .is_empty()
-                })
+                .filter(|gpu| !gpu_input_offers(gpu, configuration).is_empty())
                 .map(|_| ())
                 .ok_or("pyrowave_gpu_format_unavailable")?;
             let mut encoder = runtime.encoder(configuration.width, configuration.height)?;
-            return encoder.probe_gpu(configuration.profile.hdr(), configuration.budget());
+            return encoder.probe_gpu(configuration);
         }
     }
     if configuration.profile.hdr() {
@@ -398,7 +410,13 @@ fn probe(runtime: &Arc<Runtime>, configuration: &Configuration) -> Result<(), &'
         configuration.width,
     );
     // SAFETY: owned NV12 planes remain readable through synchronous encoding.
-    unsafe { encoder.encode(&buffer, configuration.budget()) }?;
+    unsafe {
+        encoder.encode(
+            &buffer,
+            configuration.budget(),
+            configuration.output_color(),
+        )
+    }?;
     Ok(())
 }
 pub(super) struct Provider {
@@ -605,6 +623,7 @@ impl Session {
                 configuration.width,
                 configuration.height,
                 cpu.descriptor().stride,
+                configuration.output_color(),
             );
             (converted.as_slice(), configuration.width)
         } else {
@@ -617,7 +636,11 @@ impl Session {
             self.encoder
                 .as_mut()
                 .ok_or("pyrowave_session_closed")?
-                .encode(&buffer, configuration.budget())
+                .encode(
+                    &buffer,
+                    configuration.budget(),
+                    configuration.output_color(),
+                )
         }
     }
     #[cfg(feature = "pyrowave-gpu")]
@@ -660,36 +683,22 @@ impl Session {
             self.encoder
                 .as_mut()
                 .ok_or("pyrowave_session_closed")?
-                .encode_gpu(
-                    input,
-                    self.configuration.profile.hdr(),
-                    self.configuration.profile.ten_bit(),
-                    self.configuration.budget(),
-                )
+                .encode_gpu(input, &self.configuration)
         }
     }
     pub fn gpu_only(&self) -> bool {
         self.runtime.gpu_only()
     }
+    pub(super) fn accepts_cpu_format(&self, format: u32) -> bool {
+        format != PIXEL_NV12
+            || self
+                .configuration
+                .output_color()
+                .accepts_full_range_bt709_nv12()
+    }
     #[cfg(feature = "pyrowave-gpu")]
-    pub fn gpu_offers(&self) -> Vec<DmaBufResourceCapabilities> {
-        let Some(gpu) = self.runtime.gpu_context() else {
-            return Vec::new();
-        };
-        let mut offers = gpu.offers(
-            self.configuration.width,
-            self.configuration.height,
-            self.configuration.profile.ten_bit(),
-        );
-        if self.configuration.profile == Profile::Sdr10 {
-            offers.extend(gpu.offers(self.configuration.width, self.configuration.height, false));
-        }
-        if !self.configuration.profile.hdr() {
-            for offer in &mut offers {
-                offer.color = DMABUF_COLOR_SRGB;
-            }
-        }
-        offers
+    pub fn gpu_offers(&self) -> &Arc<[DmaBufResourceCapabilities]> {
+        &self.gpu_offers
     }
     fn validate_frame(&self, descriptor: &CaptureResourceFrame) -> Result<u64, Status> {
         let selection = self.selection.ok_or(MEDIA_UNSUPPORTED)?;
@@ -748,6 +757,33 @@ impl Drop for Session {
         self.encoder.take();
     }
 }
+/// Input precision is independent of the PyroWave bitstream profile. Both SDR
+/// profiles can sample either RGB storage depth. HDR requires RGB10 with PQ.
+#[cfg(feature = "pyrowave-gpu")]
+fn gpu_input_offers(
+    gpu: &super::gpu::Context,
+    configuration: &Configuration,
+) -> Vec<DmaBufResourceCapabilities> {
+    let (width, height) = (configuration.width, configuration.height);
+    let ten_bit = configuration.profile.ten_bit();
+    let mut offers = gpu.offers(width, height, ten_bit);
+    if !configuration.profile.hdr() {
+        // Keep the full set for the preferred precision and use the remaining
+        // slots for the other SDR input depth. Resource negotiation is bounded.
+        let remaining = amaterasu_module_sdk::frame_processing::MAX_PROCESSING_OFFERS
+            .saturating_sub(offers.len());
+        offers.extend(
+            gpu.offers(width, height, !ten_bit)
+                .into_iter()
+                .take(remaining),
+        );
+        for offer in &mut offers {
+            offer.color = DMABUF_COLOR_SRGB;
+        }
+    }
+    offers
+}
+
 fn nv12(bytes: &[u8], width: u32, height: u32, stride: u32) -> CpuBuffer {
     let y_size = (stride * height) as usize;
     CpuBuffer {

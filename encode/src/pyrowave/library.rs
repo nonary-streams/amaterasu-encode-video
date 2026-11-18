@@ -1,4 +1,7 @@
 //! The pinned PyroWave 0.6 C ABI. Vulkan objects never cross the plugin boundary.
+use super::color::OutputColor;
+#[cfg(feature = "pyrowave-gpu")]
+use super::session::Configuration;
 use libloading::Library;
 use std::{
     ffi::c_void,
@@ -207,7 +210,7 @@ pub(super) struct Encoder {
 unsafe impl Send for Encoder {}
 impl Encoder {
     #[cfg(feature = "pyrowave-gpu")]
-    pub fn probe_gpu(&mut self, hdr: bool, budget: usize) -> Result<(), &'static str> {
+    pub fn probe_gpu(&mut self, configuration: &Configuration) -> Result<(), &'static str> {
         let _device = self
             .runtime
             .device
@@ -216,18 +219,32 @@ impl Encoder {
         // SAFETY: the pinned private API uses this encoder's serialized device,
         // renders its own image and completes every GPU access before returning.
         let probe = unsafe {
-            self.runtime
-                .api
-                ._library
-                .get::<unsafe extern "C" fn(Handle, bool, usize) -> i32>(
-                    b"pyrowave_amaterasu_probe_v1\0",
-                )
+            self.runtime.api._library.get::<unsafe extern "C" fn(
+                Handle,
+                bool,
+                bool,
+                usize,
+                *const f32,
+            ) -> i32>(b"pyrowave_amaterasu_probe_color_v1\0")
         }
         .map_err(|_| "pyrowave_gpu_probe_unavailable")?;
-        if unsafe { probe(self.handle, hdr, budget) } != 0 {
+        let ten_bit = configuration.profile.ten_bit();
+        let color = configuration.output_color();
+        let transform = color.coefficients(ten_bit);
+        // SAFETY: the affine coefficients remain borrowed during the native call.
+        if unsafe {
+            probe(
+                self.handle,
+                configuration.profile.hdr(),
+                ten_bit,
+                configuration.budget(),
+                transform.as_ptr().cast(),
+            )
+        } != 0
+        {
             return Err("pyrowave_gpu_probe_failed");
         }
-        self.packetize(hdr).map(|_| ())
+        self.packetize(color).map(|_| ())
     }
     /// CPU allocations must remain readable through this call. Packetization
     /// waits for GPU completion before the borrow returns, also on error: drop
@@ -236,6 +253,7 @@ impl Encoder {
         &mut self,
         input: &CpuBuffer,
         budget: usize,
+        color: OutputColor,
     ) -> Result<Vec<u8>, &'static str> {
         let _device = self
             .runtime
@@ -251,15 +269,13 @@ impl Encoder {
         if unsafe { (api.encode)(self.handle, input, &rate) } != 0 {
             return Err("pyrowave_encode_failed");
         }
-        self.packetize(false)
+        self.packetize(color)
     }
     #[cfg(feature = "pyrowave-gpu")]
     pub unsafe fn encode_gpu(
         &mut self,
         frame: &amaterasu_media::DmaBufFrame,
-        hdr: bool,
-        ten_bit: bool,
-        budget: usize,
+        configuration: &Configuration,
     ) -> Result<Vec<u8>, &'static str> {
         let _device = self
             .runtime
@@ -273,11 +289,20 @@ impl Encoder {
             .ok_or("pyrowave_gpu_unavailable")?;
         // SAFETY: caller keeps the immutable capture presentation borrowed until
         // the import's synchronous retirement, including every failure path.
-        let imported = unsafe { context.import_precision(frame, hdr, ten_bit)? };
-        unsafe { imported.encode(self.handle, budget)? };
-        self.packetize(hdr)
+        let ten_bit = configuration.profile.ten_bit();
+        let imported =
+            unsafe { context.import_precision(frame, configuration.profile.hdr(), ten_bit)? };
+        let color = configuration.output_color();
+        unsafe {
+            imported.encode(
+                self.handle,
+                configuration.budget(),
+                &color.coefficients(ten_bit),
+            )?
+        };
+        self.packetize(color)
     }
-    fn packetize(&self, hdr: bool) -> Result<Vec<u8>, &'static str> {
+    fn packetize(&self, color: OutputColor) -> Result<Vec<u8>, &'static str> {
         let api = &self.runtime.api;
         let mut raw = ptr::null();
         let mut metadata = ptr::null();
@@ -334,7 +359,7 @@ impl Encoder {
         {
             return Err("pyrowave_packetize_failed");
         }
-        set_sequence_color(&mut bitstream, hdr)?;
+        set_sequence_color(&mut bitstream, color)?;
         let mut records = Vec::with_capacity(capacity);
         records.extend_from_slice(&(count as u32).to_le_bytes());
         let mut cursor = 0;
@@ -362,7 +387,7 @@ impl Encoder {
 
 /// The pinned packer leaves the documented sequence color fields at SDR defaults.
 /// Set those fields from the negotiated profile without changing codec syntax.
-fn set_sequence_color(bitstream: &mut [u8], hdr: bool) -> Result<(), &'static str> {
+fn set_sequence_color(bitstream: &mut [u8], output: OutputColor) -> Result<(), &'static str> {
     if bitstream.len() < 8 {
         return Err("pyrowave_invalid_record");
     }
@@ -371,9 +396,8 @@ fn set_sequence_color(bitstream: &mut [u8], hdr: bool) -> Result<(), &'static st
     if sequence & (1 << 31) == 0 || color & (3 << 24) != 0 {
         return Err("pyrowave_invalid_record");
     }
-    // Bits 27..29 are BT.2020 primaries, PQ transfer and BT.2020 transform.
-    // Bit 30 remains zero for full range; bit 31 is centered chroma.
-    color = (color & !(7 << 27)) | if hdr { 7 << 27 } else { 0 };
+    // Clear all five color fields. The encoder uses centered chroma (bit 31 clear).
+    color = (color & !(31 << 27)) | output.sequence_bits();
     bitstream[4..8].copy_from_slice(&color.to_le_bytes());
     Ok(())
 }
@@ -661,17 +685,19 @@ mod bounds_tests {
 
     #[test]
     fn sequence_color_marks_hdr_without_changing_geometry_sequence_or_block_count() {
+        use amaterasu_media::ColorMode;
         let first = (1u32 << 31) | 1919 | (1079 << 14) | (3 << 28);
         let mut bytes = [first.to_le_bytes(), 23u32.to_le_bytes()].concat();
-        set_sequence_color(&mut bytes, true).unwrap();
+        let limited_hdr = OutputColor::new(true, Some(ColorMode::Bt601Limited));
+        set_sequence_color(&mut bytes, limited_hdr).unwrap();
         assert_eq!(&bytes[..4], &first.to_le_bytes());
         assert_eq!(
             u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            23 | (7 << 27)
+            23 | (15 << 27)
         );
-        set_sequence_color(&mut bytes, false).unwrap();
+        set_sequence_color(&mut bytes, OutputColor::new(false, None)).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 23);
         bytes[3] &= 0x7f;
-        assert!(set_sequence_color(&mut bytes, true).is_err());
+        assert!(set_sequence_color(&mut bytes, limited_hdr).is_err());
     }
 }

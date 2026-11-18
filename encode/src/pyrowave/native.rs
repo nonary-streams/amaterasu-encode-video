@@ -218,7 +218,7 @@ unsafe extern "C" fn enumerate(
         if session.gpu_only() {
             #[cfg(feature = "pyrowave-gpu")]
             {
-                let offers = session.gpu_offers();
+                let offers = session.gpu_offers().clone();
                 drop(state);
                 unsafe {
                     *generation = 1;
@@ -249,12 +249,16 @@ unsafe extern "C" fn enumerate(
                 return STATUS_OK;
             }
         }
+        let accepts_nv12 = session.accepts_cpu_format(PIXEL_NV12);
         drop(state);
         // SAFETY: caller provides writable generation pointer.
         unsafe {
             *generation = 1;
         }
         for (id, format) in [(1, PIXEL_BGRA8), (2, PIXEL_NV12)] {
+            if format == PIXEL_NV12 && !accepts_nv12 {
+                continue;
+            }
             let caps = CpuResourceCapabilities {
                 format,
                 min_width: width,
@@ -359,6 +363,7 @@ unsafe extern "C" fn configure(
         let (width, height) = session.dimensions();
         if !session.configured()
             || session.gpu_only()
+            || !session.accepts_cpu_format(format)
             || caps.format != format
             || width < caps.min_width
             || width > caps.max_width

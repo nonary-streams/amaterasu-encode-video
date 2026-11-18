@@ -190,12 +190,12 @@ int am_pyrowave_gpu_import(struct am_pyrowave_gpu *gpu, const struct am_pyrowave
     *output = image;
     return 0;
 }
-int am_pyrowave_gpu_encode(struct am_pyrowave_gpu_image *image, void *encoder, size_t budget) {
-    if (!image || !encoder) return -1;
+int am_pyrowave_gpu_encode(struct am_pyrowave_gpu_image *image, void *encoder, size_t budget, const float *transform) {
+    if (!image || !encoder || !transform) return -1;
     pyrowave_gpu_external_reference reference = { .image = image->image, .queue_family_index = VK_QUEUE_FAMILY_FOREIGN_EXT };
     pyrowave_gpu_sync_operation sync = { .images = &reference, .num_images = 1 };
     pyrowave_rate_control rate = { .maximum_bitstream_size = budget };
-    return image->gpu->api.encode_scaled(encoder, &sync, &sync, &image->scaling, &rate) == PYROWAVE_SUCCESS ? 0 : -1;
+    return image->gpu->api.encode_scaled(encoder, &sync, &sync, &image->scaling, &rate, transform) == PYROWAVE_SUCCESS ? 0 : -1;
 }
 void am_pyrowave_gpu_retire(struct am_pyrowave_gpu_image *image) {
     if (image) {

@@ -13,6 +13,7 @@ use std::{
 fn configuration() -> session::Configuration {
     session::Configuration {
         profile: session::Profile::Sdr8,
+        color_mode: None,
         width: 64,
         height: 48,
         fps: 60,
@@ -98,6 +99,14 @@ unsafe extern "C" fn dispatch(
             }
         }
         Command::Log { .. } => Response::Ok,
+        Command::Publish { topic, payload }
+            if topic == amaterasu_module_sdk::stream_lifecycle::STREAM_REPORTS.name() =>
+        {
+            let report: amaterasu_module_sdk::stream_lifecycle::StreamReport =
+                serde_json::from_value(payload).unwrap();
+            assert!(report.valid());
+            Response::Ok
+        }
         _ => panic!("unexpected runtime request"),
     };
     // SAFETY: serialized response lives through the sink.
