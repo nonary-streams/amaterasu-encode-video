@@ -295,7 +295,21 @@ impl Factory for AcceptanceFactory {
         config: Configuration,
     ) -> Result<Box<dyn Backend>, &'static str> {
         let shared = self.shared.upgrade().unwrap();
-        let shared_lock_available = shared.try_lock().is_ok();
+        // A broker tick can briefly hold the shared state independently of
+        // this native call. Wait for one acquisition while the call is still
+        // active to distinguish a transient tick from a lock held across it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let shared_lock_available = loop {
+            match shared.try_lock() {
+                Ok(_) => break true,
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => break false,
+            }
+        };
         self.observations.lock().unwrap().attempts.push(Attempt {
             identity: identity.clone(),
             configuration: config.clone(),
