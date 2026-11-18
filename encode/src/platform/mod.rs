@@ -40,10 +40,10 @@ pub struct Metrics {
 pub fn last_failure() -> Option<Diagnostic> {
     #[cfg(windows)]
     {
-        return windows::last_failure().map(|detail| Diagnostic {
+        windows::last_failure().map(|detail| Diagnostic {
             stage: detail.stage,
             hresult: detail.hresult,
-        });
+        })
     }
     // The NVENC, CUDA, EGL or GL code is reported in the hresult field.
     #[cfg(amaterasu_nvenc_cuda)]
@@ -59,13 +59,13 @@ pub fn metrics() -> Metrics {
     #[cfg(windows)]
     {
         let metrics = windows::metrics();
-        return Metrics {
+        Metrics {
             need_input_events: metrics.need_input_events,
             have_output_events: metrics.have_output_events,
             other_events: metrics.other_events,
             process_input_calls: metrics.process_input_calls,
             process_output_calls: metrics.process_output_calls,
-        };
+        }
     }
     #[cfg(not(windows))]
     Metrics {
@@ -113,7 +113,7 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 
 pub enum Encoder {
     #[cfg(windows)]
-    Hardware(windows::Encoder),
+    Hardware(Box<windows::Encoder>),
     #[cfg(all(target_os = "linux", amaterasu_nvenc_cuda))]
     NvencCuda(nvenc_cuda::Encoder),
     #[cfg(all(target_os = "linux", amaterasu_ffmpeg_nvenc))]
@@ -215,7 +215,9 @@ impl Encoder {
 
         #[cfg(windows)]
         {
-            windows::Encoder::open(identity, configuration).map(Self::Hardware)
+            windows::Encoder::open(identity, configuration)
+                .map(Box::new)
+                .map(Self::Hardware)
         }
         #[cfg(not(windows))]
         {

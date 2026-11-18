@@ -198,6 +198,7 @@ struct RetainedFrame {
 /// A DMA-BUF lease or a negotiated resource frame (encoder v1.5).
 #[derive(Clone, Copy)]
 enum RetainedReference {
+    #[cfg(unix)]
     Lease(DmaBufFrameLease),
     Resource(CaptureResourceFrame),
 }
@@ -240,6 +241,7 @@ fn provider_release_capacity_available() -> bool {
 fn release_reference(reference: RetainedReference) {
     match reference {
         // SAFETY: successful retain owns this reference; backend completion/close joined all GPU reads.
+        #[cfg(unix)]
         RetainedReference::Lease(lease) => unsafe {
             (lease.release.expect("validated lease"))(lease.context, -1)
         },
