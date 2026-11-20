@@ -70,6 +70,17 @@ pub(super) fn project(payload: &Value) -> Result<Option<(Value, Value)>, &'stati
         ([1; 16], 1)
     };
     let number = |key| original[key].as_u64().ok_or("invalid_configuration");
+    let color_mode = original
+        .get("color_mode")
+        .map(|mode| serde_json::from_value(mode.clone()).map_err(|_| "invalid_color_mode"))
+        .transpose()?;
+    // HDR always uses BT.2020. The common native config represents its range
+    // with the corresponding 709 mode, regardless of the legacy client matrix.
+    let color_mode = match (hdr, color_mode) {
+        (true, Some(ColorMode::Bt601Limited)) => Some(ColorMode::Bt709Limited),
+        (true, Some(ColorMode::Bt601Full)) => Some(ColorMode::Bt709Full),
+        (_, mode) => mode,
+    };
     let configuration = Configuration {
         profile: if hdr {
             Profile::Hdr10
@@ -78,10 +89,7 @@ pub(super) fn project(payload: &Value) -> Result<Option<(Value, Value)>, &'stati
         } else {
             Profile::Sdr8
         },
-        color_mode: original
-            .get("color_mode")
-            .map(|mode| serde_json::from_value(mode.clone()).map_err(|_| "invalid_color_mode"))
-            .transpose()?,
+        color_mode,
         width: u32::try_from(number("width")?).map_err(|_| "invalid_configuration")?,
         height: u32::try_from(number("height")?).map_err(|_| "invalid_configuration")?,
         fps: u32::try_from(number("fps")?).map_err(|_| "invalid_configuration")?,
@@ -211,5 +219,40 @@ mod tests {
         assert_eq!(echo["configuration"], request["configuration"]);
         request["configuration"]["extension_profile"]["codec"]["schema"] = json!(1);
         assert!(project(&request).is_err());
+    }
+
+    #[test]
+    fn hdr_broker_config_matches_native_bt2020_for_legacy_client_color_modes() {
+        let codec = json!({"namespace_id":CODEC_HDR10.namespace_id,"value":CODEC_HDR10.value,"schema":CODEC_HDR10.schema});
+        let framing = json!({"namespace_id":RECORDS.namespace_id,"value":RECORDS.value,"schema":RECORDS.schema});
+        let mut request = json!({"action":"open","operation_id":"test","encoder":{"clsid":"pyrowave"},"source_id":1,
+            "resource_output_clock":{"domain":"stream_relative","epoch_id":"07070707070707070707070707070707","host_origin_us":123},
+            "configuration":{"width":64,"height":48,"fps":60,"bitrate":1000000,
+                "video_stream_format":{"dynamic_range":"hdr"},"extension_profile":{"codec":codec,"framing":framing}}});
+        for (client_mode, range) in [
+            (ColorMode::Bt601Limited, FRAME_RANGE_LIMITED),
+            (ColorMode::Bt601Full, FRAME_RANGE_FULL),
+            (ColorMode::Bt709Limited, FRAME_RANGE_LIMITED),
+            (ColorMode::Bt709Full, FRAME_RANGE_FULL),
+        ] {
+            let native_mode = native_color_mode(
+                FrameColorMetadata {
+                    matrix: FRAME_MATRIX_BT2020_NCL,
+                    range,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+            request["configuration"]["color_mode"] = json!(client_mode);
+            let (projected, echo) = project(&request).unwrap().unwrap();
+            assert_eq!(projected["configuration"]["color_mode"], json!(native_mode));
+            assert_eq!(echo["configuration"], request["configuration"]);
+
+            request["configuration"]["video_stream_format"]["dynamic_range"] = json!("sdr");
+            let (projected, _) = project(&request).unwrap().unwrap();
+            assert_eq!(projected["configuration"]["color_mode"], json!(client_mode));
+            request["configuration"]["video_stream_format"]["dynamic_range"] = json!("hdr");
+        }
     }
 }
