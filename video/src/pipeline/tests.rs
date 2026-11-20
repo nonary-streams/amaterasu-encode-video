@@ -440,6 +440,8 @@ struct FakePlane {
     fail: bool,
     failure_code: Option<&'static str>,
     failure_code_once: Option<&'static str>,
+    frame_failure: Option<(LifecycleLayer, NativeStreamFailure)>,
+    hdr_failure: Option<&'static str>,
     freshness_api: bool,
     capture_timestamp_api: bool,
     capture_pacing_timestamp_us: u64,
@@ -468,6 +470,19 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn take_frame_failure(&mut self, _: u64) -> Option<(LifecycleLayer, NativeStreamFailure)> {
+        self.frame_failure.take()
+    }
+
+    fn hdr_metadata(
+        &mut self,
+        _: u64,
+        _: CaptureProvider,
+        _: u64,
+    ) -> Result<Option<amaterasu_media::HdrMetadata>, &'static str> {
+        self.hdr_failure.map_or(Ok(None), Err)
+    }
+
     fn source_preflight(
         &mut self,
         provider: CaptureProvider,

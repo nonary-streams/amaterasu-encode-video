@@ -26,7 +26,7 @@ use crate::{
 };
 use amaterasu_media::{CaptureGeometry, ColorMode, VideoCodec};
 use amaterasu_module_sdk::diagnostics::LatencyMetric as TimingMetric;
-use amaterasu_module_sdk::stream_lifecycle::LifecycleLayer;
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, NativeStreamFailure};
 use amaterasu_module_sdk::{Command, EncoderBackend, EncoderIdentity, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -554,8 +554,23 @@ impl Stream {
 
     #[track_caller]
     fn cleanup(&mut self, code: &'static str) {
-        eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage);
-        self.report_ending(code);
+        self.cleanup_with_native_failure(code, None);
+    }
+
+    #[track_caller]
+    fn cleanup_with_native_failure(
+        &mut self,
+        code: &'static str,
+        failure: Option<(LifecycleLayer, NativeStreamFailure)>,
+    ) {
+        match &failure {
+            Some((_, native)) => eprintln!(
+                "amaterasu video cleanup operation={} stage={:?} code={code}: {native}",
+                self.operation, self.stage,
+            ),
+            None => eprintln!("amaterasu video cleanup stage={:?} code={code}", self.stage),
+        }
+        self.report_ending(code, failure);
         if let Some(request) = self.pending.take() {
             self.unsettled = Some(request);
             self.unsettled_effect = stage_mutates_provider(self.stage);
@@ -1456,7 +1471,11 @@ impl Pipeline {
                     .startup_frame_ready(&stream.owner, id)
                     .unwrap_or(false);
                 queues.set_geometry(id, stream.desktop_geometry);
-                if let Some(capture) = stream.capture {
+                if matches!(
+                    stream.stage,
+                    Stage::Running | Stage::RestartCloseEncoder | Stage::ReplaceCapture
+                ) && let Some(capture) = stream.capture
+                {
                     match plane.hdr_metadata(id, stream.provider, capture) {
                         Ok(metadata) => queues.set_hdr(id, metadata),
                         Err(code) => stream.cleanup(code),
@@ -1845,7 +1864,7 @@ fn pump(
             if capture_start_recorded {
                 cancel_processing_start(queues, generation, id, sequence);
             }
-            stream.cleanup(code);
+            stream.cleanup_with_native_failure(code, plane.take_frame_failure(id));
         }
     }
 }

@@ -7,7 +7,8 @@ use amaterasu_module_sdk::{
         EncoderPresentation, EncoderResourceConsumer, HostVideoPresentation,
         PresentingResourceConsumer,
     },
-    frame_processing::{FrameProcessingSession, FrameProcessingStage},
+    frame_processing::{FrameProcessingEndpoint, FrameProcessingSession, FrameProcessingStage},
+    stream_lifecycle::{LifecycleLayer, NativeStreamFailure},
 };
 
 /// The selected encoder at the end of a processing chain. A native encoder
@@ -135,6 +136,41 @@ impl Session {
     }
     pub(super) fn source_matches(&self, input: &Pump<'_>) -> bool {
         self.provider == input.provider && self.capture == input.capture
+    }
+    pub(super) fn take_failure(
+        &self,
+        processor_service: &str,
+    ) -> Option<(LifecycleLayer, NativeStreamFailure)> {
+        let failure = self.connection.take_failure()?;
+        let adapter_rejected = failure.endpoint == FrameProcessingEndpoint::Consumer
+            && failure.call == "submit"
+            && matches!(&self.encoder, Edge::Consumer(edge) if !edge.submitted_to_provider());
+        let (layer, service) = match failure.endpoint {
+            FrameProcessingEndpoint::Capture => (LifecycleLayer::Capture, self.provider.service()),
+            FrameProcessingEndpoint::Processor(_) => {
+                (LifecycleLayer::FrameProcessing, processor_service)
+            }
+            FrameProcessingEndpoint::Consumer if adapter_rejected => {
+                (LifecycleLayer::EncodeVideo, "amaterasu.video/1")
+            }
+            FrameProcessingEndpoint::Consumer => {
+                (LifecycleLayer::EncodeVideo, &*self.encoder_service)
+            }
+        };
+        Some((
+            layer,
+            NativeStreamFailure {
+                service: service.to_owned(),
+                call: if adapter_rejected {
+                    "present_encoder_resource"
+                } else {
+                    failure.call
+                }
+                .into(),
+                status: failure.status,
+                capture_generation: failure.capture_generation,
+            },
+        ))
     }
     pub(super) unsafe fn select_encoder(
         &mut self,

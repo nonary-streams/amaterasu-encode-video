@@ -25,7 +25,10 @@ use crate::{
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
-    ModuleResult, NativeBinding, RuntimeClient, abi::*, media::native_contracts,
+    ModuleResult, NativeBinding, RuntimeClient,
+    abi::*,
+    media::native_contracts,
+    stream_lifecycle::{LifecycleLayer, NativeStreamFailure},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
@@ -237,6 +240,9 @@ pub trait Plane {
         expected: Option<CaptureGeometry>,
     ) -> Result<GeometryProgress, &'static str>;
     fn pump(&mut self, input: Pump<'_>) -> Result<Progress, &'static str>;
+    fn take_frame_failure(&mut self, _: u64) -> Option<(LifecycleLayer, NativeStreamFailure)> {
+        None
+    }
     fn drain(&mut self, encoder: u64) -> Result<bool, &'static str>;
     fn retire_encoder_references(&mut self, _: u64) -> Result<(), &'static str> {
         Ok(())
@@ -784,6 +790,11 @@ unsafe fn submit_to_encoder(submission: &mut Submission<'_>, frame: &CpuFrame) -
 }
 
 impl Plane for NativePlane {
+    fn take_frame_failure(&mut self, video: u64) -> Option<(LifecycleLayer, NativeStreamFailure)> {
+        self.processing_sessions
+            .get(&video)?
+            .take_failure(self.gpu_processor_service.as_deref()?)
+    }
     fn source_preflight(
         &mut self,
         provider: CaptureProvider,

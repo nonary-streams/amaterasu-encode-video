@@ -8,7 +8,7 @@
 use super::{Pipeline, Stage, Stream, stage_name};
 use crate::rpc::Send;
 use amaterasu_module_sdk::stream_lifecycle::{
-    LifecycleLayer, StreamBinding, StreamIssue, StreamIssueOutbox,
+    LifecycleLayer, NativeStreamFailure, StreamBinding, StreamIssue, StreamIssueOutbox,
 };
 
 /// Endings a caller or the host asked for. They are not stream failures.
@@ -154,7 +154,11 @@ impl Stream {
     /// Report why the stream is ending. A drain that fails is a cleanup
     /// failure beside whatever ended the stream, so it is advisory.
     #[track_caller]
-    pub(super) fn report_ending(&mut self, code: &'static str) {
+    pub(super) fn report_ending(
+        &mut self,
+        code: &'static str,
+        failure: Option<(LifecycleLayer, NativeStreamFailure)>,
+    ) {
         let provider_code = self.issues.provider_code.take();
         if self.issues.ending_reported || REQUESTED_ENDINGS.contains(&code) {
             return;
@@ -173,7 +177,11 @@ impl Stream {
                 .then(|| self.encoder_probe_reason.clone())
                 .flatten()
         });
-        let issue = with_cause(issue, dependency_for(self.stage, code));
+        let issue = match failure {
+            Some((dependency, failure)) => issue.caused_by(dependency).with_native_failure(failure),
+            None => with_cause(issue, dependency_for(self.stage, code)),
+        };
+
         self.issues.push(with_reason(issue, reason.as_deref()));
     }
 

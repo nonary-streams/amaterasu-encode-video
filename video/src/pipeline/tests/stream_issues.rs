@@ -133,3 +133,40 @@ fn reports_are_off_until_enabled_and_requested_endings_are_not_failures() {
         "a caller's close is not a failure"
     );
 }
+
+#[test]
+fn a_terminal_processing_failure_preserves_its_native_evidence_during_cleanup() {
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.enable_stream_issue_reports();
+    let request = open_from_session(EncoderSelection::Identity(encoder_identity()));
+    pipeline.handle("alice", 100, request, &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 12);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+
+    let failure = NativeStreamFailure {
+        service: "amaterasu.rtx-hdr/1".into(),
+        call: "process".into(),
+        status: amaterasu_media::MEDIA_UNSUPPORTED,
+        capture_generation: Some(9),
+    };
+    plane.failure_code_once = Some("frame_processor_failed");
+    plane.frame_failure = Some((LifecycleLayer::FrameProcessing, failure.clone()));
+    plane.hdr_failure = Some("processor_hdr_metadata_unavailable");
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].error, Some("frame_processor_failed"));
+    tick(&mut pipeline, &mut runtime, &mut plane, 8);
+
+    let published = issues(&runtime.commands);
+    let first = published
+        .iter()
+        .find(|issue| issue.code == "frame_processor_failed")
+        .unwrap();
+    assert_eq!(first.operation, "ss-2a-video");
+    assert_eq!(first.caused_by, Some(LifecycleLayer::FrameProcessing));
+    assert_eq!(first.native_failure.as_deref(), Some(&failure));
+    assert!(
+        !published
+            .iter()
+            .any(|issue| issue.code == "processor_hdr_metadata_unavailable")
+    );
+}
